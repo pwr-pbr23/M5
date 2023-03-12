@@ -29,5 +29,3 @@ COPY . /home/playground/
 WORKDIR /home/playground
 
 RUN ./build.sh
-
-# fixes the docker setup (libraries like `numpy`, `scikit` and `matplotlib ` wouldn't start with the old installation process) and makes the project runnable.
