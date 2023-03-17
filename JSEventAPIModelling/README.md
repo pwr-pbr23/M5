@@ -3,8 +3,10 @@
 First clone this repo.
 Make sure you have docker installed.
 
-Then, you'll need to download `codeql-linux64.zip` from the [latest codeql CLI releases](https://github.com/github/codeql-cli-binaries/releases).
+Then, you'll need to download `codeql-linux64.zip` or the one matching your OS from the [latest codeql CLI releases](https://github.com/github/codeql-cli-binaries/releases).
 Place this in the root directory of this repo.
+
+Keep in mind that the name of the file of codeql needs to be `codeql-linux64.zip` once you put it in the root directory, but under the hood it can be a binary for other OS, like OSX or Windows.
 
 Then, from the root of the repo, you can build and run the docker image.
 
