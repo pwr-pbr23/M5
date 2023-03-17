@@ -465,7 +465,7 @@ def getColValSpecIfNone( root_df, root, col_name, error_val):
 # return the results in a list sorted by the overall_TP_rate
 # note: the optional check_errors parameter specifies to check for correct/incorrect errors identified; if it's false we look at the 
 # results over the correct API uses diagnosed
-def getExperimentStats( param_configs, known_correct, known_broken, known_knownUnknown, check_errors = True, pkgs_to_ignore = [], debug_mode = True, data_dir = "."):
+def getExperimentStats( param_configs, known_correct, known_broken, known_knownUnknown, check_errors = True, pkgs_to_ignore = [], debug_mode = True, data_dir = "list_results"):
 	# compute stats for each run
 	# then, keep a running track of the returned ExpStats
 	# at the end, can probably order the list by different metrics 
@@ -474,6 +474,7 @@ def getExperimentStats( param_configs, known_correct, known_broken, known_knownU
 		if debug_mode:
 			print("Analyzing: " + str(ps) + "\n")
 		filename = "pe" + str(ps.prare_e) + "_pp" + str(ps.prare_p) + "_pce" + str(ps.pconfe) + "_pcp" + str(ps.pconfp) + "_.csv"
+		# print('filename', filename)
 		computed_correct = pd.DataFrame() 
 		computed_broken = pd.DataFrame() 
 		try:
@@ -754,6 +755,8 @@ def condensePortal( portal):
 
 # sample usecase 
 def main():
+	print("Starting the tests!")
+
 	# first, read in the results of the data mining (note: this is for the version with alias removal)
 	dat = processFile('MinedData/listen_merged_data.out')
 	dat_with_files = pd.read_csv('MinedData/listen_merged_data_withFile.out', sep=',', header=None)
@@ -767,7 +770,7 @@ def main():
 	# this is the set of 4069 configurations we tested in the paper
 	ncs = [0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.1, 1]
 	vs = list(set(list(itertools.product(ncs, repeat=4)))) 
-	param_configs_new = [Pscs(c[0] if c[0] != 1 else 0.25, c[1] if c[1] != 1 else 0.25, c[2], c[3]) for c in vs]
+	new_param_configs = [Pscs(c[0] if c[0] != 1 else 0.25, c[1] if c[1] != 1 else 0.25, c[2], c[3]) for c in vs]
 
 	pkgs_to_test = ['fs', 'http', 'net', 'child_process', 'zlib', 'https', 'socket.io', 
 					'socket.io-client', 'stream', 'readable-stream', 'ws', 'process', 'tls', 
@@ -775,7 +778,7 @@ def main():
 
 	# this line runs all the experiments!! 
 	# it takes a long time to run (~ 10 hours on ThinkPad P43s with 32 GB RAM)
-	runTests(dat, param_configs, pkgs_to_test, True)
+	# runTests(dat, new_param_configs, pkgs_to_test, True)
 
 	# read in the set of labelled data
 	new_known_correct = pd.read_csv('GroundTruthGeneration/correct.csv', sep=',', header=None)
@@ -792,21 +795,22 @@ def main():
 	new_known_knownUnknown.drop_duplicates(inplace=True)
 
 	# run the experiments
-	new_results = getExperimentStats( param_configs_new, new_known_correct, new_known_broken, new_known_knownUnknown, True, [], True, "list_results")
+	new_results = getExperimentStats(new_param_configs, new_known_correct, new_known_broken, new_known_knownUnknown, True, [], True, "list_results")
 	new_check = [(np.inf if np.isnan(k[0]) else k[0], k[1].overall_TP_count, k[2], k[1].overall_FP_count, k[1].overall_U_U_count) for k in new_results] # get a more readable list without the giant "diagnosed" frames
 	new_check = list(zip(new_check, list(range(len(new_check)))))
 	new_check.sort()
 	new_graphcheck = [c for c in new_check if (c[0][2].pconfe != 1 or c[0][2].pconfp != 1)] # optional: remove all the results with both threshs set to 1, since this makes no sense as results and skews the graph axis
 
 	threshs = np.arange(1, 0.79, -0.01).tolist()
-	reltable = generateTableBestGTE(check, threshs, results, dat_with_files)
+	reltable = generateTableBestGTE(new_check, threshs, new_results, dat_with_files)
 
-	root_spec_FP_res = getRootSpecificSortedResults(results, pkgs_to_test, 'root_TP_rate', 'root_TP_count')
+	root_spec_FP_res = getRootSpecificSortedResults(new_results, pkgs_to_test, 'root_TP_rate', 'root_TP_count')
 
-	correct_results = getExperimentStats( param_configs, known_correct, known_broken, False, ['inherits', 'jquery'], True, ".")
+	correct_results = getExperimentStats(new_param_configs, new_known_correct, new_known_broken, new_known_knownUnknown, False, ['inherits', 'jquery'], True, "list_results")
 	correct_check = [(k[0], k[1].diagnosed['proot'].count(), k[2]) for k in correct_results] # get a more readable list without the giant "diagnosed" frames
 	correct_root_spec_FP_res = getRootSpecificSortedResults(correct_results, pkgs_to_test, 'root_FP_rate', 'root_count')
 
 	print("Done the tests!")
 
-# main()
+if __name__ == "__main__":
+	main()		
