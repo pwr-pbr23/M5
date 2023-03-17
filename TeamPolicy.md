@@ -1,0 +1,13 @@
+# Team Policy
+
+Your team will have a number of responsibilities as it completes research project:
+
+- Designate a (team) coordinator, researcher-developer(s), and checker role (if needed). Supervisor is an additional member of the team focused on/responsible for high level guidance during course meetings. Rotate the coordinator role for every two weeks.
+- Agree on a common meeting time and what each member should have done before the meeting (readings, taking the first cut at some or all of the assigned work, etc.)
+- Do the required individual preparation.
+- Coordinator checks with other team members before the meeting to remind them of when and where they will meet and what they are supposed to do.
+- Meet and work. Coordinator keeps everyone on task and makes sure everyone is involved, researcher-developer searches for and prepares the solution(s) (sometimes in parallel with other researcher-developers or coordinator), and checker (if needed) double-checks the solutions and makes sure everyone understands both the solution and the strategy used to get it. Agree on next meeting time and roles for next assignment.
+- Consult with your Supervisor if a conflict arises that can’t be worked through by the team.
+- Dealing with non-cooperative team members. If a team member refuses to cooperate, and the problem persists, the team should meet with the supervisor so that the problem can be resolved, if possible. If the problem still continues, the cooperating team members may notify the uncooperative member in writing (email is fine) that he/she is in danger of being fired, sending a copy of the memo to the supervisor (CC, if the message is delivered via e-mail). If there is no subsequent improvement, they should notify the individual in writing (CC to the supervisor) that he/she is no longer with the team. The fired student should meet with his/her supervisor to discuss options. Similarly, students who are consistently doing all the work for their team may issue a warning memo that they will quit unless they start getting cooperation, and a second memo quitting the team if the cooperation is not forthcoming. Students who get fired or quit must either find another team willing to add them as a member, continue alone or get zeroes for the remaining assignments.
+
+As you will find out, group work isn’t always easy—team members sometimes cannot prepare for or attend group sessions because of other responsibilities, and conflicts often result from differing skill levels and work ethics. When teams work and communicate well, however, the benefits more than compensate for the difficulties. One way to improve the chances that a team will work well is to agree beforehand on what everyone on the team expects from everyone else.
