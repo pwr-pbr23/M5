@@ -1,0 +1,373 @@
+/*
+derby - class org.apache.derby.impl.store.replication.master.asynchronouslogshipper
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store replication master
+import java io ioexception
+import java util nosuchelementexception
+import org apache derby iapi error standardexception
+import org apache derby iapi reference property
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services property propertyutil
+import org apache derby iapi services sanity sanitymanager
+import org apache derby impl store replication replicationlogger
+import org apache derby impl store replication buffer replicationlogbuffer
+import org apache derby impl store replication net replicationmessage
+import org apache derby impl store replication net replicationmessagetransmit
+/**
+* <p>
+* does asynchronous shipping of log records from the master to the slave being
+* replicated to. the implementation does not ship log records as soon as they
+* become available in the log buffer (synchronously), instead it does log
+* shipping in the following two-fold scenarios
+*
+* 1) periodically (i.e.) at regular intervals of time.
+*
+* 2) when a request is sent from the master controller (force flushing of
+*    the log buffer).
+*
+* 3) when a notification is received from the log shipper about a log
+*    buffer element becoming full and the load on the log buffer so
+*    warrants a ship.
+* </p>
+*/
+public class asynchronouslogshipper extends thread implements
+logshipper
+/**
+* replication log buffer that contains the log records that need to
+* be transmitted to the slave.
+*/
+final private replicationlogbuffer logbuffer
+/**
+* replication message transmitter that is used for the network
+* transmission of the log records retrieved from the log buffer
+* (on the master) to the slave being replicated to.
+*/
+private replicationmessagetransmit transmitter
+/**
+* time interval (in milliseconds) at which the log shipping takes place.
+*/
+private long shippinginterval
+/**
+* minimum interval (in milliseconds) between log shipping.
+* defaults to min, but can be configured using system property
+* derby.replication.minlogshippinginterval
+* @see #min
+*/
+private long minshippinginterval
+/**
+* minimum interval (in milliseconds) between log shipping.
+* defaults to max, but can be configured using system property
+* derby.replication.maxlogshippinginterval
+* @see #max
+*/
+private long maxshippinginterval
+/**
+* will store the time at which the last shipping happened. will be used
+* to calculate the interval between the log ships upon receiving a
+* notification from the log buffer.
+*/
+private long lastshippingtime
+/**
+* indicates whether a stop shipping request has been sent.
+* true - stop shipping log records
+* false - shipping can continue without interruption.
+*/
+private volatile boolean stopshipping   false
+/**
+* the master controller that initialized this log shipper.
+*/
+private mastercontroller mastercontroller   null
+/**
+* object used to synchronize on while the log shipper thread
+* is moved into the wait state, or while notifying it.
+*/
+private object objlstsync   new object       lst >log shippper thread
+/** used to synchronize forceflush calls */
+private object forceflushsemaphore   new object
+/** the number of millis a call to forceflush will wait before giving
+* up sending a chunk of log to the slave */
+public static final int default_forceflush_timeout   5000
+/**
+* store the log chunk that failed during a previous shipping attempt
+* so that it can be re-shipped to the slave.
+*/
+private replicationmessage failedchunk   null
+/** the highest log instant in failedchunk  */
+private long failedchunkhighestinstant    1
+/** the highest log instant shipped so far  */
+private long highestshippedinstant    1
+/**
+* fill information value indicative of a low load in the log buffer.
+*/
+private static final int fi_low   10
+/**
+* fill information value indicative of a high load in the log buffer.
+*/
+private static final int fi_high   80
+/**
+* if the fill information (obtained from the log buffer) is less than
+* fi_high but greater than fi_low the log shipper will ship with a min ms delay.
+* min is a value that is only as large as not to affect the performance
+* of the master database significantly.
+*/
+private static final long min   100
+/**
+* if the fill information is less than fi_low the log shipper will ship
+* with a max ms delay or when a buffer becomes full whichever comes
+* first. the delay however will not be smaller than min.
+* max(max, default_number_log_buffers*min) is the maximum delay between a
+* log record is committed at the master until it is replicated  to the
+* slave. hence the default latency should be atleast greater than the maximum
+* latency offered by the choice of min, hence max > default_number_log_buffers*min.
+*/
+private static final long max   5000
+private final replicationlogger replogger
+/**
+* constructor initializes the log buffer, the replication message
+* transmitter, the shipping interval and the master controller.
+*
+* @param logbuffer the replication log buffer that contains the log record
+*                  chunks to be transmitted to the slave.
+* @param transmitter the replication message transmitter that is used for
+*                    network transmission of retrieved log records.
+* @param mastercontroller the master controller that initialized this log
+*                         shipper.
+* @param replogger the replication logger that will write messages to
+* the log file (typically derby.log)
+*/
+public asynchronouslogshipper replicationlogbuffer logbuffer
+replicationmessagetransmit transmitter
+mastercontroller mastercontroller
+replicationlogger replogger
+super     mastercontroller getdbname
+this logbuffer   logbuffer
+this transmitter   transmitter
+this mastercontroller   mastercontroller
+this stopshipping   false
+this replogger   replogger
+getlogshipperproperties
+shippinginterval   minshippinginterval
+lastshippingtime   system currenttimemillis
+/**
+* ships log records from the log buffer to the slave being replicated to.
+* the log shipping happens between shipping intervals of time, the
+* shipping interval being derived from the fill information (an indicator
+* of load in the log buffer) obtained from the log buffer. the shipping
+* can also be triggered in the following situations,
+*
+* 1) based on notifications from the log buffer, where the fill
+*    information is again used as the basis to decide whether a
+*    shipping should happen or not
+* 2) on a forceflush triggered by the log buffer becoming full
+*    and the logbufferfullexception being thrown.
+*/
+public void run
+while   stopshipping
+try
+shipalogchunk
+synchronized  forceflushsemaphore
+// wake up a thread waiting for forceflush, if any
+forceflushsemaphore notify
+//calculate the shipping interval (wait time) based on the
+//fill information obtained from the log buffer.
+shippinginterval   calculatesifromfi
+if  shippinginterval     1
+synchronized objlstsync
+objlstsync wait shippinginterval
+catch  interruptedexception ie
+//interrupt the log shipping thread.
+return
+catch  ioexception ioe
+//the transmitter is recreated if the connection to the
+//slave can be re-established.
+transmitter   mastercontroller handleexceptions ioe
+//the transmitter cannot be recreated hence stop the log
+//shipper thread.
+if  transmitter    null
+continue
+catch  standardexception se
+mastercontroller handleexceptions se
+/**
+* retrieves a chunk of log records, if available, from the log buffer and
+* transmits them to the slave. used for both periodic and forced shipping.
+*
+* @throws ioexception if an exception occurs while trying to ship the
+*                     replication message (containing the log records)
+*                     across the network.
+* @throws standardexception if an exception occurs while trying to read
+*                           log records from the log buffer.
+*
+* @return true if a chunk of log records was shipped.
+*         false if no log records were shipped because log buffer is empty.
+*/
+private synchronized boolean shipalogchunk
+throws ioexception  standardexception
+byte  logrecords   null
+replicationmessage mesg   null
+try
+//check to see if a previous log record exists that needs
+//to be re-transmitted. if there is then transmit that
+//log record and then transmit the next log record in the
+//log buffer.
+if  failedchunk    null
+transmitter sendmessage failedchunk
+highestshippedinstant   failedchunkhighestinstant
+failedchunk   null
+//transmit the log record that is at the head of
+//the log buffer.
+if  logbuffer next
+logrecords   logbuffer getdata
+mesg   new replicationmessage
+replicationmessage type_log  logrecords
+transmitter sendmessage mesg
+highestshippedinstant   logbuffer getlastinstant
+lastshippingtime   system currenttimemillis
+return true
+catch  nosuchelementexception nse
+//although next() returns true a request for data on the buffer
+//fails implying that there has been a fatal exception in the
+//buffer.
+mastercontroller handleexceptions standardexception newexception
+sqlstate replication_unexpected_exception  nse
+catch  ioexception ioe
+//an exception occurred while transmitting the log record.
+//store the previous log record so that it can be re-transmitted
+if  mesg    null
+failedchunk   mesg
+failedchunkhighestinstant   logbuffer getlastinstant
+throw ioe
+return false
+/**
+*
+* transmits all the log records in the log buffer to the slave.
+*
+* @throws ioexception if an exception occurs while trying to ship the
+*                     replication message (containing the log records)
+*                     across the network.
+* @throws standardexception if an exception occurs while trying to read
+*                           log records from the log buffer.
+*/
+public void flushbuffer   throws ioexception  standardexception
+while  shipalogchunk
+/**
+* transmits a chunk of log record from the log buffer to the slave, used
+* by the master controller when the log buffer is full and some space
+* needs to be freed for further log records.
+*
+* @throws ioexception if an exception occurs while trying to ship the
+*                     replication message (containing the log records)
+*                     across the network.
+* @throws standardexception if an exception occurs while trying to read
+*                           log records from the log buffer.
+*/
+public void forceflush   throws ioexception  standardexception
+if  stopshipping  return
+synchronized  forceflushsemaphore
+synchronized  objlstsync
+// notify the log shipping thread that
+// it is time for another send.
+objlstsync notify
+try
+forceflushsemaphore wait default_forceflush_timeout
+catch  interruptedexception ex
+/**
+* get the highest log instant shipped so far
+* @return the highest log instant shipped so far
+*/
+public long gethighestshippedinstant
+return highestshippedinstant
+/**
+* updates the information about the latest instance of the log record
+* that has been flushed to the disk. calling this method has no effect
+* in this asynchronous implementation of the log shipper.
+*
+*
+* @param latestinstanceflushedtodisk a long that contains the latest
+*        instance of the log record that has been flushed to the disk.
+*/
+public void flushedinstance long latestinstanceflushedtodisk
+//currently the asynchronous log shipper
+//does not worry about the last instance flushed.
+/**
+* stop shipping log records. if a ship is currently in progress
+* it will not be interrupted, shipping will stop only after the
+* current shipment is done.
+*/
+public void stoplogshipment
+stopshipping   true
+/**
+* used to notify the log shipper that a log buffer element is full.
+* this method would basically use the following steps to decide on the
+* action to be taken when a notification from the log shipper is received,
+*
+* a) get fi from log buffer
+* b) if fi >= fi_high
+*     b.1) notify the log shipper thread.
+* c) else if the time elapsed since last ship is greater than
+*    minshippinginterval
+*     c.1) notify the log shipper thread.
+*/
+public void worktodo
+//fill information obtained from the log buffer
+int fi
+fi   logbuffer getfillinformation
+if  fi >  fi_high
+system currenttimemillis     lastshippingtime  >
+minshippinginterval
+synchronized  objlstsync
+objlstsync notify
+/**
+* will be used to calculate the shipping interval based on the fill
+* information obtained from the log buffer. this method uses the following
+* steps to arrive at the shipping interval,
+*
+* a) fi >= fi_high return -1 (signifies that the waiting time should be 0)
+* b) fi >  fi_low and fi < fi_high return minshippinginterval
+* c) fi <= fi_low return maxshippinginterval.
+*
+* @return the shipping interval based on the fill information.
+*/
+private long calculatesifromfi
+//fill information obtained from the log buffer.
+int fi
+//shipping interval derived from the fill information.
+long si
+fi   logbuffer getfillinformation
+if  fi >  fi_high
+si    1
+else if  fi > fi_low    fi < fi_high
+si   minshippinginterval
+else
+si   maxshippinginterval
+return si
+/**
+* load relevant system properties: max and min log shipping interval
+*/
+private void getlogshipperproperties
+minshippinginterval   propertyutil
+getsystemint property replication_min_shipping_interval   int min
+maxshippinginterval   propertyutil
+getsystemint property replication_max_shipping_interval   int max
+// to guarantee a maximum log shipping delay,
+// minshippinginterval cannot be higher than
+// maxshippinginterval / #logbuffers. see javadoc for max
+int buffers   replicationlogbuffer default_number_log_buffers
+if  minshippinginterval > maxshippinginterval   buffers
+minshippinginterval   maxshippinginterval   buffers
+if  sanitymanager debug
+replogger logtext
+maxshippinginterval
+minshippinginterval
+false

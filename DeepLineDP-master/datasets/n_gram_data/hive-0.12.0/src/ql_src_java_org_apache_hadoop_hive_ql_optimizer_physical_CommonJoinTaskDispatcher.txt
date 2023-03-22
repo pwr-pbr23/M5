@@ -1,0 +1,478 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql optimizer physical
+import java io bytearrayinputstream
+import java io inputstream
+import java io serializable
+import java io unsupportedencodingexception
+import java util arraylist
+import java util hashmap
+import java util list
+import java util map
+import java util map entry
+import java util set
+import org apache hadoop conf configuration
+import org apache hadoop hive common objectpair
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive ql context
+import org apache hadoop hive ql exec conditionaltask
+import org apache hadoop hive ql exec filesinkoperator
+import org apache hadoop hive ql exec joinoperator
+import org apache hadoop hive ql exec operator
+import org apache hadoop hive ql exec operatorutils
+import org apache hadoop hive ql exec tablescanoperator
+import org apache hadoop hive ql exec task
+import org apache hadoop hive ql exec taskfactory
+import org apache hadoop hive ql exec utilities
+import org apache hadoop hive ql exec mr mapredtask
+import org apache hadoop hive ql lib dispatcher
+import org apache hadoop hive ql optimizer genmapredutils
+import org apache hadoop hive ql optimizer mapjoinprocessor
+import org apache hadoop hive ql parse parsecontext
+import org apache hadoop hive ql parse qbjointree
+import org apache hadoop hive ql parse semanticexception
+import org apache hadoop hive ql plan conditionalresolvercommonjoin
+import org apache hadoop hive ql plan conditionalresolvercommonjoin conditionalresolvercommonjoinctx
+import org apache hadoop hive ql plan conditionalwork
+import org apache hadoop hive ql plan joindesc
+import org apache hadoop hive ql plan mapwork
+import org apache hadoop hive ql plan mapredlocalwork
+import org apache hadoop hive ql plan mapredwork
+import org apache hadoop hive ql plan operatordesc
+import org apache hadoop hive ql plan reducework
+/*
+* convert tasks involving join into mapjoin.
+* if hive.auto.convert.join is true, the tasks involving join are converted.
+* consider the query:
+* select .... from t1 join t2 on t1.key = t2.key join t3 on t1.key = t3.key
+*
+* there is a map-reduce task which performs a 3-way join (t1, t2, t3).
+* the task would be converted to a conditional task which would have 4 children
+* a. mapjoin considering t1 as the big table
+* b. mapjoin considering t2 as the big table
+* c. mapjoin considering t3 as the big table
+* d. map-reduce join (the original task).
+*
+*  note that the sizes of all the inputs may not be available at compile time. at runtime, it is
+*  determined which branch we want to pick up from the above.
+*
+* however, if hive.auto.convert.join.noconditionaltask is set to true, and
+* the sum of any n-1 tables is smaller than hive.auto.convert.join.noconditionaltask.size,
+* then a mapjoin is created instead of the conditional task. for the above, if the size of
+* t1 + t2 is less than the threshold, then the task is converted to a mapjoin task with t3 as
+* the big table.
+*
+* in this case, further optimization is performed by merging 2 consecutive map-only jobs.
+* consider the query:
+* select ... from t1 join t2 on t1.key1 = t2.key1 join t3 on t1.key2 = t3.key2
+*
+* initially, the plan would consist of 2 map-reduce jobs (1 to perform join for t1 and t2)
+* followed by another map-reduce job (to perform join of the result with t3). after the
+* optimization, both these tasks would be converted to map-only tasks. these 2 map-only jobs
+* are then merged into a single map-only job. as a followup (hive-3952), it would be possible to
+* merge a map-only task with a map-reduce task.
+* consider the query:
+* select t1.key2, count(*) from t1 join t2 on t1.key1 = t2.key1 group by t1.key2;
+* initially, the plan would consist of 2 map-reduce jobs (1 to perform join for t1 and t2)
+* followed by another map-reduce job (to perform groupby of the result). after the
+* optimization, the join task would be converted to map-only tasks. after hive-3952, the map-only
+* task would be merged with the map-reduce task to create a single map-reduce task.
+*/
+/**
+* iterator each tasks. if this task has a local work,create a new task for this local work, named
+* mapredlocaltask. then make this new generated task depends on current task's parent task, and
+* make current task depends on this new generated task
+*/
+public class commonjointaskdispatcher extends abstractjointaskdispatcher implements dispatcher
+hashmap<string  long> aliastosize   null
+public commonjointaskdispatcher physicalcontext context
+super context
+/**
+* calculate the total size of local tables in loclwork.
+* @param localwork
+* @return the total size of local tables. or -1, if the total
+* size is unknown.
+*/
+private long calculatelocaltabletotalsize mapredlocalwork localwork
+long localtabletotalsize   0
+if  localwork    null
+return localtabletotalsize
+for  string alias   localwork getaliastowork   keyset
+long tabsize   aliastosize get alias
+if  tabsize    null
+// if the size is unavailable, we need to assume a size 1 greater than
+// localtabletotalsizelimit this implies that merge cannot happen
+// so we will return false.
+return  1
+localtabletotalsize    tabsize
+return localtabletotalsize
+/**
+* check if the total size of local tables will be under
+* the limit after we merge localwork1 and localwork2.
+* the limit of the total size of local tables is defined by
+* hiveconf.confvars.hiveconvertjoinnoconditionaltaskthreshold.
+* @param conf
+* @param localworks
+* @return
+*/
+private boolean islocaltabletotalsizeunderlimitaftermerge
+configuration conf
+mapredlocalwork    localworks
+final long localtabletotalsizelimit   hiveconf getlongvar conf
+hiveconf confvars hiveconvertjoinnoconditionaltaskthreshold
+long localtabletotalsize   0
+for  int i   0  i < localworks length  i
+final long localworktabletotalsize   calculatelocaltabletotalsize localworks
+if  localworktabletotalsize < 0
+// the total size of local tables in localwork[i] is unknown.
+return false
+localtabletotalsize    localworktabletotalsize
+if  localtabletotalsize > localtabletotalsizelimit
+// the total size of local tables after we merge localworks
+// is larger than the limit set by
+// hiveconf.confvars.hiveconvertjoinnoconditionaltaskthreshold.
+return false
+return true
+// get the position of the big table for this join operator and the given alias
+private int getposition mapwork work  operator<? extends operatordesc> joinop
+string alias
+operator<? extends operatordesc> parentop   work getaliastowork   get alias
+// reducesinkoperator's child is null, but joinoperator's parents is reducesink
+while   parentop getchildoperators      null
+parentop getchildoperators   isempty
+parentop   parentop getchildoperators   get 0
+return joinop getparentoperators   indexof parentop
+// create map join task and set big table as bigtableposition
+private objectpair<mapredtask  string> converttasktomapjointask mapredwork newwork
+int bigtableposition  throws unsupportedencodingexception  semanticexception
+// create a mapred task for this work
+mapredtask newtask    mapredtask  taskfactory get newwork  physicalcontext
+getparsecontext   getconf
+joinoperator newjoinop   getjoinop newtask
+// optimize this newwork given the big table position
+string bigtablealias
+mapjoinprocessor genmapjoinopandlocalwork newwork  newjoinop  bigtableposition
+return new objectpair<mapredtask  string> newtask  bigtablealias
+/*
+* a task and its child task has been converted from join to mapjoin.
+* see if the two tasks can be merged.
+*/
+private void mergemapjointaskintoitschildmapredtask mapredtask mapjointask  configuration conf
+throws semanticexception
+// step 1: check if mapjointask has a single child.
+// if so, check if we can merge mapjointask into that child.
+if  mapjointask getchildtasks      null
+mapjointask getchildtasks   size   > 1
+// no child-task to merge, nothing to do or there are more than one
+// child-tasks in which case we don't want to do anything.
+return
+task<? extends serializable> childtask   mapjointask getchildtasks   get 0
+if    childtask instanceof mapredtask
+// nothing to do if it is not a mapreduce task.
+return
+mapredtask childmapredtask    mapredtask  childtask
+mapwork mapjoinmapwork   mapjointask getwork   getmapwork
+mapwork childmapwork   childmapredtask getwork   getmapwork
+map<string  operator<? extends operatordesc>> mapjoinaliastowork
+mapjoinmapwork getaliastowork
+if  mapjoinaliastowork size   > 1
+// do not merge if the mapredwork of mapjoin has multiple input aliases.
+return
+entry<string  operator<? extends operatordesc>> mapjoinaliastoworkentry
+mapjoinaliastowork entryset   iterator   next
+string mapjoinalias   mapjoinaliastoworkentry getkey
+tablescanoperator mapjointasktablescanoperator
+operatorutils findsingleoperator
+mapjoinaliastoworkentry getvalue    tablescanoperator class
+if  mapjointasktablescanoperator    null
+throw new semanticexception     tablescanoperator getoperatorname
+mapjoinalias
+mapjoinaliastowork get mapjoinalias  getname
+filesinkoperator mapjointaskfilesinkoperator
+operatorutils findsingleoperator
+mapjointasktablescanoperator  filesinkoperator class
+if  mapjointaskfilesinkoperator    null
+throw new semanticexception     filesinkoperator getoperatorname
+// the mapjointaskfilesinkoperator writes to a different directory
+string childmrpath   mapjointaskfilesinkoperator getconf   getdirname
+list<string> childmraliases   childmapwork getpathtoaliases   get childmrpath
+if  childmraliases    null    childmraliases size      1
+return
+string childmralias   childmraliases get 0
+mapredlocalwork mapjoinlocalwork   mapjoinmapwork getmaplocalwork
+mapredlocalwork childlocalwork   childmapwork getmaplocalwork
+if   mapjoinlocalwork    null    mapjoinlocalwork getbucketmapjoincontext      null
+childlocalwork    null    childlocalwork getbucketmapjoincontext      null
+// right now, we do not handle the case that either of them is bucketed.
+// we should relax this constraint with a follow-up jira.
+return
+// we need to check if the total size of local tables is under the limit.
+// at here, we are using a strong condition, which is the total size of
+// local tables used by all input paths. actually, we can relax this condition
+// to check the total size of local tables for every input path.
+// example:
+//               union_all
+//              /         \
+//             /           \
+//            /             \
+//           /               \
+//       mapjoin1          mapjoin2
+//      /   |   \         /   |   \
+//     /    |    \       /    |    \
+//   big1   s1   s2    big2   s3   s4
+// in this case, we have two mapjoins, mapjoin1 and mapjoin2. big1 and big2 are two
+// big tables, and s1, s2, s3, and s4 are four small tables. hash tables of s1 and s2
+// will only be used by map tasks processing big1. hash tables of s3 and s4 will only
+// be used by map tasks processing big2. if big1!=big2, we should only check if the size
+// of s1 + s2 is under the limit, and if the size of s3 + s4 is under the limit.
+// but, right now, we are checking the size of s1 + s2 + s3 + s4 is under the limit.
+// if big1=big2, we will only scan a path once. so, mapjoin1 and mapjoin2 will be executed
+// in the same map task. in this case, we need to make sure the size of s1 + s2 + s3 + s4
+// is under the limit.
+if   islocaltabletotalsizeunderlimitaftermerge conf  mapjoinlocalwork  childlocalwork
+// the total size of local tables may not be under
+// the limit after we merge mapjoinlocalwork and childlocalwork.
+// do not merge.
+return
+tablescanoperator childmrtasktablescanoperator
+operatorutils findsingleoperator
+childmapwork getaliastowork   get childmralias   tablescanoperator class
+if  childmrtasktablescanoperator    null
+throw new semanticexception     tablescanoperator getoperatorname
+childmralias
+childmapwork getaliastowork   get childmralias  getname
+list<operator<? extends operatordesc>> parentsinmapjointask
+mapjointaskfilesinkoperator getparentoperators
+list<operator<? extends operatordesc>> childreninchildmrtask
+childmrtasktablescanoperator getchildoperators
+if  parentsinmapjointask size   > 1    childreninchildmrtask size   > 1
+// do not merge if we do not know how to connect two operator trees.
+return
+// step 2: merge mapjointask into the map-side of its child.
+// step 2.1: connect the operator trees of two mapredtasks.
+operator<? extends operatordesc> parentinmapjointask   parentsinmapjointask get 0
+operator<? extends operatordesc> childinchildmrtask   childreninchildmrtask get 0
+parentinmapjointask replacechild mapjointaskfilesinkoperator  childinchildmrtask
+childinchildmrtask replaceparent childmrtasktablescanoperator  parentinmapjointask
+// step 2.2: replace the corresponding part childmrwork's mapwork.
+genmapredutils replacemapwork mapjoinalias  childmralias  mapjoinmapwork  childmapwork
+// step 2.3: fill up stuff in local work
+if  mapjoinlocalwork    null
+if  childlocalwork    null
+childmapwork setmaplocalwork mapjoinlocalwork
+else
+childlocalwork getaliastofetchwork   putall mapjoinlocalwork getaliastofetchwork
+childlocalwork getaliastowork   putall mapjoinlocalwork getaliastowork
+// step 2.4: remove this mapjoin task
+list<task<? extends serializable>> parenttasks   mapjointask getparenttasks
+mapjointask setparenttasks null
+mapjointask setchildtasks null
+childmapredtask getparenttasks   remove mapjointask
+if  parenttasks    null
+childmapredtask getparenttasks   addall parenttasks
+for  task<? extends serializable> parenttask   parenttasks
+parenttask getchildtasks   remove mapjointask
+if   parenttask getchildtasks   contains childmapredtask
+parenttask getchildtasks   add childmapredtask
+else
+if  physicalcontext getroottasks   contains mapjointask
+physicalcontext removefromroottask mapjointask
+if  childmapredtask getparenttasks      null
+childmapredtask getparenttasks   size      0
+physicalcontext getroottasks   contains childmapredtask
+physicalcontext addtoroottask childmapredtask
+if  childmapredtask getparenttasks   size      0
+childmapredtask setparenttasks null
+public static boolean cannotconvert string bigtablealias
+map<string  long> aliastosize  long aliastotalknowninputsize
+long thresholdofsmalltblsizesum
+boolean ret   false
+long aliasknownsize   aliastosize get bigtablealias
+if  aliasknownsize    null    aliasknownsize longvalue   > 0
+long smalltbltotalknownsize   aliastotalknowninputsize
+aliasknownsize longvalue
+if  smalltbltotalknownsize > thresholdofsmalltblsizesum
+//this table is not good to be a big table.
+ret   true
+return ret
+@override
+public task<? extends serializable> processcurrenttask mapredtask currtask
+conditionaltask conditionaltask  context context
+throws semanticexception
+// whether it contains common join op; if contains, return this common join op
+joinoperator joinop   getjoinop currtask
+if  joinop    null    joinop getconf   isfixedassorted
+return null
+currtask settasktag task common_join
+mapwork currwork   currtask getwork   getmapwork
+// create conditional work list and task list
+list<serializable> listworks   new arraylist<serializable>
+list<task<? extends serializable>> listtasks   new arraylist<task<? extends serializable>>
+// create alias to task mapping and alias to input file mapping for resolver
+hashmap<string  task<? extends serializable>> aliastotask
+new hashmap<string  task<? extends serializable>>
+hashmap<string  arraylist<string>> pathtoaliases   currwork getpathtoaliases
+map<string  operator<? extends operatordesc>> aliastowork   currwork getaliastowork
+// get parsectx for this join operator
+parsecontext parsectx   physicalcontext getparsecontext
+qbjointree jointree   parsectx getjoincontext   get joinop
+// start to generate multiple map join tasks
+joindesc joindesc   joinop getconf
+byte order   joindesc gettagorder
+int numaliases   order length
+if  aliastosize    null
+aliastosize   new hashmap<string  long>
+try
+long aliastotalknowninputsize
+gettotalknowninputsize context  currwork  pathtoaliases  aliastosize
+set<integer> bigtablecandidates   mapjoinprocessor getbigtablecandidates joindesc
+getconds
+// no table could be the big table; there is no need to convert
+if  bigtablecandidates    null
+return null
+configuration conf   context getconf
+// if sizes of atleast n-1 tables in a n-way join is known, and their sum is smaller than
+// the threshold size, convert the join into map-join and don't create a conditional task
+boolean convertjoinmapjoin   hiveconf getboolvar conf
+hiveconf confvars hiveconvertjoinnoconditionaltask
+int bigtableposition    1
+if  convertjoinmapjoin
+// this is the threshold that the user has specified to fit in mapjoin
+long mapjoinsize   hiveconf getlongvar conf
+hiveconf confvars hiveconvertjoinnoconditionaltaskthreshold
+boolean bigtablefound   false
+long largestbigtablecandidatesize    1
+long sumtablesizes   0
+for  string alias   aliastowork keyset
+int tableposition   getposition currwork  joinop  alias
+boolean bigtablecandidate   bigtablecandidates contains tableposition
+long size   aliastosize get alias
+// the size is not available at compile time if the input is a sub-query.
+// if the size of atleast n-1 inputs for a n-way join are available at compile time,
+// and the sum of them is less than the specified threshold, then convert the join
+// into a map-join without the conditional task.
+if   size    null      size > mapjoinsize
+sumtablesizes    largestbigtablecandidatesize
+if  bigtablefound     sumtablesizes > mapjoinsize      bigtablecandidate
+convertjoinmapjoin   false
+break
+bigtablefound   true
+bigtableposition   tableposition
+largestbigtablecandidatesize   mapjoinsize   1
+else
+if  bigtablecandidate    size > largestbigtablecandidatesize
+bigtableposition   tableposition
+sumtablesizes    largestbigtablecandidatesize
+largestbigtablecandidatesize   size
+else
+sumtablesizes    size
+if  sumtablesizes > mapjoinsize
+convertjoinmapjoin   false
+break
+string bigtablealias   null
+currwork setopparsectxmap parsectx getopparsectx
+currwork setjointree jointree
+if  convertjoinmapjoin
+// create map join task and set big table as bigtableposition
+mapredtask newtask   converttasktomapjointask currtask getwork    bigtableposition  getfirst
+newtask settasktag task mapjoin_only_nobackup
+replacetask currtask  newtask  physicalcontext
+// can this task be merged with the child task. this can happen if a big table is being
+// joined with multiple small tables on different keys
+if   newtask getchildtasks      null      newtask getchildtasks   size      1
+mergemapjointaskintoitschildmapredtask newtask  conf
+return newtask
+long thresholdofsmalltblsizesum   hiveconf getlongvar conf
+hiveconf confvars hivesmalltablesfilesize
+for  int i   0  i < numaliases  i
+// this table cannot be big table
+if   bigtablecandidates contains i
+continue
+// deep copy a new mapred work from xml
+// once hive-4396 is in, it would be faster to use a cheaper method to clone the plan
+mapredwork newwork   utilities cloneplan currtask getwork
+// create map join task and set big table as i
+objectpair<mapredtask  string> newtaskalias   converttasktomapjointask newwork  i
+mapredtask newtask   newtaskalias getfirst
+bigtablealias   newtaskalias getsecond
+if  cannotconvert bigtablealias  aliastosize
+aliastotalknowninputsize  thresholdofsmalltblsizesum
+continue
+// add into conditional task
+listworks add newtask getwork
+listtasks add newtask
+newtask settasktag task converted_mapjoin
+// set up backup task
+newtask setbackuptask currtask
+newtask setbackupchildrentasks currtask getchildtasks
+// put the mapping alias to task
+aliastotask put bigtablealias  newtask
+catch  exception e
+e printstacktrace
+throw new semanticexception     e getmessage
+// insert current common join task to conditional task
+listworks add currtask getwork
+listtasks add currtask
+// clear jointree and op parse context
+currwork setopparsectxmap null
+currwork setjointree null
+// create conditional task and insert conditional task into task tree
+conditionalwork cndwork   new conditionalwork listworks
+conditionaltask cndtsk    conditionaltask  taskfactory get cndwork  parsectx getconf
+cndtsk setlisttasks listtasks
+// set resolver and resolver context
+cndtsk setresolver new conditionalresolvercommonjoin
+conditionalresolvercommonjoinctx resolverctx   new conditionalresolvercommonjoinctx
+resolverctx setpathtoaliases pathtoaliases
+resolverctx setaliastoknownsize aliastosize
+resolverctx setaliastotask aliastotask
+resolverctx setcommonjointask currtask
+resolverctx setlocaltmpdir context getlocalscratchdir false
+resolverctx sethdfstmpdir context getmrscratchdir
+cndtsk setresolverctx resolverctx
+// replace the current task with the new generated conditional task
+replacetaskwithconditionaltask currtask  cndtsk  physicalcontext
+return cndtsk
+/*
+* if any operator which does not allow map-side conversion is present in the mapper, dont
+* convert it into a conditional task.
+*/
+private boolean checkoperatorokmapjoinconversion operator<? extends operatordesc> op
+if   op opallowedconvertmapjoin
+return false
+if  op getchildoperators      null
+return true
+for  operator<? extends operatordesc> childop   op getchildoperators
+if   checkoperatorokmapjoinconversion childop
+return false
+return true
+private joinoperator getjoinop mapredtask task  throws semanticexception
+mapwork mwork   task getwork   getmapwork
+reducework rwork   task getwork   getreducework
+if  rwork    null
+return null
+operator<? extends operatordesc> reducerop   rwork getreducer
+if  reducerop instanceof joinoperator
+/* is any operator present, which prevents the conversion */
+map<string  operator<? extends operatordesc>> aliastowork   mwork getaliastowork
+for  operator<? extends operatordesc> op   aliastowork values
+if   checkoperatorokmapjoinconversion op
+return null
+return  joinoperator  reducerop
+else
+return null

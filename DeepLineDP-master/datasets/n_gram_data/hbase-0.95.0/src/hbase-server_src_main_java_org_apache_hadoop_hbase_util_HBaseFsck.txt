@@ -1,0 +1,3305 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase util
+import java io ioexception
+import java io printwriter
+import java io stringwriter
+import java net uri
+import java util arraylist
+import java util arrays
+import java util collection
+import java util collections
+import java util comparator
+import java util hashmap
+import java util hashset
+import java util iterator
+import java util list
+import java util map
+import java util map entry
+import java util set
+import java util sortedmap
+import java util sortedset
+import java util treemap
+import java util treeset
+import java util concurrent callable
+import java util concurrent concurrentskiplistmap
+import java util concurrent executionexception
+import java util concurrent executorservice
+import java util concurrent future
+import java util concurrent scheduledthreadpoolexecutor
+import java util concurrent atomic atomicinteger
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop classification interfacestability
+import org apache hadoop conf configuration
+import org apache hadoop conf configured
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop fs permission fsaction
+import org apache hadoop hbase abortable
+import org apache hadoop hbase clusterstatus
+import org apache hadoop hbase hbaseconfiguration
+import org apache hadoop hbase hcolumndescriptor
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase hregionlocation
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase exceptions masternotrunningexception
+import org apache hadoop hbase servername
+import org apache hadoop hbase exceptions zookeeperconnectionexception
+import org apache hadoop hbase catalog metaeditor
+import org apache hadoop hbase client adminprotocol
+import org apache hadoop hbase client delete
+import org apache hadoop hbase client get
+import org apache hadoop hbase client hbaseadmin
+import org apache hadoop hbase client hconnection
+import org apache hadoop hbase client hconnectionmanager
+import org apache hadoop hbase client hconnectionmanager hconnectable
+import org apache hadoop hbase client htable
+import org apache hadoop hbase client metascanner
+import org apache hadoop hbase client metascanner metascannervisitor
+import org apache hadoop hbase client metascanner metascannervisitorbase
+import org apache hadoop hbase client put
+import org apache hadoop hbase client result
+import org apache hadoop hbase client rowmutations
+import org apache hadoop hbase io hfile cacheconfig
+import org apache hadoop hbase io hfile hfile
+import org apache hadoop hbase master masterfilesystem
+import org apache hadoop hbase protobuf protobufutil
+import org apache hadoop hbase regionserver hregion
+import org apache hadoop hbase regionserver hregionfilesystem
+import org apache hadoop hbase regionserver storefileinfo
+import org apache hadoop hbase regionserver wal hlogutil
+import org apache hadoop hbase security user
+import org apache hadoop hbase util hbasefsck errorreporter error_code
+import org apache hadoop hbase util hbck hfilecorruptionchecker
+import org apache hadoop hbase util hbck tableintegrityerrorhandler
+import org apache hadoop hbase util hbck tableintegrityerrorhandlerimpl
+import org apache hadoop hbase zookeeper metaregiontracker
+import org apache hadoop hbase zookeeper zktablereadonly
+import org apache hadoop hbase zookeeper zookeeperwatcher
+import org apache hadoop security accesscontrolexception
+import org apache hadoop security usergroupinformation
+import org apache hadoop util reflectionutils
+import org apache hadoop util tool
+import org apache hadoop util toolrunner
+import org apache zookeeper keeperexception
+import com google common base joiner
+import com google common base preconditions
+import com google common collect lists
+import com google common collect multimap
+import com google common collect treemultimap
+import com google protobuf serviceexception
+/**
+* hbasefsck (hbck) is a tool for checking and repairing region consistency and
+* table integrity problems in a corrupted hbase.
+* <p>
+* region consistency checks verify that .meta., region deployment on region
+* servers and the state of data in hdfs (.regioninfo files) all are in
+* accordance.
+* <p>
+* table integrity checks verify that all possible row keys resolve to exactly
+* one region of a table.  this means there are no individual degenerate
+* or backwards regions; no holes between regions; and that there are no
+* overlapping regions.
+* <p>
+* the general repair strategy works in two phases:
+* <ol>
+* <li> repair table integrity on hdfs. (merge or fabricate regions)
+* <li> repair region consistency with .meta. and assignments
+* </ol>
+* <p>
+* for table integrity repairs, the tables' region directories are scanned
+* for .regioninfo files.  each table's integrity is then verified.  if there
+* are any orphan regions (regions with no .regioninfo files) or holes, new
+* regions are fabricated.  backwards regions are sidelined as well as empty
+* degenerate (endkey==startkey) regions.  if there are any overlapping regions,
+* a new region is created and all data is merged into the new region.
+* <p>
+* table integrity repairs deal solely with hdfs and could potentially be done
+* offline -- the hbase region servers or master do not need to be running.
+* this phase can eventually be used to completely reconstruct the meta table in
+* an offline fashion.
+* <p>
+* region consistency requires three conditions -- 1) valid .regioninfo file
+* present in an hdfs region dir,  2) valid row with .regioninfo data in meta,
+* and 3) a region is deployed only at the regionserver that was assigned to
+* with proper state in the master.
+* <p>
+* region consistency repairs require hbase to be online so that hbck can
+* contact the hbase master and region servers.  the hbck#connect() method must
+* first be called successfully.  much of the region consistency information
+* is transient and less risky to repair.
+* <p>
+* if hbck is run from the command line, there are a handful of arguments that
+* can be used to limit the kinds of repairs hbck will do.  see the code in
+* {@link #printusageandexit()} for more details.
+*/
+@interfaceaudience public
+@interfacestability evolving
+public class hbasefsck extends configured implements tool
+public static final long default_time_lag   60000     default value of 1 minute
+public static final long default_sleep_before_rerun   10000
+private static final int max_num_threads   50     #threads to contact regions
+private static boolean rssupportsoffline   true
+private static final int default_overlaps_to_sideline   2
+private static final int default_max_merge   5
+private static final string to_be_loaded
+/**********************
+* internal resources
+**********************/
+private static final log log   logfactory getlog hbasefsck class getname
+private clusterstatus status
+private hconnection connection
+private hbaseadmin admin
+private htable meta
+protected executorservice executor     threads to retrieve data from regionservers
+private long startmillis   system currenttimemillis
+private hfilecorruptionchecker hfcc
+private int retcode   0
+/***********
+* options
+***********/
+private static boolean details   false     do we display the full report
+private long timelag   default_time_lag     tables whose modtime is older
+private boolean fixassignments   false     fix assignment errors?
+private boolean fixmeta   false     fix meta errors?
+private boolean checkhdfs   true     load and check fs consistency?
+private boolean fixhdfsholes   false     fix fs holes?
+private boolean fixhdfsoverlaps   false     fix fs overlaps  risky
+private boolean fixhdfsorphans   false     fix fs holes  missing  regioninfo
+private boolean fixtableorphans   false     fix fs holes  missing  tableinfo
+private boolean fixversionfile   false     fix missing hbase version file in hdfs
+private boolean fixsplitparents   false     fix lingering split parents
+private boolean fixreferencefiles   false     fix lingering reference store file
+private boolean fixemptymetacells   false     fix  remove  empty regioninfo_qualifier rows
+// limit checking/fixes to listed tables, if empty attempt to check/fix all
+// .meta. are always checked
+private set<string> tablesincluded   new hashset<string>
+private int maxmerge   default_max_merge     maximum number of overlapping regions to merge
+private int maxoverlapstosideline   default_overlaps_to_sideline     maximum number of overlapping regions to sideline
+private boolean sidelinebigoverlaps   false     sideline overlaps with >maxmerge regions
+private path sidelinedir   null
+private boolean rerun   false     if we tried to fix something  rerun hbck
+private static boolean summary   false     if we want to print less output
+private boolean checkmetaonly   false
+private boolean ignoreprecheckpermission   false     if pre check permission
+/*********
+* state
+*********/
+final private errorreporter errors
+int fixes   0
+/**
+* this map contains the state of all hbck items.  it maps from encoded region
+* name to hbckinfo structure.  the information contained in hbckinfo is used
+* to detect and correct consistency (hdfs/meta/deployment) problems.
+*/
+private treemap<string  hbckinfo> regioninfomap   new treemap<string  hbckinfo>
+private treeset<byte> disabledtables
+new treeset<byte> bytes bytes_comparator
+// empty regioninfo qualifiers in .meta.
+private set<result> emptyregioninfoqualifiers   new hashset<result>
+/**
+* this map from tablename -> tableinfo contains the structures necessary to
+* detect table consistency problems (holes, dupes, overlaps).  it is sorted
+* to prevent dupes.
+*
+* if tablesincluded is empty, this map contains all tables.
+* otherwise, it contains only meta tables and tables in tablesincluded,
+* unless checkmetaonly is specified, in which case, it contains only
+* the meta table
+*/
+private sortedmap<string  tableinfo> tablesinfo   new concurrentskiplistmap<string tableinfo>
+/**
+* when initially looking at hdfs, we attempt to find any orphaned data.
+*/
+private list<hbckinfo> orphanhdfsdirs   collections synchronizedlist new arraylist<hbckinfo>
+private map<string  set<string>> orphantabledirs   new hashmap<string  set<string>>
+/**
+* constructor
+*
+* @param conf configuration object
+* @throws masternotrunningexception if the master is not running
+* @throws zookeeperconnectionexception if unable to connect to zookeeper
+*/
+public hbasefsck configuration conf  throws masternotrunningexception
+zookeeperconnectionexception  ioexception  classnotfoundexception
+super conf
+errors   geterrorreporter conf
+int numthreads   conf getint    max_num_threads
+executor   new scheduledthreadpoolexecutor numthreads  threads newdaemonthreadfactory
+}
+/**
+* constructor
+*
+* @param conf
+*          configuration object
+* @throws masternotrunningexception
+*           if the master is not running
+* @throws zookeeperconnectionexception
+*           if unable to connect to zookeeper
+*/
+public hbasefsck configuration conf  executorservice exec  throws masternotrunningexception
+zookeeperconnectionexception  ioexception  classnotfoundexception
+super conf
+errors   geterrorreporter getconf
+this executor   exec
+}
+/**
+* to repair region consistency, one must call connect() in order to repair
+* online state.
+*/
+public void connect   throws ioexception
+admin   new hbaseadmin getconf
+meta   new htable getconf    hconstants meta_table_name
+status   admin getclusterstatus
+connection   admin getconnection
+}
+/**
+* get deployed regions according to the region servers.
+*/
+private void loaddeployedregions   throws ioexception  interruptedexception
+// from the master, get a list of all known live region servers
+collection<servername> regionservers   status getservers
+errors print     regionservers size
+if  details
+for  servername rsinfo  regionservers
+errors print     rsinfo getservername
+}
+}
+// from the master, get a list of all dead region servers
+collection<servername> deadregionservers   status getdeadservernames
+errors print     deadregionservers size
+if  details
+for  servername name  deadregionservers
+errors print     name
+}
+}
+// print the current master name and state
+errors print     status getmaster
+// print the list of all backup masters
+collection<servername> backupmasters   status getbackupmasters
+errors print     backupmasters size
+if  details
+for  servername name  backupmasters
+errors print     name
+}
+}
+// determine what's deployed
+processregionservers regionservers
+}
+/**
+* clear the current state of hbck.
+*/
+private void clearstate
+// make sure regioninfo is empty before starting
+fixes   0
+regioninfomap clear
+emptyregioninfoqualifiers clear
+disabledtables clear
+errors clear
+tablesinfo clear
+orphanhdfsdirs clear
+}
+/**
+* this repair method analyzes hbase data in hdfs and repairs it to satisfy
+* the table integrity rules.  hbase doesn't need to be online for this
+* operation to work.
+*/
+public void offlinehdfsintegrityrepair   throws ioexception  interruptedexception
+// initial pass to fix orphans.
+if  shouldcheckhdfs       shouldfixhdfsorphans      shouldfixhdfsholes
+shouldfixhdfsoverlaps      shouldfixtableorphans
+log info
+// if nothing is happening this should always complete in two iterations.
+int maxiterations   getconf   getint    3
+int curiter   0
+do
+clearstate       clears hbck state and reset fixes to 0 and
+// repair what's on hdfs
+restorehdfsintegrity
+curiter      limit the number of iterations
+while  fixes > 0    curiter <  maxiterations
+// repairs should be done in the first iteration and verification in the second.
+// if there are more than 2 passes, something funny has happened.
+if  curiter > 2
+if  curiter    maxiterations
+log warn     curiter
+else
+log info     curiter
+}
+}
+}
+}
+/**
+* this repair method requires the cluster to be online since it contacts
+* region servers and the masters.  it makes each region's state in hdfs, in
+* .meta., and deployments consistent.
+*
+* @return if > 0 , number of errors detected, if < 0 there was an unrecoverable
+* error.  if 0, we have a clean hbase.
+*/
+public int onlineconsistencyrepair   throws ioexception  keeperexception
+interruptedexception
+clearstate
+log info
+boolean success   loadmetaentries
+if   success  return  1
+// check if .meta. is found only once and in the right place
+if   checkmetaregion
+// will remove later if we can fix it
+errors reporterror
+return  2
+}
+// empty cells in .meta.?
+reportemptymetacells
+// check if we have to cleanup empty regioninfo_qualifier rows from .meta.
+if  shouldfixemptymetacells
+fixemptymetacells
+}
+// get a list of all tables that have not changed recently.
+if   checkmetaonly
+reporttablesinflux
+}
+// get regions according to what is online on each regionserver
+loaddeployedregions
+// load regiondirs and regioninfos from hdfs
+if  shouldcheckhdfs
+loadhdfsregiondirs
+loadhdfsregioninfos
+}
+// get disabled tables from zookeeper
+loaddisabledtables
+// fix the orphan tables
+fixorphantables
+// check and fix consistency
+checkandfixconsistency
+// check integrity (does not fix)
+checkintegrity
+return errors geterrorlist   size
+}
+/**
+* contacts the master and prints out cluster-wide information
+* @return 0 on success, non-zero on failure
+*/
+public int onlinehbck   throws ioexception  keeperexception  interruptedexception  serviceexception
+// print hbase server version
+errors print     status gethbaseversion
+offlinehdfsintegrityrepair
+// turn the balancer off
+boolean oldbalancer   admin setbalancerrunning false  true
+try {
+onlineconsistencyrepair
+}
+finally
+admin setbalancerrunning oldbalancer  false
+}
+offlinereferencefilerepair
+// print table summary
+printtablesummary tablesinfo
+return errors summarize
+}
+/**
+* iterates through the list of all orphan/invalid regiondirs.
+*/
+private void adopthdfsorphans collection<hbckinfo> orphanhdfsdirs  throws ioexception
+for  hbckinfo hi   orphanhdfsdirs
+log info     hi gethdfsregiondir
+adopthdfsorphan hi
+}
+}
+/**
+* orphaned regions are regions without a .regioninfo file in them.  we "adopt"
+* these orphans by creating a new region, and moving the column families,
+* recovered edits, hlogs, into the new region dir.  we determine the region
+* startkey and endkeys by looking at all of the hfiles inside the column
+* families to identify the min and max keys. the resulting region will
+* likely violate table integrity but will be dealt with by merging
+* overlapping regions.
+*/
+private void adopthdfsorphan hbckinfo hi  throws ioexception
+path p   hi gethdfsregiondir
+filesystem fs   p getfilesystem getconf
+filestatus dirs   fs liststatus p
+if  dirs    null
+log warn
+p
+return
+}
+string tablename   bytes tostring hi gettablename
+tableinfo tableinfo   tablesinfo get tablename
+preconditions checknotnull tableinfo      tablename
+htabledescriptor template   tableinfo gethtd
+// find min and max key values
+pair<byte byte> orphanregionrange   null
+for  filestatus cf   dirs
+string cfname  cf getpath   getname
+// todo figure out what the special dirs are
+if  cfname startswith       cfname equals     continue
+filestatus hfiles   fs liststatus cf getpath
+for  filestatus hfile   hfiles
+byte start  end
+hfile reader hf   null
+try {
+cacheconfig cacheconf   new cacheconfig getconf
+hf   hfile createreader fs  hfile getpath    cacheconf
+hf loadfileinfo
+keyvalue startkv   keyvalue createkeyvaluefromkey hf getfirstkey
+start   startkv getrow
+keyvalue endkv   keyvalue createkeyvaluefromkey hf getlastkey
+end   endkv getrow
+catch  ioexception ioe
+log warn     hfile
+continue;
+catch  nullpointerexception ioe
+log warn     hfile
+continue;
+finally
+if  hf    null
+hf close
+}
+}
+// expand the range to include the range of all hfiles
+if  orphanregionrange    null
+// first range
+orphanregionrange   new pair<byte  byte> start  end
+else
+// todo add test
+// expand range only if the hfile is wider.
+if  bytes compareto orphanregionrange getfirst    start  > 0
+orphanregionrange setfirst start
+}
+if  bytes compareto orphanregionrange getsecond    end  < 0
+orphanregionrange setsecond end
+}
+}
+}
+}
+if  orphanregionrange    null
+log warn     p
+fixes
+sidelineregiondir fs  hi
+return
+}
+log info     bytes tostring orphanregionrange getfirst
+bytes tostring orphanregionrange getsecond
+// create new region on hdfs.  move data into place.
+hregioninfo hri   new hregioninfo template getname    orphanregionrange getfirst    orphanregionrange getsecond
+log info     hri
+hregion region   hbasefsckrepair createhdfsregiondir getconf    hri  template
+path target   region getregionfilesystem   getregiondir
+// rename all the data to new region
+mergeregiondirs target  hi
+fixes
+}
+/**
+* this method determines if there are table integrity errors in hdfs.  if
+* there are errors and the appropriate "fix" options are enabled, the method
+* will first correct orphan regions making them into legit regiondirs, and
+* then reload to merge potentially overlapping regions.
+*
+* @return number of table integrity errors found
+*/
+private int restorehdfsintegrity   throws ioexception  interruptedexception
+// determine what's on hdfs
+log info
+loadhdfsregiondirs       populating regioninfo table
+int errs   errors geterrorlist   size
+// first time just get suggestions.
+tablesinfo   loadhdfsregioninfos       update tableinfos based on region info in fs
+checkhdfsintegrity false  false
+if  errors geterrorlist   size      errs
+log info
+return 0
+}
+if  shouldfixhdfsorphans      orphanhdfsdirs size   > 0
+adopthdfsorphans orphanhdfsdirs
+// todo optimize by incrementally adding instead of reloading.
+}
+// make sure there are no holes now.
+if  shouldfixhdfsholes
+clearstate       this also resets # fixes
+loadhdfsregiondirs
+tablesinfo   loadhdfsregioninfos       update tableinfos based on region info in fs
+tablesinfo   checkhdfsintegrity shouldfixhdfsholes    false
+}
+// now we fix overlaps
+if  shouldfixhdfsoverlaps
+// second pass we fix overlaps.
+clearstate       this also resets # fixes
+loadhdfsregiondirs
+tablesinfo   loadhdfsregioninfos       update tableinfos based on region info in fs
+tablesinfo   checkhdfsintegrity false  shouldfixhdfsoverlaps
+}
+return errors geterrorlist   size
+}
+/**
+* scan all the store file names to find any lingering reference files,
+* which refer to some none-exiting files. if "fix" option is enabled,
+* any lingering reference file will be sidelined if found.
+* <p>
+* lingering reference file prevents a region from opening. it has to
+* be fixed before a cluster can start properly.
+*/
+private void offlinereferencefilerepair   throws ioexception
+configuration conf   getconf
+path hbaseroot   fsutils getrootdir conf
+filesystem fs   hbaseroot getfilesystem conf
+map<string  path> allfiles   fsutils gettablestorefilepathmap fs  hbaseroot
+for  path path  allfiles values
+boolean isreference   false
+try {
+isreference   storefileinfo isreference path
+catch  throwable t
+// ignore. some files may not be store files at all.
+// for example, files under .oldlogs folder in .meta.
+// warning message is already logged by
+// storefile#isreference.
+}
+if   isreference  continue
+path referredtofile   storefileinfo getreferredtofile path
+if  fs exists referredtofile   continue      good  expected
+// found a lingering reference file
+errors reporterror error_code lingering_reference_hfile
+path
+if   shouldfixreferencefiles    continue
+// now, trying to fix it since requested
+boolean success   false
+string pathstr   path tostring
+// a reference file path should be like
+// ${hbase.rootdir}/table_name/region_id/family_name/referred_file.region_name
+// up 3 directories to get the table folder.
+// so the file will be sidelined to a similar folder structure.
+int index   pathstr lastindexof path separator_char
+for  int i   0  index > 0    i < 3  i
+index   pathstr lastindexof path separator_char  index
+}
+if  index > 0
+path rootdir   getsidelinedir
+path dst   new path rootdir  pathstr substring index
+fs mkdirs dst getparent
+log info
+path       dst
+setshouldrerun
+success   fs rename path  dst
+}
+if   success
+log error     path
+}
+}
+}
+/**
+* todo -- need to add tests for this.
+*/
+private void reportemptymetacells
+errors print
+emptyregioninfoqualifiers size
+if  details
+for  result r  emptyregioninfoqualifiers
+errors print     r
+}
+}
+}
+/**
+* todo -- need to add tests for this.
+*/
+private void reporttablesinflux
+atomicinteger numskipped   new atomicinteger 0
+htabledescriptor alltables   gettables numskipped
+errors print     alltables length
+if  details
+if  numskipped get   > 0
+errors detail     numskipped get
+}
+for  htabledescriptor td   alltables
+string tablename   td getnameasstring
+errors detail     tablename
+td isreadonly   ?
+td ismetaregion   ?
+td getfamilies   size
+}
+}
+}
+public errorreporter geterrors
+return errors
+}
+/**
+* read the .regioninfo file from the file system.  if there is no
+* .regioninfo, add it to the orphan hdfs region list.
+*/
+private void loadhdfsregioninfo hbckinfo hbi  throws ioexception
+path regiondir   hbi gethdfsregiondir
+if  regiondir    null
+log warn     hbi       hbi metaentry
+return
+}
+if  hbi hdfsentry hri    null
+// already loaded data
+return
+}
+filesystem fs   filesystem get getconf
+hregioninfo hri   hregionfilesystem loadregioninfofilecontent fs  regiondir
+log debug     hri tostring
+hbi hdfsentry hri   hri
+}
+/**
+* exception thrown when a integrity repair operation fails in an
+* unresolvable way.
+*/
+public static class regionrepairexception extends ioexception
+private static final long serialversionuid   1l
+final ioexception ioe
+public regionrepairexception string s  ioexception ioe
+super s
+this ioe   ioe
+}
+}
+/**
+* populate hbi's from regioninfos loaded from file system.
+*/
+private sortedmap<string  tableinfo> loadhdfsregioninfos   throws ioexception  interruptedexception
+tablesinfo clear       regenerating the data
+// generate region split structure
+collection<hbckinfo> hbckinfos   regioninfomap values
+// parallelized read of .regioninfo files.
+list<workitemhdfsregioninfo> hbis   new arraylist<workitemhdfsregioninfo> hbckinfos size
+list<future<void>> hbifutures
+for  hbckinfo hbi   hbckinfos
+workitemhdfsregioninfo work   new workitemhdfsregioninfo hbi  this  errors
+hbis add work
+}
+// submit and wait for completion
+hbifutures   executor invokeall hbis
+for int i 0  i<hbifutures size    i
+workitemhdfsregioninfo work   hbis get i
+future<void> f   hbifutures get i
+try {
+f.get();
+} catch(executionexception e) {
+log warn
+work hbi getregionnameasstring    e getcause
+}
+}
+// serialized table info gathering.
+for  hbckinfo hbi  hbckinfos
+if  hbi gethdfshri      null
+// was an orphan
+continue;
+}
+// get table name from hdfs, populate various hbasefsck tables.
+string tablename   bytes tostring hbi gettablename
+if  tablename    null
+// there was an entry in meta not in the hdfs?
+log warn     hbi
+continue;
+}
+tableinfo modtinfo   tablesinfo get tablename
+if  modtinfo    null
+// only executed once per table.
+modtinfo   new tableinfo tablename
+path hbaseroot   fsutils getrootdir getconf
+tablesinfo put tablename  modtinfo
+try {
+htabledescriptor htd
+fstabledescriptors gettabledescriptor hbaseroot getfilesystem getconf
+hbaseroot  tablename
+modtinfo htds add htd
+catch  ioexception ioe
+if   orphantabledirs containskey tablename
+log warn     hbaseroot  ioe
+//should only report once for each table
+errors reporterror error_code no_tableinfo_file
+hbaseroot       tablename
+set<string> columns   new hashset<string>
+orphantabledirs put tablename  getcolumnfamilylist columns  hbi
+}
+}
+}
+if   hbi isskipchecks
+modtinfo addregioninfo hbi
+}
+}
+return tablesinfo
+}
+/**
+* to get the column family list according to the column family dirs
+* @param columns
+* @param hbi
+* @return
+* @throws ioexception
+*/
+private set<string> getcolumnfamilylist set<string> columns  hbckinfo hbi  throws ioexception
+path regiondir   hbi gethdfsregiondir
+filesystem fs   regiondir getfilesystem getconf
+filestatus subdirs   fs liststatus regiondir  new fsutils familydirfilter fs
+for  filestatus subdir   subdirs
+string columnfamily   subdir getpath   getname
+columns add columnfamily
+}
+return columns
+}
+/**
+* to fabricate a .tableinfo file with following contents<br>
+* 1. the correct tablename <br>
+* 2. the correct colfamily list<br>
+* 3. the default properties for both {@link htabledescriptor} and {@link hcolumndescriptor}<br>
+* @param tablename
+* @throws ioexception
+*/
+private boolean fabricatetableinfo string tablename  set<string> columns  throws ioexception
+if  columns   null    columns isempty    return false
+htabledescriptor htd   new htabledescriptor tablename
+for  string columnfamimly   columns
+htd addfamily new hcolumndescriptor columnfamimly
+}
+fstabledescriptors createtabledescriptor htd  getconf    true
+return true
+}
+/**
+* to fix the empty regioninfo_qualifier rows from .meta. <br>
+* @throws ioexception
+*/
+public void fixemptymetacells   throws ioexception
+if  shouldfixemptymetacells       emptyregioninfoqualifiers isempty
+log info
+for  result region   emptyregioninfoqualifiers
+deletemetaregion region getrow
+errors geterrorlist   remove error_code empty_meta_cell
+}
+emptyregioninfoqualifiers clear
+}
+}
+/**
+* to fix orphan table by creating a .tableinfo file under tabledir <br>
+* 1. if tableinfo is cached, to recover the .tableinfo accordingly <br>
+* 2. else create a default .tableinfo file with following items<br>
+* &nbsp;2.1 the correct tablename <br>
+* &nbsp;2.2 the correct colfamily list<br>
+* &nbsp;2.3 the default properties for both {@link htabledescriptor} and {@link hcolumndescriptor}<br>
+* @throws ioexception
+*/
+public void fixorphantables   throws ioexception
+if  shouldfixtableorphans       orphantabledirs isempty
+path hbaseroot   fsutils getrootdir getconf
+list<string> tmplist   new arraylist<string>
+tmplist addall orphantabledirs keyset
+htabledescriptor htds   gethtabledescriptors tmplist
+iterator<entry<string  set<string>>> iter   orphantabledirs entryset   iterator
+int j   0
+int numfailedcase   0
+while  iter hasnext
+entry<string  set<string>> entry    entry<string  set<string>>  iter next
+string tablename   entry getkey
+log info     tablename
+if  j < htds length
+if  tablename equals bytes tostring htds getname
+htabledescriptor htd   htds
+log info     tablename
+fstabledescriptors createtabledescriptor
+hbaseroot getfilesystem getconf     hbaseroot  htd  true
+j
+iter remove
+}
+else
+if  fabricatetableinfo tablename  entry getvalue
+log warn     tablename
+log warn     tablename
+iter remove
+else
+log error     tablename
+numfailedcase
+}
+}
+fixes
+}
+if  orphantabledirs isempty
+// all orphantabledirs are luckily recovered
+// re-run dofsck after recovering the .tableinfo file
+setshouldrerun
+log warn
+else if  numfailedcase > 0
+log error     numfailedcase
+}
+}
+//cleanup the list
+orphantabledirs clear
+}
+/**
+* this borrows code from masterfilesystem.bootstrap()
+*
+* @return an open .meta. hregion
+*/
+private hregion createnewmeta   throws ioexception
+path rootdir   fsutils getrootdir getconf
+configuration c   getconf
+hregioninfo metahri   new hregioninfo hregioninfo first_meta_regioninfo
+masterfilesystem setinfofamilycachingformeta false
+hregion meta   hregion createhregion metahri  rootdir  c
+htabledescriptor meta_tabledesc
+masterfilesystem setinfofamilycachingformeta true
+return meta
+}
+/**
+* generate set of puts to add to new meta.  this expects the tables to be
+* clean with no overlaps or holes.  if there are any problems it returns null.
+*
+* @return an array list of puts to do in bulk, null if tables have problems
+*/
+private arraylist<put> generateputs sortedmap<string  tableinfo> tablesinfo  throws ioexception
+arraylist<put> puts   new arraylist<put>
+boolean hasproblems   false
+for  entry<string  tableinfo> e   tablesinfo entryset
+string name   e getkey
+// skip ".meta."
+if  bytes compareto bytes tobytes name   hconstants meta_table_name     0
+continue;
+}
+tableinfo ti   e getvalue
+for  entry<byte  collection<hbckinfo>> spl   ti sc getstarts   asmap
+entryset
+collection<hbckinfo> his   spl getvalue
+int sz   his size
+if  sz    1
+// problem
+log error     bytes tostringbinary spl getkey
+sz
+hasproblems   true
+continue;
+}
+// add the row directly to meta.
+hbckinfo hi   his iterator   next
+hregioninfo hri   hi gethdfshri       hi metaentry
+put p   metaeditor makeputfromregioninfo hri
+puts add p
+}
+}
+return hasproblems ? null   puts
+}
+/**
+* suggest fixes for each table
+*/
+private void suggestfixes sortedmap<string  tableinfo> tablesinfo  throws ioexception
+for  tableinfo tinfo   tablesinfo values
+tableintegrityerrorhandler handler   tinfo new integrityfixsuggester tinfo  errors
+tinfo checkregionchain handler
+}
+}
+/**
+* rebuilds meta from information in hdfs/fs.  depends on configuration
+* settings passed into hbck constructor to point to a particular fs/dir.
+*
+* @param fix flag that determines if method should attempt to fix holes
+* @return true if successful, false if attempt failed.
+*/
+public boolean rebuildmeta boolean fix  throws ioexception
+interruptedexception
+// todo check to make sure hbase is offline. (or at least the table
+// currently being worked on is off line)
+// determine what's on hdfs
+log info
+loadhdfsregiondirs       populating regioninfo table
+int errs   errors geterrorlist   size
+tablesinfo   loadhdfsregioninfos       update tableinfos based on region info in fs
+checkhdfsintegrity false  false
+// make sure ok.
+if  errors geterrorlist   size      errs
+// while in error state, iterate until no more fixes possible
+while true
+fixes   0
+suggestfixes tablesinfo
+errors clear
+loadhdfsregioninfos       update tableinfos based on region info in fs
+checkhdfsintegrity shouldfixhdfsholes    shouldfixhdfsoverlaps
+int errcount   errors geterrorlist   size
+if  fixes    0
+if  errcount > 0
+return false     failed to fix problems
+else
+break     no fixes and no problems? drop out and fix stuff
+}
+}
+}
+}
+// we can rebuild, move old meta out of the way and start
+log info
+path backupdir   sidelineoldmeta
+log info
+hregion meta   createnewmeta
+// populate meta
+list<put> puts   generateputs tablesinfo
+if  puts    null
+log fatal
+return false
+}
+meta put puts toarray new put
+hregion closehregion meta
+log info
+log info     backupdir
+return true
+}
+private sortedmap<string  tableinfo> checkhdfsintegrity boolean fixholes
+boolean fixoverlaps  throws ioexception
+log info
+for  tableinfo tinfo   tablesinfo values
+tableintegrityerrorhandler handler
+if  fixholes    fixoverlaps
+handler   tinfo new hdfsintegrityfixer tinfo  errors  getconf
+fixholes  fixoverlaps
+else
+handler   tinfo new integrityfixsuggester tinfo  errors
+}
+if   tinfo checkregionchain handler
+// should dump info as well.
+errors report     tinfo getname
+}
+}
+return tablesinfo
+}
+private path getsidelinedir   throws ioexception
+if  sidelinedir    null
+path hbasedir   fsutils getrootdir getconf
+path hbckdir   new path hbasedir  hconstants hbck_sidelinedir_name
+sidelinedir   new path hbckdir  hbasedir getname
+startmillis
+}
+return sidelinedir
+}
+/**
+* sideline a region dir (instead of deleting it)
+*/
+path sidelineregiondir filesystem fs  hbckinfo hi  throws ioexception
+return sidelineregiondir fs  null  hi
+}
+/**
+* sideline a region dir (instead of deleting it)
+*
+* @param parentdir if specified, the region will be sidelined to
+* folder like .../parentdir/<table name>/<region name>. the purpose
+* is to group together similar regions sidelined, for example, those
+* regions should be bulk loaded back later on. if null, it is ignored.
+*/
+path sidelineregiondir filesystem fs
+string parentdir  hbckinfo hi  throws ioexception
+string tablename   bytes tostring hi gettablename
+path regiondir   hi gethdfsregiondir
+if   fs exists regiondir
+log warn     regiondir
+return null;
+}
+path rootdir   getsidelinedir
+if  parentdir    null
+rootdir   new path rootdir  parentdir
+}
+path sidelinetabledir  new path rootdir  tablename
+path sidelineregiondir   new path sidelinetabledir  regiondir getname
+fs mkdirs sidelineregiondir
+boolean success   false
+filestatus cfs    fs liststatus regiondir
+if  cfs    null
+log info     regiondir
+else
+for  filestatus cf   cfs
+path src   cf getpath
+path dst    new path sidelineregiondir  src getname
+if  fs isfile src
+// simple file
+success   fs rename src  dst
+if   success
+string msg       src        dst
+log error msg
+throw new ioexception msg
+}
+continue;
+}
+// is a directory.
+fs mkdirs dst
+log info     src       dst
+// filesystem.rename is inconsistent with directories -- if the
+// dst (foo/a) exists and is a dir, and the src (foo/b) is a dir,
+// it moves the src into the dst dir resulting in (foo/a/b).  if
+// the dst does not exist, and the src a dir, src becomes dst. (foo/b)
+filestatus hfiles   fs liststatus src
+if  hfiles    null    hfiles length > 0
+for  filestatus hfile   hfiles
+success   fs rename hfile getpath    dst
+if   success
+string msg       src        dst
+log error msg
+throw new ioexception msg
+}
+}
+}
+log debug
+debuglsr sidelineregiondir
+}
+}
+log info     regiondir
+success   fs delete regiondir  true
+if   success
+string msg       regiondir
+log error msg
+throw new ioexception msg
+}
+return sidelineregiondir
+}
+/**
+* side line an entire table.
+*/
+void sidelinetable filesystem fs  byte table  path hbasedir
+path backuphbasedir  throws ioexception
+string tablename   bytes tostring table
+path tabledir   new path hbasedir  tablename
+if  fs exists tabledir
+path backuptabledir  new path backuphbasedir  tablename
+boolean success   fs rename tabledir  backuptabledir
+if   success
+throw new ioexception     tablename
+tabledir getname         backuptabledir getname
+}
+else
+log info     tablename
+}
+}
+/**
+* @return path to backup of original directory
+*/
+path sidelineoldmeta   throws ioexception
+// put current .meta. aside.
+path hbasedir   fsutils getrootdir getconf
+filesystem fs   hbasedir getfilesystem getconf
+path backupdir   getsidelinedir
+fs mkdirs backupdir
+try {
+sidelinetable fs  hconstants meta_table_name  hbasedir  backupdir
+} catch (ioexception e) {
+log fatal
+backupdir getname
+hbasedir getname        e
+throw e     throw original exception
+}
+return backupdir
+}
+/**
+* load the list of disabled tables in zk into local set.
+* @throws zookeeperconnectionexception
+* @throws ioexception
+*/
+private void loaddisabledtables
+throws zookeeperconnectionexception  ioexception
+hconnectionmanager execute new hconnectable<void> getconf
+@override
+public void connect hconnection connection  throws ioexception
+zookeeperwatcher zkw   createzookeeperwatcher
+try {
+for  string tablename   zktablereadonly getdisabledordisablingtables zkw
+disabledtables add bytes tobytes tablename
+}
+catch  keeperexception ke
+throw new ioexception ke
+finally
+zkw close
+}
+return null;
+}
+}
+/**
+* check if the specified region's table is disabled.
+*/
+private boolean istabledisabled hregioninfo regioninfo
+return disabledtables contains regioninfo gettablename
+}
+/**
+* scan hdfs for all regions, recording their information into
+* regioninfomap
+*/
+public void loadhdfsregiondirs   throws ioexception  interruptedexception
+path rootdir   fsutils getrootdir getconf
+filesystem fs   rootdir getfilesystem getconf
+// list all tables from hdfs
+list<filestatus> tabledirs   lists newarraylist
+boolean foundversionfile   false
+filestatus files   fs liststatus rootdir
+for  filestatus file   files
+string dirname   file getpath   getname
+if  dirname equals hconstants version_file_name
+foundversionfile   true
+else
+if    checkmetaonly    istableincluded dirname
+dirname equals
+tabledirs add file
+}
+}
+}
+// verify that version file exists
+if   foundversionfile
+errors reporterror error_code no_version_file
+rootdir
+if  shouldfixversionfile
+log info     hconstants version_file_name
+setshouldrerun
+fsutils setversion fs  rootdir  getconf   getint
+hconstants thread_wake_frequency  10   1000   getconf   getint
+hconstants version_file_write_attempts
+hconstants default_version_file_write_attempts
+}
+}
+// level 1:  <hbase_dir>/*
+list<workitemhdfsdir> dirs = new arraylist<workitemhdfsdir>(tabledirs.size());
+list<future<void>> dirsfutures;
+for (filestatus tabledir : tabledirs) {
+log.debug("loading region dirs from " +tabledir.getpath());
+dirs.add(new workitemhdfsdir(this, fs, errors, tabledir));
+}
+// invoke and wait for callables to complete
+dirsfutures = executor.invokeall(dirs);
+for(future<void> f: dirsfutures) {
+try {
+f.get();
+} catch(executionexception e) {
+log.warn("could not load region dir " , e.getcause());
+}
+}
+}
+/**
+* record the location of the meta region as found in zookeeper.
+*/
+private boolean recordmetaregion   throws ioexception
+hregionlocation metalocation   connection locateregion
+hconstants meta_table_name  hconstants empty_start_row
+// check if meta region is valid and existing
+if  metalocation    null    metalocation getregioninfo      null
+metalocation gethostname      null
+errors reporterror error_code null_meta_region
+return false
+}
+servername sn
+try {
+sn   getmetaregionservername
+catch  keeperexception e
+throw new ioexception e
+}
+metaentry m
+new metaentry metalocation getregioninfo    sn  system currenttimemillis
+hbckinfo hbinfo   new hbckinfo m
+regioninfomap put metalocation getregioninfo   getencodedname    hbinfo
+return true
+}
+private zookeeperwatcher createzookeeperwatcher   throws ioexception
+return new zookeeperwatcher getconf       new abortable
+@override
+public void abort string why  throwable e
+log error why  e
+system exit 1
+}
+@override
+public boolean isaborted
+return false
+}
+}
+private servername getmetaregionservername
+throws ioexception  keeperexception
+zookeeperwatcher zkw   createzookeeperwatcher
+servername sn   null
+try {
+sn   metaregiontracker getmetaregionlocation zkw
+finally
+zkw close
+}
+return sn
+}
+/**
+* contacts each regionserver and fetches metadata about regions.
+* @param regionserverlist - the list of region servers to connect to
+* @throws ioexception if a remote or network exception occurs
+*/
+void processregionservers collection<servername> regionserverlist
+throws ioexception  interruptedexception
+list<workitemregion> workitems   new arraylist<workitemregion> regionserverlist size
+list<future<void>> workfutures
+// loop to contact each region server in parallel
+for  servername rsinfo  regionserverlist
+workitems add new workitemregion this  rsinfo  errors  connection
+}
+workfutures   executor invokeall workitems
+for int i 0  i<workfutures size    i
+workitemregion item   workitems get i
+future<void> f   workfutures get i
+try {
+f.get();
+} catch(executionexception e) {
+log warn     item rsinfo gethostandport
+e getcause
+}
+}
+}
+/**
+* check consistency of all regions that have been found in previous phases.
+*/
+private void checkandfixconsistency
+throws ioexception  keeperexception  interruptedexception
+for  java util map entry<string  hbckinfo> e  regioninfomap entryset
+checkregionconsistency e getkey    e getvalue
+}
+}
+private void precheckpermission   throws ioexception  accesscontrolexception
+if  shouldignoreprecheckpermission
+return
+}
+path hbasedir   fsutils getrootdir getconf
+filesystem fs   hbasedir getfilesystem getconf
+usergroupinformation ugi   user getcurrent   getugi
+filestatus files   fs liststatus hbasedir
+for  filestatus file   files
+try {
+fsutils checkaccess ugi  file  fsaction write
+catch  accesscontrolexception ace
+log warn    ace
+errors reporterror error_code wrong_usage      ugi getusername
+file getpath
+file getowner
+throw new accesscontrolexception ace
+}
+}
+}
+/**
+* deletes region from meta table
+*/
+private void deletemetaregion hbckinfo hi  throws ioexception
+deletemetaregion hi metaentry getregionname
+}
+/**
+* deletes region from meta table
+*/
+private void deletemetaregion byte metakey  throws ioexception
+delete d   new delete metakey
+meta delete d
+meta flushcommits
+log info     bytes tostring metakey
+}
+/**
+* reset the split parent region info in meta table
+*/
+private void resetsplitparent hbckinfo hi  throws ioexception
+rowmutations mutations   new rowmutations hi metaentry getregionname
+delete d   new delete hi metaentry getregionname
+d deletecolumn hconstants catalog_family  hconstants splita_qualifier
+d deletecolumn hconstants catalog_family  hconstants splitb_qualifier
+mutations add d
+hregioninfo hri   new hregioninfo hi metaentry
+hri setoffline false
+hri setsplit false
+put p   metaeditor makeputfromregioninfo hri
+mutations add p
+meta mutaterow mutations
+meta flushcommits
+log info     hi metaentry getregionnameasstring
+}
+/**
+* this backwards-compatibility wrapper for permanently offlining a region
+* that should not be alive.  if the region server does not support the
+* "offline" method, it will use the closest unassign method instead.  this
+* will basically work until one attempts to disable or delete the affected
+* table.  the problem has to do with in-memory only master state, so
+* restarting the hmaster or failing over to another should fix this.
+*/
+private void offline byte regionname  throws ioexception
+string regionstring   bytes tostringbinary regionname
+if   rssupportsoffline
+log warn     regionstring
+admin unassign regionname  true
+return
+}
+// first time we assume the rs's supports #offline.
+try {
+log info     regionstring
+admin offline regionname
+catch  ioexception ioe
+string notfoundmsg
+if  ioe getmessage   contains notfoundmsg
+log warn     regionstring
+rssupportsoffline   false     in the future just use unassign
+admin unassign regionname  true
+return
+}
+throw ioe
+}
+}
+private void undeployregions hbckinfo hi  throws ioexception  interruptedexception
+for  onlineentry rse   hi deployedentries
+log debug      rse hri       rse hsa
+try {
+hbasefsckrepair closeregionsilentlyandwait admin  rse hsa  rse hri
+offline rse hri getregionname
+catch  ioexception ioe
+log warn
+bytes tostring rse hri getregionname     ioe
+}
+}
+}
+/**
+* attempts to undeploy a region from a region server based in information in
+* meta.  any operations that modify the file system should make sure that
+* its corresponding region is not deployed to prevent data races.
+*
+* a separate call is required to update the master in-memory region state
+* kept in the assignementmanager.  because disable uses this state instead of
+* that found in meta, we can't seem to cleanly disable/delete tables that
+* have been hbck fixed.  when used on a version of hbase that does not have
+* the offline ipc call exposed on the master (<0.90.5, <0.92.0) a master
+* restart or failover may be required.
+*/
+private void closeregion hbckinfo hi  throws ioexception  interruptedexception
+if  hi metaentry    null    hi hdfsentry    null
+undeployregions hi
+return
+}
+// get assignment info and hregioninfo from meta.
+get get   new get hi getregionname
+get addcolumn hconstants catalog_family  hconstants regioninfo_qualifier
+get addcolumn hconstants catalog_family  hconstants server_qualifier
+get addcolumn hconstants catalog_family  hconstants startcode_qualifier
+result r   meta get get
+servername servername   hregioninfo getservername r
+if  servername    null
+errors reporterror
+hi getregionnameasstring
+return
+}
+hregioninfo hri   hregioninfo gethregioninfo r
+if  hri    null
+log warn     hi getregionnameasstring
+hconstants catalog_family_str
+bytes tostring hconstants regioninfo_qualifier
+return
+}
+// close the region -- close files and remove assignment
+hbasefsckrepair closeregionsilentlyandwait admin  servername  hri
+}
+private void tryassignmentrepair hbckinfo hbi  string msg  throws ioexception
+keeperexception  interruptedexception
+// if we are trying to fix the errors
+if  shouldfixassignments
+errors print msg
+undeployregions hbi
+setshouldrerun
+hregioninfo hri   hbi gethdfshri
+if  hri    null
+hri   hbi metaentry
+}
+hbasefsckrepair fixunassigned admin  hri
+hbasefsckrepair waituntilassigned admin  hri
+}
+}
+/**
+* check a single region for consistency and correct deployment.
+*/
+private void checkregionconsistency final string key  final hbckinfo hbi
+throws ioexception  keeperexception  interruptedexception
+string descriptivename   hbi tostring
+boolean inmeta   hbi metaentry    null
+// in case not checking hdfs, assume the region is on hdfs
+boolean inhdfs    shouldcheckhdfs      hbi gethdfsregiondir      null
+boolean hasmetaassignment   inmeta    hbi metaentry regionserver    null
+boolean isdeployed    hbi deployedon isempty
+boolean ismultiplydeployed   hbi deployedon size   > 1
+boolean deploymentmatchesmeta
+hasmetaassignment    isdeployed     ismultiplydeployed
+hbi metaentry regionserver equals hbi deployedon get 0
+boolean splitparent
+hbi metaentry    null ? false  hbi metaentry issplit      hbi metaentry isoffline
+boolean shouldbedeployed   inmeta     istabledisabled hbi metaentry
+boolean recentlymodified   inhdfs
+hbi getmodtime     timelag > system currenttimemillis
+// ========== first the healthy cases =============
+if  hbi containsonlyhdfsedits
+return
+}
+if  inmeta    inhdfs    isdeployed    deploymentmatchesmeta    shouldbedeployed
+return
+else if  inmeta    inhdfs     shouldbedeployed     isdeployed
+log info     descriptivename
+return
+else if  recentlymodified
+log warn     descriptivename
+return
+}
+// ========== cases where the region is not in meta =============
+else if   inmeta     inhdfs     isdeployed
+// we shouldn't have record of this region at all then!
+assert false
+else if   inmeta     inhdfs    isdeployed
+errors reporterror error_code not_in_meta_hdfs
+descriptivename       key
+joiner on    join hbi deployedon
+if  shouldfixassignments
+undeployregions hbi
+}
+else if   inmeta    inhdfs     isdeployed
+errors reporterror error_code not_in_meta_or_deployed
+descriptivename
+// restore region consistency of an adopted orphan
+if  shouldfixmeta
+if   hbi ishdfsregioninfopresent
+log error     hbi gethdfshri
+return
+}
+log info     hbi gethdfshri
+hbasefsckrepair fixmetaholeonline getconf    hbi gethdfshri
+tryassignmentrepair hbi
+}
+else if   inmeta    inhdfs    isdeployed
+errors reporterror error_code not_in_meta      descriptivename
+joiner on    join hbi deployedon
+debuglsr hbi gethdfsregiondir
+if  shouldfixmeta
+if   hbi ishdfsregioninfopresent
+log error
+return
+}
+log info     hbi gethdfshri
+hbasefsckrepair fixmetaholeonline getconf    hbi gethdfshri
+tryassignmentrepair hbi
+}
+// ========== cases where the region is in meta =============
+else if  inmeta    inhdfs     isdeployed    splitparent
+// check whether this is an actual error, or just transient state where parent
+// is not cleaned
+if  hbi metaentry splita    null    hbi metaentry splitb    null
+// check that split daughters are there
+hbckinfo infoa   this regioninfomap get hbi metaentry splita getencodedname
+hbckinfo infob   this regioninfomap get hbi metaentry splitb getencodedname
+if  infoa    null    infob    null
+// we already processed or will process daughters. move on, nothing to see here.
+hbi setskipchecks true
+return
+}
+}
+errors reporterror error_code lingering_split_parent
+descriptivename
+if  shouldfixsplitparents
+setshouldrerun
+resetsplitparent hbi
+}
+else if  inmeta     inhdfs     isdeployed
+errors reporterror error_code not_in_hdfs_or_deployed
+descriptivename
+if  shouldfixmeta
+deletemetaregion hbi
+}
+else if  inmeta     inhdfs    isdeployed
+errors reporterror error_code not_in_hdfs      descriptivename
+joiner on    join hbi deployedon
+// we treat hdfs as ground truth.  any information in meta is transient
+// and equivalent data can be regenerated.  so, lets unassign and remove
+// these problems from meta.
+if  shouldfixassignments
+errors print
+closeregion hbi     close region will cause rs to abort
+}
+if  shouldfixmeta
+// wait for it to complete
+deletemetaregion hbi
+}
+else if  inmeta    inhdfs     isdeployed    shouldbedeployed
+errors reporterror error_code not_deployed      descriptivename
+tryassignmentrepair hbi
+else if  inmeta    inhdfs    isdeployed     shouldbedeployed
+errors reporterror error_code should_not_be_deployed
+descriptivename
+joiner on    join hbi deployedon
+if  shouldfixassignments
+errors print     descriptivename
+setshouldrerun
+hbasefsckrepair fixmultiassignment admin  hbi metaentry  hbi deployedon
+}
+else if  inmeta    inhdfs    ismultiplydeployed
+errors reporterror error_code multi_deployed      descriptivename
+hbi metaentry regionserver
+joiner on    join hbi deployedon
+// if we are trying to fix the errors
+if  shouldfixassignments
+errors print
+setshouldrerun
+hbasefsckrepair fixmultiassignment admin  hbi metaentry  hbi deployedon
+}
+else if  inmeta    inhdfs    isdeployed     deploymentmatchesmeta
+errors reporterror error_code server_does_not_match_meta
+descriptivename
+hbi metaentry regionserver
+hbi deployedon get 0
+// if we are trying to fix the errors
+if  shouldfixassignments
+errors print
+setshouldrerun
+hbasefsckrepair fixmultiassignment admin  hbi metaentry  hbi deployedon
+hbasefsckrepair waituntilassigned admin  hbi gethdfshri
+}
+else
+errors reporterror error_code unknown      descriptivename
+inmeta
+inhdfs
+isdeployed
+ismultiplydeployed
+deploymentmatchesmeta
+shouldbedeployed
+}
+}
+/**
+* checks tables integrity. goes over all regions and scans the tables.
+* collects all the pieces for each table and checks if there are missing,
+* repeated or overlapping ones.
+* @throws ioexception
+*/
+sortedmap<string  tableinfo> checkintegrity   throws ioexception
+tablesinfo   new treemap<string tableinfo>
+list<hbckinfo> nohdfsregioninfos   new arraylist<hbckinfo>
+log debug     regioninfomap size
+for  hbckinfo hbi   regioninfomap values
+// check only valid, working regions
+if  hbi metaentry    null
+// this assumes that consistency check has run loadmetaentry
+nohdfsregioninfos add hbi
+path p   hbi gethdfsregiondir
+if  p    null
+errors report     hbi
+}
+// todo test.
+continue;
+}
+if  hbi metaentry regionserver    null
+errors detail     hbi
+continue;
+}
+if  hbi metaentry isoffline
+errors detail     hbi
+continue;
+}
+if  hbi containsonlyhdfsedits
+errors detail     hbi
+continue;
+}
+// missing regiondir or over-deployment is checked elsewhere. include
+// these cases in modtinfo, so we can evaluate those regions as part of
+// the region chain in meta
+//if (hbi.foundregiondir == null) continue;
+//if (hbi.deployedon.size() != 1) continue;
+if  hbi deployedon size      0  continue
+// we should be safe here
+string tablename   hbi metaentry gettablenameasstring
+tableinfo modtinfo   tablesinfo get tablename
+if  modtinfo    null
+modtinfo   new tableinfo tablename
+}
+for  servername server   hbi deployedon
+modtinfo addserver server
+}
+if   hbi isskipchecks
+modtinfo addregioninfo hbi
+}
+tablesinfo put tablename  modtinfo
+}
+for  tableinfo tinfo   tablesinfo values
+tableintegrityerrorhandler handler   tinfo new integrityfixsuggester tinfo  errors
+if   tinfo checkregionchain handler
+errors report     tinfo getname
+}
+}
+return tablesinfo
+}
+/**
+* merge hdfs data by moving from contained hbckinfo into targetregiondir.
+* @return number of file move fixes done to merge regions.
+*/
+public int mergeregiondirs path targetregiondir  hbckinfo contained  throws ioexception
+int filemoves   0
+log debug
+debuglsr contained gethdfsregiondir
+// rename the contained into the container.
+filesystem fs   targetregiondir getfilesystem getconf
+filestatus dirs   fs liststatus contained gethdfsregiondir
+if  dirs    null
+if   fs exists contained gethdfsregiondir
+log warn     contained gethdfsregiondir
+else
+sidelineregiondir fs  contained
+}
+return filemoves
+}
+for  filestatus cf   dirs
+path src   cf getpath
+path dst    new path targetregiondir  src getname
+if  src getname   equals hregionfilesystem region_info_file
+// do not copy the old .regioninfo file.
+continue;
+}
+if  src getname   equals hconstants hregion_oldlogdir_name
+// do not copy the .oldlogs files
+continue;
+}
+log info     src       dst
+// filesystem.rename is inconsistent with directories -- if the
+// dst (foo/a) exists and is a dir, and the src (foo/b) is a dir,
+// it moves the src into the dst dir resulting in (foo/a/b).  if
+// the dst does not exist, and the src a dir, src becomes dst. (foo/b)
+for  filestatus hfile   fs liststatus src
+boolean success   fs rename hfile getpath    dst
+if  success
+filemoves
+}
+}
+log debug
+debuglsr targetregiondir
+}
+// if all success.
+sidelineregiondir fs  contained
+log info    contained gethdfsregiondir
+getsidelinedir
+debuglsr contained gethdfsregiondir
+return filemoves
+}
+/**
+* maintain information about a particular table.
+*/
+public class tableinfo
+string tablename
+treeset <servername> deployedon
+// backwards regions
+final list<hbckinfo> backwards   new arraylist<hbckinfo>
+// sidelined big overlapped regions
+final map<path  hbckinfo> sidelinedregions   new hashmap<path  hbckinfo>
+// region split calculator
+final regionsplitcalculator<hbckinfo> sc   new regionsplitcalculator<hbckinfo> cmp
+// histogram of different htabledescriptors found.  ideally there is only one!
+final set<htabledescriptor> htds   new hashset<htabledescriptor>
+// key = start split, values = set of splits in problem group
+final multimap<byte  hbckinfo> overlapgroups
+treemultimap create regionsplitcalculator bytes_comparator  cmp
+tableinfo string name
+this tablename   name
+deployedon   new treeset <servername>
+}
+/**
+* @return descriptor common to all regions.  null if are none or multiple!
+*/
+private htabledescriptor gethtd
+if  htds size      1
+return  htabledescriptor htds toarray
+else
+log error
+tablename       htds
+}
+return null;
+}
+public void addregioninfo hbckinfo hir
+if  bytes equals hir getendkey    hconstants empty_end_row
+// end key is absolute end key, just add it.
+sc add hir
+return
+}
+// if not the absolute end key, check for cycle
+if  bytes compareto hir getstartkey    hir getendkey    > 0
+errors reporterror
+error_code region_cycle
+string format
+bytes tostringbinary hir getstartkey
+bytes tostringbinary hir getendkey      this  hir
+backwards add hir
+return
+}
+// main case, add to split calculator
+sc add hir
+}
+public void addserver servername server
+this deployedon add server
+}
+public string getname
+return tablename
+}
+public int getnumregions
+return sc getstarts   size     backwards size
+}
+private class integrityfixsuggester extends tableintegrityerrorhandlerimpl
+errorreporter errors
+integrityfixsuggester tableinfo ti  errorreporter errors
+this errors   errors
+settableinfo ti
+}
+@override
+public void handleregionstartkeynotempty hbckinfo hi  throws ioexception
+errors reporterror error_code first_region_startkey_not_empty
+gettableinfo    hi
+}
+@override
+public void handleregionendkeynotempty byte curendkey  throws ioexception
+errors reporterror error_code last_region_endkey_not_empty
+gettableinfo
+}
+@override
+public void handledegenerateregion hbckinfo hi  throws ioexception
+errors reporterror error_code degenerate_region
+gettableinfo    hi
+}
+@override
+public void handleduplicatestartkeys hbckinfo r1  hbckinfo r2  throws ioexception
+byte key   r1 getstartkey
+// dup start key
+errors reporterror error_code dupe_startkeys
+bytes tostringbinary key   gettableinfo    r1
+errors reporterror error_code dupe_startkeys
+bytes tostringbinary key   gettableinfo    r2
+}
+@override
+public void handleoverlapinregionchain hbckinfo hi1  hbckinfo hi2  throws ioexception
+errors reporterror error_code overlap_in_region_chain
+gettableinfo    hi1  hi2
+}
+@override
+public void handleholeinregionchain byte holestart  byte holestop  throws ioexception
+errors reporterror
+error_code hole_in_region_chain
+bytes tostringbinary holestart
+bytes tostringbinary holestop
+}
+/**
+* this handler fixes integrity errors from hdfs information.  there are
+* basically three classes of integrity problems 1) holes, 2) overlaps, and
+* 3) invalid regions.
+*
+* this class overrides methods that fix holes and the overlap group case.
+* individual cases of particular overlaps are handled by the general
+* overlap group merge repair case.
+*
+* if hbase is online, this forces regions offline before doing merge
+* operations.
+*/
+private class hdfsintegrityfixer extends integrityfixsuggester
+configuration conf
+boolean fixoverlaps   true
+hdfsintegrityfixer tableinfo ti  errorreporter errors  configuration conf
+boolean fixholes  boolean fixoverlaps
+super ti  errors
+this conf   conf
+this fixoverlaps   fixoverlaps
+// todo properly use fixholes
+}
+/**
+* this is a special case hole -- when the first region of a table is
+* missing from meta, hbase doesn't acknowledge the existance of the
+* table.
+*/
+public void handleregionstartkeynotempty hbckinfo next  throws ioexception
+errors reporterror error_code first_region_startkey_not_empty
+gettableinfo    next
+htabledescriptor htd   gettableinfo   gethtd
+// from special empty_start_row to next region's startkey
+hregioninfo newregion   new hregioninfo htd getname
+hconstants empty_start_row  next getstartkey
+// todo test
+hregion region   hbasefsckrepair createhdfsregiondir conf  newregion  htd
+log info
+newregion      region
+fixes
+}
+public void handleregionendkeynotempty byte curendkey  throws ioexception
+errors reporterror error_code last_region_endkey_not_empty
+gettableinfo
+htabledescriptor htd   gettableinfo   gethtd
+// from curendkey to empty_start_row
+hregioninfo newregion   new hregioninfo htd getname    curendkey
+hconstants empty_start_row
+hregion region   hbasefsckrepair createhdfsregiondir conf  newregion  htd
+log info     newregion
+region
+fixes
+}
+/**
+* there is a hole in the hdfs regions that violates the table integrity
+* rules.  create a new empty region that patches the hole.
+*/
+public void handleholeinregionchain byte holestartkey  byte holestopkey  throws ioexception
+errors reporterror
+error_code hole_in_region_chain
+bytes tostringbinary holestartkey
+bytes tostringbinary holestopkey
+htabledescriptor htd   gettableinfo   gethtd
+hregioninfo newregion   new hregioninfo htd getname    holestartkey  holestopkey
+hregion region   hbasefsckrepair createhdfsregiondir conf  newregion  htd
+log info    newregion      region
+fixes
+}
+/**
+* this takes set of overlapping regions and merges them into a single
+* region.  this covers cases like degenerate regions, shared start key,
+* general overlaps, duplicate ranges, and partial overlapping regions.
+*
+* cases:
+* - clean regions that overlap
+* - only .oldlogs regions (can't find start/stop range, or figure out)
+*/
+@override
+public void handleoverlapgroup collection<hbckinfo> overlap
+throws ioexception
+preconditions checknotnull overlap
+preconditions checkargument overlap size   >0
+if   this fixoverlaps
+log warn
+return
+}
+if  overlap size   > maxmerge
+log warn     overlap size
+maxmerge
+if  sidelinebigoverlaps
+// we only sideline big overlapped groups that exceeds the max number of regions to merge
+sidelinebigoverlaps overlap
+}
+return
+}
+mergeoverlaps overlap
+}
+void mergeoverlaps collection<hbckinfo> overlap
+throws ioexception
+log info
+joiner on    join overlap
+// get the min / max range and close all concerned regions
+pair<byte  byte> range   null
+for  hbckinfo hi   overlap
+if  range    null
+range   new pair<byte  byte> hi getstartkey    hi getendkey
+else
+if  regionsplitcalculator bytes_comparator
+compare hi getstartkey    range getfirst    < 0
+range setfirst hi getstartkey
+}
+if  regionsplitcalculator bytes_comparator
+compare hi getendkey    range getsecond    > 0
+range setsecond hi getendkey
+}
+}
+// need to close files so delete can happen.
+log debug      hi
+log debug
+debuglsr hi gethdfsregiondir
+try {
+log info     hi
+closeregion hi
+catch  ioexception ioe
+log warn     hi
+ioe
+catch  interruptedexception e
+log warn     hi
+e
+}
+try {
+log info     hi
+offline hi getregionname
+catch  ioexception ioe
+log warn     hi
+ioe
+}
+}
+// create new empty container region.
+htabledescriptor htd   gettableinfo   gethtd
+// from start key to end key
+hregioninfo newregion   new hregioninfo htd getname    range getfirst
+range getsecond
+hregion region   hbasefsckrepair createhdfsregiondir conf  newregion  htd
+log info
+newregion       joiner on    join overlap
+debuglsr region getregionfilesystem   getregiondir
+// all target regions are closed, should be able to safely cleanup.
+boolean didfix  false
+path target   region getregionfilesystem   getregiondir
+for  hbckinfo contained   overlap
+log info     contained        target
+int merges   mergeregiondirs target  contained
+if  merges > 0
+didfix   true
+}
+}
+if  didfix
+fixes
+}
+}
+/**
+* sideline some regions in a big overlap group so that it
+* will have fewer regions, and it is easier to merge them later on.
+*
+* @param bigoverlap the overlapped group with regions more than maxmerge
+* @throws ioexception
+*/
+void sidelinebigoverlaps
+collection<hbckinfo> bigoverlap  throws ioexception
+int overlapstosideline   bigoverlap size     maxmerge
+if  overlapstosideline > maxoverlapstosideline
+overlapstosideline   maxoverlapstosideline
+}
+list<hbckinfo> regionstosideline
+regionsplitcalculator findbigranges bigoverlap  overlapstosideline
+filesystem fs   filesystem get conf
+for  hbckinfo regiontosideline  regionstosideline
+try {
+log info     regiontosideline
+closeregion regiontosideline
+catch  ioexception ioe
+log warn     regiontosideline
+ioe
+catch  interruptedexception e
+log warn     regiontosideline
+e
+}
+try {
+log info     regiontosideline
+offline regiontosideline getregionname
+catch  ioexception ioe
+log warn     regiontosideline
+ioe
+}
+log info     regiontosideline tostring
+path sidelineregiondir   sidelineregiondir fs  to_be_loaded  regiontosideline
+if  sidelineregiondir    null
+sidelinedregions put sidelineregiondir  regiontosideline
+log info
+regiontosideline getregionnameasstring
+sidelineregiondir tostring
+fixes
+}
+}
+}
+}
+/**
+* check the region chain (from meta) of this table.  we are looking for
+* holes, overlaps, and cycles.
+* @return false if there are errors
+* @throws ioexception
+*/
+public boolean checkregionchain tableintegrityerrorhandler handler  throws ioexception
+// when table is disabled no need to check for the region chain. some of the regions
+// accidently if deployed, this below code might report some issues like missing start
+// or end regions or region hole in chain and may try to fix which is unwanted.
+if  disabledtables contains this tablename getbytes
+return true
+}
+int originalerrorscount   errors geterrorlist   size
+multimap<byte  hbckinfo> regions   sc calccoverage
+sortedset<byte> splits   sc getsplits
+byte prevkey   null
+byte problemkey   null
+for  byte key   splits
+collection<hbckinfo> ranges   regions get key
+if  prevkey    null     bytes equals key  hconstants empty_byte_array
+for  hbckinfo rng   ranges
+handler handleregionstartkeynotempty rng
+}
+}
+// check for degenerate ranges
+for  hbckinfo rng   ranges
+// special endkey case converts '' to null
+byte endkey   rng getendkey
+endkey    endkey length    0  ? null   endkey
+if  bytes equals rng getstartkey   endkey
+handler handledegenerateregion rng
+}
+}
+if  ranges size      1
+// this split key is ok -- no overlap, not a hole.
+if  problemkey    null
+log warn     bytes tostringbinary key
+}
+problemkey   null     fell through  no more problem
+else if  ranges size   > 1
+// set the new problem key group name, if already have problem key, just
+// keep using it.
+if  problemkey    null
+// only for overlap regions.
+log warn     bytes tostringbinary key
+problemkey   key
+}
+overlapgroups putall problemkey  ranges
+// record errors
+arraylist<hbckinfo> subrange   new arraylist<hbckinfo> ranges
+//  this dumb and n^2 but this shouldn't happen often
+for  hbckinfo r1   ranges
+subrange remove r1
+for  hbckinfo r2   subrange
+if  bytes compareto r1 getstartkey    r2 getstartkey     0
+handler handleduplicatestartkeys r1 r2
+else
+// overlap
+handler handleoverlapinregionchain r1  r2
+}
+}
+}
+else if  ranges size      0
+if  problemkey    null
+log warn     bytes tostringbinary key
+}
+problemkey   null
+byte holestopkey   sc getsplits   higher key
+// if higher key is null we reached the top.
+if  holestopkey    null
+// hole
+handler handleholeinregionchain key  holestopkey
+}
+}
+prevkey   key
+}
+// when the last region of a table is proper and having an empty end key, 'prevkey'
+// will be null.
+if  prevkey    null
+handler handleregionendkeynotempty prevkey
+}
+for  collection<hbckinfo> overlap   overlapgroups asmap   values
+handler handleoverlapgroup overlap
+}
+if  details
+// do full region split map dump
+errors print       this tablename
+dump splits  regions
+errors print       this tablename
+dumpoverlapproblems overlapgroups
+errors print     overlapgroups keyset   size
+overlapgroups size
+}
+if   sidelinedregions isempty
+log warn
+errors print       this tablename
+dumpsidelinedregions sidelinedregions
+}
+return errors geterrorlist   size      originalerrorscount
+}
+/**
+* this dumps data in a visually reasonable way for visual debugging
+*
+* @param splits
+* @param regions
+*/
+void dump sortedset<byte> splits  multimap<byte  hbckinfo> regions
+// we display this way because the last end key should be displayed as well.
+stringbuilder sb   new stringbuilder
+for  byte k   splits
+sb setlength 0      clear out existing buffer  if any
+sb append bytes tostringbinary k
+for  hbckinfo r   regions get k
+sb append    r tostring
+bytes tostringbinary r getendkey
+}
+errors print sb tostring
+}
+}
+}
+public void dumpoverlapproblems multimap<byte  hbckinfo> regions
+// we display this way because the last end key should be displayed as
+// well.
+for  byte k   regions keyset
+errors print bytes tostringbinary k
+for  hbckinfo r   regions get k
+errors print     r tostring
+bytes tostringbinary r getendkey
+}
+errors print
+}
+}
+public void dumpsidelinedregions map<path  hbckinfo> regions
+for  map entry<path  hbckinfo> entry  regions entryset
+string tablename   bytes tostringbinary entry getvalue   gettablename
+path path   entry getkey
+errors print
+path tostring
+errors print
+path touri   getpath        tablename
+}
+}
+public multimap<byte  hbckinfo> getoverlapgroups
+string table
+tableinfo ti   tablesinfo get table
+return ti overlapgroups
+}
+/**
+* return a list of user-space table names whose metadata have not been
+* modified in the last few milliseconds specified by timelag
+* if any of the regioninfo_qualifier, server_qualifier, startcode_qualifier,
+* splita_qualifier, splitb_qualifier have not changed in the last
+* milliseconds specified by timelag, then the table is a candidate to be returned.
+* @return tables that have not been modified recently
+* @throws ioexception if an error is encountered
+*/
+htabledescriptor gettables atomicinteger numskipped
+list<string> tablenames   new arraylist<string>
+long now   system currenttimemillis
+for  hbckinfo hbi   regioninfomap values
+metaentry info   hbi metaentry
+// if the start key is zero, then we have found the first region of a table.
+// pick only those tables that were not modified in the last few milliseconds.
+if  info    null    info getstartkey   length    0     info ismetaregion
+if  info modtime   timelag < now
+tablenames add info gettablenameasstring
+else
+numskipped incrementandget       one more in flux table
+}
+}
+}
+return gethtabledescriptors tablenames
+}
+htabledescriptor gethtabledescriptors list<string> tablenames
+htabledescriptor htd   new htabledescriptor
+try {
+log info     tablenames
+htd   new hbaseadmin getconf    gettabledescriptors tablenames
+} catch (ioexception e) {
+log debug    e
+}
+return htd
+}
+/**
+* gets the entry in regioninfo corresponding to the the given encoded
+* region name. if the region has not been seen yet, a new entry is added
+* and returned.
+*/
+private synchronized hbckinfo getorcreateinfo string name
+hbckinfo hbi   regioninfomap get name
+if  hbi    null
+hbi   new hbckinfo null
+regioninfomap put name  hbi
+}
+return hbi
+}
+/**
+* check values in regioninfo for .meta.
+* check if zero or more than one regions with meta are found.
+* if there are inconsistencies (i.e. zero or more than one regions
+* pretend to be holding the .meta.) try to fix that and report an error.
+* @throws ioexception from hbasefsckrepair functions
+* @throws keeperexception
+* @throws interruptedexception
+*/
+boolean checkmetaregion
+throws ioexception  keeperexception  interruptedexception
+list <hbckinfo> metaregions   lists newarraylist
+for  hbckinfo value   regioninfomap values
+if  value metaentry ismetaregion
+metaregions add value
+}
+}
+// if something is wrong
+if  metaregions size      1
+hregionlocation rootlocation   connection locateregion
+hconstants root_table_name  hconstants empty_start_row
+hbckinfo root
+regioninfomap get rootlocation getregioninfo   getencodedname
+// if there is no region holding .meta.
+if  metaregions size      0
+errors reporterror error_code no_meta_region
+if  shouldfixassignments
+errors print
+setshouldrerun
+// try to fix it (treat it as unassigned region)
+hbasefsckrepair fixunassigned admin  root metaentry
+hbasefsckrepair waituntilassigned admin  root gethdfshri
+}
+}
+// if there are more than one regions pretending to hold the .meta.
+else if  metaregions size   > 1
+errors reporterror error_code multi_meta_region
+if  shouldfixassignments
+errors print
+setshouldrerun
+// try fix it (treat is a dupe assignment)
+list <servername> deployedon   lists newarraylist
+for  hbckinfo mregion   metaregions
+deployedon add mregion metaentry regionserver
+}
+hbasefsckrepair fixmultiassignment admin  root metaentry  deployedon
+}
+}
+// rerun hbck with hopefully fixed meta
+return false
+}
+// no errors, so continue normally
+return true
+}
+/**
+* scan .meta., adding all regions found to the regioninfo map.
+* @throws ioexception if an error is encountered
+*/
+boolean loadmetaentries   throws ioexception
+// get a list of all regions from the master. this involves
+// scanning the meta table
+if   recordmetaregion
+// will remove later if we can fix it
+errors reporterror
+return false
+}
+metascannervisitor visitor   new metascannervisitorbase
+int countrecord   1
+// comparator to sort keyvalues with latest modtime
+final comparator<keyvalue> comp   new comparator<keyvalue>
+public int compare keyvalue k1  keyvalue k2
+return  int  k1 gettimestamp     k2 gettimestamp
+}
+public boolean processrow result result  throws ioexception
+try {
+// record the latest modification of this meta record
+long ts    collections max result list    comp  gettimestamp
+pair<hregioninfo  servername> pair   hregioninfo gethregioninfoandservername result
+if  pair    null    pair getfirst      null
+emptyregioninfoqualifiers add result
+errors reporterror error_code empty_meta_cell
+return true
+}
+servername sn   null
+if  pair getsecond      null
+sn   pair getsecond
+}
+hregioninfo hri   pair getfirst
+if    istableincluded hri gettablenameasstring
+hri ismetaregion
+return true
+}
+pairofsametype<hregioninfo> daughters   hregioninfo getdaughterregions result
+metaentry m   new metaentry hri  sn  ts  daughters getfirst    daughters getsecond
+hbckinfo hbinfo   new hbckinfo m
+hbckinfo previous   regioninfomap put hri getencodedname    hbinfo
+if  previous    null
+throw new ioexception     previous
+}
+// show proof of progress to the user, once for every 100 records.
+if  countrecord % 100    0
+errors progress
+}
+countrecord
+return true
+catch  runtimeexception e
+log error     result
+throw e;
+}
+}
+if   checkmetaonly
+// scan .meta. to pick up user regions
+metascanner metascan getconf    visitor
+}
+errors print
+return true
+}
+/**
+* stores the regioninfo entries scanned from meta
+*/
+static class metaentry extends hregioninfo
+servername regionserver       server hosting this region
+long modtime              timestamp of most recent modification metadata
+hregioninfo splita  splitb    split daughters
+public metaentry hregioninfo rinfo  servername regionserver  long modtime
+this rinfo  regionserver  modtime  null  null
+}
+public metaentry hregioninfo rinfo  servername regionserver  long modtime
+hregioninfo splita  hregioninfo splitb
+super rinfo
+this regionserver   regionserver
+this modtime   modtime
+this splita   splita
+this splitb   splitb
+}
+public boolean equals object o
+boolean supereq   super equals o
+if   supereq
+return supereq
+}
+metaentry me    metaentry  o
+if   regionserver equals me regionserver
+return false
+}
+return  modtime    me modtime
+}
+@override
+public int hashcode
+int hash   arrays hashcode getregionname
+hash ^  getregionid
+hash ^  arrays hashcode getstartkey
+hash ^  arrays hashcode getendkey
+hash ^  boolean valueof isoffline    hashcode
+hash ^  arrays hashcode gettablename
+if  regionserver    null
+hash ^  regionserver hashcode
+}
+hash ^  modtime
+return hash
+}
+}
+/**
+* stores the regioninfo entries from hdfs
+*/
+static class hdfsentry
+hregioninfo hri
+path hdfsregiondir   null
+long hdfsregiondirmodtime    0
+boolean hdfsregioninfofilepresent   false
+boolean hdfsonlyedits   false
+}
+/**
+* stores the regioninfo retrieved from online region servers.
+*/
+static class onlineentry
+hregioninfo hri
+servername hsa
+public string tostring
+return hsa tostring         hri getregionnameasstring
+}
+}
+/**
+* maintain information about a particular region.  it gathers information
+* from three places -- hdfs, meta, and region servers.
+*/
+public static class hbckinfo implements keyrange
+private metaentry metaentry   null     info in meta
+private hdfsentry hdfsentry   null     info in hdfs
+private list<onlineentry> deployedentries   lists newarraylist       on region server
+private list<servername> deployedon   lists newarraylist       info on rs's
+private boolean skipchecks   false     whether to skip further checks to this region info
+hbckinfo metaentry metaentry
+this metaentry   metaentry
+}
+public synchronized void addserver hregioninfo hri  servername server
+onlineentry rse   new onlineentry
+rse hri   hri
+rse hsa   server
+this deployedentries add rse
+this deployedon add server
+}
+public synchronized string tostring
+stringbuilder sb   new stringbuilder
+sb append
+sb append  metaentry    null ? metaentry getregionnameasstring
+sb append      gethdfsregiondir
+sb append      joiner on    join deployedentries
+sb append
+return sb tostring
+}
+@override
+public byte getstartkey
+if  this metaentry    null
+return this metaentry getstartkey
+else if  this hdfsentry    null
+return this hdfsentry hri getstartkey
+else
+log error     this
+return null;
+}
+}
+@override
+public byte getendkey
+if  this metaentry    null
+return this metaentry getendkey
+else if  this hdfsentry    null
+return this hdfsentry hri getendkey
+else
+log error     this
+return null;
+}
+}
+public byte gettablename
+if  this metaentry    null
+return this metaentry gettablename
+else if  this hdfsentry    null
+// we are only guaranteed to have a path and not an hri for hdfsentry,
+// so we get the name from the path
+path tabledir   this hdfsentry hdfsregiondir getparent
+return bytes tobytes tabledir getname
+else
+// currently no code exercises this path, but we could add one for
+// getting table name from onlineentry
+return null;
+}
+}
+public string getregionnameasstring
+if  metaentry    null
+return metaentry getregionnameasstring
+else if  hdfsentry    null
+if  hdfsentry hri    null
+return hdfsentry hri getregionnameasstring
+}
+}
+return null;
+}
+public byte getregionname
+if  metaentry    null
+return metaentry getregionname
+else if  hdfsentry    null
+return hdfsentry hri getregionname
+else
+return null;
+}
+}
+path gethdfsregiondir
+if  hdfsentry    null
+return null;
+}
+return hdfsentry hdfsregiondir
+}
+boolean containsonlyhdfsedits
+if  hdfsentry    null
+return false
+}
+return hdfsentry hdfsonlyedits
+}
+boolean ishdfsregioninfopresent
+if  hdfsentry    null
+return false
+}
+return hdfsentry hdfsregioninfofilepresent
+}
+long getmodtime
+if  hdfsentry    null
+return 0
+}
+return hdfsentry hdfsregiondirmodtime
+}
+hregioninfo gethdfshri
+if  hdfsentry    null
+return null;
+}
+return hdfsentry hri
+}
+public void setskipchecks boolean skipchecks
+this skipchecks   skipchecks
+}
+public boolean isskipchecks
+return skipchecks
+}
+}
+final static comparator<hbckinfo> cmp   new comparator<hbckinfo>
+@override
+public int compare hbckinfo l  hbckinfo r
+if  l    r
+// same instance
+return 0
+}
+int tablecompare   regionsplitcalculator bytes_comparator compare
+l gettablename    r gettablename
+if  tablecompare    0
+return tablecompare
+}
+int startcomparison   regionsplitcalculator bytes_comparator compare
+l getstartkey    r getstartkey
+if  startcomparison    0
+return startcomparison
+}
+// special case for absolute endkey
+byte endkey   r getendkey
+endkey    endkey length    0  ? null   endkey
+byte endkey2   l getendkey
+endkey2    endkey2 length    0  ? null   endkey2
+int endcomparison   regionsplitcalculator bytes_comparator compare
+endkey2   endkey
+if  endcomparison    0
+return endcomparison
+}
+// use regionid as tiebreaker.
+// null is considered after all possible values so make it bigger.
+if  l hdfsentry    null    r hdfsentry    null
+return 0
+}
+if  l hdfsentry    null    r hdfsentry    null
+return 1
+}
+// l.hdfsentry must not be null
+if  r hdfsentry    null
+return  1
+}
+// both l.hdfsentry and r.hdfsentry must not be null.
+return  int   l hdfsentry hri getregionid    r hdfsentry hri getregionid
+}
+/**
+* prints summary of all tables found on the system.
+*/
+private void printtablesummary sortedmap<string  tableinfo> tablesinfo
+stringbuilder sb   new stringbuilder
+errors print
+for  tableinfo tinfo   tablesinfo values
+if  errors tablehaserrors tinfo
+errors print     tinfo getname
+else
+errors print     tinfo getname
+}
+errors print     tinfo getnumregions
+sb setlength 0      clear out existing buffer  if any
+sb append
+for  servername server   tinfo deployedon
+sb append     server tostring
+}
+errors print sb tostring
+}
+}
+static errorreporter geterrorreporter
+final configuration conf  throws classnotfoundexception
+class<? extends errorreporter> reporter   conf getclass    printingerrorreporter class  errorreporter class
+return  errorreporter reflectionutils newinstance reporter  conf
+}
+public interface errorreporter
+public static enum error_code
+unknown  no_meta_region  null_meta_region  no_version_file  not_in_meta_hdfs  not_in_meta
+not_in_meta_or_deployed  not_in_hdfs_or_deployed  not_in_hdfs  server_does_not_match_meta  not_deployed
+multi_deployed  should_not_be_deployed  multi_meta_region  rs_connect_failure
+first_region_startkey_not_empty  last_region_endkey_not_empty  dupe_startkeys
+hole_in_region_chain  overlap_in_region_chain  region_cycle  degenerate_region
+orphan_hdfs_region  lingering_split_parent  no_tableinfo_file  lingering_reference_hfile
+wrong_usage  empty_meta_cell
+}
+public void clear
+public void report string message
+public void reporterror string message
+public void reporterror error_code errorcode  string message
+public void reporterror error_code errorcode  string message  tableinfo table
+public void reporterror error_code errorcode  string message  tableinfo table  hbckinfo info
+public void reporterror error_code errorcode  string message  tableinfo table  hbckinfo info1  hbckinfo info2
+public int summarize
+public void detail string details
+public arraylist<error_code> geterrorlist
+public void progress
+public void print string message
+public void reseterrors
+public boolean tablehaserrors tableinfo table
+}
+static class printingerrorreporter implements errorreporter
+public int errorcount   0
+private int showprogress
+set<tableinfo> errortables   new hashset<tableinfo>
+// for use by unit tests to verify which errors were discovered
+private arraylist<error_code> errorlist   new arraylist<error_code>
+public void clear
+errortables clear
+errorlist clear
+errorcount   0
+}
+public synchronized void reporterror error_code errorcode  string message
+if  errorcode    error_code wrong_usage
+system err println message
+return
+}
+errorlist add errorcode
+if   summary
+system out println     message
+}
+errorcount
+showprogress   0
+}
+public synchronized void reporterror error_code errorcode  string message  tableinfo table
+errortables add table
+reporterror errorcode  message
+}
+public synchronized void reporterror error_code errorcode  string message  tableinfo table
+hbckinfo info
+errortables add table
+string reference       info getregionnameasstring
+reporterror errorcode  reference       message
+}
+public synchronized void reporterror error_code errorcode  string message  tableinfo table
+hbckinfo info1  hbckinfo info2
+errortables add table
+string reference       info1 getregionnameasstring
+info2 getregionnameasstring
+reporterror errorcode  reference       message
+}
+public synchronized void reporterror string message
+reporterror error_code unknown  message
+}
+/**
+* report error information, but do not increment the error count.  intended for cases
+* where the actual error would have been reported previously.
+* @param message
+*/
+public synchronized void report string message
+if    summary
+system out println     message
+}
+showprogress   0
+}
+public synchronized int summarize
+system out println integer tostring errorcount
+if  errorcount    0
+system out println
+return 0
+else
+system out println
+return  1
+}
+}
+public arraylist<error_code> geterrorlist
+return errorlist
+}
+public synchronized void print string message
+if   summary
+system out println message
+}
+}
+@override
+public boolean tablehaserrors tableinfo table
+return errortables contains table
+}
+@override
+public void reseterrors
+errorcount   0
+}
+public synchronized void detail string message
+if  details
+system out println message
+}
+showprogress   0
+}
+public synchronized void progress
+if  showprogress      10
+if   summary
+system out print
+}
+showprogress   0
+}
+}
+}
+/**
+* contact a region server and get all information from it
+*/
+static class workitemregion implements callable<void>
+private hbasefsck hbck
+private servername rsinfo
+private errorreporter errors
+private hconnection connection
+workitemregion hbasefsck hbck  servername info
+errorreporter errors  hconnection connection
+this hbck   hbck
+this rsinfo   info
+this errors   errors
+this connection   connection
+}
+@override
+public synchronized void call   throws ioexception
+errors progress
+try {
+adminprotocol server
+connection getadmin rsinfo
+// list all online regions from this region server
+list<hregioninfo> regions   protobufutil getonlineregions server
+regions   filterregions regions
+if  details
+errors detail     rsinfo getservername
+regions size
+for  hregioninfo rinfo  regions
+errors detail     rinfo getregionnameasstring
+rinfo getregionid
+rinfo getencodedname
+bytes tostringbinary rinfo getstartkey
+bytes tostringbinary rinfo getendkey
+}
+}
+// check to see if the existence of this region matches the region in meta
+for  hregioninfo r regions
+hbckinfo hbi   hbck getorcreateinfo r getencodedname
+hbi addserver r  rsinfo
+}
+catch  ioexception e                unable to connect to the region server
+errors reporterror error_code rs_connect_failure      rsinfo getservername
+e
+throw e;
+}
+return null;
+}
+private list<hregioninfo> filterregions list<hregioninfo> regions
+list<hregioninfo> ret   lists newarraylist
+for  hregioninfo hri   regions
+if  hri ismetatable        hbck checkmetaonly
+hbck istableincluded hri gettablenameasstring
+ret add hri
+}
+}
+return ret
+}
+}
+/**
+* contact hdfs and get all information about specified table directory into
+* regioninfo list.
+*/
+static class workitemhdfsdir implements callable<void>
+private hbasefsck hbck
+private filestatus tabledir
+private errorreporter errors
+private filesystem fs
+workitemhdfsdir hbasefsck hbck  filesystem fs  errorreporter errors
+filestatus status
+this hbck   hbck
+this fs   fs
+this tabledir   status
+this errors   errors
+}
+@override
+public synchronized void call   throws ioexception
+try {
+string tablename   tabledir getpath   getname
+// ignore hidden files
+if  tablename startswith
+tablename equals  bytes tostring hconstants meta_table_name
+return null;
+}
+// level 2: <hbase_dir>/<table>/*
+filestatus[] regiondirs = fs.liststatus(tabledir.getpath());
+for (filestatus regiondir : regiondirs) {
+string encodedname = regiondir.getpath().getname();
+// ignore directories that aren't hexadecimal
+if (!encodedname.tolowercase().matches("[0-9a-f]+")) {
+continue;
+}
+log.debug("loading region info from hdfs:"+ regiondir.getpath());
+hbckinfo hbi = hbck.getorcreateinfo(encodedname);
+hdfsentry he = new hdfsentry();
+synchronized (hbi) {
+if (hbi.gethdfsregiondir() != null) {
+errors.print("directory " + encodedname + " duplicate??" +
+hbi.gethdfsregiondir());
+}
+he.hdfsregiondir = regiondir.getpath();
+he.hdfsregiondirmodtime = regiondir.getmodificationtime();
+path regioninfofile = new path(he.hdfsregiondir, hregionfilesystem.region_info_file);
+he.hdfsregioninfofilepresent = fs.exists(regioninfofile);
+// we add to orphan list when we attempt to read .regioninfo
+// set a flag if this region contains only edits
+// this is special case if a region is left after split
+he.hdfsonlyedits = true;
+filestatus[] subdirs = fs.liststatus(regiondir.getpath());
+path epath = hlogutil.getregiondirrecoverededitsdir(regiondir.getpath());
+for (filestatus subdir : subdirs) {
+string sdname = subdir.getpath().getname();
+if (!sdname.startswith(".") && !sdname.equals(epath.getname())) {
+he.hdfsonlyedits = false;
+break;
+}
+}
+hbi.hdfsentry = he;
+}
+}
+} catch (ioexception e) {
+// unable to connect to the region server.
+errors.reporterror(error_code.rs_connect_failure, "table directory: "
++ tabledir.getpath().getname()
++ " unable to fetch region information. " + e);
+throw e;
+}
+return null;
+}
+}
+/**
+* contact hdfs and get all information about specified table directory into
+* regioninfo list.
+*/
+static class workitemhdfsregioninfo implements callable<void>
+private hbckinfo hbi
+private hbasefsck hbck
+private errorreporter errors
+workitemhdfsregioninfo hbckinfo hbi  hbasefsck hbck  errorreporter errors
+this hbi   hbi
+this hbck   hbck
+this errors   errors
+}
+@override
+public synchronized void call   throws ioexception
+// only load entries that haven't been loaded yet.
+if  hbi gethdfshri      null
+try {
+hbck loadhdfsregioninfo hbi
+catch  ioexception ioe
+string msg
+bytes tostring hbi gettablename
+hbi gethdfsregiondir
+errors reporterror error_code orphan_hdfs_region  msg
+try {
+hbck debuglsr hbi gethdfsregiondir
+catch  ioexception ioe2
+log error     hbi gethdfsregiondir    ioe2
+throw ioe2
+}
+hbck orphanhdfsdirs add hbi
+throw ioe
+}
+}
+return null;
+}
+/**
+* display the full report from fsck. this displays all live and dead region
+* servers, and all known regions.
+*/
+public void setdisplayfullreport
+details   true
+}
+/**
+* set summary mode.
+* print only summary of the tables and status (ok or inconsistent)
+*/
+void setsummary
+summary   true
+}
+/**
+* set meta check mode.
+* print only info about meta table deployment/state
+*/
+void setcheckmetaonly
+checkmetaonly   true
+}
+/**
+* check if we should rerun fsck again. this checks if we've tried to
+* fix something and we should rerun fsck tool again.
+* display the full report from fsck. this displays all live and dead
+* region servers, and all known regions.
+*/
+void setshouldrerun
+rerun   true
+}
+boolean shouldrerun
+return rerun
+}
+/**
+* fix inconsistencies found by fsck. this should try to fix errors (if any)
+* found by fsck utility.
+*/
+public void setfixassignments boolean shouldfix
+fixassignments   shouldfix
+}
+boolean shouldfixassignments
+return fixassignments
+}
+public void setfixmeta boolean shouldfix
+fixmeta   shouldfix
+}
+boolean shouldfixmeta
+return fixmeta
+}
+public void setfixemptymetacells boolean shouldfix
+fixemptymetacells   shouldfix
+}
+boolean shouldfixemptymetacells
+return fixemptymetacells
+}
+public void setcheckhdfs boolean checking
+checkhdfs   checking
+}
+boolean shouldcheckhdfs
+return checkhdfs
+}
+public void setfixhdfsholes boolean shouldfix
+fixhdfsholes   shouldfix
+}
+boolean shouldfixhdfsholes
+return fixhdfsholes
+}
+public void setfixtableorphans boolean shouldfix
+fixtableorphans   shouldfix
+}
+boolean shouldfixtableorphans
+return fixtableorphans
+}
+public void setfixhdfsoverlaps boolean shouldfix
+fixhdfsoverlaps   shouldfix
+}
+boolean shouldfixhdfsoverlaps
+return fixhdfsoverlaps
+}
+public void setfixhdfsorphans boolean shouldfix
+fixhdfsorphans   shouldfix
+}
+boolean shouldfixhdfsorphans
+return fixhdfsorphans
+}
+public void setfixversionfile boolean shouldfix
+fixversionfile   shouldfix
+}
+public boolean shouldfixversionfile
+return fixversionfile
+}
+public void setsidelinebigoverlaps boolean sbo
+this sidelinebigoverlaps   sbo
+}
+public boolean shouldsidelinebigoverlaps
+return sidelinebigoverlaps
+}
+public void setfixsplitparents boolean shouldfix
+fixsplitparents   shouldfix
+}
+boolean shouldfixsplitparents
+return fixsplitparents
+}
+public void setfixreferencefiles boolean shouldfix
+fixreferencefiles   shouldfix
+}
+boolean shouldfixreferencefiles
+return fixreferencefiles
+}
+public boolean shouldignoreprecheckpermission
+return ignoreprecheckpermission
+}
+public void setignoreprecheckpermission boolean ignoreprecheckpermission
+this ignoreprecheckpermission   ignoreprecheckpermission
+}
+/**
+* @param mm maximum number of regions to merge into a single region.
+*/
+public void setmaxmerge int mm
+this maxmerge   mm
+}
+public int getmaxmerge
+return maxmerge
+}
+public void setmaxoverlapstosideline int mo
+this maxoverlapstosideline   mo
+}
+public int getmaxoverlapstosideline
+return maxoverlapstosideline
+}
+/**
+* only check/fix tables specified by the list,
+* empty list means all tables are included.
+*/
+boolean istableincluded string table
+return  tablesincluded size      0     tablesincluded contains table
+}
+public void includetable string table
+tablesincluded add table
+}
+set<string> getincludedtables
+return new hashset<string> tablesincluded
+}
+/**
+* we are interested in only those tables that have not changed their state in
+* meta during the last few seconds specified by hbase.admin.fsck.timelag
+* @param seconds - the time in seconds
+*/
+public void settimelag long seconds
+timelag   seconds   1000     convert to milliseconds
+}
+/**
+*
+* @param sidelinedir - hdfs path to sideline data
+*/
+public void setsidelinedir string sidelinedir
+this sidelinedir   new path sidelinedir
+}
+protected hfilecorruptionchecker createhfilecorruptionchecker boolean sidelinecorrupthfiles  throws ioexception
+return new hfilecorruptionchecker getconf    executor  sidelinecorrupthfiles
+}
+public hfilecorruptionchecker gethfilecorruptionchecker
+return hfcc
+}
+public void sethfilecorruptionchecker hfilecorruptionchecker hfcc
+this hfcc   hfcc
+}
+public void setretcode int code
+this retcode   code
+}
+public int getretcode
+return retcode
+}
+protected hbasefsck printusageandexit
+stringwriter sw   new stringwriter 2048
+printwriter out   new printwriter sw
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println     default_max_merge
+out println
+out println     default_overlaps_to_sideline
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out println
+out flush
+errors reporterror error_code wrong_usage  sw tostring
+setretcode  2
+return this
+}
+/**
+* main program
+*
+* @param args
+* @throws exception
+*/
+public static void main string args  throws exception
+// create a fsck object
+configuration conf   hbaseconfiguration create
+path hbasedir   fsutils getrootdir conf
+uri defaultfs   hbasedir getfilesystem conf  geturi
+fsutils setfsdefault conf  new path defaultfs
+int ret   toolrunner run new hbasefsck conf   args
+system exit ret
+}
+@override
+public int run string args  throws exception
+exec executor  args
+return getretcode
+}
+public hbasefsck exec executorservice exec  string args  throws keeperexception  ioexception
+serviceexception  interruptedexception
+long sleepbeforererun   default_sleep_before_rerun
+boolean checkcorrupthfiles   false
+boolean sidelinecorrupthfiles   false
+// process command-line args.
+for  int i   0  i < args length  i
+string cmd   args
+if  cmd equals       cmd equals
+return printusageandexit
+else if  cmd equals
+setdisplayfullreport
+else if  cmd equals
+if  i    args length   1
+errors reporterror error_code wrong_usage
+return printusageandexit
+}
+try {
+long timelag   long parselong args
+settimelag timelag
+catch  numberformatexception e
+errors reporterror error_code wrong_usage
+return printusageandexit
+}
+i
+else if  cmd equals
+if  i    args length   1
+errors reporterror error_code wrong_usage
+return printusageandexit
+}
+try {
+sleepbeforererun   long parselong args
+catch  numberformatexception e
+errors reporterror error_code wrong_usage
+return printusageandexit
+}
+i
+else if  cmd equals
+if  i    args length   1
+errors reporterror error_code wrong_usage
+return printusageandexit
+}
+i
+setsidelinedir args
+else if  cmd equals
+errors reporterror error_code wrong_usage
+setfixassignments true
+else if  cmd equals
+setfixassignments true
+else if  cmd equals
+setfixmeta true
+else if  cmd equals
+setcheckhdfs false
+else if  cmd equals
+setfixhdfsholes true
+else if  cmd equals
+setfixhdfsorphans true
+else if  cmd equals
+setfixtableorphans true
+else if  cmd equals
+setfixhdfsoverlaps true
+else if  cmd equals
+setfixversionfile true
+else if  cmd equals
+setsidelinebigoverlaps true
+else if  cmd equals
+setfixsplitparents true
+else if  cmd equals
+setignoreprecheckpermission true
+else if  cmd equals
+checkcorrupthfiles   true
+else if  cmd equals
+sidelinecorrupthfiles   true
+else if  cmd equals
+setfixreferencefiles true
+else if  cmd equals
+setfixemptymetacells true
+else if  cmd equals
+// this attempts to merge overlapping hdfs regions, needs testing
+// under load
+setfixhdfsholes true
+setfixhdfsorphans true
+setfixmeta true
+setfixassignments true
+setfixhdfsoverlaps true
+setfixversionfile true
+setsidelinebigoverlaps true
+setfixsplitparents false
+setcheckhdfs true
+setfixreferencefiles true
+else if  cmd equals
+// this will make all missing hdfs regions available but may lose data
+setfixhdfsholes true
+setfixhdfsorphans false
+setfixmeta true
+setfixassignments true
+setfixhdfsoverlaps false
+setsidelinebigoverlaps false
+setfixsplitparents false
+setcheckhdfs true
+else if  cmd equals
+if  i    args length   1
+errors reporterror error_code wrong_usage
+return printusageandexit
+}
+try {
+int maxoverlapstosideline   integer parseint args
+setmaxoverlapstosideline maxoverlapstosideline
+catch  numberformatexception e
+errors reporterror error_code wrong_usage
+return printusageandexit
+}
+i
+else if  cmd equals
+if  i    args length   1
+errors reporterror error_code wrong_usage
+return printusageandexit
+}
+try {
+int maxmerge   integer parseint args
+setmaxmerge maxmerge
+catch  numberformatexception e
+errors reporterror error_code wrong_usage
+return printusageandexit
+}
+i
+else if  cmd equals
+setsummary
+else if  cmd equals
+setcheckmetaonly
+else if  cmd startswith
+errors reporterror error_code wrong_usage      cmd
+return printusageandexit
+else
+includetable cmd
+errors print     cmd
+}
+}
+// pre-check current user has fs write permission or not
+try {
+precheckpermission
+catch  accesscontrolexception ace
+runtime getruntime   exit  1
+catch  ioexception ioe
+runtime getruntime   exit  1
+}
+// do the real work of hbck
+connect
+// if corrupt file mode is on, first fix them since they may be opened later
+if  checkcorrupthfiles    sidelinecorrupthfiles
+log info
+hfilecorruptionchecker hfcc   createhfilecorruptionchecker sidelinecorrupthfiles
+sethfilecorruptionchecker hfcc      so we can get result
+collection<string> tables   getincludedtables
+collection<path> tabledirs   new arraylist<path>
+path rootdir   fsutils getrootdir getconf
+if  tables size   > 0
+for  string t   tables
+tabledirs add fsutils gettablepath rootdir  t
+}
+else
+tabledirs   fsutils gettabledirs fsutils getcurrentfilesystem getconf     rootdir
+}
+hfcc checktables tabledirs
+hfcc report errors
+}
+// check and fix table integrity, region consistency.
+int code   onlinehbck
+setretcode code
+// if we have changed the hbase state it is better to run hbck again
+// to see if we haven't broken something else in the process.
+// we run it only once more because otherwise we can easily fall into
+// an infinite loop.
+if  shouldrerun
+try {
+log info     sleepbeforererun
+thread sleep sleepbeforererun
+catch  interruptedexception ie
+return this
+}
+// just report
+setfixassignments false
+setfixmeta false
+setfixhdfsholes false
+setfixhdfsoverlaps false
+setfixversionfile false
+setfixtableorphans false
+errors reseterrors
+code   onlinehbck
+setretcode code
+}
+return this
+}
+/**
+* ls -r for debugging purposes
+*/
+void debuglsr path p  throws ioexception
+debuglsr getconf    p  errors
+}
+/**
+* ls -r for debugging purposes
+*/
+public static void debuglsr configuration conf
+path p  throws ioexception
+debuglsr conf  p  new printingerrorreporter
+}
+/**
+* ls -r for debugging purposes
+*/
+public static void debuglsr configuration conf
+path p  errorreporter errors  throws ioexception
+if   log isdebugenabled      p    null
+return
+}
+filesystem fs   p getfilesystem conf
+if   fs exists p
+// nothing
+return
+}
+errors print p tostring
+if  fs isfile p
+return
+}
+if  fs getfilestatus p  isdir
+filestatus fss  fs liststatus p
+for  filestatus status   fss
+debuglsr conf  status getpath    errors
+}
+}
+}
+}

@@ -1,0 +1,1116 @@
+/*
+derby - class org.apache.derby.client.net.typdef
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby client net
+import org apache derby iapi reference drdaconstants
+import org apache derby iapi reference jdbc30translation
+import org apache derby client am cursor
+import org apache derby client am disconnectexception
+import org apache derby client am signedbinary
+import org apache derby client am clientmessageid
+import org apache derby shared common reference sqlstate
+//
+//  general notes
+//  descriptors are overriden using two distinct mechanisms
+//  - new typdefnam and typdefovr specifications which override environmental
+//    specifications originally established at connect time.
+//  - mdd/sda pairs providing specific field level overrides for user data
+//    not conforming to the typdefnam and typdefovr specifications currently
+//    in effect.  grouping triplets then refer to the new sdas to specify
+//    the actual representation of the user data.
+//  - there are two types of early descriptor triplets, the t and the m triplets.
+//        early
+//        ---------------------------
+//        environmental   grp row arr
+//        ttttttttttttt   mmmmmmmmmmm
+//      - the t triplets are established by the typdefnam and typdefovr values.
+//        these can be overridden for any command or reply by specifying
+//        a new value for typdefnam and typdefovr.
+//      - the m triplets are established by the mgrlvl parameter on excsat.
+//        they define protocol information units such as the sqlca.
+//        these grouping and structuring triplets cannot be overriden
+//        any change would mean a change in what information was exchanged
+//        rather than just how that information would be represented.
+//  - there are two types of late descriptor triplets, the o and u triplets.
+//        late
+//        ---------------------------
+//        environmental   grp row arr
+//        ooooooooooooo   uuuuuuuuuuu
+//      - the o triplets provide specific overrides.
+//      - the u triplets define actual user data, sometimes in combination
+//        with protocol information units.  the u triplets reference o triplets
+//        and both t triplets and m triplets (which in turn reference t triplets).
+//   - rules for assigning lids to o triplets
+//      - select lid within range of 1 to 255.
+//      - select lid which doesn't interfere with references to early triplets
+//        or o triplets.
+//
+//  requirements
+//  - if this object handles overrides, they are only in effect for one
+//    command or the reply to one command.  make sure that the correct
+//    "in effect" overrides are used especially when mdd overrides are present.
+//  - raise error if no ccsidmbc or ccsiddbc has been specified for mixed or
+//    double byte data.  return sqlstate 57017 with 0 as source ccsid token.
+//  possible errors:
+//  - check for valid lid at sqlam level.
+//      - if the lid is greater than the max
+//        supported lid then the descriptor is invalid for the supported sqlam level.
+//  error checking and reporting notes taken from protocol manual.
+//    - if the receiver of an fdodsc finds it in error, the error must
+//      be reported with a ddm message dscinvrm.  if the descriptor
+//      passes protocol validity checks, but the data does not match the
+//      descriptors, the mismatch must be reported with a ddm message dtamchrm.
+//      so descriptor must be correct and valid and then the data must match
+//      the descriptor.
+//    - possible general errors
+//      - 01 fd:oca triplet not used in protocol descriptors or type code invalid.
+//      - 02 triplet sequence error: the two possible sequences are:
+//           1.) gda,(cpt,)rlo<,rlo><== normal case with no overrrides
+//           2.) mdd,sda,(mdd,sda,)mdd,gda,(cpt,)\
+//               mdd,rlo<,mdd,rlo>
+//               where () indicates an optional repeating group and <> indicates
+//               a field allowed only when arrays are expected.
+//      - 03 an array description is required, and this one does not
+//           describe an array (probably too many or too few rlo triplets).
+//      - 04 a row description is required, and this one does not describe a row
+//           probably too many or too few rlo triplets.
+//      - 05 late environmental descriptor just received not supported (probably
+//           due to non-support of requested overrides).
+//      - 06 malformed triplet; missing required parameter.
+//      - 07 parameter value not acceptable.
+//    - possible mdd errors
+//      - 11 mdd present is not recognized as protocol descriptor
+//      - 12 mdd class not recognized as valid protocol class.
+//      - 13 mdd type not recognized as valid protocol type.
+//    - possible sda errors
+//      - 21 representation incompatible with protocol type (in prior mdd).
+//      - 22 ccsid not supported
+//    - possible gda/cpt errors
+//      - 32 gda references a lid that is not an sda or gda.
+//      - 33 gda length override exceeds limits.
+//      - 34 gda precision exceeds limits.
+//      - 35 gda scale > precision or scale negative
+//      - 36 gda length override missing or incompatible with protocol type.
+//    - possible rlo errors
+//      - 41 rlo references a lid that is not an rlo or gda
+//      - 42 rlo fails to reference a required gda or rlo (for example, qrydsc
+//           must include a reference to sqlcagrp).
+//
+//  nullable sql and protocol types are all odd numbers and nullable type is
+//  one number higher than the related non-nullable type
+//
+//  earlyttriplets
+//  late0triplets
+//
+// typdef end
+public class typdef implements java lang cloneable
+//---------------------navigational members-----------------------------------
+//-----------------------------state------------------------------------------
+// double byte character set
+static final short ccsiddbc   1
+// multi-byte character set
+static final short ccsidmbc   2
+// single byte character set
+static final short ccsidsbc   3
+// no ccsid
+static final short noccsid   0
+// fixed length
+static final short fixedlength   0
+// 2-byte variable length
+static final short twobytelength   1
+// 1-byte variable length
+static final short onebytelength   2
+// decimal length
+static final short decimallength   3
+// lob length
+static final short loblength   4
+public static final string utf8encoding
+private static final int override_table_size   0xff
+private static final int fdocatypetorepresentationmap_
+0x00    0
+0x01    cursor bytes     fdoca_type_fixedbytes
+0x02    cursor variable_string     fdoca_type_varbytes
+0x03    cursor null_terminated_bytes     fdoca_type_ntbytes
+0x04    0
+0x05    0
+0x06    0
+0x07    cursor variable_short_string     fdoca_type_psclbyte
+0x08    0
+0x09    0
+0x0a    0
+0x0b    0
+0x0c    0
+0x0d    0
+0x0e    0
+0x0f    0
+0x10    cursor string     fdoca_type_fixedchar
+0x11    cursor variable_string     fdoca_type_varchar
+0x12    0
+0x13    0
+0x14    cursor null_terminated_string     fdoca_type_ntchar
+0x15    0
+0x16    0
+0x17    0
+0x18    0
+0x19    cursor variable_short_string     fdoca_type_psclchar
+0x1a    0
+0x1b    0
+0x1c    0
+0x1d    0
+0x1e    0
+0x1f    0
+0x20    0
+0x21    0
+0x22    0
+0x23    signedbinary big_endian     fdoca_type_integer_be
+0x24    signedbinary little_endian     fdoca_type_integer_le
+0x25    0
+0x26    0
+0x27    0
+0x28    0
+0x29    0
+0x2a    0
+0x2b    0
+0x2c    0
+0x2d    0
+0x2e    0
+0x2f    0
+0x30    org apache derby client am decimal packed_decimal     fdoca_type_decimal
+0x31    0
+0x32    0
+0x33    0
+0x34    0
+0x35    0
+0x36    0
+0x37    0
+0x38    0
+0x39    0
+0x3a    0
+0x3b    0
+0x3c    0
+0x3d    0
+0x3e    0
+0x3f    0
+0x40    0
+0x41    0
+0x42    0
+0x43    0
+0x44    0
+0x45    0
+0x46    0
+0x47    0
+0x48    org apache derby client am floatingpoint ieee_754_floating_point     fdoca_type_float_ieee
+0x49    0
+0x4a    0
+0x4b    0
+0x4c    0
+0x4d    0
+0x4e    0
+0x4f    0
+0x50    0     fdoca_type_lobbytes         is 0 correct
+0x51    0     fdoca_type_lobchar          is 0 correct
+0x52    0
+0x53    0
+0x54    0
+0x55    0
+0x56    0
+0x57    0
+0x58    0
+0x59    0
+0x5a    0
+0x5b    0
+0x5c    0
+0x5d    0
+0x5e    0
+0x5f    0
+//
+// fixme: instead of magic numbers, the first arg in each of these
+// constructor calls should be the corresponding constant from
+// drdaconstants.
+//
+protected static final fdocasimpledataarray environmenttables_
+/* 0x00 empties */
+
+/* 0x01 empties */
+
+/* 0x02 4-byte int */
+new fdocasimpledataarray 0x02  fdocaconstants fdoca_type_integer_be  signedbinary big_endian  noccsid  0  0  4  fixedlength
+/* 0x03 null 4-byte int */
+new fdocasimpledataarray 0x03  fdocaconstants fdoca_type_ninteger_be  signedbinary big_endian  noccsid  0  0  4  fixedlength
+/* 0x04 2-byte int */
+new fdocasimpledataarray 0x04  fdocaconstants fdoca_type_integer_be  signedbinary big_endian  noccsid  0  0  2  fixedlength
+/* 0x05 null 2-byte int */
+new fdocasimpledataarray 0x05  fdocaconstants fdoca_type_ninteger_be  signedbinary big_endian  noccsid  0  0  2  fixedlength
+/* 0x06 1-byte int */
+new fdocasimpledataarray 0x06  fdocaconstants fdoca_type_integer_be  signedbinary big_endian  noccsid  0  0  1  fixedlength
+/* 0x07 null 1-byte int */
+new fdocasimpledataarray 0x07  fdocaconstants fdoca_type_ninteger_be  signedbinary big_endian  noccsid  0  0  1  fixedlength
+/* 0x08 16-byte bin float */
+new fdocasimpledataarray 0x08  fdocaconstants fdoca_type_float_ieee  org apache derby client am floatingpoint ieee_754_floating_point  noccsid  0  0  16  fixedlength
+/* 0x09 null 16-byte bin float */
+new fdocasimpledataarray 0x09  fdocaconstants fdoca_type_nfloat_ieee  org apache derby client am floatingpoint ieee_754_floating_point  noccsid  0  0  16  fixedlength
+/* 0x0a 8-byte bin float */
+new fdocasimpledataarray 0x0a  fdocaconstants fdoca_type_float_ieee  org apache derby client am floatingpoint ieee_754_floating_point  noccsid  0  0  8  fixedlength
+/* 0x0b null 8-byte bin float */
+new fdocasimpledataarray 0x0b  fdocaconstants fdoca_type_nfloat_ieee  org apache derby client am floatingpoint ieee_754_floating_point  noccsid  0  0  8  fixedlength
+/* 0x0c 4-byte bin float */
+new fdocasimpledataarray 0x0c  fdocaconstants fdoca_type_float_ieee  org apache derby client am floatingpoint ieee_754_floating_point  noccsid  0  0  4  fixedlength
+/* 0x0d null 4-byte bin float */
+new fdocasimpledataarray 0x0d  fdocaconstants fdoca_type_nfloat_ieee  org apache derby client am floatingpoint ieee_754_floating_point  noccsid  0  0  4  fixedlength
+/* 0x0e fixed decimal */
+new fdocasimpledataarray 0x0e  fdocaconstants fdoca_type_decimal  org apache derby client am decimal packed_decimal  noccsid  0  0  31  decimallength
+/* 0x0f null fixed decimal */
+new fdocasimpledataarray 0x0f  fdocaconstants fdoca_type_ndecimal  org apache derby client am decimal packed_decimal  noccsid  0  0  31  decimallength
+/* 0x10 empties */
+
+/* 0x11 empties */
+
+/* 0x12 numeric */
+
+/* 0x13 null numeric */
+
+/* 0x14 empties */
+
+/* 0x15 empties */
+
+/* 0x16 big int */
+new fdocasimpledataarray 0x16  fdocaconstants fdoca_type_integer_be  signedbinary big_endian  noccsid  0  0  8  fixedlength
+/* 0x17 null big int */
+new fdocasimpledataarray 0x17  fdocaconstants fdoca_type_ninteger_be  signedbinary big_endian  noccsid  0  0  8  fixedlength
+/* 0x18 large obj bytes loc */
+new fdocasimpledataarray 0x18  fdocaconstants fdoca_type_fixedbytes  0x00  noccsid  0  0  4  fixedlength
+/* 0x19 null large obj bytes loc */
+new fdocasimpledataarray 0x19  fdocaconstants fdoca_type_nfixedbytes  0x00  noccsid  0  0  4  fixedlength
+/* 0x1a empties */
+
+/* 0x1b null large obj char loc */
+new fdocasimpledataarray 0x1b  fdocaconstants fdoca_type_nfixedbytes  0x00  noccsid  0  0  4  fixedlength
+/* 0x1c large obj char dbcs loc */
+new fdocasimpledataarray 0x1c  fdocaconstants fdoca_type_fixedbytes  0x00  noccsid  0  0  4  fixedlength
+/* 0x1d null large obj char dbcs loc */
+new fdocasimpledataarray 0x1d  fdocaconstants fdoca_type_nfixedbytes  0x00  noccsid  0  0  4  fixedlength
+/* 0x1e row identifier */
+new fdocasimpledataarray 0x1e  fdocaconstants fdoca_type_varbytes  cursor variable_bytes  noccsid  0  1  40  twobytelength
+/* 0x1f null row identifier */
+new fdocasimpledataarray 0x1f  fdocaconstants fdoca_type_nvarbytes  cursor variable_bytes  noccsid  0  1  40  twobytelength
+/* 0x20 date */
+new fdocasimpledataarray 0x20  fdocaconstants fdoca_type_fixedchar  cursor string  ccsidsbc  1  0  10  fixedlength
+/* 0x21 null date */
+new fdocasimpledataarray 0x21  fdocaconstants fdoca_type_nfixedchar  cursor string  ccsidsbc  1  0  10  fixedlength
+/* 0x22 time */
+new fdocasimpledataarray 0x22  fdocaconstants fdoca_type_fixedchar  cursor string  ccsidsbc  1  0  8  fixedlength
+/* 0x23 null time */
+new fdocasimpledataarray 0x23  fdocaconstants fdoca_type_nfixedchar  cursor string  ccsidsbc  1  0  8  fixedlength
+/* 0x24 timestamp */
+new fdocasimpledataarray 0x24  fdocaconstants fdoca_type_fixedchar  cursor string  ccsidsbc  1  0  26  fixedlength
+/* 0x25 null timestamp */
+new fdocasimpledataarray 0x25  fdocaconstants fdoca_type_nfixedchar  cursor string  ccsidsbc  1  0  26  fixedlength
+/* 0x26 fixed bytes */
+new fdocasimpledataarray 0x26  fdocaconstants fdoca_type_fixedbytes  cursor bytes  noccsid  0  0  32767  fixedlength
+/* 0x27 null fixed bytes */
+new fdocasimpledataarray 0x27  fdocaconstants fdoca_type_nfixedbytes  cursor bytes  noccsid  0  0  32767  fixedlength
+/* 0x28 variable bytes */
+new fdocasimpledataarray 0x28  fdocaconstants fdoca_type_varbytes  cursor variable_bytes  noccsid  0  1  32767  twobytelength
+/* 0x29 null variable bytes */
+new fdocasimpledataarray 0x29  fdocaconstants fdoca_type_nvarbytes  cursor variable_bytes  noccsid  0  1  32767  twobytelength
+/* 0x2a long var bytes */
+new fdocasimpledataarray 0x2a  fdocaconstants fdoca_type_varbytes  cursor variable_bytes  noccsid  0  1  32767  twobytelength
+/* 0x2b null long var bytes */
+new fdocasimpledataarray 0x2b  fdocaconstants fdoca_type_nvarbytes  cursor variable_bytes  noccsid  0  1  32767  twobytelength
+/* 0x2c nullterm bytes */
+new fdocasimpledataarray 0x2c  fdocaconstants fdoca_type_ntbytes  cursor null_terminated_bytes  noccsid  0  1  32767  fixedlength
+/* 0x2d null nullterm bytes */
+new fdocasimpledataarray 0x2d  fdocaconstants fdoca_type_nntbytes  cursor null_terminated_string  noccsid  0  1  32767  fixedlength
+/* 0x2e nullterm sbcs */
+new fdocasimpledataarray 0x2e  fdocaconstants fdoca_type_ntchar  cursor null_terminated_string  ccsidsbc  1  1  32767  fixedlength
+/* 0x2f null nullterm sbcs */
+new fdocasimpledataarray 0x2f  fdocaconstants fdoca_type_nntchar  cursor null_terminated_string  ccsidsbc  1  1  32767  fixedlength
+/* 0x30 fix char sbcs */
+new fdocasimpledataarray 0x30  fdocaconstants fdoca_type_fixedchar  cursor string  ccsidsbc  1  0  32767  fixedlength
+/* 0x31 null fix char sbcs */
+new fdocasimpledataarray 0x31  fdocaconstants fdoca_type_nfixedchar  cursor string  ccsidsbc  1  0  32767  fixedlength
+/* 0x32 var char sbcs */
+new fdocasimpledataarray 0x32  fdocaconstants fdoca_type_varchar  cursor variable_string  ccsidsbc  1  1  32767  twobytelength
+/* 0x33 null var char sbcs */
+new fdocasimpledataarray 0x33  fdocaconstants fdoca_type_nvarchar  cursor variable_string  ccsidsbc  1  1  32767  twobytelength
+/* 0x34 long var sbcs */
+new fdocasimpledataarray 0x34  fdocaconstants fdoca_type_varchar  cursor variable_string  ccsidsbc  1  1  32767  twobytelength
+/* 0x35 null long var sbcs */
+new fdocasimpledataarray 0x35  fdocaconstants fdoca_type_nvarchar  cursor variable_string  ccsidsbc  1  1  32767  twobytelength
+/* 0x36 fix char dbcs */
+new fdocasimpledataarray 0x36  fdocaconstants fdoca_type_fixedchar  0x00  ccsiddbc  2  0  16383  fixedlength
+/* 0x37 null fix char dbcs */
+new fdocasimpledataarray 0x37  fdocaconstants fdoca_type_nfixedchar  0x00  ccsiddbc  2  0  16383  fixedlength
+/* 0x38 var char dbcs */
+new fdocasimpledataarray 0x38  fdocaconstants fdoca_type_varchar  cursor variable_string  ccsiddbc  2  1  16383  twobytelength
+/* 0x39 null var char dbcs */
+new fdocasimpledataarray 0x39  fdocaconstants fdoca_type_nvarchar  cursor variable_string  ccsiddbc  2  1  16383  twobytelength
+/* 0x3a long var dbcs */
+new fdocasimpledataarray 0x3a  fdocaconstants fdoca_type_varchar  cursor variable_string  ccsiddbc  2  1  16383  twobytelength
+/* 0x3b null long var dbcs */
+new fdocasimpledataarray 0x3b  fdocaconstants fdoca_type_nvarchar  cursor variable_string  ccsiddbc  2  1  16383  twobytelength
+/* 0x3c fix char mbcs */
+new fdocasimpledataarray 0x3c  fdocaconstants fdoca_type_fixedchar  0x00  ccsidmbc  1  0  32767  fixedlength
+/* 0x3d null fix char mbcs */
+new fdocasimpledataarray 0x3d  fdocaconstants fdoca_type_nfixedchar  0x00  ccsidmbc  1  0  32767  fixedlength
+/* 0x3e var char mbcs */
+new fdocasimpledataarray 0x3e  fdocaconstants fdoca_type_varchar  cursor variable_string  ccsidmbc  1  1  32767  twobytelength
+/* 0x3f null var char mbcs */
+new fdocasimpledataarray 0x3f  fdocaconstants fdoca_type_nvarchar  cursor variable_string  ccsidmbc  1  1  32767  twobytelength
+/* 0x40 long var mbcs */
+new fdocasimpledataarray 0x40  fdocaconstants fdoca_type_varchar  cursor variable_string  ccsidmbc  1  1  32767  twobytelength
+/* 0x41 null long var mbcs */
+new fdocasimpledataarray 0x41  fdocaconstants fdoca_type_nvarchar  cursor variable_string  ccsidmbc  1  1  32767  twobytelength
+/* 0x42 nullterm mbcs */
+new fdocasimpledataarray 0x42  fdocaconstants fdoca_type_ntchar  cursor null_terminated_string  ccsidmbc  1  1  32767  fixedlength
+/* 0x43 null nullterm mbcs */
+new fdocasimpledataarray 0x43  fdocaconstants fdoca_type_nntchar  cursor null_terminated_string  ccsidmbc  1  1  32767  fixedlength
+/* 0x44 l string bytes */
+new fdocasimpledataarray 0x44  fdocaconstants fdoca_type_psclbyte  cursor variable_short_string  noccsid  0  1  255  onebytelength
+/* 0x45 null l string bytes */
+new fdocasimpledataarray 0x45  fdocaconstants fdoca_type_npsclbyte  cursor variable_short_string  noccsid  0  1  255  onebytelength
+/* 0x46 l string sbcs */
+new fdocasimpledataarray 0x46  fdocaconstants fdoca_type_psclchar  cursor variable_short_string  ccsidsbc  1  1  255  onebytelength
+/* 0x47 null l string sbcs */
+new fdocasimpledataarray 0x47  fdocaconstants fdoca_type_npsclchar  cursor variable_short_string  ccsidsbc  1  1  255  onebytelength
+/* 0x48 l string mbcs */
+new fdocasimpledataarray 0x48  fdocaconstants fdoca_type_psclchar  cursor variable_short_string  ccsidmbc  1  1  255  onebytelength
+/* 0x49 null l string mbcs */
+new fdocasimpledataarray 0x49  fdocaconstants fdoca_type_npsclchar  cursor variable_short_string  ccsidmbc  1  1  255  onebytelength
+/* 0x4a empties */
+
+/* 0x4b empties */
+
+/* 0x4c  sbcs */
+new fdocasimpledataarray 0x4c  fdocaconstants fdoca_type_varchar  cursor variable_string  ccsidsbc  1  1  32767  twobytelength
+/* 0x4d null  sbcs */
+new fdocasimpledataarray 0x4d  fdocaconstants fdoca_type_nvarchar  cursor variable_string  ccsidsbc  1  1  32767  twobytelength
+/* 0x4e  mbcs */
+new fdocasimpledataarray 0x4e  fdocaconstants fdoca_type_varchar  cursor variable_string  ccsidmbc  1  1  32767  twobytelength
+/* 0x4f null  mbcs */
+new fdocasimpledataarray 0x4f  fdocaconstants fdoca_type_nvarchar  cursor variable_string  ccsidmbc  1  1  32767  twobytelength
+/* 0x50 empties */
+
+/* 0x51 empties */
+
+/* 0x52 empties */
+
+/* 0x53 empties */
+
+/* 0x54 empties */
+
+/* 0x55 empties */
+
+/* 0x56 empties */
+
+/* 0x57 empties */
+
+/* 0x58 empties */
+
+/* 0x59 empties */
+
+/* 0x5a empties */
+
+/* 0x5b empties */
+
+/* 0x5c empties */
+
+/* 0x5d empties */
+
+/* 0x5e empties */
+
+/* 0x5f empties */
+
+/* 0x60 empties */
+
+/* 0x61 empties */
+
+/* 0x62 empties */
+
+/* 0x63 empties */
+
+/* 0x64 empties */
+
+/* 0x65 empties */
+
+/* 0x66 empties */
+
+/* 0x67 empties */
+
+/* 0x68 empties */
+
+/* 0x69 empties */
+
+/* 0x6a empties */
+
+/* 0x6b empties */
+
+/* 0x6c empties */
+
+/* 0x6d empties */
+
+/* 0x6e empties */
+
+/* 0x6f empties */
+
+/* 0x70 empties */
+
+/* 0x71 empties */
+
+/* 0x72 empties */
+
+/* 0x73 empties */
+
+/* 0x74 empties */
+
+/* 0x75 empties */
+
+/* 0x76 empties */
+
+/* 0x77 empties */
+
+/* 0x78 empties */
+
+/* 0x79 empties */
+
+/* 0x7a empties */
+
+/* 0x7b empties */
+
+/* 0x7c empties */
+
+/* 0x7d empties */
+
+/* 0x7e empties */
+
+/* 0x7f empties */
+
+/* 0x80 empties */
+
+/* 0x81 empties */
+
+/* 0x82 empties */
+
+/* 0x83 empties */
+
+/* 0x84 empties */
+
+/* 0x85 empties */
+
+/* 0x86 empties */
+
+/* 0x87 empties */
+
+/* 0x88 empties */
+
+/* 0x89 empties */
+
+/* 0x8a empties */
+
+/* 0x8b empties */
+
+/* 0x8c empties */
+
+/* 0x8d empties */
+
+/* 0x8e empties */
+
+/* 0x8f empties */
+
+/* 0x90 empties */
+
+/* 0x91 empties */
+
+/* 0x92 empties */
+
+/* 0x93 empties */
+
+/* 0x94 empties */
+
+/* 0x95 empties */
+
+/* 0x96 empties */
+
+/* 0x97 empties */
+
+/* 0x98 empties */
+
+/* 0x99 empties */
+
+/* 0x9a empties */
+
+/* 0x9b empties */
+
+/* 0x9c empties */
+
+/* 0x9d empties */
+
+/* 0x9e empties */
+
+/* 0x9f empties */
+
+/* 0xa0 empties */
+
+/* 0xa1 empties */
+
+/* 0xa2 empties */
+
+/* 0xa3 empties */
+
+/* 0xa4 empties */
+
+/* 0xa5 empties */
+
+/* 0xa6 empties */
+
+/* 0xa7 empties */
+
+/* 0xa8 empties */
+
+/* 0xa9 empties */
+
+/* 0xaa empties */
+
+/* 0xab empties */
+
+/* 0xac empties */
+
+/* 0xad empties */
+
+/* 0xae empties */
+
+/* 0xaf empties */
+
+/* 0xb0 empties */
+
+/* 0xb1 empties */
+
+/* 0xb2 empties */
+
+/* 0xb3 empties */
+
+/* 0xb4 empties */
+
+/* 0xb5 empties */
+
+/* 0xb6 empties */
+
+/* 0xb7 empties */
+
+/* 0xb8 empties */
+
+/* 0xb9 empties */
+
+/* 0xba empties */
+
+/* 0xbb empties */
+
+/* 0xbc empties */
+
+/* 0xbd empties */
+
+/* 0xbe empties */
+
+/* 0xbf empties */
+
+/* 0xc0 empties */
+
+/* 0xc1 empties */
+
+/* 0xc2 empties */
+
+/* 0xc3 empties */
+
+/* 0xc4 empties */
+
+/* 0xc5 empties */
+
+/* 0xc6 empties */
+
+/* 0xc7 empties */
+
+/* 0xc8 large object bytes */
+new fdocasimpledataarray 0xc8  fdocaconstants fdoca_type_lobbytes  0x00  noccsid  0  1  8  loblength
+/* 0xc9 null large object bytes */
+new fdocasimpledataarray 0xc9  fdocaconstants fdoca_type_nlobbytes  0x00  noccsid  0  1  8  loblength
+/* 0xca large object char sbcs */
+new fdocasimpledataarray 0xca  fdocaconstants fdoca_type_lobchar  cursor sbcs_clob  ccsidsbc  1  1  8  loblength
+/* 0xcb null large object char sbcs */
+new fdocasimpledataarray 0xcb  fdocaconstants fdoca_type_nlobchar  cursor sbcs_clob  ccsidsbc  1  1  8  loblength
+/* 0xcc large object char dbcs */
+new fdocasimpledataarray 0xcc  fdocaconstants fdoca_type_lobchar  cursor dbcs_clob  ccsiddbc  2  1  8  loblength
+/* 0xcd null large object char dbcs */
+new fdocasimpledataarray 0xcd  fdocaconstants fdoca_type_nlobchar  cursor dbcs_clob  ccsiddbc  2  1  8  loblength
+/* 0xce large object char mbcs */
+new fdocasimpledataarray 0xce  fdocaconstants fdoca_type_lobchar  cursor mbcs_clob  ccsidmbc  1  1  8  loblength
+/* 0xcf null large object char mbcs */
+new fdocasimpledataarray 0xcf  fdocaconstants fdoca_type_nlobchar  cursor mbcs_clob  ccsidmbc  1  1  8  loblength
+private static final int protocoltojdbctypes_
+0x00     0x00 empties
+0x00     0x01 empties
+java sql types integer     0x02 4 byte int
+java sql types integer     0x03 null 4 byte int
+java sql types smallint     0x04 2 byte int
+java sql types smallint     0x05 null 2 byte int
+java sql types tinyint     0x06 1 byte int
+java sql types tinyint     0x07 null 1 byte int
+java sql types decimal     0x08 16 byte bin float
+java sql types decimal     0x09 null 16 byte bin float
+java sql types double     0x0a 8 byte bin float
+java sql types double     0x0b null 8 byte bin float
+java sql types real     0x0c 4 byte bin float
+java sql types real     0x0d null 4 byte bin float
+java sql types decimal     0x0e fixed decimal
+java sql types decimal     0x0f null fixed decimal
+java sql types decimal     0x10 zone decimal
+java sql types decimal     0x11 null zone decimal
+java sql types decimal     0x12 numeirc
+java sql types decimal     0x13 null numeric
+0x00     0x14 empties
+0x00     0x15 empties
+java sql types bigint     0x16 big int
+java sql types bigint     0x17 null big int
+0x00
+0x00
+0x00
+0x00
+0x00
+0x00
+0x00
+0x00
+java sql types date     0x20 date
+java sql types date     0x21 null date
+java sql types time     0x22 time
+java sql types time     0x23 null time
+java sql types timestamp     0x24 timestamp
+java sql types timestamp     0x25 null timestamp
+java sql types binary     0x26 fixed bytes
+java sql types binary     0x27 null fixed bytes
+java sql types varbinary     0x28 variable bytes
+java sql types varbinary     0x29 null variable bytes
+java sql types longvarbinary     0x2a long var bytes
+java sql types longvarbinary     0x2b null long var bytes
+java sql types varbinary     0x2c nullterm bytes
+java sql types varbinary     0x2d null nullterm bytes
+java sql types char     0x2e nullterm sbcs
+java sql types char     0x2f null nullterm sbcs
+java sql types char     0x30 fix char sbcs
+java sql types char     0x31 null fix char sbcs
+java sql types varchar     0x32 var char sbcs
+java sql types varchar     0x33 null var char sbcs
+java sql types longvarchar     0x34 long var sbcs
+java sql types longvarchar     0x35 null long var sbcs
+0x00     0x36 empties
+0x00     0x37 empties
+0x00     0x38 empties
+0x00     0x39 empties
+0x00     0x3a empties
+0x00     0x3b empties
+// the following will have to be changed later for situations where
+java sql types char     0x3c fix char mbcs
+java sql types char     0x3d null fix char mbcs
+java sql types varchar     0x3e var char mbcs
+java sql types varchar     0x3f null var char mbcs
+java sql types longvarchar     0x40 long var mbcs
+java sql types longvarchar     0x41 null long var mbcs
+java sql types char     0x42 nullterm mbcs
+java sql types char     0x43 null nullterm mbcs
+java sql types varbinary     0x44 l string bytes
+java sql types varbinary     0x45 null l string bytes
+java sql types varchar     0x46 l string sbcs
+java sql types varchar     0x47 null l string sbcs
+java sql types varchar     0x48 l string mbcs
+java sql types varchar     0x49 null l string mbcs
+0x00     0x4a empties
+0x00     0x4b empties
+java sql types varchar     0x4c sbcs
+java sql types varchar     0x4d null sbcs
+java sql types varchar     0x4e mbcs
+java sql types varchar     0x4f null mbcs
+0x00     0x50 empties
+0x00     0x51 empties
+0x00     0x52 empties
+0x00     0x53 empties
+0x00     0x54 empties
+0x00     0x55 empties
+0x00     0x56 empties
+0x00     0x57 empties
+0x00     0x58 empties
+0x00     0x59 empties
+0x00     0x5a empties
+0x00     0x5b empties
+0x00     0x5c empties
+0x00     0x5d empties
+0x00     0x5e empties
+0x00     0x5f empties
+0x00     0x60 empties
+0x00     0x61 empties
+0x00     0x62 empties
+0x00     0x63 empties
+0x00     0x64 empties
+0x00     0x65 empties
+0x00     0x66 empties
+0x00     0x67 empties
+0x00     0x68 empties
+0x00     0x69 empties
+0x00     0x6a empties
+0x00     0x6b empties
+0x00     0x6c empties
+0x00     0x6d empties
+0x00     0x6e empties
+0x00     0x6f empties
+0x00     0x70 empties
+0x00     0x71 empties
+0x00     0x72 empties
+0x00     0x73 empties
+0x00     0x74 empties
+0x00     0x75 empties
+0x00     0x76 empties
+0x00     0x77 empties
+0x00     0x78 empties
+0x00     0x79 empties
+0x00     0x7a empties
+0x00     0x7b empties
+0x00     0x7c empties
+0x00     0x7d empties
+0x00     0x7e empties
+0x00     0x7f empties
+0x00     0x80 empties
+0x00     0x81 empties
+0x00     0x82 empties
+0x00     0x83 empties
+0x00     0x84 empties
+0x00     0x85 empties
+0x00     0x86 empties
+0x00     0x87 empties
+0x00     0x88 empties
+0x00     0x89 empties
+0x00     0x8a empties
+0x00     0x8b empties
+0x00     0x8c empties
+0x00     0x8d empties
+0x00     0x8e empties
+0x00     0x8f empties
+0x00     0x90 empties
+0x00     0x91 empties
+0x00     0x92 empties
+0x00     0x93 empties
+0x00     0x94 empties
+0x00     0x95 empties
+0x00     0x96 empties
+0x00     0x97 empties
+0x00     0x98 empties
+0x00     0x99 empties
+0x00     0x9a empties
+0x00     0x9b empties
+0x00     0x9c empties
+0x00     0x9d empties
+0x00     0x9e empties
+0x00     0x9f empties
+0x00     0xa0 empties
+0x00     0xa1 empties
+0x00     0xa2 empties
+0x00     0xa3 empties
+0x00     0xa4 empties
+0x00     0xa5 empties
+0x00     0xa6 empties
+0x00     0xa7 empties
+0x00     0xa8 empties
+0x00     0xa9 empties
+0x00     0xaa empties
+0x00     0xab empties
+0x00     0xac empties
+0x00     0xad empties
+0x00     0xae empties
+0x00     0xaf empties
+0x00     0xb0 empties
+0x00     0xb1 empties
+0x00     0xb2 empties
+0x00     0xb3 empties
+0x00     0xb4 empties
+0x00     0xb5 empties
+0x00     0xb6 empties
+0x00     0xb7 empties
+0x00     0xb8 empties
+0x00     0xb9 empties
+0x00     0xba empties
+0x00     0xbb empties
+0x00     0xbc empties
+0x00     0xbd empties
+0x00     0xbe empties
+0x00     0xbf empties
+0x00     0xc0 empties
+0x00     0xc1 empties
+0x00     0xc2 empties
+0x00     0xc3 empties
+0x00     0xc4 empties
+0x00     0xc5 empties
+0x00     0xc6 empties
+0x00     0xc7 empties
+java sql types blob     0xc8 large object bytes
+java sql types blob     0xc9 null large object bytes
+java sql types clob     0xca large object char sbcs
+java sql types clob     0xcb null large object char sbcs
+0x00
+0x00
+java sql types clob     0xce large object char mbcs
+java sql types clob     0xcf null large object char mbcs
+private netagent netagent_
+private string typdefnam_
+private int ccsidsbc_
+private boolean ccsidsbcset_
+private string ccsidsbcencoding_
+private int ccsiddbc_
+private boolean ccsiddbcset_
+private string ccsiddbcencoding_
+private int ccsidmbc_
+private boolean ccsidmbcset_
+private string ccsidmbcencoding_
+protected int environment_
+private boolean mddoverride_   false
+private fdocasimpledataarray overridetable_   new fdocasimpledataarray
+//---------------------constructors/finalizer---------------------------------
+typdef netagent netagent  throws disconnectexception
+this initialize netagent  0  false  0  false  0  false  null
+typdef netagent netagent  int ccsidsbc  string typdefnam  throws disconnectexception
+this initialize netagent  ccsidsbc  true  0  false  0  false  typdefnam
+public typdef netagent netagent  int ccsidsbc  string typdefnam  int ccsiddbc  int ccsidmbc  throws disconnectexception
+this initialize netagent  ccsidsbc  true  ccsidmbc  true  ccsiddbc  true  typdefnam
+private void initialize netagent netagent
+int ccsidsbc
+boolean ccsidsbcset
+int ccsidmbc
+boolean ccsidmbcset
+int ccsiddbc
+boolean ccsiddbcset
+string typdefnam  throws disconnectexception
+netagent_   netagent
+ccsidsbc_   ccsidsbc
+ccsidsbcset_   ccsidsbcset
+ccsidsbcencoding_   null
+ccsidmbc_   ccsidmbc
+ccsidmbcset_   ccsidmbcset
+ccsidmbcencoding_   null
+ccsiddbc_   ccsiddbc
+ccsiddbcset_   ccsiddbcset
+ccsiddbcencoding_   null
+settypdefnam typdefnam
+//-------------------------private and package friendly methods---------------
+string gettypdefnam
+return typdefnam_
+void settypdefnam string typdefnam  throws disconnectexception
+typdefnam_   typdefnam
+if  typdefnam_    null
+return
+int getccsidsbc
+return ccsidsbc_
+void setccsidsbc int ccsid
+ccsidsbc_   ccsid
+ccsidsbcset_   true
+ccsidsbcencoding_   null
+void clearccsidsbc
+ccsidsbc_   0
+ccsidsbcset_   false
+ccsidsbcencoding_   null
+boolean isccsidsbcset
+return ccsidsbcset_
+// analyze exception handling some more here
+string getccsidsbcencoding   throws disconnectexception
+if  ccsidsbcencoding_    null
+ccsidsbcencoding_   utf8encoding
+return ccsidsbcencoding_
+int getccsiddbc
+return ccsiddbc_
+void setccsiddbc int ccsid
+ccsiddbc_   ccsid
+ccsiddbcset_   true
+ccsiddbcencoding_   null
+void clearccsiddbc
+ccsiddbc_   0
+ccsiddbcset_   false
+ccsiddbcencoding_   null
+boolean isccsiddbcset
+return ccsiddbcset_
+// analyze exception handling some more here
+string getccsiddbcencoding   throws disconnectexception
+if  ccsiddbcencoding_    null
+ccsiddbcencoding_   utf8encoding
+return ccsiddbcencoding_
+int getccsidmbc
+return ccsidmbc_
+void setccsidmbc int ccsid
+ccsidmbc_   ccsid
+ccsidmbcset_   true
+ccsidmbcencoding_   null
+void clearccsidmbc
+ccsidmbc_   0
+ccsidmbcset_   false
+ccsidmbcencoding_   null
+boolean isccsidmbcset
+return ccsidmbcset_
+// analyze exception handling some more here
+string getccsidmbcencoding   throws disconnectexception
+if  ccsidmbcencoding_    null
+ccsidmbcencoding_   utf8encoding
+return ccsidmbcencoding_
+int getbyteorder
+return signedbinary big_endian
+public object clone
+try
+return super clone
+catch  java lang clonenotsupportedexception e
+return null     this shouldn't happen since we implement the cloneable interface
+// populates netcursor descriptors, rename this populatecursordescriptors()
+void updatecolumn netcursor netcursor
+int columnindex
+int protocollid
+int protocollength  throws disconnectexception
+fdocasimpledataarray sda   environmenttables_
+if   mddoverride_      overridetable_    null
+sda   overridetable_
+if  sda    null
+netagent_ accumulatechainbreakingreadexceptionandthrow
+new disconnectexception netagent_
+new clientmessageid sqlstate net_invalid_fdoca_id
+// 2. set null indicator based on protocol type.
+//    nullable sql and protocol types are all odd numbers and the nullable
+//    type is one number higher than the related non-nullable type.
+netcursor nullable_     sda protocoltype_ % 2     1
+// 3. update ccsid
+//    the typdef object should store the java encoding,
+switch  sda ccsid_
+case ccsidsbc
+netcursor charsetname_   getccsidsbcencoding
+netcursor ccsid_   this ccsidsbc_
+break
+case ccsidmbc
+if  isccsidmbcset       ccsidmbc_    0
+netcursor charsetname_   getccsidmbcencoding
+netcursor ccsid_   ccsidmbc_
+else
+// if the server didn't return a mixed byte ccsid, set both the
+// encoding and the btc reference to null. see ccsiddbc comment below.
+netcursor charsetname_   null
+netcursor ccsid_   0
+break
+case ccsiddbc
+if  isccsiddbcset       ccsiddbc_    0
+netcursor charsetname_   getccsiddbcencoding
+netcursor ccsid_   this ccsiddbc_
+else
+// if the server didn't return a double byte ccsid, set both the
+// encoding and the btc reference to null.  later an exception will
+// be thrown on the getxxx method.  calling the getccsiddbcencoding method
+// will throw the exception here and this is not desirable.
+netcursor charsetname_   null
+netcursor ccsid_   0
+break
+default       this default case is used for mdd override ccsids
+// in this case the sda.ccsid_ is the actual native ccsid,
+// otherwise the sda.ccsid_ is a placeholder:
+//  ccsidmbc, ccsidddbc, ccsidsbc to indicate that
+// the actual ccsid is the connection's ccsid (in protocol lingo the connection's typdef ccsid).
+netcursor charsetname_   utf8encoding
+netcursor ccsid_   sda ccsid_
+break
+// 5. set the length fdoca length.
+//    for some types this may be a precision and a scale.
+//    this includes fixed decimal (protocol type 0x0e, 0x0f),
+// retain the high order placeholder for lobs)
+// this includes large object bytes (protocol type 0xc8, 0xc9)
+//               large object char sbcs (protocol type 0xca, 0xcb)
+//               large object char dbcs (protocol type 0xcc, 0xcd)
+//               large object char mixed (protocol type 0xce, 0xcf)
+// also set the haslobs_ flag to true
+if   sda protocoltype_ >  0xc8      sda protocoltype_ <  0xcf
+// retain placeholder information
+// right now just set the length...
+// probably need to accomodate for the high order placeholder bit
+netcursor fdocalength_   protocollength
+netcursor haslobs_   true
+else
+netcursor fdocalength_   protocollength
+// 6. set jdbc type.
+netcursor jdbctypes_   protocoltojdbctypes_
+// 7. get the number of bytes to read for variable length data.
+netcursor typetouseforcomputingdatalength_   sda typetouseforcomputingdatalength_
+// 8. update the maximumrowsize
+// count : column null indicator +
+//         column length +
+//         posibly a 2-byte length for varchar columns
+switch  netcursor typetouseforcomputingdatalength_
+case decimallength
+netcursor maximumrowsize_    1   16
+break
+case loblength
+netcursor maximumrowsize_    1    netcursor fdocalength_   0x7fff
+break
+default
+netcursor maximumrowsize_    1   netcursor fdocalength_   2     2 is the length indicator for varchar
+break
+// 9. get the character size.
+if  sda charactersize_    2
+netcursor isgraphic_   true
+// called before the code parses a descriptor
+void clearmddoverrides
+if  mddoverride_    false
+return
+mddoverride_   false
+for  int i   0  i < override_table_size  i
+overridetable_   null
+// called after the code parses a descriptor
+void setmddoverride int protocoltype
+int fdocatripletlid
+int fdocafieldtype
+int ccsid
+int charactersize
+int mode
+int length
+mddoverride_   true
+if  overridetable_    null
+overridetable_   new fdocasimpledataarray
+protocoltype
+fdocafieldtype
+fdocatypetorepresentationmap_
+ccsid
+charactersize
+mode
+length
+mapfdocatypetotypetouseforcomputingdatalength fdocafieldtype
+else
+overridetable_ update protocoltype
+fdocafieldtype
+fdocatypetorepresentationmap_
+ccsid
+charactersize
+mode
+length
+mapfdocatypetotypetouseforcomputingdatalength fdocafieldtype
+private int mapfdocatypetotypetouseforcomputingdatalength int fdocafieldtype
+switch  fdocafieldtype   0x7f        0x7f masks out the null indicator
+case fdocaconstants fdoca_type_varchar
+case fdocaconstants fdoca_type_varbytes
+return typdef twobytelength
+case fdocaconstants fdoca_type_decimal
+case fdocaconstants fdoca_type_numeric_char
+return typdef decimallength
+case fdocaconstants fdoca_type_lobbytes
+case fdocaconstants fdoca_type_lobchar
+return typdef loblength
+case fdocaconstants fdoca_type_psclbyte
+case fdocaconstants fdoca_type_psclchar
+return typdef onebytelength
+default
+return 0

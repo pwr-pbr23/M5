@@ -1,0 +1,496 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql exec
+import java io bufferedinputstream
+import java io bufferedoutputstream
+import java io datainputstream
+import java io dataoutputstream
+import java io file
+import java io ioexception
+import java io serializable
+import java util arraylist
+import java util arrays
+import java util iterator
+import java util map
+import java util timer
+import java util timertask
+import org apache hadoop conf configuration
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive ql metadata hiveexception
+import org apache hadoop hive ql plan scriptdesc
+import org apache hadoop hive ql plan api operatortype
+import org apache hadoop hive serde2 deserializer
+import org apache hadoop hive serde2 serdeexception
+import org apache hadoop hive serde2 serializer
+import org apache hadoop hive serde2 objectinspector objectinspector
+import org apache hadoop io byteswritable
+import org apache hadoop io longwritable
+import org apache hadoop io text
+import org apache hadoop io writable
+import org apache hadoop util stringutils
+/**
+* scriptoperator.
+*
+*/
+public class scriptoperator extends operator<scriptdesc> implements
+serializable
+private static final long serialversionuid   1l
+/**
+* counter.
+*
+*/
+public static enum counter
+deserialize_errors  serialize_errors
+private final transient longwritable deserialize_error_count   new longwritable
+private final transient longwritable serialize_error_count   new longwritable
+transient thread outthread   null
+transient thread errthread   null
+transient process scriptpid   null
+transient configuration hconf
+// input to the script
+transient serializer scriptinputserializer
+// output from the script
+transient deserializer scriptoutputdeserializer
+transient volatile throwable scripterror   null
+transient recordwriter scriptoutwriter   null
+static final string io_exception_broken_pipe_string
+/**
+* sends periodic reports back to the tracker.
+*/
+transient autoprogressor autoprogressor
+// first row - the process should only be started if necessary, as it may
+// conflict with some
+// of the user assumptions.
+transient boolean firstrow
+/**
+* addjobconftoenvironment is shamelessly copied from hadoop streaming.
+*/
+static string safeenvvarname string var
+stringbuilder safe   new stringbuilder
+int len   var length
+for  int i   0  i < len  i
+char c   var charat i
+char s
+if   c >       c <         c >       c <
+c >       c <
+s   c
+else
+s
+safe append s
+return safe tostring
+static void addjobconftoenvironment configuration conf
+map<string  string> env
+iterator<map entry<string  string>> it   conf iterator
+while  it hasnext
+map entry<string  string> en   it next
+string name   en getkey
+// string value = (string)en.getvalue(); // does not apply variable
+// expansion
+string value   conf get name      does variable expansion
+name   safeenvvarname name
+env put name  value
+/**
+* maps a relative pathname to an absolute pathname using the path enviroment.
+*/
+public class pathfinder
+string pathenv     a string of pathnames
+string pathsep     the path seperator
+string filesep     the file seperator in a directory
+/**
+* construct a pathfinder object using the path from the specified system
+* environment variable.
+*/
+public pathfinder string envpath
+pathenv   system getenv envpath
+pathsep   system getproperty
+filesep   system getproperty
+/**
+* appends the specified component to the path list.
+*/
+public void prependpathcomponent string str
+pathenv   str   pathsep   pathenv
+/**
+* returns the full path name of this file if it is listed in the path.
+*/
+public file getabsolutepath string filename
+if  pathenv    null    pathsep    null    filesep    null
+return null
+int val    1
+string classvalue   pathenv   pathsep
+while    val   classvalue indexof pathsep   >  0
+classvalue length   > 0
+//
+// extract each entry from the pathenv
+//
+string entry   classvalue substring 0  val  trim
+file f   new file entry
+try
+if  f isdirectory
+//
+// this entry in the pathenv is a directory.
+// see if the required file is in this directory
+//
+f   new file entry   filesep   filename
+//
+// see if the filename matches and we can read it
+//
+if  f isfile      f canread
+return f
+catch  exception exp
+classvalue   classvalue substring val   1  trim
+return null
+@override
+protected void initializeop configuration hconf  throws hiveexception
+firstrow   true
+statsmap put counter deserialize_errors  deserialize_error_count
+statsmap put counter serialize_errors  serialize_error_count
+try
+this hconf   hconf
+scriptoutputdeserializer   conf getscriptoutputinfo
+getdeserializerclass   newinstance
+scriptoutputdeserializer initialize hconf  conf getscriptoutputinfo
+getproperties
+scriptinputserializer    serializer  conf getscriptinputinfo
+getdeserializerclass   newinstance
+scriptinputserializer initialize hconf  conf getscriptinputinfo
+getproperties
+outputobjinspector   scriptoutputdeserializer getobjectinspector
+// initialize all children before starting the script
+initializechildren hconf
+catch  exception e
+throw new hiveexception    e
+boolean isbrokenpipeexception ioexception e
+return  e getmessage   comparetoignorecase io_exception_broken_pipe_string     0
+boolean allowpartialconsumption
+return hiveconf getboolvar hconf  hiveconf confvars allowpartialconsump
+void displaybrokenpipeinfo
+log
+info
+log info     hiveconf confvars allowpartialconsump tostring
+return
+@override
+public void processop object row  int tag  throws hiveexception
+// initialize the user's process only when you recieve the first row
+if  firstrow
+firstrow   false
+try
+string cmdargs   splitargs conf getscriptcmd
+string prog   cmdargs
+file currentdir   new file    getabsolutefile
+if   new file prog  isabsolute
+pathfinder finder   new pathfinder
+finder prependpathcomponent currentdir tostring
+file f   finder getabsolutepath prog
+if  f    null
+cmdargs   f getabsolutepath
+f   null
+string wrappedcmdargs   addwrapper cmdargs
+log info     arrays aslist wrappedcmdargs
+log info
+hconf get hiveconf confvars hivetablename varname
+log info
+hconf get hiveconf confvars hivepartitionname varname
+log info     alias
+processbuilder pb   new processbuilder wrappedcmdargs
+map<string  string> env   pb environment
+addjobconftoenvironment hconf  env
+env put safeenvvarname hiveconf confvars hivealias varname   string
+valueof alias
+// create an environment variable that uniquely identifies this script
+// operator
+string idenvvarname   hiveconf getvar hconf
+hiveconf confvars hivescriptidenvvar
+string idenvvarval   getoperatorid
+env put safeenvvarname idenvvarname   idenvvarval
+scriptpid   pb start       runtime getruntime   exec wrappedcmdargs
+dataoutputstream scriptout   new dataoutputstream
+new bufferedoutputstream scriptpid getoutputstream
+datainputstream scriptin   new datainputstream new bufferedinputstream
+scriptpid getinputstream
+datainputstream scripterr   new datainputstream
+new bufferedinputstream scriptpid geterrorstream
+scriptoutwriter   conf getinrecordwriterclass   newinstance
+scriptoutwriter initialize scriptout  hconf
+recordreader scriptoutputreader   conf getoutrecordreaderclass
+newinstance
+scriptoutputreader initialize scriptin  hconf  conf
+getscriptoutputinfo   getproperties
+outthread   new streamthread scriptoutputreader
+new outputstreamprocessor scriptoutputdeserializer
+getobjectinspector
+recordreader scripterrreader   conf geterrrecordreaderclass
+newinstance
+scripterrreader initialize scripterr  hconf  conf getscripterrinfo
+getproperties
+errthread   new streamthread scripterrreader  new errorstreamprocessor
+hiveconf getintvar hconf  hiveconf confvars scripterrorlimit
+if  hiveconf
+getboolvar hconf  hiveconf confvars hivescriptautoprogress
+autoprogressor   new autoprogressor this getclass   getname
+reporter  utilities getdefaultnotificationinterval hconf
+hiveconf getintvar hconf  hiveconf confvars hives_auto_progress_timeout    1000
+autoprogressor go
+outthread start
+errthread start
+catch  exception e
+throw new hiveexception    e
+if  scripterror    null
+throw new hiveexception scripterror
+try
+writable res   scriptinputserializer serialize row
+inputobjinspectors
+scriptoutwriter write res
+catch  serdeexception e
+log error     e getmessage
+scripterror   e
+serialize_error_count set serialize_error_count get     1
+throw new hiveexception e
+catch  ioexception e
+if  isbrokenpipeexception e     allowpartialconsumption
+setdone true
+log
+warn
+else
+log error     e getmessage
+if  isbrokenpipeexception e
+displaybrokenpipeinfo
+scripterror   e
+throw new hiveexception e
+@override
+public void close boolean abort  throws hiveexception
+boolean new_abort   abort
+if   abort
+if  scripterror    null
+throw new hiveexception scripterror
+// everything ok. try normal shutdown
+try
+try
+if  scriptoutwriter    null
+scriptoutwriter close
+catch  ioexception e
+if  isbrokenpipeexception e     allowpartialconsumption
+log warn
+else
+if  isbrokenpipeexception e
+displaybrokenpipeinfo
+throw e
+int exitval   0
+if  scriptpid    null
+exitval   scriptpid waitfor
+if  exitval    0
+log error     exitval
+new_abort   true
+catch  ioexception e
+log error     e getmessage
+e printstacktrace
+new_abort   true
+catch  interruptedexception e
+else
+// error already occurred, but we still want to get the
+// error code of the child process if possible.
+try
+// interrupt the current thread after 1 second
+final thread mythread   thread currentthread
+timer timer   new timer true
+timer schedule new timertask
+@override
+public void run
+mythread interrupt
+1000
+// wait for the child process to finish
+int exitval   0
+if  scriptpid    null
+scriptpid waitfor
+// cancel the timer
+timer cancel
+// output the exit code
+log error     exitval
+catch  interruptedexception e
+// ignore
+log error
+// try these best effort
+try
+if  outthread    null
+outthread join 0
+catch  exception e
+log warn
+stringutils stringifyexception e
+try
+if  errthread    null
+errthread join 0
+catch  exception e
+log warn
+stringutils stringifyexception e
+try
+if  scriptpid    null
+scriptpid destroy
+catch  exception e
+log warn
+stringutils stringifyexception e
+super close new_abort
+if  new_abort     abort
+throw new hiveexception
+interface streamprocessor
+void processline writable line  throws hiveexception
+void close   throws hiveexception
+class outputstreamprocessor implements streamprocessor
+object row
+objectinspector rowinspector
+public outputstreamprocessor objectinspector rowinspector
+this rowinspector   rowinspector
+public void processline writable line  throws hiveexception
+try
+row   scriptoutputdeserializer deserialize line
+catch  serdeexception e
+deserialize_error_count set deserialize_error_count get     1
+return
+forward row  rowinspector
+public void close
+/**
+* the processor for stderr stream.
+*
+* todo: in the future when we move to hadoop 0.18 and above, we should borrow
+* the logic from hadoopstreaming: pipemapred.java mrerrorthread to support
+* counters and status updates.
+*/
+class errorstreamprocessor implements streamprocessor
+private long bytescopied   0
+private final long maxbytes
+private long lastreporttime
+public errorstreamprocessor int maxbytes
+this maxbytes   maxbytes
+lastreporttime   0
+public void processline writable line  throws hiveexception
+string stringline   line tostring
+int len   0
+if  line instanceof text
+len     text  line  getlength
+else if  line instanceof byteswritable
+len     byteswritable  line  getsize
+// report progress for each stderr line, but no more frequently than once
+// per minute.
+long now   system currenttimemillis
+// reporter is a member variable of the operator class.
+if  now   lastreporttime > 60   1000    reporter    null
+log info
+lastreporttime   now
+reporter progress
+if   maxbytes < 0      bytescopied < maxbytes
+system err println stringline
+if  bytescopied < maxbytes    bytescopied   len >  maxbytes
+system err println     id       getname
+maxbytes
+bytescopied    len
+public void close
+class streamthread extends thread
+recordreader in
+streamprocessor proc
+string name
+streamthread recordreader in  streamprocessor proc  string name
+this in   in
+this proc   proc
+this name   name
+setdaemon true
+@override
+public void run
+try
+writable row   in createrow
+while  true
+long bytes   in next row
+if  bytes <  0
+break
+proc processline row
+log info     name
+catch  throwable th
+scripterror   th
+log warn     th getmessage
+th getcause
+log warn stringutils stringifyexception th
+finally
+try
+if  in    null
+in close
+catch  exception e
+log warn name
+log warn stringutils stringifyexception e
+try
+if  null    proc
+proc close
+catch  exception e
+log warn   stringutils stringifyexception e
+/**
+* wrap the script in a wrapper that allows admins to control.
+*/
+protected string addwrapper string inargs
+string wrapper   hiveconf getvar hconf  hiveconf confvars scriptwrapper
+if  wrapper    null
+return inargs
+string wrapcomponents   splitargs wrapper
+int totallength   wrapcomponents length   inargs length
+string finalargv   new string
+for  int i   0  i < wrapcomponents length  i
+finalargv   wrapcomponents
+for  int i   0  i < inargs length  i
+finalargv   inargs
+return  finalargv
+// code below shameless borrowed from hadoop streaming
+public static string splitargs string args
+final int outside   1
+final int singleq   2
+final int doubleq   3
+arraylist arglist   new arraylist
+char ch   args tochararray
+int clen   ch length
+int state   outside
+int argstart   0
+for  int c   0  c <  clen  c
+boolean last    c    clen
+int laststate   state
+boolean endtoken   false
+if   last
+if  ch
+if  state    outside
+state   singleq
+else if  state    singleq
+state   outside
+endtoken    state    laststate
+else if  ch
+if  state    outside
+state   doubleq
+else if  state    doubleq
+state   outside
+endtoken    state    laststate
+else if  ch
+if  state    outside
+endtoken   true
+if  last    endtoken
+if  c    argstart
+// unquoted space
+else
+string a
+a   args substring argstart  c
+arglist add a
+argstart   c   1
+laststate   state
+return  string  arglist toarray new string
+@override
+public string getname
+return
+@override
+public operatortype gettype
+return operatortype script

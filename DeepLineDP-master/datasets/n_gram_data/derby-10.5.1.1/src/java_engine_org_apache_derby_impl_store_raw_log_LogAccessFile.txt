@@ -1,0 +1,672 @@
+/*
+derby - class org.apache.derby.impl.store.raw.log.logaccessfile
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store raw log
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby io storagerandomaccessfile
+import java io ioexception
+import java io outputstream
+import java io syncfailedexception
+import java io interruptedioexception
+import java util linkedlist
+import org apache derby iapi services io formatidoutputstream
+import org apache derby iapi services io arrayoutputstream
+import org apache derby iapi store replication master masterfactory
+import org apache derby iapi store raw rawstorefactory
+/**
+wraps a randomaccessfile file to provide buffering
+on log writes. only supports the write calls
+required for the log!
+mt - unsafe.  caller of this class must provide synchronization.  the one
+exception is with the log file access, logaccessfile will touch the log
+only inside synchronized block protected by the semaphore, which is
+defined by the creator of this object.
+write to the log buffers are allowed when there are free buffers even
+when dirty buffers are being written(flushed) to the disk by a different
+thread. only one flush writes to log file at a time, other wait for it to finish.
+except for flushlogaccessfile , syncaccesslogfile other function callers
+must provide syncronization that will allow only one of them to write to
+the buffers.
+log buffers are used in circular fashion, each buffer moves through following stages:
+freebuffers --> dirtybuffers --> freebuffers. movement of buffers from one
+stage to 	another stage is synchronized using	the object(this) of this class.
+a checksum log record that has the checksum value for the data that is
+being written to the disk is generated and written 	before the actual data.
+except for the large log records that does not fit into a single buffer,
+checksum is calcualted for a group of log records that are in the buffer
+when buffers is switched. checksum log record is written into the reserved
+space in the beginning buffer.
+in case of a large log record that does not fit into a buffer, the
+checksum is written to the byte[] allocated for the big log
+record.
+checksum log records helps in identifying the incomplete log disk writes during
+recovery. this is done by recalculating the checksum value for the data on
+the disk and comparing it to the the value stored in the checksum log
+record.
+*/
+public class logaccessfile
+/**
+* the fixed size of a log record is 16 bytes:
+*     int   length             : 4 bytes
+*     long  instant            : 8 bytes
+*     int   trailing length    : 4 bytes
+**/
+private static final int            log_record_fixed_overhead_size   16
+private static final int            log_record_header_size   12     length   instant
+private static final int            log_record_trailer_size   4    trailing length
+private static final int            log_number_log_buffers   3
+private linkedlist    freebuffers     list of free buffers
+private linkedlist    dirtybuffers    list of dirty buffers to flush
+private  logaccessfilebuffer currentbuffer    current active buffer
+private boolean flushinprogress   false
+private final storagerandomaccessfile  log
+// log can be touched only inside synchronized block protected by
+// logfilesemaphore.
+private final object            logfilesemaphore
+static int                      mon_numwritestolog
+static int                      mon_numbytestolog
+// the masterfactory that will accept log when in replication master mode
+masterfactory masterfac
+boolean inreplicationmastermode   false
+boolean inreplicationslavemode   false
+//streams used to generated check sume log record ; see if there is any simpler way
+private arrayoutputstream logoutputbuffer
+private formatidoutputstream logicalout
+private long checksuminstant    1
+private int checksumlength
+private int checksumlogrecordsize         checksumlength   log_record_fixed_overhead_size
+private boolean writechecksum
+private checksumoperation checksumlogoperation
+private logrecord checksumlogrecord
+private logtofile logfactory
+private boolean databaseencrypted false
+public logaccessfile logtofile logfactory
+storagerandomaccessfile    log
+int                 buffersize
+if  sanitymanager debug
+if sanitymanager debug_on
+buffersize   10 	   make it very tiny
+// puts this logaccessfile object in replication slave or
+// master mode if the database has such a role
+logfactory checkforreplication this
+this log              log
+logfilesemaphore      log
+this logfactory       logfactory
+if  sanitymanager debug
+sanitymanager assert log_number_log_buffers >  1
+//initialize buffers lists
+freebuffers   new linkedlist
+dirtybuffers   new linkedlist
+//add all buffers to free list
+for  int i   0  i < log_number_log_buffers  i
+logaccessfilebuffer b   new logaccessfilebuffer buffersize
+freebuffers addlast b
+currentbuffer    logaccessfilebuffer  freebuffers removefirst
+// support for transaction log checksum in derby was added in 10.1
+// check to see if the store have been upgraded to 10.1 or later before
+// writing the checksum log records.  otherwise recovery will fail
+// incase user tries to revert back to versions before 10.1 in
+// soft upgrade mode.
+writechecksum   logfactory checkversion rawstorefactory derby_store_major_version_10
+rawstorefactory derby_store_minor_version_1
+// checksums are received from the master if in slave replication mode
+if  inreplicationslavemode  writechecksum   false
+if writechecksum
+/**
+* setup structures that are required to write the checksum log records
+* for a group of log records are being written to the disk.
+*/
+checksumlogoperation   new checksumoperation
+checksumlogoperation init
+checksumlogrecord   new logrecord
+// note: checksum log records are not related any particular transaction,
+// they are written to store a checksum information identify
+// incomplete log record writes. no transacton id is set for this
+// log record. that is why a null argument is passed below
+// setvalue(..) call.
+checksumlogrecord setvalue null  checksumlogoperation
+checksumlength
+checksumlogrecord getstoredsize checksumlogoperation group    null
+checksumlogoperation getstoredsize
+// calculate checksum log operation length when the database is encrypted
+if  logfactory databaseencrypted
+checksumlength    logfactory getencrypteddatalength checksumlength
+databaseencrypted   true
+checksumlogrecordsize   checksumlength    log_record_fixed_overhead_size
+//streams required to convert a log record to raw byte array.
+logoutputbuffer   new arrayoutputstream
+logicalout   new formatidoutputstream logoutputbuffer
+/** initialize the buffer with space reserved for checksum log record in
+* the beginning of the log buffer; checksum record is written into
+* this space when buffer is switched
+*/
+else
+//checksumming of transaction log feature is not in use.
+checksumlogrecordsize   0
+currentbuffer init checksumlogrecordsize
+/**
+* write a single log record to the stream.
+* <p>
+* for performance pass all parameters rather into a specialized routine
+* rather than maintaining the writeint, writelong, and write interfaces
+* that this class provides as a standard outputstream.  it will make it
+* harder to use other outputstream implementations, but makes for less
+* function calls and allows optimizations knowing when to switch buffers.
+* <p>
+* this routine handles all log records which are smaller than one log
+* buffer.  if a log record is bigger than a log buffer it calls
+* writeunbufferedlogrecord().
+* <p>
+* the log record written will always look the same as if the following
+* code had been executed:
+*     writeint(length)
+*     writelong(instant)
+*     write(data, data_offset, (length - optional_data_length) )
+*
+*     if (optional_data_length != 0)
+*         write(optional_data, optional_data_offset, optional_data_length)
+*
+*     writeint(length)
+*
+* @param length                (data + optional_data) length bytes to write
+* @param instant               the log address of this log record.
+* @param data                  "from" array to copy "data" portion of rec
+* @param data_offset           offset in "data" to start copying from.
+* @param optional_data         "from" array to copy "optional data" from
+* @param optional_data_offset  offset in "optional_data" to start copy from
+* @param optional_data_length  length of optional data to copy.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void writelogrecord
+int     length
+long    instant
+byte  data
+int     data_offset
+byte  optional_data
+int     optional_data_offset
+int     optional_data_length
+throws standardexception  ioexception
+int total_log_record_length   length   log_record_fixed_overhead_size
+if  total_log_record_length <  currentbuffer bytes_free
+int newpos   appendlogrecordtobuffer currentbuffer buffer
+currentbuffer position
+length
+instant
+data
+data_offset
+optional_data
+optional_data_offset
+optional_data_length
+currentbuffer position   newpos
+currentbuffer bytes_free    total_log_record_length
+currentbuffer greatest_instant   instant
+if  sanitymanager debug
+int normalizedposition   currentbuffer position
+if  writechecksum
+normalizedposition    checksumlogrecordsize
+sanitymanager assert
+currentbuffer bytes_free   normalizedposition
+currentbuffer length
+else
+/* the current log record will never fit in a single
+* buffer. the reason is that reservespaceforchecksum is
+* always called before writelogrecord (see
+* logtofile#appendlogrecord). when we reach this point,
+* reservespaceforchecksum has already found out that the
+* previous buffer did not have enough free bytes to store
+* this log record, and therefore switched to a fresh
+* buffer. hence, currentbuffer is empty now, and
+* switching to the next free buffer will not help. since
+* there is no way for this log record to fit into a
+* buffer, it is written to a new, big enough, byte[] and
+* then written to log file instead of writing it to
+* buffer.
+*/
+// allocate a byte[] that is big enough to contain the
+// giant log record:
+int bigbufferlength
+checksumlogrecordsize   total_log_record_length
+byte bigbuffer   new byte
+appendlogrecordtobuffer bigbuffer  checksumlogrecordsize
+length
+instant
+data
+data_offset
+optional_data
+optional_data_offset
+optional_data_length
+// write checksum to bigbuffer
+if writechecksum
+checksumlogoperation reset
+checksumlogoperation update bigbuffer  checksumlogrecordsize
+total_log_record_length
+writechecksumlogrecord bigbuffer
+// flush all buffers before writing the bigbuffer to the
+// log file.
+flushlogaccessfile
+// note:no special synchronization required here , there
+// will be nothing to write by flushdirtybuffers that can
+// run in parallel to the threads that is executing this
+// code. above flush call should have written all the
+// buffers and no new log will get added until the
+// following direct log to file call finishes.
+// write the log record directly to the log file.
+writetolog bigbuffer  0  bigbufferlength  instant
+/**
+* append a log record to a byte[]. typically, the byte[] will be
+* currentbuffer, but if a log record that is too big to fit in a
+* buffer is added, buff will be a newly allocated byte[].
+*
+* @param buff the byte[] the log record is appended to
+* @param pos the position in buff where the method will start to
+* append to
+* @param length (data + optional_data) length bytes to write
+* @param instant the log address of this log record.
+* @param data "from" array to copy "data" portion of rec
+* @param data_offset offset in "data" to start copying from.
+* @param optional_data "from" array to copy "optional data" from
+* @param optional_data_offset offset in "optional_data" to start copy from
+* @param optional_data_length length of optional data to copy.
+*
+* @see logaccessfile#writelogrecord
+*/
+private int appendlogrecordtobuffer byte buff  int pos
+int length
+long instant
+byte data
+int data_offset
+byte optional_data
+int optional_data_offset
+int optional_data_length
+pos   writeint length  buff  pos
+pos   writelong instant  buff  pos
+int data_length   length   optional_data_length
+system arraycopy data  data_offset
+buff  pos
+data_length
+pos    data_length
+if  optional_data_length    0
+system arraycopy optional_data  optional_data_offset
+buff  pos
+optional_data_length
+pos    optional_data_length
+pos   writeint length  buff  pos
+return pos
+private final int writeint int i   byte b  int p
+b    byte    i >>> 24    0xff
+b    byte    i >>> 16    0xff
+b    byte    i >>> 8    0xff
+b    byte   i   0xff
+return p
+private final int writelong long l   byte b  int p
+b    byte     int  l >>> 56     0xff
+b    byte     int  l >>> 48     0xff
+b    byte     int  l >>> 40     0xff
+b    byte     int  l >>> 32     0xff
+b    byte     int  l >>> 24     0xff
+b    byte     int  l >>> 16     0xff
+b    byte     int  l >>> 8     0xff
+b    byte     int l    0xff
+return p
+public void writeint int i
+if  sanitymanager debug
+sanitymanager assert currentbuffer bytes_free >  4
+currentbuffer position
+writeint i   currentbuffer buffer  currentbuffer position
+currentbuffer bytes_free    4
+public void writelong long l
+if  sanitymanager debug
+sanitymanager assert currentbuffer bytes_free >  8
+currentbuffer position
+writelong l   currentbuffer buffer  currentbuffer position
+currentbuffer bytes_free    8
+public void write int b
+if  sanitymanager debug
+sanitymanager assert currentbuffer bytes_free > 0
+currentbuffer buffer    byte  b
+currentbuffer bytes_free
+public void write byte b  int off  int len
+if  sanitymanager debug
+sanitymanager assert len <  currentbuffer bytes_free
+system arraycopy b  off  currentbuffer buffer  currentbuffer position  len
+currentbuffer bytes_free    len
+currentbuffer position    len
+/**
+* write data from all dirty buffers into the log file.
+* <p>
+* a call for clients of logaccessfile to insure that all privately buffered
+* data has been writen to the file - so that reads on the file using one
+* of the various scan classes will see
+* all the data which has been writen to this point.
+* <p>
+* note that this routine only "writes" the data to the file, this does not
+* mean that the data has been synced to disk unless file was opened in
+* write sync mode(rws/rwd).  the only way to insure that is by calling
+* is to call synclogaccessfile() after this call in non-write sync mode(rw)
+*
+* <p>
+* mt-safe : parallel thereads can call this function, only one threads does
+* the flush and the other threads waits for the one that is doing the flush to finish.
+* currently there are two possible threads that can call this function in parallel
+* 1) a thread that is doing the commit
+* 2) a thread that is writing to the log and log buffers are full or
+* a log records does not fit in a buffer. (log buffers
+* full(switchlogbuffer() or a log record size that is greater than
+* logbuffer size has to be writtern through writetolog call directlty)
+* note: writetolog() is not synchronized on the semaphore
+* that is used to do  buffer management to allow writes
+* to the free buffers when flush is in progress.
+**/
+protected void flushdirtybuffers   throws ioexception
+logaccessfilebuffer buf   null
+int noofbuffers
+int nflushed  0
+try
+synchronized this
+/**if some one else flushing wait, otherwise it is possible
+* different threads will get different buffers and order can
+* not be determined.
+*
+**/
+while flushinprogress
+try
+wait
+catch  interruptedexception ie
+//do nothing, let the flush request to complete.
+//because it possible that other thread which is
+//currently might have completed this request also ,
+//if exited  on interrupt and throw exception, can not
+//be sure whether this transaction is committed ot not.
+noofbuffers   dirtybuffers size
+if noofbuffers > 0
+buf    logaccessfilebuffer  dirtybuffers removefirst
+flushinprogress   true
+while nflushed < noofbuffers
+if  buf position    0
+writetolog buf buffer  0  buf position  buf greatest_instant
+nflushed
+synchronized this
+//add the buffer that was written previosly to the free list
+freebuffers addlast buf
+if nflushed < noofbuffers
+buf    logaccessfilebuffer  dirtybuffers removefirst
+else
+//see if we can flush more, that came when we are at it.
+//don't flush more than the total number of buffers,
+//that might lead to starvation of the current thread.
+int size   dirtybuffers size
+if size > 0    nflushed <  log_number_log_buffers
+noofbuffers    size
+buf    logaccessfilebuffer  dirtybuffers removefirst
+finally
+synchronized this
+flushinprogress   false
+notifyall
+//flush all the the dirty buffers to disk
+public void flushlogaccessfile   throws ioexception   standardexception
+switchlogbuffer
+flushdirtybuffers
+/**
+* appends the current buffer to the dirty buffer list and assigns a free
+* buffer to be the currrent active buffer . flushing of the buffer
+* to disk is delayed if there is a free buffer available.
+* dirty buffers will be  flushed to the disk
+* when  flushdirtybuffers() is invoked by  a commit call
+* or when no more free buffers are available.
+*/
+public void switchlogbuffer   throws ioexception  standardexception
+synchronized this
+// ignore empty buffer switch requests
+if currentbuffer position    checksumlogrecordsize
+return
+// calculate the checksum for the current log buffer
+// and write the record to the space reserverd in
+// the beginning of the buffer.
+if writechecksum
+checksumlogoperation reset
+checksumlogoperation update currentbuffer buffer  checksumlogrecordsize  currentbuffer position   checksumlogrecordsize
+writechecksumlogrecord currentbuffer buffer
+//add the current buffer to the flush buffer list
+dirtybuffers addlast currentbuffer
+//if there is no free buffer, flush the buffers to get a free one
+if freebuffers size      0
+flushdirtybuffers
+//after the flush call there should be a free buffer
+//because this is only methods removes items from
+//free buffers and removal is in synchronized block.
+// there should be free buffer available at this point.
+if  sanitymanager debug
+sanitymanager assert freebuffers size   > 0
+//switch over to the next log buffer, let someone else write it.
+currentbuffer    logaccessfilebuffer  freebuffers removefirst
+currentbuffer init checksumlogrecordsize
+if  sanitymanager debug
+sanitymanager assert currentbuffer position    checksumlogrecordsize
+sanitymanager assert
+currentbuffer bytes_free    currentbuffer length
+sanitymanager assert currentbuffer bytes_free > 0
+/**
+* guarantee all writes up to the last call to flushlogaccessfile on disk.
+* <p>
+* a call for clients of logaccessfile to insure that all data written
+* up to the last call to flushlogaccessfile() are written to disk.
+* this call will not return until those writes have hit disk.
+* <p>
+* note that this routine may block waiting for i/o to complete so
+* callers should limit the number of resource held locked while this
+* operation is called.  it is expected that the caller
+* note that this routine only "writes" the data to the file, this does not
+* mean that the data has been synced to disk.  the only way to insure that
+* is to first call switchlogbuffer() and then follow by a call of sync().
+*
+**/
+public void synclogaccessfile
+throws ioexception  standardexception
+for  int i 0
+// 3311: jvm sync call sometimes fails under high load against nfs
+// mounted disk.  we re-try to do this 20 times.
+try
+synchronized  this
+log sync  false
+// the sync succeed, so return
+break
+catch  syncfailedexception sfe
+i
+try
+// wait for .2 of a second, hopefully i/o is done by now
+// we wait a max of 4 seconds before we give up
+thread sleep  200
+catch  interruptedexception ie
+does not matter weather i get interrupted or not
+if  i > 20
+throw standardexception newexception
+sqlstate log_full  sfe
+/**
+the database is being marked corrupted, get rid of file pointer without
+writing out anything more.
+*/
+public void corrupt   throws ioexception
+synchronized logfilesemaphore
+if  log    null
+log close
+public void close   throws ioexception  standardexception
+if  sanitymanager debug
+if  currentbuffer position     checksumlogrecordsize
+sanitymanager throwassert
+currentbuffer position        currentbuffer bytes_free
+flushlogaccessfile
+synchronized logfilesemaphore
+if  log    null
+log close
+/**
+* make this logaccessfile pass chunks of log records (byte[]) to
+* the masterfactory when the chunks are written to disk.
+* @param masterfac the masterfactory service responsible for
+* controlling the master side replication behaviour.
+*/
+protected void setreplicationmasterrole masterfactory masterfac
+this masterfac   masterfac
+inreplicationmastermode   true
+/**
+* stop this logaccessfile from passing chunks of log records to
+* the masterfactory.
+*/
+protected void stopreplicationmasterrole
+inreplicationmastermode   false
+masterfac   null
+/**
+* method to put this logaccessfile object in replication slave
+* mode, effectively disabling checksum writes.
+*
+* because checksums are received from the replication master, the
+* slave can not be allowed to add it's own checksums - that would
+* invalidate the checksums and would stop the database from
+* recovering. replication slave mode must therefore be set before
+* logaccessfile decides whether to write it's own checksums, and
+* this method is therefore indirectly called from the constructor
+* of this class by calling logfactory.checkforreplication
+*
+* if replication slave mode for the database is stopped after
+* this object has been created, checksums cannot be reenabled
+* without creating a new instance of this class. that is
+* conveniently handled as logtofile.recover completes (which
+* automatically happens once replication slave mode is no longer
+* active)
+*
+* @see logtofile#checkforreplication
+*/
+protected void setreplicationslaverole
+inreplicationslavemode   true
+/* write to the log file */
+private void writetolog byte b  int off  int len  long highestinstant
+throws ioexception
+synchronized logfilesemaphore
+if  log    null
+// try to handle case where user application is throwing
+// random interrupts at derby threads, retry in the case
+// of io exceptions 5 times.  after that hope that it is
+// a real disk problem - an io error in a write to the log file
+// is going to take down the whole system, so seems worthwhile
+// to retry.
+for  int i   0   i
+try
+log write b  off  len
+if  inreplicationmastermode
+masterfac appendlog highestinstant
+b  off  len
+break
+catch  ioexception ioe
+// just fall through and rety the log write 1st 5 times.
+if  i >  5
+throw ioe
+if  sanitymanager debug
+mon_numwritestolog
+mon_numbytestolog    len
+/**
+* reserve the space for the checksum log record in the log file.
+*
+* @param  length           the length of the log record to be written
+* @param  logfilenumber    current log file number
+* @param  currentposition  current position in the log file.
+*
+* @return the space that is needed to write a checksum log record.
+*/
+protected long reservespaceforchecksum int length  long logfilenumber  long currentposition
+throws standardexception  ioexception
+int total_log_record_length   length   log_record_fixed_overhead_size
+boolean reservechecksumspace   false
+/* checksum log record is calculated for a group of log
+* records that can fit in to a single buffer or for
+* a single record when it does not fit into
+* a fit into a buffer at all. when a new buffer
+* is required to write a log record, log space
+* has to be reserved before writing the log record
+* becuase checksum is written in the before the
+* log records that are being checksummed.
+* what it also means is a real log instant has to be
+* reserved for writing the checksum log record in addition
+* to the log buffer space.
+*/
+/* reserve checkum space for new log records if a log buffer switch had
+* happened before because of a explicit log flush requests(like commit)
+* or a long record write
+*/
+if currentbuffer position    checksumlogrecordsize
+// reserver space if log checksum feature is enabled.
+reservechecksumspace   writechecksum
+else
+if  total_log_record_length > currentbuffer bytes_free
+// the log record that is going to be written is not
+// going to fit in the current buffer, switch the
+// log buffer to create buffer space for it.
+switchlogbuffer
+// reserve space if log checksum feature is enabled.
+reservechecksumspace   writechecksum
+if reservechecksumspace
+if  sanitymanager debug
+// prevoiusly reserved real checksum instant should have been
+// used, before an another one is generated.
+sanitymanager assert checksuminstant     1
+checksuminstant   logcounter makeloginstantaslong logfilenumber  currentposition
+return  checksumlogrecordsize
+else
+return 0
+/**
+* generate the checkum log record and write it into the log
+* buffer. the checksum applies to all bytes from this checksum
+* log record to the next one.
+* @param buffer the byte[] the checksum is written to. the
+* checksum is always written at the beginning of buffer.
+*/
+private void writechecksumlogrecord byte buffer
+throws ioexception  standardexception
+int    p      0    checksum is written in the beginning of the buffer
+// writeint(length)
+p   writeint checksumlength  buffer  p
+// writelong(instant)
+p   writelong checksuminstant  buffer  p
+//write the checksum log operation
+logoutputbuffer setdata buffer
+logoutputbuffer setposition p
+logicalout writeobject checksumlogrecord
+if databaseencrypted
+//encrypt the checksum log operation part.
+int len
+logfactory encrypt buffer  log_record_header_size  checksumlength
+buffer  log_record_header_size
+if  sanitymanager debug
+sanitymanager assert len    checksumlength
+p   log_record_header_size   checksumlength
+// writeint(length) trailing
+p   writeint checksumlength  buffer  p
+if  sanitymanager debug
+sanitymanager assert p    checksumlogrecordsize      p        checksumlogrecordsize
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag
+logcounter todebugstring checksuminstant
+checksumlength       checksumlogoperation
+checksuminstant    1
+protected void writeendmarker int marker  throws ioexception  standardexception
+//flush all the buffers and then write the end marker.
+flushlogaccessfile
+byte b      currentbuffer buffer
+int    p      0    end is written in the beginning of the buffer  no
+//need to checksum a int write.
+p   writeint marker   b   p
+writetolog b  0  p   1     end marker has no instant

@@ -1,0 +1,1162 @@
+/**
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase ipc
+import java io bufferedinputstream
+import java io bufferedoutputstream
+import java io datainputstream
+import java io dataoutputstream
+import java io filterinputstream
+import java io ioexception
+import java io inputstream
+import java io outputstream
+import java lang reflect method
+import java net connectexception
+import java net inetsocketaddress
+import java net socket
+import java net socketexception
+import java net sockettimeoutexception
+import java net unknownhostexception
+import java nio bytebuffer
+import java security privilegedexceptionaction
+import java util hashmap
+import java util iterator
+import java util linkedlist
+import java util map
+import java util map entry
+import java util random
+import java util concurrent concurrentskiplistmap
+import java util concurrent atomic atomicboolean
+import java util concurrent atomic atomiclong
+import javax net socketfactory
+import javax security sasl saslexception
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop hbase cellscanner
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase ipcprotocol
+import org apache hadoop hbase codec codec
+import org apache hadoop hbase codec keyvaluecodec
+import org apache hadoop hbase protobuf generated rpcprotos cellblockmeta
+import org apache hadoop hbase protobuf generated rpcprotos connectionheader
+import org apache hadoop hbase protobuf generated rpcprotos exceptionresponse
+import org apache hadoop hbase protobuf generated rpcprotos requestheader
+import org apache hadoop hbase protobuf generated rpcprotos responseheader
+import org apache hadoop hbase protobuf generated rpcprotos userinformation
+import org apache hadoop hbase protobuf generated tracing rpctinfo
+import org apache hadoop hbase security authmethod
+import org apache hadoop hbase security hbasesaslrpcclient
+import org apache hadoop hbase security kerberosinfo
+import org apache hadoop hbase security tokeninfo
+import org apache hadoop hbase security user
+import org apache hadoop hbase security token authenticationtokenidentifier
+import org apache hadoop hbase security token authenticationtokenselector
+import org apache hadoop hbase util environmentedgemanager
+import org apache hadoop hbase util pair
+import org apache hadoop hbase util poolmap
+import org apache hadoop hbase util poolmap pooltype
+import org apache hadoop io ioutils
+import org apache hadoop io text
+import org apache hadoop io compress compressioncodec
+import org apache hadoop ipc remoteexception
+import org apache hadoop net netutils
+import org apache hadoop security securityutil
+import org apache hadoop security usergroupinformation
+import org apache hadoop security token token
+import org apache hadoop security token tokenidentifier
+import org apache hadoop security token tokenselector
+import org cloudera htrace span
+import org cloudera htrace trace
+import com google protobuf message
+import com google protobuf message builder
+import com google protobuf textformat
+/**
+* a client for an ipc service.  ipc calls take a single protobuf message as a
+* request and returns a single protobuf message as result.  a service runs on
+* a port and is defined by a parameter class and a value class.
+*
+* <p>see hbaseserver
+*/
+@interfaceaudience private
+public class hbaseclient
+public static final log log   logfactory getlog
+protected final poolmap<connectionid  connection> connections
+private reflectioncache reflectioncache   new reflectioncache
+protected int counter                                counter for call ids
+protected final atomicboolean running   new atomicboolean true      if client runs
+final protected configuration conf
+final protected int maxidletime     connections will be culled if it was idle for
+// maxidletime microsecs
+final protected int maxretries    the max  no  of retries for socket connections
+final protected long failuresleep     time to sleep before retry on failure
+protected final boolean tcpnodelay     if t then disable nagle's algorithm
+protected final boolean tcpkeepalive     if t then use keepalives
+protected int pinginterval     how often sends ping to the server in msecs
+protected int sockettimeout     socket timeout
+protected failedservers failedservers
+private final codec codec
+private final compressioncodec compressor
+private final ipcutil ipcutil
+protected final socketfactory socketfactory               how to create sockets
+protected string clusterid
+final private static string ping_interval_name
+final private static string socket_timeout
+final static int default_ping_interval   60000      1 min
+final static int default_socket_timeout   20000     20 seconds
+final static int ping_call_id    1
+public final static string failed_server_expiry_key
+public final static int failed_server_expiry_default   2000
+/**
+* a class to manage a list of servers that failed recently.
+*/
+static class failedservers
+private final linkedlist<pair<long  string>> failedservers   new
+linkedlist<pair<long  java lang string>>
+private final int recheckserverstimeout
+failedservers configuration conf
+this recheckserverstimeout   conf getint
+failed_server_expiry_key  failed_server_expiry_default
+/**
+* add an address to the list of the failed servers list.
+*/
+public synchronized void addtofailedservers inetsocketaddress address
+final long expiry   environmentedgemanager currenttimemillis     recheckserverstimeout
+failedservers addfirst new pair<long  string> expiry  address tostring
+/**
+* check if the server should be considered as bad. clean the old entries of the list.
+*
+* @return true if the server is in the failed servers list
+*/
+public synchronized boolean isfailedserver final inetsocketaddress address
+if  failedservers isempty
+return false
+final string lookup   address tostring
+final long now   environmentedgemanager currenttimemillis
+// iterate, looking for the search entry and cleaning expired entries
+iterator<pair<long  string>> it   failedservers iterator
+while  it hasnext
+pair<long  string> cur   it next
+if  cur getfirst   < now
+it remove
+else
+if  lookup equals cur getsecond
+return true
+return false
+@suppresswarnings
+public static class failedserverexception extends ioexception
+public failedserverexception string s
+super s
+/**
+* set the ping interval value in configuration
+*
+* @param conf configuration
+* @param pinginterval the ping interval
+*/
+// any reason we couldn't just do tcp keepalive instead of this pingery?
+// st.ack 20130121
+public static void setpinginterval configuration conf  int pinginterval
+conf setint ping_interval_name  pinginterval
+/**
+* get the ping interval from configuration;
+* if not set in the configuration, return the default value.
+*
+* @param conf configuration
+* @return the ping interval
+*/
+static int getpinginterval configuration conf
+return conf getint ping_interval_name  default_ping_interval
+/**
+* set the socket timeout
+* @param conf configuration
+* @param sockettimeout the socket timeout
+*/
+public static void setsockettimeout configuration conf  int sockettimeout
+conf setint socket_timeout  sockettimeout
+/**
+* @return the socket timeout
+*/
+static int getsockettimeout configuration conf
+return conf getint socket_timeout  default_socket_timeout
+/** a call waiting for a value. */
+protected class call
+final int id                                     call id
+final message param                              rpc request method param object
+/**
+* optionally has cells when making call.  optionally has cells set on response.  used
+* passing cells to the rpc and receiving the response.
+*/
+cellscanner cells
+message response                                 value  null if error
+ioexception error                                exception  null if value
+boolean done                                     true when call is done
+long starttime
+final method method
+protected call final method method  message param  final cellscanner cells
+this param   param
+this method   method
+this cells   cells
+this starttime   system currenttimemillis
+synchronized  hbaseclient this
+this id   counter
+@override
+public string tostring
+return     this id       this method getname
+this param    null? textformat shortdebugstring this param
+/** indicate when the call is complete and the
+* value or error are available.  notifies by default.  */
+protected synchronized void callcomplete
+this done   true
+notify                                       notify caller
+/** set the exception when there is an error.
+* notify the caller the call is done.
+*
+* @param error exception thrown by the call; either local or remote
+*/
+public synchronized void setexception ioexception error
+this error   error
+callcomplete
+/** set the return value when there is no error.
+* notify the caller the call is done.
+*
+* @param response return value of the call.
+* @param cells can be null
+*/
+public synchronized void setresponse message response  final cellscanner cells
+this response   response
+this cells   cells
+callcomplete
+public long getstarttime
+return this starttime
+protected final static map<string tokenselector<? extends tokenidentifier>> tokenhandlers
+new hashmap<string tokenselector<? extends tokenidentifier>>
+static
+tokenhandlers put authenticationtokenidentifier auth_token_type tostring
+new authenticationtokenselector
+/**
+* creates a connection. can be overridden by a subclass for testing.
+* @param remoteid - the connectionid to use for the connection creation.
+*/
+protected connection createconnection connectionid remoteid  final codec codec
+final compressioncodec compressor
+throws ioexception
+return new connection remoteid  codec  compressor
+/** thread that reads responses and notifies callers.  each connection owns a
+* socket connected to a remote address.  calls are multiplexed through this
+* socket: responses may be delivered out of order. */
+protected class connection extends thread
+private connectionheader header                  connection header
+protected connectionid remoteid
+protected socket socket   null                     connected socket
+protected datainputstream in
+protected dataoutputstream out
+private inetsocketaddress server                 server ip port
+private string serverprincipal      server's krb5 principal name
+private authmethod authmethod     authentication method
+private boolean usesasl
+private token<? extends tokenidentifier> token
+private hbasesaslrpcclient saslrpcclient
+private int reloginmaxbackoff     max pause before relogin on sasl failure
+private final codec codec
+private final compressioncodec compressor
+// currently active calls
+protected final concurrentskiplistmap<integer  call> calls
+new concurrentskiplistmap<integer  call>
+protected final atomiclong lastactivity
+new atomiclong       last i o activity time
+protected final atomicboolean shouldcloseconnection
+new atomicboolean        indicate if the connection is closed
+protected ioexception closeexception     close reason
+connection connectionid remoteid  final codec codec  final compressioncodec compressor
+throws ioexception
+if  remoteid getaddress   isunresolved
+throw new unknownhostexception     remoteid getaddress   gethostname
+this server   remoteid getaddress
+this codec   codec
+this compressor   compressor
+usergroupinformation ticket   remoteid getticket   getugi
+class<?> protocol   remoteid getprotocol
+this usesasl   user ishbasesecurityenabled conf
+if  usesasl    protocol    null
+tokeninfo tokeninfo   protocol getannotation tokeninfo class
+if  tokeninfo    null
+tokenselector<? extends tokenidentifier> tokenselector
+tokenhandlers get tokeninfo value
+if  tokenselector    null
+token   tokenselector selecttoken new text clusterid
+ticket gettokens
+else if  log isdebugenabled
+log debug   tokeninfo value
+kerberosinfo krbinfo   protocol getannotation kerberosinfo class
+if  krbinfo    null
+string serverkey   krbinfo serverprincipal
+if  serverkey    null
+throw new ioexception
+serverprincipal   securityutil getserverprincipal
+conf get serverkey   server getaddress   getcanonicalhostname   tolowercase
+if  log isdebugenabled
+log debug
+protocol getcanonicalname         serverprincipal
+if   usesasl
+authmethod   authmethod simple
+else if  token    null
+authmethod   authmethod digest
+else
+authmethod   authmethod kerberos
+if  log isdebugenabled
+log debug     authmethod
+protocol getsimplename
+reloginmaxbackoff   conf getint    5000
+this remoteid   remoteid
+connectionheader builder builder   connectionheader newbuilder
+builder setprotocol protocol    null ?     protocol getname
+userinformation userinfopb
+if   userinfopb   getuserinfo ticket      null
+builder setuserinfo userinfopb
+builder setcellblockcodecclass this codec getclass   getcanonicalname
+if  this compressor    null
+builder setcellblockcompressorclass this compressor getclass   getcanonicalname
+this header   builder build
+this setname     socketfactory hashcode
+remoteid getaddress   tostring
+ticket  null ?
+ticket getusername
+this setdaemon true
+private userinformation getuserinfo usergroupinformation ugi
+if  ugi    null    authmethod    authmethod digest
+// don't send user for token auth
+return null
+userinformation builder userinfopb   userinformation newbuilder
+if  authmethod    authmethod kerberos
+// send effective user for kerberos auth
+userinfopb seteffectiveuser ugi getusername
+else if  authmethod    authmethod simple
+//send both effective user and real user for simple auth
+userinfopb seteffectiveuser ugi getusername
+if  ugi getrealuser      null
+userinfopb setrealuser ugi getrealuser   getusername
+return userinfopb build
+/** update lastactivity with the current time. */
+protected void touch
+lastactivity set system currenttimemillis
+/**
+* add a call to this connection's call queue and notify
+* a listener; synchronized. if the connection is dead, the call is not added, and the
+* caller is notified.
+* this function can return a connection that is already marked as 'shouldcloseconnection'
+*  it is up to the user code to check this status.
+* @param call to add
+*/
+protected synchronized void addcall call call
+// if the connection is about to close, we manage this as if the call was already added
+//  to the connection calls list. if not, the connection creations are serialized, as
+//  mentioned in hbase-6364
+if  this shouldcloseconnection get
+if  this closeexception    null
+call setexception new ioexception
+call id       remoteid
+else
+call setexception this closeexception
+synchronized  call
+call notifyall
+else
+calls put call id  call
+notify
+/** this class sends a ping to the remote side when timeout on
+* reading. if no failure is detected, it retries until at least
+* a byte is read.
+*/
+protected class pinginputstream extends filterinputstream
+/* constructor */
+protected pinginputstream inputstream in
+super in
+/* process timeout exception
+* if the connection is not going to be closed, send a ping.
+* otherwise, throw the timeout exception.
+*/
+private void handletimeout sockettimeoutexception e  throws ioexception
+if  shouldcloseconnection get       running get
+remoteid rpctimeout > 0
+throw e
+sendping
+/** read a byte from the stream.
+* send a ping if timeout on read. retries if no failure is detected
+* until a byte is read.
+* @throws ioexception for any io problem other than socket timeout
+*/
+@override
+public int read   throws ioexception
+do
+try
+return super read
+catch  sockettimeoutexception e
+handletimeout e
+while  true
+/** read bytes into a buffer starting from offset <code>off</code>
+* send a ping if timeout on read. retries if no failure is detected
+* until a byte is read.
+*
+* @return the total number of bytes read; -1 if the connection is closed.
+*/
+@override
+public int read byte buf  int off  int len  throws ioexception
+do
+try
+return super read buf  off  len
+catch  sockettimeoutexception e
+handletimeout e
+while  true
+protected synchronized void setupconnection   throws ioexception
+short iofailures   0
+short timeoutfailures   0
+while  true
+try
+this socket   socketfactory createsocket
+this socket settcpnodelay tcpnodelay
+this socket setkeepalive tcpkeepalive
+// connection time out is 20s
+netutils connect this socket  remoteid getaddress
+getsockettimeout conf
+if  remoteid rpctimeout > 0
+pinginterval   remoteid rpctimeout     overwrite pinginterval
+this socket setsotimeout pinginterval
+return
+catch  sockettimeoutexception toe
+/* the max number of retries is 45,
+* which amounts to 20s*45 = 15 minutes retries.
+*/
+handleconnectionfailure timeoutfailures    maxretries  toe
+catch  ioexception ie
+handleconnectionfailure iofailures    maxretries  ie
+protected void closeconnection
+// close the current connection
+if  socket    null
+try
+socket close
+catch  ioexception e
+log warn    e
+// set socket to null so that the next call to setupiostreams
+// can start the process of connect all over again.
+socket   null
+/**
+*  handle connection failures
+*
+* if the current number of retries is equal to the max number of retries,
+* stop retrying and throw the exception; otherwise backoff n seconds and
+* try connecting again.
+*
+* this method is only called from inside setupiostreams(), which is
+* synchronized. hence the sleep is synchronized; the locks will be retained.
+*
+* @param curretries current number of retries
+* @param maxretries max number of retries allowed
+* @param ioe failure reason
+* @throws ioexception if max number of retries is reached
+*/
+private void handleconnectionfailure
+int curretries  int maxretries  ioexception ioe  throws ioexception
+closeconnection
+// throw the exception if the maximum number of retries is reached
+if  curretries >  maxretries
+throw ioe
+// otherwise back off and retry
+try
+thread sleep failuresleep
+catch  interruptedexception ignored
+log info     remoteid getaddress
+failuresleep       curretries
+/* wait till someone signals us to start reading rpc response or
+* it is idle too long, it is marked as to be closed,
+* or the client is marked as not running.
+*
+* return true if it is time to read a response; false otherwise.
+*/
+protected synchronized boolean waitforwork
+if  calls isempty       shouldcloseconnection get       running get
+long timeout   maxidletime    system currenttimemillis   lastactivity get
+if  timeout>0
+try
+wait timeout
+catch  interruptedexception ignored
+if   calls isempty       shouldcloseconnection get      running get
+return true
+else if  shouldcloseconnection get
+return false
+else if  calls isempty         idle connection closed or stopped
+markclosed null
+return false
+else      get stopped but there are still pending requests
+markclosed  ioexception new ioexception   initcause
+new interruptedexception
+return false
+public inetsocketaddress getremoteaddress
+return remoteid getaddress
+/* send a ping to the server if the time elapsed
+* since last i/o activity is equal to or greater than the ping interval
+*/
+protected synchronized void sendping   throws ioexception
+// can we do tcp keepalive instead of this pinging?
+long curtime   system currenttimemillis
+if   curtime   lastactivity get   >  pinginterval
+lastactivity set curtime
+//noinspection synchronizeonnonfinalfield
+synchronized  this out
+out writeint ping_call_id
+out flush
+@override
+public void run
+if  log isdebugenabled
+log debug getname         connections size
+try
+while  waitforwork       wait here for work   read or close connection
+readresponse
+catch  throwable t
+log warn getname        t
+markclosed new ioexception    t
+close
+if  log isdebugenabled
+log debug getname         connections size
+private synchronized void disposesasl
+if  saslrpcclient    null
+try
+saslrpcclient dispose
+saslrpcclient   null
+catch  ioexception ioe
+log error    ioe
+private synchronized boolean shouldauthenticateoverkrb   throws ioexception
+usergroupinformation loginuser   usergroupinformation getloginuser
+usergroupinformation currentuser
+usergroupinformation getcurrentuser
+usergroupinformation realuser   currentuser getrealuser
+return authmethod    authmethod kerberos
+loginuser    null
+//make sure user logged in using kerberos either keytab or tgt
+loginuser haskerberoscredentials
+// relogin only in case it is the login user (e.g. jt)
+// or superuser (like oozie).
+loginuser equals currentuser     loginuser equals realuser
+private synchronized boolean setupsaslconnection final inputstream in2
+final outputstream out2  throws ioexception
+saslrpcclient   new hbasesaslrpcclient authmethod  token  serverprincipal
+return saslrpcclient saslconnect in2  out2
+/**
+* if multiple clients with the same principal try to connect
+* to the same server at the same time, the server assumes a
+* replay attack is in progress. this is a feature of kerberos.
+* in order to work around this, what is done is that the client
+* backs off randomly and tries to initiate the connection
+* again.
+* the other problem is to do with ticket expiry. to handle that,
+* a relogin is attempted.
+* <p>
+* the retry logic is governed by the {@link #shouldauthenticateoverkrb}
+* method. in case when the user doesn't have valid credentials, we don't
+* need to retry (from cache or ticket). in such cases, it is prudent to
+* throw a runtime exception when we receive a saslexception from the
+* underlying authentication implementation, so there is no retry from
+* other high level (for eg, hcm or hbaseadmin).
+* </p>
+*/
+private synchronized void handlesaslconnectionfailure
+final int currretries
+final int maxretries  final exception ex  final random rand
+final usergroupinformation user
+throws ioexception  interruptedexception
+user doas new privilegedexceptionaction<object>
+public object run   throws ioexception  interruptedexception
+closeconnection
+if  shouldauthenticateoverkrb
+if  currretries < maxretries
+log debug
+ex
+//try re-login
+if  usergroupinformation isloginkeytabbased
+usergroupinformation getloginuser   reloginfromkeytab
+else
+usergroupinformation getloginuser   reloginfromticketcache
+disposesasl
+//have granularity of milliseconds
+//we are sleeping with the connection lock held but since this
+//connection instance is being used for connecting to the server
+//in question, it is okay
+thread sleep  rand nextint reloginmaxbackoff    1
+return null
+else
+string msg
+usergroupinformation getloginuser   getusername
+serverprincipal
+log warn msg
+throw  ioexception  new ioexception msg  initcause ex
+else
+log warn
+ex
+if  ex instanceof remoteexception
+throw  remoteexception ex
+if  ex instanceof saslexception
+string msg
+log fatal msg  ex
+throw new runtimeexception msg  ex
+throw new ioexception ex
+protected synchronized void setupiostreams
+throws ioexception  interruptedexception
+if  socket    null    shouldcloseconnection get
+return
+if  failedservers isfailedserver remoteid getaddress
+if  log isdebugenabled
+log debug     server
+ioexception e   new failedserverexception
+server
+markclosed e
+close
+throw e
+try
+if  log isdebugenabled
+log debug     server
+short numretries   0
+final short max_retries   5
+random rand   null
+while  true
+setupconnection
+inputstream instream   netutils getinputstream socket
+outputstream outstream   netutils getoutputstream socket
+// write out the preamble -- magic, version, and auth to use.
+writeconnectionheaderpreamble outstream
+if  usesasl
+final inputstream in2   instream
+final outputstream out2   outstream
+usergroupinformation ticket   remoteid getticket   getugi
+if  authmethod    authmethod kerberos
+if  ticket    null    ticket getrealuser      null
+ticket   ticket getrealuser
+boolean continuesasl   false
+try
+if  ticket    null
+throw new nullpointerexception
+else
+continuesasl
+ticket doas new privilegedexceptionaction<boolean>
+@override
+public boolean run   throws ioexception
+return setupsaslconnection in2  out2
+catch  exception ex
+if  rand    null
+rand   new random
+handlesaslconnectionfailure numretries    max_retries  ex  rand  ticket
+continue
+if  continuesasl
+// sasl connect is successful. let's set up sasl i/o streams.
+instream   saslrpcclient getinputstream instream
+outstream   saslrpcclient getoutputstream outstream
+else
+// fall back to simple auth because server told us so.
+authmethod   authmethod simple
+usesasl   false
+this in   new datainputstream new bufferedinputstream new pinginputstream instream
+this out   new dataoutputstream new bufferedoutputstream outstream
+// now write out the connection header
+writeconnectionheader
+// update last activity time
+touch
+// start the receiver thread after the socket connection has been set up
+start
+return
+catch  throwable t
+failedservers addtofailedservers remoteid address
+ioexception e   null
+if  t instanceof ioexception
+e    ioexception t
+markclosed e
+else
+e   new ioexception    t
+markclosed e
+close
+throw e
+/**
+* write the rpc header: <magic word -- 'hbas'> <onebyte_version> <onebyte_auth_type>
+*/
+private void writeconnectionheaderpreamble outputstream outstream  throws ioexception
+// assemble the preamble up in a buffer first and then send it.  writing individual elements,
+// they are getting sent across piecemeal according to wireshark and then server is messing
+// up the reading on occasion (the passed in stream is not buffered yet).
+// preamble is six bytes -- 'hbas' + version + auth_code
+int rpcheaderlen   hconstants rpc_header array   length
+byte  preamble   new byte
+system arraycopy hconstants rpc_header array    0  preamble  0  rpcheaderlen
+preamble   hconstants rpc_current_version
+preamble   authmethod code
+outstream write preamble
+outstream flush
+/**
+* write the connection header.
+* out is not synchronized because only the first thread does this.
+*/
+private void writeconnectionheader   throws ioexception
+this out writeint this header getserializedsize
+this header writeto this out
+this out flush
+/** close the connection. */
+protected synchronized void close
+if   shouldcloseconnection get
+log error getname
+return
+// release the resources
+// first thing to do;take the connection out of the connection list
+synchronized  connections
+if  connections get remoteid     this
+connections remove remoteid
+// close the streams and therefore the socket
+ioutils closestream out
+ioutils closestream in
+disposesasl
+// clean up all calls
+if  closeexception    null
+if   calls isempty
+log warn getname
+calls size
+// clean up calls anyway
+closeexception   new ioexception
+cleanupcalls
+else
+// log the info
+if  log isdebugenabled
+log debug getname         server
+closeexception getmessage   closeexception
+// cleanup calls
+cleanupcalls
+if  log isdebugenabled
+log debug getname
+/**
+* initiates a call by sending the parameter to the remote server.
+* note: this is not called from the connection thread, but by other
+* threads.
+* @param call
+* @see #readresponse()
+*/
+protected void writerequest call call
+if  shouldcloseconnection get    return
+try
+requestheader builder builder   requestheader newbuilder
+builder setcallid call id
+if  trace istracing
+span s   trace currenttrace
+builder settraceinfo rpctinfo newbuilder
+setparentid s getspanid    settraceid s gettraceid
+builder setmethodname call method getname
+builder setrequestparam call param    null
+bytebuffer cellblock   ipcutil buildcellblock this codec  this compressor  call cells
+if  cellblock    null
+cellblockmeta builder cellblockbuilder   cellblockmeta newbuilder
+cellblockbuilder setlength cellblock limit
+builder setcellblockmeta cellblockbuilder build
+//noinspection synchronizeonnonfinalfield
+requestheader header   builder build
+synchronized  this out       findbugs is2_inconsistent_sync
+ipcutil write this out  header  call param  cellblock
+if  log isdebugenabled
+log debug getname         textformat shortdebugstring header
+catch ioexception e
+markclosed e
+/* receive a response.
+* because only one receiver, so no synchronization on in.
+*/
+protected void readresponse
+if  shouldcloseconnection get    return
+touch
+try
+// see hbaseserver.call.setresponse for where we write out the response.
+// total size of the response.  unused.  but have to read it in anyways.
+int totalsize     in readint
+// read the header
+responseheader responseheader   responseheader parsedelimitedfrom in
+int id   responseheader getcallid
+if  log isdebugenabled
+log debug getname
+textformat shortdebugstring responseheader
+call call   calls get id
+if  responseheader hasexception
+exceptionresponse exceptionresponse   responseheader getexception
+remoteexception re   createremoteexception exceptionresponse
+if  isfatalconnectionexception exceptionresponse
+markclosed re
+else
+if  call    null  call setexception re
+else
+message rpcresponsetype
+try
+// todo: why pb engine pollution in here in this class?  fix.
+rpcresponsetype
+protobufrpcclientengine invoker getreturnprototype
+reflectioncache getmethod remoteid getprotocol    call method getname
+catch  exception e
+throw new runtimeexception e     local exception
+message value   null
+if  rpcresponsetype    null
+builder builder   rpcresponsetype newbuilderfortype
+builder mergedelimitedfrom in
+value   builder build
+cellscanner cellblockscanner   null
+if  responseheader hascellblockmeta
+int size   responseheader getcellblockmeta   getlength
+byte  cellblock   new byte
+ioutils readfully this in  cellblock  0  cellblock length
+cellblockscanner   ipcutil createcellscanner this codec  this compressor  cellblock
+// it's possible that this call may have been cleaned up due to a rpc
+// timeout, so check if it still exists before setting the value.
+if  call    null  call setresponse value  cellblockscanner
+if  call    null  calls remove id
+catch  ioexception e
+if  e instanceof sockettimeoutexception    remoteid rpctimeout > 0
+// clean up open calls but don't treat this as a fatal condition,
+// since we expect certain responses to not make it by the specified
+// {@link connectionid#rpctimeout}.
+closeexception   e
+else
+// since the server did not respond within the default ping interval
+// time, treat this as a fatal condition and close this connection
+markclosed e
+finally
+if  remoteid rpctimeout > 0
+cleanupcalls remoteid rpctimeout
+/**
+* @param e
+* @return true if the exception is a fatal connection exception.
+*/
+private boolean isfatalconnectionexception final exceptionresponse e
+return e getexceptionclassname
+equals fatalconnectionexception class getname
+/**
+* @param e
+* @return remoteexception made from passed <code>e</code>
+*/
+private remoteexception createremoteexception final exceptionresponse e
+string innerexceptionclassname   e getexceptionclassname
+boolean donotretry   e getdonotretry
+return e hashostname  ?
+// if a hostname then add it to the remotewithextrasexception
+new remotewithextrasexception innerexceptionclassname
+e getstacktrace    e gethostname    e getport    donotretry
+new remotewithextrasexception innerexceptionclassname
+e getstacktrace    donotretry
+protected synchronized void markclosed ioexception e
+if  shouldcloseconnection compareandset false  true
+closeexception   e
+notifyall
+/* cleanup all calls and mark them as done */
+protected void cleanupcalls
+cleanupcalls 0
+protected void cleanupcalls long rpctimeout
+iterator<entry<integer  call>> itor   calls entryset   iterator
+while  itor hasnext
+call c   itor next   getvalue
+long waittime   system currenttimemillis     c getstarttime
+if  waittime >  rpctimeout
+if  this closeexception    null
+// there may be no exception in the case that there are many calls
+// being multiplexed over this connection and these are succeeding
+// fine while this call object is taking a long time to finish
+// over on the server; e.g. i just asked the regionserver to bulk
+// open 3k regions or its a big fat multiput into a heavily-loaded
+// server (perhaps this only happens at the extremes?)
+this closeexception   new calltimeoutexception     c id
+waittime       rpctimeout
+c setexception this closeexception
+synchronized  c
+c notifyall
+itor remove
+else
+break
+try
+if   calls isempty
+call firstcall   calls get calls firstkey
+long maxwaittime   system currenttimemillis     firstcall getstarttime
+if  maxwaittime < rpctimeout
+rpctimeout    maxwaittime
+if   shouldcloseconnection get
+closeexception   null
+if  socket    null
+socket setsotimeout  int  rpctimeout
+catch  socketexception e
+log debug
+/**
+* client-side call timeout
+*/
+@suppresswarnings
+public static class calltimeoutexception extends ioexception
+public calltimeoutexception final string msg
+super msg
+/**
+* construct an ipc client whose values are of the {@link message}
+* class.
+* @param conf configuration
+* @param factory socket factory
+*/
+public hbaseclient configuration conf  string clusterid  socketfactory factory
+this maxidletime
+conf getint    10000     10s
+this maxretries   conf getint    0
+this failuresleep   conf getint    1000
+this tcpnodelay   conf getboolean    true
+this tcpkeepalive   conf getboolean    true
+this pinginterval   getpinginterval conf
+if  log isdebugenabled
+log debug     this pinginterval
+this ipcutil   new ipcutil conf
+this conf   conf
+this codec   getcodec conf
+this compressor   getcompressor conf
+this socketfactory   factory
+this clusterid   clusterid    null ? clusterid   hconstants cluster_id_default
+this connections   new poolmap<connectionid  connection>
+getpooltype conf   getpoolsize conf
+this failedservers   new failedservers conf
+/**
+* encapsulate the ugly casting and runtimeexception conversion in private method.
+* @param conf
+* @return codec to use on this client.
+*/
+private static codec getcodec final configuration conf
+string classname   conf get    keyvaluecodec class getcanonicalname
+try
+return  codec class forname classname  newinstance
+catch  exception e
+throw new runtimeexception     classname  e
+/**
+* encapsulate the ugly casting and runtimeexception conversion in private method.
+* @param conf
+* @return the compressor to use on this client.
+*/
+private static compressioncodec getcompressor final configuration conf
+string classname   conf get    null
+if  classname    null    classname isempty    return null
+try
+return  compressioncodec class forname classname  newinstance
+catch  exception e
+throw new runtimeexception     classname  e
+/**
+* construct an ipc client with the default socketfactory
+* @param conf configuration
+*/
+public hbaseclient configuration conf  string clusterid
+this conf  clusterid  netutils getdefaultsocketfactory conf
+/**
+* return the pool type specified in the configuration, which must be set to
+* either {@link pooltype#roundrobin} or {@link pooltype#threadlocal},
+* otherwise default to the former.
+*
+* for applications with many user threads, use a small round-robin pool. for
+* applications with few user threads, you may want to try using a
+* thread-local pool. in any case, the number of {@link hbaseclient} instances
+* should not exceed the operating system's hard limit on the number of
+* connections.
+*
+* @param config configuration
+* @return either a {@link pooltype#roundrobin} or
+*         {@link pooltype#threadlocal}
+*/
+protected static pooltype getpooltype configuration config
+return pooltype valueof config get hconstants hbase_client_ipc_pool_type
+pooltype roundrobin  pooltype threadlocal
+/**
+* return the pool size specified in the configuration, which is applicable only if
+* the pool type is {@link pooltype#roundrobin}.
+*
+* @param config
+* @return the maximum pool size
+*/
+protected static int getpoolsize configuration config
+return config getint hconstants hbase_client_ipc_pool_size  1
+/** return the socket factory of this client
+*
+* @return this client's socket factory
+*/
+socketfactory getsocketfactory
+return socketfactory
+/** stop all threads related to this client.  no further calls may be made
+* using this client. */
+public void stop
+if  log isdebugenabled
+log debug
+if   running compareandset true  false
+return
+// wake up all connections
+synchronized  connections
+for  connection conn   connections values
+conn interrupt
+// wait until all connections are closed
+while   connections isempty
+try
+thread sleep 100
+catch  interruptedexception ignored
+/** make a call, passing <code>param</code>, to the ipc server running at
+* <code>address</code> which is servicing the <code>protocol</code> protocol,
+* with the <code>ticket</code> credentials, returning the value.
+* throws exceptions if there are network problems or if the remote code
+* threw an exception.
+* @param method
+* @param param
+* @param cells
+* @param addr
+* @param protocol
+* @param ticket be careful which ticket you pass.  a new user will mean a new connection.
+* {@link user#getcurrent()} makes a new instance of user each time so will be a new connection
+* each time.
+* @param rpctimeout
+* @return a pair with the message response and the cell data (if any).
+* @throws interruptedexception
+* @throws ioexception
+*/
+public pair<message  cellscanner> call method method  message param  cellscanner cells
+inetsocketaddress addr  class<? extends ipcprotocol> protocol  user ticket  int rpctimeout
+throws interruptedexception  ioexception
+call call   new call method  param  cells
+connection connection
+getconnection addr  protocol  ticket  rpctimeout  call  this codec  this compressor
+connection writerequest call                      send the parameter
+boolean interrupted   false
+//noinspection synchronizationonlocalvariableormethodparameter
+synchronized  call
+while   call done
+try
+call wait                                 wait for the result
+catch  interruptedexception ignored
+// save the fact that we were interrupted
+interrupted   true
+if  interrupted
+// set the interrupt flag now that we are done waiting
+thread currentthread   interrupt
+if  call error    null
+if  call error instanceof remoteexception
+call error fillinstacktrace
+throw call error
+// local exception
+throw wrapexception addr  call error
+return new pair<message  cellscanner> call response  call cells
+/**
+* take an ioexception and the address we were trying to connect to
+* and return an ioexception with the input exception as the cause.
+* the new exception provides the stack trace of the place where
+* the exception is thrown and some extra diagnostics information.
+* if the exception is connectexception or sockettimeoutexception,
+* return a new one of the same type; otherwise return an ioexception.
+*
+* @param addr target address
+* @param exception the relevant exception
+* @return an exception to throw
+*/
+protected ioexception wrapexception inetsocketaddress addr
+ioexception exception
+if  exception instanceof connectexception
+//connection refused; include the host:port in the error
+return  connectexception new connectexception
+addr       exception
+initcause exception
+else if  exception instanceof sockettimeoutexception
+return  sockettimeoutexception new sockettimeoutexception     addr
+exception  initcause exception
+else
+return  ioexception new ioexception     addr
+exception  initcause exception
+/**
+* interrupt the connections to the given ip:port server. this should be called if the server
+*  is known as actually dead. this will not prevent current operation to be retried, and,
+*  depending on their own behavior, they may retry on the same server. this can be a feature,
+*  for example at startup. in any case, they're likely to get connection refused (if the
+*  process died) or no route to host: i.e. there next retries should be faster and with a
+*  safe exception.
+*/
+public void cancelconnections string hostname  int port  ioexception ioe
+synchronized  connections
+for  connection connection   connections values
+if  connection isalive
+connection getremoteaddress   getport      port
+connection getremoteaddress   gethostname   equals hostname
+log info     hostname       port
+connection remoteid
+connection closeconnection
+// we could do a connection.interrupt(), but it's safer not to do it, as the
+//  interrupted exception behavior is not defined nor enforced enough.
+/* get a connection from the pool, or create a new one and add it to the
+* pool.  connections to a given host/port are reused. */
+protected connection getconnection inetsocketaddress addr  class<? extends ipcprotocol> protocol
+user ticket  int rpctimeout  call call  final codec codec  final compressioncodec compressor
+throws ioexception  interruptedexception
+if   running get
+// the client is stopped
+throw new ioexception
+connection connection
+/* we could avoid this allocation for each rpc by having a
+* connectionsid object and with set() method. we need to manage the
+* refs for keys in hashmap properly. for now its ok.
+*/
+connectionid remoteid   new connectionid addr  protocol  ticket  rpctimeout
+synchronized  connections
+connection   connections get remoteid
+if  connection    null
+connection   createconnection remoteid  this codec  this compressor
+connections put remoteid  connection
+connection addcall call
+//we don't invoke the method below inside "synchronized (connections)"
+//block above. the reason for that is if the server happens to be slow,
+//it will take longer to establish a connection and that will slow the
+//entire system down.
+//moreover, if the connection is currently created, there will be many threads
+// waiting here; as setupiostreams is synchronized. if the connection fails with a
+// timeout, they will all fail simultaneously. this is checked in setupiostreams.
+connection setupiostreams
+return connection
+/**
+* this class holds the address and the user ticket. the client connections
+* to servers are uniquely identified by <remoteaddress, ticket>
+*/
+protected static class connectionid
+final inetsocketaddress address
+final user ticket
+final int rpctimeout
+class<? extends ipcprotocol> protocol
+private static final int prime   16777619
+connectionid inetsocketaddress address  class<? extends ipcprotocol> protocol
+user ticket
+int rpctimeout
+this protocol   protocol
+this address   address
+this ticket   ticket
+this rpctimeout   rpctimeout
+inetsocketaddress getaddress
+return address
+class<? extends ipcprotocol> getprotocol
+return protocol
+user getticket
+return ticket
+@override
+public string tostring
+return this address tostring         this protocol       this ticket
+this rpctimeout
+@override
+public boolean equals object obj
+if  obj instanceof connectionid
+connectionid id    connectionid  obj
+return address equals id address     protocol    id protocol
+ticket    null    ticket equals id ticket
+ticket    id ticket      rpctimeout    id rpctimeout
+return false
+@override     simply use the default object#hashcode   ?
+public int hashcode
+int hashcode    address hashcode     prime    prime   system identityhashcode protocol  ^
+ticket    null ? 0   ticket hashcode       ^ rpctimeout
+return hashcode

@@ -1,0 +1,1416 @@
+/**
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase client
+import java io closeable
+import java io ioexception
+import java lang reflect proxy
+import java lang reflect undeclaredthrowableexception
+import java net inetsocketaddress
+import java util arraylist
+import java util collections
+import java util hashmap
+import java util hashset
+import java util linkedhashmap
+import java util list
+import java util map
+import java util map entry
+import java util set
+import java util treemap
+import java util concurrent callable
+import java util concurrent concurrenthashmap
+import java util concurrent copyonwritearrayset
+import java util concurrent executionexception
+import java util concurrent executorservice
+import java util concurrent future
+import java util concurrent atomic atomicboolean
+import java util concurrent atomic atomicinteger
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop hbase donotretryioexception
+import org apache hadoop hbase hbaseconfiguration
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase hregionlocation
+import org apache hadoop hbase hserveraddress
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase masteraddresstracker
+import org apache hadoop hbase masternotrunningexception
+import org apache hadoop hbase remoteexceptionhandler
+import org apache hadoop hbase servername
+import org apache hadoop hbase tablenotfoundexception
+import org apache hadoop hbase zookeeperconnectionexception
+import org apache hadoop hbase client metascanner metascannervisitor
+import org apache hadoop hbase client coprocessor batch
+import org apache hadoop hbase ipc coprocessorprotocol
+import org apache hadoop hbase ipc execrpcinvoker
+import org apache hadoop hbase ipc hbaserpc
+import org apache hadoop hbase ipc hmasterinterface
+import org apache hadoop hbase ipc hregioninterface
+import org apache hadoop hbase security user
+import org apache hadoop hbase util addressing
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util pair
+import org apache hadoop hbase util softvaluesortedmap
+import org apache hadoop hbase util writables
+import org apache hadoop hbase zookeeper clusterid
+import org apache hadoop hbase zookeeper rootregiontracker
+import org apache hadoop hbase zookeeper zktable
+import org apache hadoop hbase zookeeper zkutil
+import org apache hadoop hbase zookeeper zookeeperwatcher
+import org apache hadoop ipc remoteexception
+import org apache zookeeper keeperexception
+/**
+* a non-instantiable class that manages {@link hconnection}s.
+* this class has a static map of {@link hconnection} instances keyed by
+* {@link configuration}; all invocations of {@link #getconnection(configuration)}
+* that pass the same {@link configuration} instance will be returned the same
+* {@link  hconnection} instance (adding properties to a configuration
+* instance does not change its object identity).  sharing {@link hconnection}
+* instances is usually what you want; all clients of the {@link hconnection}
+* instances share the hconnections' cache of region locations rather than each
+* having to discover for itself the location of meta, root, etc.  it makes
+* sense for the likes of the pool of htables class {@link htablepool}, for
+* instance (if concerned that a single {@link hconnection} is insufficient
+* for sharing amongst clients in say an heavily-multithreaded environment,
+* in practise its not proven to be an issue.  besides, {@link hconnection} is
+* implemented atop hadoop rpc and as of this writing, hadoop rpc does a
+* connection per cluster-member, exclusively).
+*
+* <p>but sharing connections
+* makes clean up of {@link hconnection} instances a little awkward.  currently,
+* clients cleanup by calling
+* {@link #deleteconnection(configuration, boolean)}.  this will shutdown the
+* zookeeper connection the hconnection was using and clean up all
+* hconnection resources as well as stopping proxies to servers out on the
+* cluster. not running the cleanup will not end the world; it'll
+* just stall the closeup some and spew some zookeeper connection failed
+* messages into the log.  running the cleanup on a {@link hconnection} that is
+* subsequently used by another will cause breakage so be careful running
+* cleanup.
+* <p>to create a {@link hconnection} that is not shared by others, you can
+* create a new {@link configuration} instance, pass this new instance to
+* {@link #getconnection(configuration)}, and then when done, close it up by
+* doing something like the following:
+* <pre>
+* {@code
+* configuration newconfig = new configuration(originalconf);
+* hconnection connection = hconnectionmanager.getconnection(newconfig);
+* // use the connection to your hearts' delight and then when done...
+* hconnectionmanager.deleteconnection(newconfig, true);
+* }
+* </pre>
+* <p>cleanup used to be done inside in a shutdown hook.  on startup we'd
+* register a shutdown hook that called {@link #deleteallconnections(boolean)}
+* on its way out but the order in which shutdown hooks run is not defined so
+* were problematic for clients of hconnection that wanted to register their
+* own shutdown hooks so we removed ours though this shifts the onus for
+* cleanup to the client.
+*/
+@suppresswarnings
+public class hconnectionmanager
+// an lru map of hconnectionkey -> hconnection (tableserver).  all
+// access must be synchronized.  this map is not private because tests
+// need to be able to tinker with it.
+static final map<hconnectionkey  hconnectionimplementation> hbase_instances
+public static final int max_cached_hbase_instances
+private static log log   logfactory getlog hconnectionmanager class
+static
+// we set instances to one more than the value specified for {@link
+// hconstants#zookeeper_max_client_cnxns}. by default, the zk default max
+// connections to the ensemble from the one client is 30, so in that case we
+// should run into zk issues before the lru hit this value of 31.
+max_cached_hbase_instances   hbaseconfiguration create   getint
+hconstants zookeeper_max_client_cnxns
+hconstants default_zookeper_max_client_cnxns    1
+hbase_instances   new linkedhashmap<hconnectionkey  hconnectionimplementation>
+int   max_cached_hbase_instances   0 75f    1  0 75f  true
+@override
+protected boolean removeeldestentry
+map entry<hconnectionkey  hconnectionimplementation> eldest
+return size   > max_cached_hbase_instances
+/*
+* non-instantiable.
+*/
+protected hconnectionmanager
+super
+/**
+* get the connection that goes with the passed <code>conf</code>
+* configuration instance.
+* if no current connection exists, method creates a new connection for the
+* passed <code>conf</code> instance.
+* @param conf configuration
+* @return hconnection object for <code>conf</code>
+* @throws zookeeperconnectionexception
+*/
+public static hconnection getconnection configuration conf
+throws zookeeperconnectionexception
+hconnectionkey connectionkey   new hconnectionkey conf
+synchronized  hbase_instances
+hconnectionimplementation connection   hbase_instances get connectionkey
+if  connection    null
+connection   new hconnectionimplementation conf  true
+hbase_instances put connectionkey  connection
+connection inccount
+return connection
+/**
+* create a new hconnection instance using the passed <code>conf</code>
+* instance.
+* note: this bypasses the usual hconnection life cycle management!
+* use this with caution, the caller is responsible for closing the
+* created connection.
+* @param conf configuration
+* @return hconnection object for <code>conf</code>
+* @throws zookeeperconnectionexception
+*/
+public static hconnection createconnection configuration conf
+throws zookeeperconnectionexception
+return new hconnectionimplementation conf  false
+/**
+* delete connection information for the instance specified by configuration.
+* if there are no more references to it, this will then close connection to
+* the zookeeper ensemble and let go of all resources.
+*
+* @param conf
+*          configuration whose identity is used to find {@link hconnection}
+*          instance.
+* @param stopproxy
+*          shuts down all the proxy's put up to cluster members including to
+*          cluster hmaster. calls
+*          {@link hbaserpc#stopproxy(org.apache.hadoop.hbase.ipc.versionedprotocol)}
+*          .
+*/
+public static void deleteconnection configuration conf  boolean stopproxy
+deleteconnection new hconnectionkey conf   stopproxy  false
+/**
+* delete stale connection information for the instance specified by configuration.
+* this will then close connection to
+* the zookeeper ensemble and let go of all resources.
+*
+* @param connection
+*/
+public static void deletestaleconnection hconnection connection
+deleteconnection connection  true  true
+/**
+* delete information for all connections.
+* @param stopproxy stop the proxy as well
+* @throws ioexception
+*/
+public static void deleteallconnections boolean stopproxy
+synchronized  hbase_instances
+set<hconnectionkey> connectionkeys   new hashset<hconnectionkey>
+connectionkeys addall hbase_instances keyset
+for  hconnectionkey connectionkey   connectionkeys
+deleteconnection connectionkey  stopproxy  false
+hbase_instances clear
+private static void deleteconnection hconnection connection  boolean stopproxy
+boolean staleconnection
+synchronized  hbase_instances
+for  entry<hconnectionkey  hconnectionimplementation> connectionentry   hbase_instances
+entryset
+if  connectionentry getvalue      connection
+deleteconnection connectionentry getkey    stopproxy  staleconnection
+break
+private static void deleteconnection hconnectionkey connectionkey
+boolean stopproxy  boolean staleconnection
+synchronized  hbase_instances
+hconnectionimplementation connection   hbase_instances
+get connectionkey
+if  connection    null
+connection deccount
+if  connection iszeroreference      staleconnection
+hbase_instances remove connectionkey
+connection close stopproxy
+else if  stopproxy
+connection stopproxyonclose stopproxy
+else
+log error
+connectionkey
+/**
+* it is provided for unit test cases which verify the behavior of region
+* location cache prefetch.
+* @return number of cached regions for the table.
+* @throws zookeeperconnectionexception
+*/
+static int getcachedregioncount configuration conf
+final byte tablename
+throws ioexception
+return execute new hconnectable<integer> conf
+@override
+public integer connect hconnection connection
+return   hconnectionimplementation  connection
+getnumberofcachedregionlocations tablename
+/**
+* it's provided for unit test cases which verify the behavior of region
+* location cache prefetch.
+* @return true if the region where the table and row reside is cached.
+* @throws zookeeperconnectionexception
+*/
+static boolean isregioncached configuration conf
+final byte tablename  final byte row  throws ioexception
+return execute new hconnectable<boolean> conf
+@override
+public boolean connect hconnection connection
+return   hconnectionimplementation  connection  isregioncached tablename  row
+/**
+* this class makes it convenient for one to execute a command in the context
+* of a {@link hconnection} instance based on the given {@link configuration}.
+*
+* <p>
+* if you find yourself wanting to use a {@link hconnection} for a relatively
+* short duration of time, and do not want to deal with the hassle of creating
+* and cleaning up that resource, then you should consider using this
+* convenience class.
+*
+* @param <t>
+*          the return type of the {@link hconnectable#connect(hconnection)}
+*          method.
+*/
+public static abstract class hconnectable<t>
+public configuration conf
+public hconnectable configuration conf
+this conf   conf
+public abstract t connect hconnection connection  throws ioexception
+/**
+* this convenience method invokes the given {@link hconnectable#connect}
+* implementation using a {@link hconnection} instance that lasts just for the
+* duration of that invocation.
+*
+* @param <t> the return type of the connect method
+* @param connectable the {@link hconnectable} instance
+* @return the value returned by the connect method
+* @throws ioexception
+*/
+public static <t> t execute hconnectable<t> connectable  throws ioexception
+if  connectable    null    connectable conf    null
+return null
+configuration conf   connectable conf
+hconnection connection   hconnectionmanager getconnection conf
+boolean connectsucceeded   false
+try
+t returnvalue   connectable connect connection
+connectsucceeded   true
+return returnvalue
+finally
+try
+connection close
+catch  exception e
+if  connectsucceeded
+throw new ioexception     connection
+e
+/**
+* denotes a unique key to a {@link hconnection} instance.
+*
+* in essence, this class captures the properties in {@link configuration}
+* that may be used in the process of establishing a connection. in light of
+* that, if any new such properties are introduced into the mix, they must be
+* added to the {@link hconnectionkey#properties} list.
+*
+*/
+static class hconnectionkey
+public static string connection_properties   new string
+hconstants zookeeper_quorum  hconstants zookeeper_znode_parent
+hconstants zookeeper_client_port
+hconstants zookeeper_recoverable_waittime
+hconstants hbase_client_pause  hconstants hbase_client_retries_number
+hconstants hbase_client_rpc_maxattempts
+hconstants hbase_rpc_timeout_key
+hconstants hbase_client_prefetch_limit
+hconstants hbase_meta_scanner_caching
+hconstants hbase_client_instance_id
+private map<string  string> properties
+private string username
+public hconnectionkey configuration conf
+map<string  string> m   new hashmap<string  string>
+if  conf    null
+for  string property   connection_properties
+string value   conf get property
+if  value    null
+m put property  value
+this properties   collections unmodifiablemap m
+try
+user currentuser   user getcurrent
+if  currentuser    null
+username   currentuser getname
+catch  ioexception ioe
+log warn
+ioe
+@override
+public int hashcode
+final int prime   31
+int result   1
+if  username    null
+result   username hashcode
+for  string property   connection_properties
+string value   properties get property
+if  value    null
+result   prime   result   value hashcode
+return result
+@override
+public boolean equals object obj
+if  this    obj
+return true
+if  obj    null
+return false
+if  getclass      obj getclass
+return false
+hconnectionkey that    hconnectionkey  obj
+if  this username    null     this username equals that username
+return false
+else if  this username    null    that username    null
+return false
+if  this properties    null
+if  that properties    null
+return false
+else
+if  that properties    null
+return false
+for  string property   connection_properties
+string thisvalue   this properties get property
+string thatvalue   that properties get property
+if  thisvalue    thatvalue
+continue
+if  thisvalue    null     thisvalue equals thatvalue
+return false
+return true
+@override
+public string tostring
+return
+properties
+username
+/* encapsulates connection to zookeeper and regionservers.*/
+static class hconnectionimplementation implements hconnection  closeable
+static final log log   logfactory getlog hconnectionimplementation class
+private final class<? extends hregioninterface> serverinterfaceclass
+private final long pause
+private final int numretries
+private final int maxrpcattempts
+private final int rpctimeout
+private final int prefetchregionlimit
+private final object masterlock   new object
+private volatile boolean closed
+private volatile boolean aborted
+private volatile hmasterinterface master
+private volatile boolean masterchecked
+// zookeeper reference
+private volatile zookeeperwatcher zookeeper
+// zookeeper-based master address tracker
+private volatile masteraddresstracker masteraddresstracker
+private volatile rootregiontracker rootregiontracker
+private volatile clusterid clusterid
+private final object metaregionlock   new object
+private final object userregionlock   new object
+private final configuration conf
+// known region hserveraddress.tostring() -> hregioninterface
+private final map<string  hregioninterface> servers
+new concurrenthashmap<string  hregioninterface>
+private final concurrenthashmap<string  string> connectionlock
+new concurrenthashmap<string  string>
+/**
+* map of table to table {@link hregionlocation}s.  the table key is made
+* by doing a {@link bytes#mapkey(byte[])} of the table's name.
+*/
+private final map<integer  softvaluesortedmap<byte   hregionlocation>>
+cachedregionlocations
+new hashmap<integer  softvaluesortedmap<byte   hregionlocation>>
+// the presence of a server in the map implies it's likely that there is an
+// entry in cachedregionlocations that map to this server; but the absence
+// of a server in this map guarentees that there is no entry in cache that
+// maps to the absent server.
+private final set<string> cachedservers
+new hashset<string>
+// region cache prefetch is enabled by default. this set contains all
+// tables whose region cache prefetch are disabled.
+private final set<integer> regioncacheprefetchdisabledtables
+new copyonwritearrayset<integer>
+private boolean stopproxy
+private int refcount
+// indicates whether this connection's life cycle is managed
+private final boolean managed
+/**
+* constructor
+* @param conf configuration object
+*/
+@suppresswarnings
+public hconnectionimplementation configuration conf  boolean managed
+throws zookeeperconnectionexception
+this conf   conf
+this managed   managed
+string serverclassname   conf get hconstants region_server_class
+hconstants default_region_server_class
+this closed   false
+try
+this serverinterfaceclass
+class<? extends hregioninterface>  class forname serverclassname
+catch  classnotfoundexception e
+throw new unsupportedoperationexception
+serverclassname  e
+this pause   conf getlong hconstants hbase_client_pause
+hconstants default_hbase_client_pause
+this numretries   conf getint hconstants hbase_client_retries_number
+hconstants default_hbase_client_retries_number
+this maxrpcattempts   conf getint
+hconstants hbase_client_rpc_maxattempts
+hconstants default_hbase_client_rpc_maxattempts
+this rpctimeout   conf getint
+hconstants hbase_rpc_timeout_key
+hconstants default_hbase_rpc_timeout
+this prefetchregionlimit   conf getint
+hconstants hbase_client_prefetch_limit
+hconstants default_hbase_client_prefetch_limit
+this master   null
+this masterchecked   false
+private synchronized void ensurezookeepertrackers
+throws zookeeperconnectionexception
+// initialize zookeeper and master address manager
+if  zookeeper    null
+zookeeper   getzookeeperwatcher
+if  clusterid    null
+clusterid   new clusterid zookeeper  this
+if  masteraddresstracker    null
+masteraddresstracker   new masteraddresstracker zookeeper  this
+masteraddresstracker start
+if  rootregiontracker    null
+rootregiontracker   new rootregiontracker zookeeper  this
+rootregiontracker start
+private synchronized void resetzookeepertrackers
+if  masteraddresstracker    null
+masteraddresstracker stop
+masteraddresstracker   null
+if  rootregiontracker    null
+rootregiontracker stop
+rootregiontracker   null
+clusterid   null
+if  zookeeper    null
+zookeeper close
+zookeeper   null
+public configuration getconfiguration
+return this conf
+public hmasterinterface getmaster
+throws masternotrunningexception  zookeeperconnectionexception
+// todo: remove.  move to hbaseadmin and redo as a callable!!!
+// check if we already have a good master connection
+try
+if  master    null    master ismasterrunning
+return master
+catch  undeclaredthrowableexception ute
+// log, but ignore, the loop below will attempt to reconnect
+log info    ute getcause
+ensurezookeepertrackers
+checkifbasenodeavailable
+servername sn   null
+synchronized  this masterlock
+this master   null
+for  int tries   0
+this closed
+this masterchecked    this master    null
+tries < numretries
+tries
+try
+sn   masteraddresstracker getmasteraddress
+if  sn    null
+log info
+throw new masternotrunningexception
+if  clusterid hasid
+conf set hconstants cluster_id  clusterid getid
+inetsocketaddress isa
+new inetsocketaddress sn gethostname    sn getport
+hmasterinterface trymaster    hmasterinterface hbaserpc getproxy
+hmasterinterface class  hmasterinterface version  isa  this conf
+this rpctimeout
+if  trymaster ismasterrunning
+this master   trymaster
+this masterlock notifyall
+break
+catch  ioexception e
+if  tries    numretries   1
+// this was our last chance - don't bother sleeping
+log info     tries       numretries
+e
+break
+log info     tries       numretries
+connectionutils getpausetime this pause  tries   e
+// cannot connect to master or it is not running. sleep & retry
+try
+this masterlock wait connectionutils getpausetime this pause  tries
+catch  interruptedexception e
+thread currentthread   interrupt
+throw new runtimeexception
+// avoid re-checking in the future if this is a managed hconnection,
+// even if we failed to acquire a master.
+// (this is to retain the existing behavior before hbase-5058)
+this masterchecked   managed
+if  this master    null
+if  sn    null
+throw new masternotrunningexception
+throw new masternotrunningexception sn tostring
+return this master
+private void checkifbasenodeavailable   throws masternotrunningexception
+if  false    masteraddresstracker checkifbasenodeavailable
+string errormsg
+log error errormsg
+throw new masternotrunningexception errormsg
+public boolean ismasterrunning
+throws masternotrunningexception  zookeeperconnectionexception
+if  this master    null
+getmaster
+boolean isrunning   master ismasterrunning
+if isrunning
+return true
+throw new masternotrunningexception
+public hregionlocation getregionlocation final byte  name
+final byte  row  boolean reload
+throws ioexception
+return reload? relocateregion name  row   locateregion name  row
+public boolean istableenabled byte tablename  throws ioexception
+return testtableonlinestate tablename  true
+public boolean istabledisabled byte tablename  throws ioexception
+return testtableonlinestate tablename  false
+public boolean istableavailable final byte tablename  throws ioexception
+final atomicboolean available   new atomicboolean true
+final atomicinteger regioncount   new atomicinteger 0
+metascannervisitor visitor   new metascannervisitor
+@override
+public boolean processrow result row  throws ioexception
+byte value   row getvalue hconstants catalog_family
+hconstants regioninfo_qualifier
+hregioninfo info   writables gethregioninfoornull value
+if  info    null
+if  bytes equals tablename  info gettablename
+value   row getvalue hconstants catalog_family
+hconstants server_qualifier
+if  value    null
+available set false
+return false
+regioncount incrementandget
+return true
+metascanner metascan conf  visitor
+return available get       regioncount get   > 0
+/*
+* @param true if table is online
+*/
+private boolean testtableonlinestate byte  tablename  boolean online
+throws ioexception
+if  bytes equals tablename  hconstants root_table_name
+// the root region is always enabled
+return online
+getzookeeperwatcher
+string tablenamestr   bytes tostring tablename
+try
+if  online
+return zktable isenabledtable this zookeeper  tablenamestr
+return zktable isdisabledtable this zookeeper  tablenamestr
+catch  keeperexception e
+throw new ioexception    e
+@override
+public hregionlocation locateregion final byte  regionname
+throws ioexception
+// todo implement.  use old stuff or new stuff?
+return null
+@override
+public list<hregionlocation> locateregions final byte  tablename
+throws ioexception
+// todo implement.  use old stuff or new stuff?
+return null
+public hregionlocation locateregion final byte  tablename
+final byte  row
+throws ioexception
+return locateregion tablename  row  true
+public hregionlocation relocateregion final byte  tablename
+final byte  row
+throws ioexception
+return locateregion tablename  row  false
+private hregionlocation locateregion final byte  tablename
+final byte  row  boolean usecache
+throws ioexception
+if  this closed  throw new ioexception tostring
+if  tablename    null    tablename length    0
+throw new illegalargumentexception
+ensurezookeepertrackers
+if  bytes equals tablename  hconstants root_table_name
+try
+servername servername   this rootregiontracker getrootregionlocation
+log debug     this
+servername    null ?    servername tostring
+if  servername    null  return null
+return new hregionlocation hregioninfo root_regioninfo
+servername gethostname    servername getport
+catch  interruptedexception e
+thread currentthread   interrupt
+return null
+else if  bytes equals tablename  hconstants meta_table_name
+return locateregioninmeta hconstants root_table_name  tablename  row
+usecache  metaregionlock
+else
+// region not in the cache - have to go to the meta rs
+return locateregioninmeta hconstants meta_table_name  tablename  row
+usecache  userregionlock
+/*
+* search .meta. for the hregionlocation info that contains the table and
+* row we're seeking. it will prefetch certain number of regions info and
+* save them to the global region cache.
+*/
+private void prefetchregioncache final byte tablename
+final byte row
+// implement a new visitor for metascanner, and use it to walk through
+// the .meta.
+metascannervisitor visitor   new metascannervisitor
+public boolean processrow result result  throws ioexception
+try
+byte value   result getvalue hconstants catalog_family
+hconstants regioninfo_qualifier
+hregioninfo regioninfo   null
+if  value    null
+// convert the row result into the hregionlocation we need!
+regioninfo   writables gethregioninfo value
+// possible we got a region of a different table...
+if   bytes equals regioninfo gettablename
+tablename
+return false     stop scanning
+if  regioninfo isoffline
+// don't cache offline regions
+return true
+value   result getvalue hconstants catalog_family
+hconstants server_qualifier
+if  value    null
+return true      don't cache it
+final string hostandport   bytes tostring value
+string hostname   addressing parsehostname hostandport
+int port   addressing parseport hostandport
+value   result getvalue hconstants catalog_family
+hconstants startcode_qualifier
+// instantiate the location
+hregionlocation loc
+new hregionlocation regioninfo  hostname  port
+// cache this meta entry
+cachelocation tablename  loc
+return true
+catch  runtimeexception e
+throw new ioexception e
+try
+// pre-fetch certain number of regions info at region cache.
+metascanner metascan conf  visitor  tablename  row
+this prefetchregionlimit
+catch  ioexception e
+log warn    e
+/*
+* search one of the meta tables (-root- or .meta.) for the hregionlocation
+* info that contains the table and row we're seeking.
+*/
+private hregionlocation locateregioninmeta final byte  parenttable
+final byte  tablename  final byte  row  boolean usecache
+object regionlockobject
+throws ioexception
+hregionlocation location
+// if we are supposed to be using the cache, look in the cache to see if
+// we already have the region.
+if  usecache
+location   getcachedlocation tablename  row
+if  location    null
+return location
+// build the key of the meta region we should be looking for.
+// the extra 9's on the end are necessary to allow "exact" matches
+// without knowing the precise region names.
+byte  metakey   hregioninfo createregionname tablename  row
+hconstants nines  false
+for  int tries   0  true  tries
+if  tries >  numretries
+throw new noserverforregionexception
+bytes tostringbinary row        numretries
+hregionlocation metalocation   null
+try
+// locate the root or meta region
+metalocation   locateregion parenttable  metakey
+// if null still, go around again.
+if  metalocation    null  continue
+hregioninterface server
+gethregionconnection metalocation gethostname    metalocation getport
+result regioninforow   null
+// this block guards against two threads trying to load the meta
+// region at the same time. the first will load the meta region and
+// the second will use the value that the first one found.
+synchronized  regionlockobject
+// if the parent table is meta, we may want to pre-fetch some
+// region info into the global region cache for this table.
+if  bytes equals parenttable  hconstants meta_table_name
+getregioncacheprefetch tablename
+prefetchregioncache tablename  row
+// check the cache again for a hit in case some other thread made the
+// same query while we were waiting on the lock. if not supposed to
+// be using the cache, delete any existing cached location so it won't
+// interfere.
+if  usecache
+location   getcachedlocation tablename  row
+if  location    null
+return location
+else
+deletecachedlocation tablename  row
+// query the root or meta region for the location of the meta region
+regioninforow   server getclosestrowbefore
+metalocation getregioninfo   getregionname    metakey
+hconstants catalog_family
+if  regioninforow    null
+throw new tablenotfoundexception bytes tostring tablename
+byte  value   regioninforow getvalue hconstants catalog_family
+hconstants regioninfo_qualifier
+if  value    null    value length    0
+throw new ioexception
+bytes tostring parenttable        regioninforow
+// convert the row result into the hregionlocation we need!
+hregioninfo regioninfo    hregioninfo  writables getwritable
+value  new hregioninfo
+// possible we got a region of a different table...
+if   bytes equals regioninfo gettablename    tablename
+throw new tablenotfoundexception
+bytes tostring tablename
+bytes tostring regioninfo gettablename
+if  regioninfo issplit
+throw new regionofflineexception
+regioninfo getregionnameasstring
+if  regioninfo isoffline
+throw new regionofflineexception
+regioninfo getregionnameasstring
+value   regioninforow getvalue hconstants catalog_family
+hconstants server_qualifier
+string hostandport
+if  value    null
+hostandport   bytes tostring value
+if  hostandport equals
+throw new noserverforregionexception
+bytes tostring parenttable
+regioninfo getregionnameasstring
+bytes tostringbinary row
+// instantiate the location
+string hostname   addressing parsehostname hostandport
+int port   addressing parseport hostandport
+location   new hregionlocation regioninfo  hostname  port
+cachelocation tablename  location
+return location
+catch  tablenotfoundexception e
+// if we got this error, probably means the table just plain doesn't
+// exist. rethrow the error immediately. this should always be coming
+// from the htable constructor.
+throw e
+catch  ioexception e
+if  e instanceof remoteexception
+e   remoteexceptionhandler decoderemoteexception  remoteexception  e
+if  tries < numretries   1
+if  log isdebugenabled
+log debug
+bytes tostring parenttable
+metalocation    null ?        metalocation
+tries
+this numretries
+connectionutils getpausetime this pause  tries        e getmessage
+else
+throw e
+// only relocate the parent region if necessary
+if   e instanceof regionofflineexception
+e instanceof noserverforregionexception
+relocateregion parenttable  metakey
+try
+thread sleep connectionutils getpausetime this pause  tries
+catch  interruptedexception e
+thread currentthread   interrupt
+throw new ioexception
+/*
+* search the cache for a location that fits our table and row key.
+* return null if no suitable region is located. todo: synchronization note
+*
+* <p>todo: this method during writing consumes 15% of cpu doing lookup
+* into the soft reference sortedmap.  improve.
+*
+* @param tablename
+* @param row
+* @return null or region location found in cache.
+*/
+hregionlocation getcachedlocation final byte  tablename
+final byte  row
+softvaluesortedmap<byte   hregionlocation> tablelocations
+gettablelocations tablename
+// start to examine the cache. we can only do cache actions
+// if there's something in the cache for this table.
+if  tablelocations isempty
+return null
+hregionlocation possibleregion   tablelocations get row
+if  possibleregion    null
+return possibleregion
+possibleregion   tablelocations lowervaluebykey row
+if  possibleregion    null
+return null
+// make sure that the end key is greater than the row we're looking
+// for, otherwise the row actually belongs in the next region, not
+// this one. the exception case is when the endkey is
+// hconstants.empty_end_row, signifying that the region we're
+// checking is actually the last region in the table.
+byte endkey   possibleregion getregioninfo   getendkey
+if  bytes equals endkey  hconstants empty_end_row
+keyvalue getrowcomparator tablename  comparerows
+endkey  0  endkey length  row  0  row length  > 0
+return possibleregion
+// passed all the way through, so we got nothin - complete cache miss
+return null
+/**
+* delete a cached location
+* @param tablename tablename
+* @param row
+*/
+void deletecachedlocation final byte  tablename  final byte  row
+synchronized  this cachedregionlocations
+map<byte  hregionlocation> tablelocations
+gettablelocations tablename
+// start to examine the cache. we can only do cache actions
+// if there's something in the cache for this table.
+if   tablelocations isempty
+hregionlocation rl   getcachedlocation tablename  row
+if  rl    null
+tablelocations remove rl getregioninfo   getstartkey
+if  log isdebugenabled
+log debug
+rl getregioninfo   getregionnameasstring
+bytes tostring tablename
+bytes tostringbinary row
+@override
+public void clearcaches string sn
+clearcachedlocationforserver sn
+/*
+* delete all cached entries of a table that maps to a specific location.
+*
+* @param tablename
+* @param server
+*/
+private void clearcachedlocationforserver final string server
+boolean deletedsomething   false
+synchronized  this cachedregionlocations
+if   cachedservers contains server
+return
+for  map<byte  hregionlocation> tablelocations
+cachedregionlocations values
+for  entry<byte  hregionlocation> e   tablelocations entryset
+if  e getvalue   gethostnameport   equals server
+tablelocations remove e getkey
+deletedsomething   true
+cachedservers remove server
+if  deletedsomething    log isdebugenabled
+log debug     server
+/*
+* @param tablename
+* @return map of cached locations for passed <code>tablename</code>
+*/
+private softvaluesortedmap<byte   hregionlocation> gettablelocations
+final byte  tablename
+// find the map of cached locations for this table
+integer key   bytes mapkey tablename
+softvaluesortedmap<byte   hregionlocation> result
+synchronized  this cachedregionlocations
+result   this cachedregionlocations get key
+// if tablelocations for this table isn't built yet, make one
+if  result    null
+result   new softvaluesortedmap<byte   hregionlocation>
+bytes bytes_comparator
+this cachedregionlocations put key  result
+return result
+@override
+public void clearregioncache
+synchronized this cachedregionlocations
+this cachedregionlocations clear
+this cachedservers clear
+@override
+public void clearregioncache final byte  tablename
+synchronized  this cachedregionlocations
+this cachedregionlocations remove bytes mapkey tablename
+/*
+* put a newly discovered hregionlocation into the cache.
+*/
+private void cachelocation final byte  tablename
+final hregionlocation location
+byte  startkey   location getregioninfo   getstartkey
+map<byte   hregionlocation> tablelocations
+gettablelocations tablename
+boolean hasnewcache   false
+synchronized  this cachedregionlocations
+cachedservers add location gethostnameport
+hasnewcache    tablelocations put startkey  location     null
+if  hasnewcache
+log debug
+location getregioninfo   getregionnameasstring
+location gethostnameport
+public hregioninterface gethregionconnection hserveraddress hsa
+throws ioexception
+return gethregionconnection hsa  false
+@override
+public hregioninterface gethregionconnection final string hostname
+final int port
+throws ioexception
+return gethregionconnection hostname  port  false
+public hregioninterface gethregionconnection hserveraddress hsa
+boolean master
+throws ioexception
+return gethregionconnection null   1  hsa getinetsocketaddress    master
+@override
+public hregioninterface gethregionconnection final string hostname
+final int port  final boolean master
+throws ioexception
+return gethregionconnection hostname  port  null  master
+/**
+* either the passed <code>isa</code> is null or <code>hostname</code>
+* can be but not both.
+* @param hostname
+* @param port
+* @param isa
+* @param master
+* @return proxy.
+* @throws ioexception
+*/
+hregioninterface gethregionconnection final string hostname  final int port
+final inetsocketaddress isa  final boolean master
+throws ioexception
+if  master  getmaster
+hregioninterface server
+string rsname   null
+if  isa    null
+rsname   addressing createhostandportstr isa gethostname
+isa getport
+else
+rsname   addressing createhostandportstr hostname  port
+ensurezookeepertrackers
+// see if we already have a connection (common case)
+server   this servers get rsname
+if  server    null
+// create a unique lock for this rs (if necessary)
+this connectionlock putifabsent rsname  rsname
+// get the rs lock
+synchronized  this connectionlock get rsname
+// do one more lookup in case we were stalled above
+server   this servers get rsname
+if  server    null
+try
+if  clusterid hasid
+conf set hconstants cluster_id  clusterid getid
+// only create isa when we need to.
+inetsocketaddress address   isa    null? isa
+new inetsocketaddress hostname  port
+// definitely a cache miss. establish an rpc for this rs
+server    hregioninterface  hbaserpc waitforproxy
+serverinterfaceclass  hregioninterface version
+address  this conf
+this maxrpcattempts  this rpctimeout  this rpctimeout
+this servers put addressing createhostandportstr
+address gethostname    address getport     server
+catch  remoteexception e
+log warn    e
+// throw what the remoteexception was carrying.
+throw e unwrapremoteexception
+return server
+/**
+* get the zookeeper instance for this tableservers instance.
+*
+* if zk has not been initialized yet, this will connect to zk.
+* @returns zookeeper reference
+* @throws zookeeperconnectionexception if there's a problem connecting to zk
+*/
+public synchronized zookeeperwatcher getzookeeperwatcher
+throws zookeeperconnectionexception
+if zookeeper    null
+try
+this zookeeper   new zookeeperwatcher conf     this
+catch zookeeperconnectionexception zce
+throw zce
+catch  ioexception e
+throw new zookeeperconnectionexception
+e
+return zookeeper
+public <t> t getregionserverwithretries servercallable<t> callable
+throws ioexception  runtimeexception
+return callable withretries
+public <t> t getregionserverwithoutretries servercallable<t> callable
+throws ioexception  runtimeexception
+return callable withoutretries
+private <r> callable<multiresponse> createcallable final hregionlocation loc
+final multiaction<r> multi  final byte  tablename
+// todo: this does not belong in here!!! st.ack  hconnections should
+// not be dealing in callables; callables have hconnections, not other
+// way around.
+final hconnection connection   this
+return new callable<multiresponse>
+public multiresponse call   throws ioexception
+servercallable<multiresponse> callable
+new servercallable<multiresponse> connection  tablename  null
+public multiresponse call   throws ioexception
+return server multi multi
+@override
+public void connect boolean reload  throws ioexception
+server   connection gethregionconnection loc gethostname    loc getport
+return callable withoutretries
+public void processbatch list<? extends row> list
+final byte tablename
+executorservice pool
+object results  throws ioexception  interruptedexception
+// this belongs in htable!!! not in here.  st.ack
+// results must be the same size as list
+if  results length    list size
+throw new illegalargumentexception
+processbatchcallback list  tablename  pool  results  null
+/**
+* executes the given
+* {@link org.apache.hadoop.hbase.client.coprocessor.batch.call}
+* callable for each row in the
+* given list and invokes
+* {@link org.apache.hadoop.hbase.client.coprocessor.batch.callback#update(byte[], byte[], object)}
+* for each result returned.
+*
+* @param protocol the protocol interface being called
+* @param rows a list of row keys for which the callable should be invoked
+* @param tablename table name for the coprocessor invoked
+* @param pool executorservice used to submit the calls per row
+* @param callable instance on which to invoke
+* {@link org.apache.hadoop.hbase.client.coprocessor.batch.call#call(object)}
+* for each row
+* @param callback instance on which to invoke
+* {@link org.apache.hadoop.hbase.client.coprocessor.batch.callback#update(byte[], byte[], object)}
+* for each result
+* @param <t> the protocol interface type
+* @param <r> the callable's return type
+* @throws ioexception
+*/
+public <t extends coprocessorprotocol r> void processexecs
+final class<t> protocol
+list<byte> rows
+final byte tablename
+executorservice pool
+final batch call<t r> callable
+final batch callback<r> callback
+throws ioexception  throwable
+map<byte future<r>> futures
+new treemap<byte future<r>> bytes bytes_comparator
+for  final byte r   rows
+final execrpcinvoker invoker
+new execrpcinvoker conf  this  protocol  tablename  r
+future<r> future   pool submit
+new callable<r>
+public r call   throws exception
+t instance    t proxy newproxyinstance conf getclassloader
+new class protocol
+invoker
+r result   callable call instance
+byte region   invoker getregionname
+if  callback    null
+callback update region  r  result
+return result
+futures put r  future
+for  map entry<byte future<r>> e   futures entryset
+try
+e getvalue   get
+catch  executionexception ee
+log warn   bytes tostringbinary e getkey     ee
+throw ee getcause
+catch  interruptedexception ie
+thread currentthread   interrupt
+throw new ioexception
+bytes tostringbinary e getkey     ie
+/**
+* parameterized batch processing, allowing varying return types for
+* different {@link row} implementations.
+*/
+public <r> void processbatchcallback
+list<? extends row> list
+byte tablename
+executorservice pool
+object results
+batch callback<r> callback
+throws ioexception  interruptedexception
+// this belongs in htable!!! not in here.  st.ack
+// results must be the same size as list
+if  results length    list size
+throw new illegalargumentexception
+if  list isempty
+return
+// keep track of the most recent servers for any given item for better
+// exceptional reporting.  we keep hregionlocation to save on parsing.
+// later below when we use lastservers, we'll pull what we need from
+// lastservers.
+hregionlocation  lastservers   new hregionlocation
+list<row> workinglist   new arraylist<row> list
+boolean retry   true
+// count that helps presize actions array
+int actioncount   0
+for  int tries   0  tries < numretries    retry    tries
+// sleep first, if this is a retry
+if  tries >  1
+long sleeptime   connectionutils getpausetime this pause  tries
+log debug    tries     sleeptime
+thread sleep sleeptime
+// step 1: break up into regionserver-sized chunks and build the data structs
+map<hregionlocation  multiaction<r>> actionsbyserver
+new hashmap<hregionlocation  multiaction<r>>
+for  int i   0  i < workinglist size    i
+row row   workinglist get i
+if  row    null
+hregionlocation loc   locateregion tablename  row getrow    true
+byte regionname   loc getregioninfo   getregionname
+multiaction<r> actions   actionsbyserver get loc
+if  actions    null
+actions   new multiaction<r>
+actionsbyserver put loc  actions
+action<r> action   new action<r> row  i
+lastservers   loc
+actions add regionname  action
+// step 2: make the requests
+map<hregionlocation  future<multiresponse>> futures
+new hashmap<hregionlocation  future<multiresponse>>
+actionsbyserver size
+for  entry<hregionlocation  multiaction<r>> e  actionsbyserver entryset
+futures put e getkey    pool submit createcallable e getkey    e getvalue    tablename
+// step 3: collect the failures and successes and prepare for retry
+for  entry<hregionlocation  future<multiresponse>> responseperserver
+futures entryset
+hregionlocation loc   responseperserver getkey
+try
+future<multiresponse> future   responseperserver getvalue
+multiresponse resp   future get
+if  resp    null
+// entire server failed
+log debug     loc gethostnameport
+continue
+for  entry<byte  list<pair<integer object>>> e   resp getresults   entryset
+byte regionname   e getkey
+list<pair<integer  object>> regionresults   e getvalue
+for  pair<integer  object> regionresult   regionresults
+if  regionresult    null
+// if the first/only record is 'null' the entire region failed.
+log debug
+bytes tostringbinary regionname
+else
+// result might be an exception, including dnrioe
+results   regionresult getsecond
+if  callback    null      regionresult getsecond   instanceof throwable
+callback update e getkey
+list get regionresult getfirst    getrow
+r regionresult getsecond
+catch  executionexception e
+log warn     loc  e
+// step 4: identify failures and prep for a retry (if applicable).
+// find failures (i.e. null result), and add them to the workinglist (in
+// order), so they can be retried.
+retry   false
+workinglist clear
+actioncount   0
+for  int i   0  i < results length  i
+// if null (fail) or instanceof throwable && not instanceof dnrioe
+// then retry that row. else dont.
+if  results    null
+results instanceof throwable
+results instanceof donotretryioexception
+retry   true
+actioncount
+row row   list get i
+workinglist add row
+deletecachedlocation tablename  row getrow
+else
+if  results    null    results instanceof throwable
+actioncount
+// add null to workinglist, so the order remains consistent with the original list argument.
+workinglist add null
+list<throwable> exceptions   new arraylist<throwable> actioncount
+list<row> actions   new arraylist<row> actioncount
+list<string> addresses   new arraylist<string> actioncount
+for  int i   0   i < results length  i
+if  results    null    results instanceof throwable
+exceptions add  throwable results
+actions add list get i
+addresses add lastservers gethostnameport
+if   exceptions isempty
+throw new retriesexhaustedwithdetailsexception exceptions
+actions
+addresses
+/*
+* return the number of cached region for a table. it will only be called
+* from a unit test.
+*/
+int getnumberofcachedregionlocations final byte tablename
+integer key   bytes mapkey tablename
+synchronized  this cachedregionlocations
+map<byte  hregionlocation> tablelocs
+this cachedregionlocations get key
+if  tablelocs    null
+return 0
+return tablelocs values   size
+/**
+* check the region cache to see whether a region is cached yet or not.
+* called by unit tests.
+* @param tablename tablename
+* @param row row
+* @return region cached or not.
+*/
+boolean isregioncached final byte tablename  final byte row
+hregionlocation location   getcachedlocation tablename  row
+return location    null
+public void setregioncacheprefetch final byte tablename
+final boolean enable
+if   enable
+regioncacheprefetchdisabledtables add bytes mapkey tablename
+else
+regioncacheprefetchdisabledtables remove bytes mapkey tablename
+public boolean getregioncacheprefetch final byte tablename
+return  regioncacheprefetchdisabledtables contains bytes mapkey tablename
+@override
+public void prewarmregioncache byte tablename
+map<hregioninfo  hserveraddress> regions
+for  map entry<hregioninfo  hserveraddress> e   regions entryset
+hserveraddress hsa   e getvalue
+if  hsa    null    hsa getinetsocketaddress      null  continue
+cachelocation tablename
+new hregionlocation e getkey    hsa gethostname    hsa getport
+@override
+public void abort final string msg  throwable t
+if  t instanceof keeperexception
+log info
+if  t instanceof keeperexception sessionexpiredexception
+log info
+resetzookeepertrackers
+return
+if  t    null  log fatal msg  t
+else log fatal msg
+this aborted   true
+close
+@override
+public boolean isclosed
+return this closed
+@override
+public boolean isaborted
+return this aborted
+public int getcurrentnrhrs   throws ioexception
+try
+getzookeeperwatcher
+// we go to zk rather than to master to get count of regions to avoid
+// htable having a master dependency.  see hbase-2828
+return zkutil getnumberofchildren this zookeeper
+this zookeeper rsznode
+catch  keeperexception ke
+throw new ioexception    ke
+public void stopproxyonclose boolean stopproxy
+this stopproxy   stopproxy
+/**
+* increment this client's reference count.
+*/
+void inccount
+refcount
+/**
+* decrement this client's reference count.
+*/
+void deccount
+if  refcount > 0
+refcount
+/**
+* return if this client has no reference
+*
+* @return true if this client has no reference; false otherwise
+*/
+boolean iszeroreference
+return refcount    0
+void close boolean stopproxy
+if  this closed
+return
+if  master    null
+if  stopproxy
+hbaserpc stopproxy master
+master   null
+masterchecked   false
+if  stopproxy
+for  hregioninterface i   servers values
+hbaserpc stopproxy i
+this servers clear
+if  this zookeeper    null
+log info
+long tohexstring this zookeeper getrecoverablezookeeper   getsessionid
+this zookeeper close
+this zookeeper   null
+this closed   true
+public void close
+if  managed
+hconnectionmanager deleteconnection  hconnection this  stopproxy  false
+else
+close true
+if  log istraceenabled    log debug     this zookeeper
+/**
+* close the connection for good, regardless of what the current value of
+* {@link #refcount} is. ideally, {@link refcount} should be zero at this
+* point, which would be the case if all of its consumers close the
+* connection. however, on the off chance that someone is unable to close
+* the connection, perhaps because it bailed out prematurely, the method
+* below will ensure that this {@link connection} instance is cleaned up.
+* caveat: the jvm may take an unknown amount of time to call finalize on an
+* unreachable object, so our hope is that every consumer cleans up after
+* itself, like any good citizen.
+*/
+@override
+protected void finalize   throws throwable
+// pretend as if we are about to release the last remaining reference
+refcount   1
+close
+log debug     this zookeeper
+public htabledescriptor listtables   throws ioexception
+if  this master    null
+this master   getmaster
+htabledescriptor htd   master gethtabledescriptors
+return htd
+public htabledescriptor gethtabledescriptors list<string> tablenames  throws ioexception
+if  tablenames    null    tablenames size      0  return null
+if  this master    null
+this master   getmaster
+return master gethtabledescriptors tablenames
+public htabledescriptor gethtabledescriptor final byte tablename
+throws ioexception
+if  tablename    null    tablename length    0  return null
+if  bytes equals tablename  hconstants root_table_name
+return new unmodifyablehtabledescriptor htabledescriptor root_tabledesc
+if  bytes equals tablename  hconstants meta_table_name
+return htabledescriptor meta_tabledesc
+if  this master    null
+this master   getmaster
+htabledescriptor htabledescriptor   null
+htabledescriptor htds   master gethtabledescriptors
+if  htds    null    htds length > 0
+for  htabledescriptor htd  htds
+if  bytes equals tablename  htd getname
+htabledescriptor   htd
+//htabledescriptor htd = master.gethtabledescriptor(tablename);
+if  htabledescriptor    null
+throw new tablenotfoundexception bytes tostring tablename
+return htabledescriptor
+/**
+* set the number of retries to use serverside when trying to communicate
+* with another server over {@link hconnection}.  used updating catalog
+* tables, etc.  call this method before we create any connections.
+* @param c the configuration instance to set the retries into.
+* @param log used to log what we set in here.
+*/
+public static void setserversidehconnectionretries final configuration c
+final log log
+int hcretries   c getint hconstants hbase_client_retries_number
+hconstants default_hbase_client_retries_number
+// go big.  multiply by 10.  if we can't get to meta after this many retries
+// then something seriously wrong.
+int serversidemultiplier
+c getint    10
+int retries   hcretries   serversidemultiplier
+c setint hconstants hbase_client_retries_number  retries
+log debug     retries

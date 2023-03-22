@@ -1,0 +1,589 @@
+/*
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase client
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop hbase tablename
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hregionlocation
+import org apache hadoop hbase donotretryioexception
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hregionlocation
+import org apache hadoop hbase protobuf generated tracing
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util environmentedgemanager
+import org apache hadoop hbase util pair
+import org cloudera htrace span
+import org cloudera htrace trace
+import java io ioexception
+import java io interruptedioexception
+import java util arraylist
+import java util arrays
+import java util hashmap
+import java util iterator
+import java util list
+import java util map
+import java util concurrent concurrenthashmap
+import java util concurrent concurrentmap
+import java util concurrent executorservice
+import java util concurrent rejectedexecutionexception
+import java util concurrent atomic atomicboolean
+import java util concurrent atomic atomicinteger
+import java util concurrent atomic atomiclong
+/**
+* this class  allows a continuous flow of requests. it's written to be compatible with a
+* synchronous caller such as htable.
+* <p>
+* the caller sends a buffer of operation, by calling submit. this class extract from this list
+* the operations it can send, i.e. the operations that are on region that are not considered
+* as busy. the process is asynchronous, i.e. it returns immediately when if has finished to
+* iterate on the list. if, and only if, the maximum number of current task is reached, the call
+* to submit will block.
+* </p>
+* <p>
+* the class manages internally the retries.
+* </p>
+* <p>
+* the class includes an error marker: it allows to know if an operation has failed or not, and
+* to get the exception details, i.e. the full list of throwables for each attempt. this marker
+* is here to help the backward compatibility in htable. in most (new) cases, it should be
+* managed by the callbacks.
+* </p>
+* <p>
+* a callback is available, in order to: <list>
+* <li>get the result of the operation (failure or success)</li>
+* <li>when an operation fails but could be retried, allows or not to retry</li>
+* <li>when an operation fails for good (can't be retried or already retried the maximum number
+* time), register the error or not.
+* </list>
+* <p>
+* this class is not thread safe externally; only one thread should submit operations at a time.
+* internally, the class is thread safe enough to manage simultaneously new submission and results
+* arising from older operations.
+* </p>
+* <p>
+* internally, this class works with {@link row}, this mean it could be theoretically used for
+* gets as well.
+* </p>
+*/
+class asyncprocess<cresult>
+private static final log log   logfactory getlog asyncprocess class
+protected final hconnection hconnection
+protected final tablename tablename
+protected final executorservice pool
+protected final asyncprocesscallback<cresult> callback
+protected final batcherrors errors   new batcherrors
+protected final batcherrors retriederrors   new batcherrors
+protected final atomicboolean haserror   new atomicboolean false
+protected final atomiclong taskssent   new atomiclong 0
+protected final atomiclong tasksdone   new atomiclong 0
+protected final concurrentmap<string  atomicinteger> taskcounterperregion
+new concurrenthashmap<string  atomicinteger>
+protected final int maxtotalconcurrenttasks
+protected final int maxconcurrenttasksperregion
+protected final long pause
+protected int numtries
+protected final boolean useservertrackerforretries
+protected int servertrackertimeout
+protected rpcretryingcallerfactory rpccallerfactory
+/**
+* this interface allows to keep the interface of the previous synchronous interface, that uses
+* an array of object to return the result.
+* <p/>
+* this interface allows the caller to specify the behavior on errors: <list>
+* <li>if we have not yet reach the maximum number of retries, the user can nevertheless
+* specify if this specific operation should be retried or not.
+* </li>
+* <li>if an operation fails (i.e. is not retried or fails after all retries), the user can
+* specify is we should mark this asyncprocess as in error or not.
+* </li>
+* </list>
+*/
+interface asyncprocesscallback<cresult>
+/**
+* called on success. originalindex holds the index in the action list.
+*/
+void success int originalindex  byte region  row row  cresult result
+/**
+* called on failure, if we don't retry (i.e. called once per failed operation).
+*
+* @return true if we should store the error and tag this async process as being in error.
+*         false if the failure of this operation can be safely ignored, and does not require
+*         the current process to be stopped without proceeding with the other operations in
+*         the queue.
+*/
+boolean failure int originalindex  byte region  row row  throwable t
+/**
+* called on a failure we plan to retry. this allows the user to stop retrying. will be
+* called multiple times for a single action if it fails multiple times.
+*
+* @return false if we should retry, true otherwise.
+*/
+boolean retriablefailure int originalindex  row row  byte region  throwable exception
+private static class batcherrors
+private list<throwable> throwables   new arraylist<throwable>
+private list<row> actions   new arraylist<row>
+private list<string> addresses   new arraylist<string>
+public void add throwable ex  row row  hregionlocation location
+throwables add ex
+actions add row
+addresses add location    null ? location gethostnameport
+private retriesexhaustedwithdetailsexception makeexception
+return new retriesexhaustedwithdetailsexception
+new arraylist<throwable> throwables
+new arraylist<row> actions   new arraylist<string> addresses
+public void clear
+throwables clear
+actions clear
+addresses clear
+public asyncprocess hconnection hc  tablename tablename  executorservice pool
+asyncprocesscallback<cresult> callback  configuration conf
+rpcretryingcallerfactory rpccaller
+this hconnection   hc
+this tablename   tablename
+this pool   pool
+this callback   callback
+this pause   conf getlong hconstants hbase_client_pause
+hconstants default_hbase_client_pause
+this numtries   conf getint hconstants hbase_client_retries_number
+hconstants default_hbase_client_retries_number
+this maxtotalconcurrenttasks   conf getint    200
+// with one, we ensure that the ordering of the queries is respected: we don't start
+//  a set of operations on a region before the previous one is done. as well, this limits
+//  the pressure we put on the region server.
+this maxconcurrenttasksperregion   conf getint    1
+this useservertrackerforretries
+conf getboolean hconnectionmanager retries_by_server_key  true
+if  this useservertrackerforretries
+// server tracker allows us to do faster, and yet useful (hopefully), retries.
+// however, if we are too useful, we might fail very quickly due to retry count limit.
+// to avoid this, we are going to cheat for now (see hbase-7659), and calculate maximum
+// retry time if normal retries were used. then we will retry until this time runs out.
+// if we keep hitting one server, the net effect will be the incremental backoff, and
+// essentially the same number of retries as planned. if we have to do faster retries,
+// we will do more retries in aggregate, but the user will be none the wiser.
+this servertrackertimeout   0
+for  int i   0  i < this numtries    i
+servertrackertimeout    connectionutils getpausetime this pause  i
+this rpccallerfactory   rpccaller
+/**
+* extract from the rows list what we can submit. the rows we can not submit are kept in the
+* list.
+*
+* @param rows - the submitted row. modified by the method: we remove the rows we took.
+* @param atleastone true if we should submit at least a subset.
+*/
+public void submit list<? extends row> rows  boolean atleastone  throws interruptedioexception
+if  rows isempty
+return
+map<hregionlocation  multiaction<row>> actionsbyserver
+new hashmap<hregionlocation  multiaction<row>>
+list<action<row>> retainedactions   new arraylist<action<row>> rows size
+do
+map<string  boolean> regionincluded   new hashmap<string  boolean>
+long currenttasknumber   waitformaximumcurrenttasks maxtotalconcurrenttasks
+int posinlist    1
+iterator<? extends row> it   rows iterator
+while  it hasnext
+row r   it next
+hregionlocation loc   finddestlocation r  1  posinlist  false  regionincluded
+if  loc    null         loc is null if the dest is too busy or there is an error
+action<row> action   new action<row> r    posinlist
+retainedactions add action
+addaction loc  action  actionsbyserver
+it remove
+if  retainedactions isempty      atleastone     haserror
+waitfornexttaskdone currenttasknumber
+while  retainedactions isempty      atleastone     haserror
+hconnectionmanager servererrortracker errorsbyserver   createservererrortracker
+sendmultiaction retainedactions  actionsbyserver  1  errorsbyserver
+/**
+* group the actions per region server.
+*
+* @param loc - the destination. must not be null.
+* @param action - the action to add to the multiaction
+* @param actionsbyserver the multiaction per server
+*/
+private void addaction hregionlocation loc  action<row> action  map<hregionlocation
+multiaction<row>> actionsbyserver
+final byte regionname   loc getregioninfo   getregionname
+multiaction<row> multiaction   actionsbyserver get loc
+if  multiaction    null
+multiaction   new multiaction<row>
+actionsbyserver put loc  multiaction
+multiaction add regionname  action
+/**
+* find the destination, if this destination is not considered as busy.
+*
+* @param row          the row
+* @param numattempt   the num attempt
+* @param posinlist    the position in the list
+* @param force        if we must submit whatever the server load
+* @param regionstatus the
+* @return null if we should not submit, the destination otherwise.
+*/
+private hregionlocation finddestlocation row row  int numattempt
+int posinlist  boolean force
+map<string  boolean> regionstatus
+hregionlocation loc   null
+ioexception locationexception   null
+try
+loc   hconnection locateregion this tablename  row getrow
+if  loc    null
+locationexception   new ioexception
+tablename
+arrays tostring row getrow
+catch  ioexception e
+locationexception   e
+if  locationexception    null
+// there are multiple retries in locateregion already. no need to add new.
+// we can't continue with this row, hence it's the last retry.
+manageerror numattempt  posinlist  row  false  locationexception  null
+return null
+if  force
+return loc
+string regionname   loc getregioninfo   getencodedname
+boolean addit   regionstatus get regionname
+if  addit    null
+addit   cantakenewoperations regionname
+regionstatus put regionname  addit
+return addit ? loc   null
+/**
+* check if we should send new operations to this region.
+*
+* @param encodedregionname region name
+* @return true if this region is considered as busy.
+*/
+protected boolean cantakenewoperations string encodedregionname
+atomicinteger ct   taskcounterperregion get encodedregionname
+return ct    null    ct get   < maxconcurrenttasksperregion
+/**
+* submit immediately the list of rows, whatever the server status. kept for backward
+* compatibility: it allows to be used with the batch interface that return an array of objects.
+*
+* @param rows the list of rows.
+*/
+public void submitall list<? extends row> rows
+list<action<row>> actions   new arraylist<action<row>> rows size
+// the position will be used by the processbatch to match the object array returned.
+int posinlist    1
+for  row r   rows
+posinlist
+action<row> action   new action<row> r  posinlist
+actions add action
+hconnectionmanager servererrortracker errorsbyserver   createservererrortracker
+submit actions  actions  1  true  errorsbyserver
+/**
+* group a list of actions per region servers, and send them. the created multiactions are
+* added to the inprogress list.
+*
+* @param initialactions - the full list of the actions in progress
+* @param currentactions - the list of row to submit
+* @param numattempt - the current numattempt (first attempt is 1)
+* @param force - true if we submit the rowlist without taking into account the server load
+*/
+private void submit list<action<row>> initialactions
+list<action<row>> currentactions  int numattempt  boolean force
+final hconnectionmanager servererrortracker errorsbyserver
+// group per location => regions server
+final map<hregionlocation  multiaction<row>> actionsbyserver
+new hashmap<hregionlocation  multiaction<row>>
+// we have the same policy for a single region per call to submit: we don't want
+//  to send half of the actions because the status changed in the middle. so we keep the
+//  status
+map<string  boolean> regionincluded   new hashmap<string  boolean>
+for  action<row> action   currentactions
+hregionlocation loc   finddestlocation
+action getaction    1  action getoriginalindex    force  regionincluded
+if  loc    null
+addaction loc  action  actionsbyserver
+if   actionsbyserver isempty
+sendmultiaction initialactions  actionsbyserver  numattempt  errorsbyserver
+/**
+* send a multi action structure to the servers, after a delay depending on the attempt
+* number. asynchronous.
+*
+* @param initialactions  the list of the actions, flat.
+* @param actionsbyserver the actions structured by regions
+* @param numattempt      the attempt number.
+*/
+public void sendmultiaction final list<action<row>> initialactions
+map<hregionlocation  multiaction<row>> actionsbyserver
+final int numattempt
+final hconnectionmanager servererrortracker errorsbyserver
+// send the queries and add them to the inprogress list
+for  map entry<hregionlocation  multiaction<row>> e   actionsbyserver entryset
+final hregionlocation loc   e getkey
+final multiaction<row> multi   e getvalue
+final string regionname   loc getregioninfo   getencodedname
+inctaskcounters regionname
+runnable runnable   trace wrap    new runnable
+@override
+public void run
+multiresponse res
+try
+multiservercallable<row> callable   createcallable loc  multi
+try
+res   createcaller callable  callwithoutretries callable
+catch  ioexception e
+log warn
+loc  e
+resubmitall initialactions  multi  loc  numattempt   1  e  errorsbyserver
+return
+receivemultiaction initialactions  multi  loc  res  numattempt  errorsbyserver
+finally
+dectaskcounters regionname
+try
+this pool submit runnable
+catch  rejectedexecutionexception ree
+// this should never happen. but as the pool is provided by the end user, let's secure
+//  this a little.
+dectaskcounters regionname
+log warn
+loc  ree
+// we're likely to fail again, but this will increment the attempt counter, so it will
+//  finish.
+resubmitall initialactions  multi  loc  numattempt   1  ree  errorsbyserver
+/**
+* create a callable. isolated to be easily overridden in the tests.
+*/
+protected multiservercallable<row> createcallable final hregionlocation location
+final multiaction<row> multi
+return new multiservercallable<row> hconnection  tablename  location  multi
+/**
+* for tests.
+* @param callable
+* @return returns a caller.
+*/
+protected rpcretryingcaller<multiresponse> createcaller multiservercallable<row> callable
+// callable is unused.
+return rpccallerfactory <multiresponse> newcaller
+/**
+* check that we can retry acts accordingly: logs, set the error status, call the callbacks.
+*
+* @param numattempt    the number of this attempt
+* @param originalindex the position in the list sent
+* @param row           the row
+* @param canretry      if false, we won't retry whatever the settings.
+* @param throwable     the throwable, if any (can be null)
+* @param location      the location, if any (can be null)
+* @return true if the action can be retried, false otherwise.
+*/
+private boolean manageerror int numattempt  int originalindex  row row  boolean canretry
+throwable throwable  hregionlocation location
+if  canretry
+if  numattempt >  numtries
+throwable    null    throwable instanceof donotretryioexception
+canretry   false
+byte region   location    null ? null   location getregioninfo   getencodednameasbytes
+if  canretry    callback    null
+canretry   callback retriablefailure originalindex  row  region  throwable
+if  canretry
+if  log istraceenabled
+retriederrors add throwable  row  location
+else
+if  callback    null
+callback failure originalindex  region  row  throwable
+this haserror set true
+errors add throwable  row  location
+return canretry
+/**
+* resubmit all the actions from this multiaction after a failure.
+*
+* @param initialactions the full initial action list
+* @param rsactions  the actions still to do from the initial list
+* @param location   the destination
+* @param numattempt the number of attempts so far
+* @param t the throwable (if any) that caused the resubmit
+*/
+private void resubmitall list<action<row>> initialactions  multiaction<row> rsactions
+hregionlocation location  int numattempt  throwable t
+hconnectionmanager servererrortracker errorsbyserver
+// do not use the exception for updating cache because it might be coming from
+// any of the regions in the multiaction.
+hconnection updatecachedlocations tablename
+rsactions actions values   iterator   next   get 0  getaction   getrow    null  location
+errorsbyserver reportservererror location
+list<action<row>> toreplay   new arraylist<action<row>>
+for  list<action<row>> actions   rsactions actions values
+for  action<row> action   actions
+if  manageerror numattempt  action getoriginalindex    action getaction
+true  t  location
+toreplay add action
+if  toreplay isempty
+log warn     numattempt       numtries
+initialactions size         location getservername
+tablename       location
+else
+submit initialactions  toreplay  numattempt  true  errorsbyserver
+/**
+* called when we receive the result of a server query.
+*
+* @param initialactions - the whole action list
+* @param rsactions      - the actions for this location
+* @param location       - the location
+* @param responses      - the response, if any
+* @param numattempt     - the attempt
+*/
+private void receivemultiaction list<action<row>> initialactions
+multiaction<row> rsactions  hregionlocation location
+multiresponse responses  int numattempt
+hconnectionmanager servererrortracker errorsbyserver
+if  responses    null
+log info     numattempt       numtries
+location getservername
+tablename       location
+resubmitall initialactions  rsactions  location  numattempt   1  null  errorsbyserver
+return
+// success or partial success
+// analyze detailed results. we can still have individual failures to be redo.
+// two specific throwables are managed:
+//  - donotretryioexception: we continue to retry for other actions
+//  - regionmovedexception: we update the cache with the new region location
+list<action<row>> toreplay   new arraylist<action<row>>
+throwable throwable   null
+int failurecount   0
+boolean canretry   true
+for  map entry<byte  list<pair<integer  object>>> resultsforrs
+responses getresults   entryset
+for  pair<integer  object> regionresult   resultsforrs getvalue
+object result   regionresult getsecond
+// failure: retry if it's make sense else update the errors lists
+if  result    null    result instanceof throwable
+throwable    throwable  result
+action<row> correspondingaction   initialactions get regionresult getfirst
+row row   correspondingaction getaction
+if  failurecount      0       we're doing this once per location
+hconnection updatecachedlocations this tablename  row getrow    result  location
+if  errorsbyserver    null
+errorsbyserver reportservererror location
+canretry   errorsbyserver canretrymore
+if  manageerror numattempt  correspondingaction getoriginalindex    row  canretry
+throwable  location
+toreplay add correspondingaction
+else      success
+if  callback    null
+action<row> correspondingaction   initialactions get regionresult getfirst
+row row   correspondingaction getaction
+//noinspection unchecked
+this callback success correspondingaction getoriginalindex
+resultsforrs getkey    row   cresult  result
+if   toreplay isempty
+long backofftime    errorsbyserver    null ?
+errorsbyserver calculatebackofftime location  pause
+connectionutils getpausetime pause  numattempt
+if  numattempt > 3    log isdebugenabled
+// we use this value to have some logs when we have multiple failures, but not too many
+//  logs as errors are to be expected wehn region moves, split and so on
+log debug     numattempt       numtries       failurecount
+location getservername
+toreplay size         tablename
+location       throwable
+backofftime
+try
+thread sleep backofftime
+catch  interruptedexception e
+log warn     toreplay size
+tablename       location  e
+thread interrupted
+return
+submit initialactions  toreplay  numattempt   1  true  errorsbyserver
+else if  failurecount    0
+log warn     numattempt       numtries       failurecount
+location getservername
+tablename       location
+/**
+* waits for another task to finish.
+* @param currentnumberoftask - the number of task finished when calling the method.
+*/
+protected void waitfornexttaskdone long currentnumberoftask  throws interruptedioexception
+while  currentnumberoftask    tasksdone get
+try
+synchronized  this tasksdone
+this tasksdone wait 100
+catch  interruptedexception e
+throw new interruptedioexception
+currentnumberoftask
+tablename       tasksdone get
+/**
+* wait until the async does not have more than max tasks in progress.
+*/
+private long waitformaximumcurrenttasks int max  throws interruptedioexception
+long lastlog   environmentedgemanager currenttimemillis
+long currenttasksdone   this tasksdone get
+while   taskssent get     currenttasksdone  > max
+long now   environmentedgemanager currenttimemillis
+if  now > lastlog   10000
+lastlog   now
+log info
+max       taskssent get         tasksdone get
+currenttasksdone       tablename
+waitfornexttaskdone currenttasksdone
+currenttasksdone   this tasksdone get
+return currenttasksdone
+/**
+* wait until all tasks are executed, successfully or not.
+*/
+public void waituntildone   throws interruptedioexception
+waitformaximumcurrenttasks 0
+public boolean haserror
+return haserror get
+public list<? extends row> getfailedoperations
+return errors actions
+/**
+* clean the errors stacks. should be called only when there are no actions in progress.
+*/
+public void clearerrors
+errors clear
+retriederrors clear
+haserror set false
+public retriesexhaustedwithdetailsexception geterrors
+return errors makeexception
+/**
+* incrementer the tasks counters for a given region. mt safe.
+*/
+protected void inctaskcounters string encodedregionname
+taskssent incrementandget
+atomicinteger counterperserver   taskcounterperregion get encodedregionname
+if  counterperserver    null
+taskcounterperregion putifabsent encodedregionname  new atomicinteger
+counterperserver   taskcounterperregion get encodedregionname
+counterperserver incrementandget
+/**
+* decrements the counters for a given region
+*/
+protected void dectaskcounters string encodedregionname
+atomicinteger counterperserver   taskcounterperregion get encodedregionname
+counterperserver decrementandget
+tasksdone incrementandget
+synchronized  tasksdone
+tasksdone notifyall
+/**
+* creates the server error tracker to use inside process.
+* currently, to preserve the main assumption about current retries, and to work well with
+* the retry-limit-based calculation, the calculation is local per process object.
+* we may benefit from connection-wide tracking of server errors.
+* @return servererrortracker to use, null if there is no servererrortracker on this connection
+*/
+protected hconnectionmanager servererrortracker createservererrortracker
+if  useservertrackerforretries
+return new hconnectionmanager servererrortracker this servertrackertimeout
+else
+return null

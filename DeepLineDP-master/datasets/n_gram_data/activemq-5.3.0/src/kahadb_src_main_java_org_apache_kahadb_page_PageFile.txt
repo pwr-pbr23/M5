@@ -1,0 +1,810 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache kahadb page
+import java io bytearrayinputstream
+import java io bytearrayoutputstream
+import java io datainputstream
+import java io dataoutputstream
+import java io file
+import java io fileinputstream
+import java io fileoutputstream
+import java io ioexception
+import java io interruptedioexception
+import java io randomaccessfile
+import java util arraylist
+import java util arrays
+import java util collection
+import java util iterator
+import java util linkedhashmap
+import java util map
+import java util properties
+import java util treemap
+import java util map entry
+import java util concurrent countdownlatch
+import java util concurrent atomic atomicboolean
+import java util concurrent atomic atomiclong
+import java util zip adler32
+import java util zip checksum
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache kahadb util databytearrayoutputstream
+import org apache kahadb util iohelper
+import org apache kahadb util introspectionsupport
+import org apache kahadb util lrucache
+import org apache kahadb util sequence
+import org apache kahadb util sequenceset
+/**
+* a pagefile provides you random access to fixed sized disk pages. this object is not thread safe and therefore access to it should
+* be externally synchronized.
+*
+* the file has 3 parts:
+* metadata space: 4k : reserved metadata area. used to store persistent config about the file.
+* recovery buffer space: page size * 1000 : this is a redo log used to prevent partial page writes from making the file inconsistent
+* page space: the pages in the page file.
+*
+* @version $revision$
+*/
+public class pagefile
+private static final string pagefile_suffix
+private static final string recovery_file_suffix
+private static final string free_file_suffix
+// 4k default page size.
+public static final int default_page_size   integer parseint system getproperty      1024 4
+public static final int default_write_batch_size   integer parseint system getproperty      1000
+private static final int recovery_file_header_size 1024 4
+private static final int page_file_header_size 1024 4
+// recovery header is (long offset)
+private static final log log   logfactory getlog pagefile class
+// a pagefile will use a couple of files in this directory
+private file directory
+// and the file names in that directory will be based on this name.
+private final string name
+// file handle used for reading pages..
+private randomaccessfile readfile
+// file handle used for writing pages..
+private randomaccessfile writefile
+// file handle used for writing pages..
+private randomaccessfile recoveryfile
+// the size of pages
+private int pagesize   default_page_size
+// the minimum number of space allocated to the recovery file in number of pages.
+private int recoveryfileminpagecount   1000
+// the max size that we let the recovery file grow to.. ma exceed the max, but the file will get resize
+// to this max size as soon as  possible.
+private int recoveryfilemaxpagecount   10000
+// the number of pages in the current recovery buffer
+private int recoverypagecount
+private atomicboolean loaded   new atomicboolean
+// the number of pages we are aiming to write every time we
+// write to disk.
+int writebatchsize   default_write_batch_size
+// we keep a cache of pages recently used?
+private lrucache<long  page> pagecache
+// the cache of recently used pages.
+private boolean enablepagecaching true
+// how many pages will we keep in the cache?
+private int pagecachesize   100
+// should first log the page write to the recovery buffer? avoids partial
+// page write failures..
+private boolean enablerecoveryfile true
+// will we sync writes to disk. ensures that data will not be lost after a checkpoint()
+private boolean enabledisksyncs true
+// will writes be done in an async thread?
+private boolean enabledwritethread false
+// these are used if enableasyncwrites==true
+private atomicboolean stopwriter   new atomicboolean
+private thread writerthread
+private countdownlatch checkpointlatch
+// keeps track of writes that are being written to disk.
+private treemap<long  pagewrite> writes new treemap<long  pagewrite>
+// keeps track of free pages.
+private final atomiclong nextfreepageid   new atomiclong
+private sequenceset freelist   new sequenceset
+private atomiclong nexttxid   new atomiclong
+// persistent settings stored in the page file.
+private metadata metadata
+/**
+* use to keep track of updated pages which have not yet been committed.
+*/
+static class pagewrite
+page page
+byte current
+byte diskbound
+public pagewrite page page  byte data
+this page page
+current data
+public void setcurrent page page  byte data
+this page page
+current data
+@override
+public string tostring
+return   page getpageid
+@suppresswarnings
+public page getpage
+return page
+void begin
+diskbound   current
+current   null
+/**
+* @return true if there is no pending writes to do.
+*/
+boolean done
+diskbound null
+return current    null
+/**
+* the metadata object hold the persistent data associated with a pagefile object.
+*/
+public static class metadata
+string filetype
+string filetypeversion
+long metadatatxid  1
+int pagesize
+boolean cleanshutdown
+long lasttxid
+long freepages
+public string getfiletype
+return filetype
+public void setfiletype string filetype
+this filetype   filetype
+public string getfiletypeversion
+return filetypeversion
+public void setfiletypeversion string version
+this filetypeversion   version
+public long getmetadatatxid
+return metadatatxid
+public void setmetadatatxid long metadatatxid
+this metadatatxid   metadatatxid
+public int getpagesize
+return pagesize
+public void setpagesize int pagesize
+this pagesize   pagesize
+public boolean iscleanshutdown
+return cleanshutdown
+public void setcleanshutdown boolean cleanshutdown
+this cleanshutdown   cleanshutdown
+public long getlasttxid
+return lasttxid
+public void setlasttxid long lasttxid
+this lasttxid   lasttxid
+public long getfreepages
+return freepages
+public void setfreepages long value
+this freepages   value
+public transaction tx
+assertloaded
+return new transaction this
+/**
+* creates a pagefile in the specified directory who's data files are named by name.
+*
+* @param directory
+* @param name
+*/
+public pagefile file directory  string name
+this directory   directory
+this name   name
+/**
+* deletes the files used by the pagefile object.  this method can only be used when this object is not loaded.
+*
+* @throws ioexception
+*         if the files cannot be deleted.
+* @throws illegalstateexception
+*         if this pagefile is loaded
+*/
+public void delete   throws ioexception
+if  loaded get
+throw new illegalstateexception
+delete getmainpagefile
+delete getfreefile
+delete getrecoveryfile
+/**
+* @param file
+* @throws ioexception
+*/
+private void delete file file  throws ioexception
+if  file exists
+if   file delete
+throw new ioexception   file getpath
+/**
+* loads the page file so that it can be accessed for read/write purposes.  this allocates os resources.  if this is the
+* first time the page file is loaded, then this creates the page file in the file system.
+*
+* @throws ioexception
+*         if the page file cannot be loaded. this could be cause the existing page file is corrupt is a bad version or if
+*         there was a disk error.
+* @throws illegalstateexception
+*         if the page file was already loaded.
+*/
+public void load   throws ioexception  illegalstateexception
+if  loaded compareandset false  true
+if  enablepagecaching
+pagecache   new lrucache<long  page> pagecachesize  pagecachesize  0 75f  true
+file file   getmainpagefile
+iohelper mkdirs file getparentfile
+writefile   new randomaccessfile file
+readfile   new randomaccessfile file
+if  readfile length   > 0
+// load the page size setting cause that can't change once the file is created.
+loadmetadata
+pagesize   metadata getpagesize
+else
+// store the page size setting cause that can't change once the file is created.
+metadata   new metadata
+metadata setfiletype pagefile class getname
+metadata setfiletypeversion
+metadata setpagesize getpagesize
+metadata setcleanshutdown true
+metadata setfreepages  1
+metadata setlasttxid 0
+storemetadata
+if  enablerecoveryfile
+recoveryfile   new randomaccessfile getrecoveryfile
+if   metadata iscleanshutdown
+nexttxid set metadata getlasttxid   1
+if  metadata getfreepages  >0
+loadfreelist
+else
+log debug
+nexttxid set redorecoveryupdates
+// scan all to find the free pages.
+freelist   new sequenceset
+for  iterator i   tx   iterator true   i hasnext
+page page    page i next
+if  page gettype      page page_free_type
+freelist add page getpageid
+metadata setcleanshutdown false
+storemetadata
+getfreefile   delete
+if  writefile length   < page_file_header_size
+writefile setlength page_file_header_size
+nextfreepageid set  writefile length   page_file_header_size  pagesize
+startwriter
+else
+throw new illegalstateexception
+/**
+* unloads a previously loaded pagefile.  this deallocates os related resources like file handles.
+* once unloaded, you can no longer use the page file to read or write pages.
+*
+* @throws ioexception
+*         if there was a disk error occurred while closing the down the page file.
+* @throws illegalstateexception
+*         if the pagefile is not loaded
+*/
+public void unload   throws ioexception
+if  loaded compareandset true  false
+flush
+try
+stopwriter
+catch  interruptedexception e
+throw new interruptedioexception
+if  freelist isempty
+metadata setfreepages 0
+else
+storefreelist
+metadata setfreepages freelist size
+metadata setlasttxid  nexttxid get   1
+metadata setcleanshutdown true
+storemetadata
+if  readfile    null
+readfile close
+readfile   null
+writefile close
+writefile null
+if  enablerecoveryfile
+recoveryfile close
+recoveryfile null
+freelist clear
+if  pagecache  null
+pagecache null
+synchronized writes
+writes clear
+else
+throw new illegalstateexception
+public boolean isloaded
+return loaded get
+/**
+* flush and sync all write buffers to disk.
+*
+* @throws ioexception
+*         if an disk error occurred.
+*/
+public void flush   throws ioexception
+if  enabledwritethread    stopwriter get
+throw new ioexception
+// setup a latch that gets notified when all buffered writes hits the disk.
+countdownlatch checkpointlatch
+synchronized  writes
+if  writes isempty
+return
+if  enabledwritethread
+if  this checkpointlatch    null
+this checkpointlatch   new countdownlatch 1
+checkpointlatch   this checkpointlatch
+writes notify
+else
+writebatch
+return
+try
+int size   writes size
+long start   system currenttimemillis
+checkpointlatch await
+long end   system currenttimemillis
+if  end start > 100
+log warn     size      end start
+catch  interruptedexception e
+throw new interruptedioexception
+public string tostring
+return   getmainpagefile
+///////////////////////////////////////////////////////////////////
+// private implementation methods
+///////////////////////////////////////////////////////////////////
+private file getmainpagefile
+return new file directory  iohelper tofilesystemsafename name  pagefile_suffix
+public file getfreefile
+return new file directory  iohelper tofilesystemsafename name  free_file_suffix
+public file getrecoveryfile
+return new file directory  iohelper tofilesystemsafename name  recovery_file_suffix
+private long tooffset long pageid
+return page_file_header_size  pageid pagesize
+private void loadmetadata   throws ioexception
+bytearrayinputstream is
+metadata v1   new metadata
+metadata v2   new metadata
+try
+properties p   new properties
+byte d   new byte
+readfile seek 0
+readfile readfully d
+is   new bytearrayinputstream d
+p load is
+introspectionsupport setproperties v1  p
+catch  ioexception e
+v1   null
+try
+properties p   new properties
+byte d   new byte
+readfile seek page_file_header_size 2
+readfile readfully d
+is   new bytearrayinputstream d
+p load is
+introspectionsupport setproperties v2  p
+catch  ioexception e
+v2   null
+if  v1  null    v2  null
+throw new ioexception
+if  v1    null    v1 metadatatxid<0
+metadata   v2
+else if  v2  null    v1 metadatatxid<0
+metadata   v1
+else if  v1 metadatatxid  v2 metadatatxid
+metadata   v1     use the first since the 2nd could be a partial
+else
+metadata   v2     use the second cause the first is probably a partial
+private void storemetadata   throws ioexception
+// convert the metadata into a property format
+metadata metadatatxid
+properties p   new properties
+introspectionsupport getproperties metadata  p  null
+bytearrayoutputstream os   new bytearrayoutputstream page_file_header_size
+p store os
+if  os size   > page_file_header_size 2
+throw new ioexception   page_file_header_size 2
+// fill the rest with space...
+byte filler   new byte
+arrays fill filler   byte
+os write filler
+os flush
+byte d   os tobytearray
+// so we don't loose it.. write it 2 times...
+writefile seek 0
+writefile write d
+writefile getfd   sync
+writefile seek page_file_header_size 2
+writefile write d
+writefile getfd   sync
+private void storefreelist   throws ioexception
+fileoutputstream os   new fileoutputstream getfreefile
+dataoutputstream dos   new dataoutputstream os
+sequenceset marshaller instance writepayload freelist  dos
+dos close
+private void loadfreelist   throws ioexception
+freelist clear
+fileinputstream is   new fileinputstream getfreefile
+datainputstream dis   new datainputstream is
+freelist   sequenceset marshaller instance readpayload dis
+dis close
+///////////////////////////////////////////////////////////////////
+// property accessors
+///////////////////////////////////////////////////////////////////
+/**
+* is the recovery buffer used to double buffer page writes.  enabled by default.
+*
+* @return is the recovery buffer enabled.
+*/
+public boolean isenablerecoveryfile
+return enablerecoveryfile
+/**
+* sets if the recovery buffer uses to double buffer page writes.  enabled by default.  disabling this
+* may potentially cause partial page writes which can lead to page file corruption.
+*/
+public void setenablerecoveryfile boolean doublebuffer
+assertnotloaded
+this enablerecoveryfile   doublebuffer
+/**
+* @return are page writes synced to disk?
+*/
+public boolean isenabledisksyncs
+return enabledisksyncs
+/**
+* allows you enable syncing writes to disk.
+* @param syncwrites
+*/
+public void setenabledisksyncs boolean syncwrites
+assertnotloaded
+this enabledisksyncs   syncwrites
+/**
+* @return the page size
+*/
+public int getpagesize
+return this pagesize
+/**
+* @return the amount of content data that a page can hold.
+*/
+public int getpagecontentsize
+return this pagesize page page_header_size
+/**
+* configures the page size used by the page file.  by default it is 4k.  once a page file is created on disk,
+* subsequent loads of that file will use the original pagesize.  once the pagefile is loaded, this setting
+* can no longer be changed.
+*
+* @param pagesize the pagesize to set
+* @throws illegalstateexception
+*         once the page file is loaded.
+*/
+public void setpagesize int pagesize  throws illegalstateexception
+assertnotloaded
+this pagesize   pagesize
+/**
+* @return true if read page caching is enabled
+*/
+public boolean isenablepagecaching
+return this enablepagecaching
+/**
+* @param allows you to enable read page caching
+*/
+public void setenablepagecaching boolean enablepagecaching
+assertnotloaded
+this enablepagecaching   enablepagecaching
+/**
+* @return the maximum number of pages that will get stored in the read page cache.
+*/
+public int getpagecachesize
+return this pagecachesize
+/**
+* @param sets the maximum number of pages that will get stored in the read page cache.
+*/
+public void setpagecachesize int pagecachesize
+assertnotloaded
+this pagecachesize   pagecachesize
+public boolean isenabledwritethread
+return enabledwritethread
+public void setenablewritethread boolean enableasyncwrites
+assertnotloaded
+this enabledwritethread   enableasyncwrites
+public long getdisksize   throws ioexception
+return tooffset nextfreepageid get
+/**
+* @return the number of pages allocated in the pagefile
+*/
+public long getpagecount
+return nextfreepageid get
+public int getrecoveryfileminpagecount
+return recoveryfileminpagecount
+public void setrecoveryfileminpagecount int recoveryfileminpagecount
+assertnotloaded
+this recoveryfileminpagecount   recoveryfileminpagecount
+public int getrecoveryfilemaxpagecount
+return recoveryfilemaxpagecount
+public void setrecoveryfilemaxpagecount int recoveryfilemaxpagecount
+assertnotloaded
+this recoveryfilemaxpagecount   recoveryfilemaxpagecount
+public int getwritebatchsize
+return writebatchsize
+public void setwritebatchsize int writebatchsize
+assertnotloaded
+this writebatchsize   writebatchsize
+///////////////////////////////////////////////////////////////////
+// package protected methods exposed to transaction
+///////////////////////////////////////////////////////////////////
+/**
+* @throws illegalstateexception if the page file is not loaded.
+*/
+void assertloaded   throws illegalstateexception
+if   loaded get
+throw new illegalstateexception
+void assertnotloaded   throws illegalstateexception
+if  loaded get
+throw new illegalstateexception
+/**
+* allocates a block of free pages that you can write data to.
+*
+* @param count the number of sequential pages to allocate
+* @return the first page of the sequential set.
+* @throws ioexception
+*         if an disk error occurred.
+* @throws illegalstateexception
+*         if the pagefile is not loaded
+*/
+<t> page<t> allocate int count  throws ioexception
+assertloaded
+if  count <  0
+throw new illegalargumentexception
+sequence seq   freelist removefirstsequence count
+// we may need to create new free pages...
+if  seq    null
+page<t> first   null
+int c   count
+while  c > 0
+page<t> page   new page<t> nextfreepageid getandincrement
+page makefree getnextwritetransactionid
+if  first    null
+first   page
+addtocache page
+databytearrayoutputstream out   new databytearrayoutputstream pagesize
+page write out
+write page  out getdata
+// log.debug("allocate writing: "+page.getpageid());
+c
+return first
+page<t> page   new page<t> seq getfirst
+page makefree 0
+// log.debug("allocated: "+page.getpageid());
+return page
+long getnextwritetransactionid
+return nexttxid incrementandget
+void readpage long pageid  byte data  throws ioexception
+readfile seek tooffset pageid
+readfile readfully data
+public void freepage long pageid
+freelist add pageid
+if  enablepagecaching
+pagecache remove pageid
+@suppresswarnings
+private <t> void write page<t> page  byte data  throws ioexception
+final pagewrite write   new pagewrite page  data
+entry<long  pagewrite> entry   new entry<long  pagewrite>
+public long getkey
+return write getpage   getpageid
+public pagewrite getvalue
+return write
+public pagewrite setvalue pagewrite value
+return null
+entry<long  pagewrite> entries   new map entry entry
+write arrays aslist entries
+void write collection<map entry<long  pagewrite>> updates  throws ioexception
+synchronized  writes
+if  enabledwritethread
+while  writes size   >  writebatchsize     stopwriter get
+try
+writes wait
+catch  interruptedexception e
+thread currentthread   interrupt
+throw new interruptedioexception
+for  map entry<long  pagewrite> entry   updates
+long key   entry getkey
+pagewrite value   entry getvalue
+pagewrite write   writes get key
+if  write  null
+writes put key  value
+else
+write setcurrent value page  value current
+// once we start approaching capacity, notify the writer to start writing
+if  canstartwritebatch
+if  enabledwritethread
+writes notify
+else
+writebatch
+private boolean canstartwritebatch
+int capacityused     writes size     100  writebatchsize
+if  enabledwritethread
+// the constant 10 here controls how soon write batches start going to disk..
+// would be nice to figure out how to auto tune that value.  make to small and
+// we reduce through put because we are locking the write mutex too often doing writes
+return capacityused >  10    checkpointlatch  null
+else
+return capacityused >  80    checkpointlatch  null
+///////////////////////////////////////////////////////////////////
+// cache related operations
+///////////////////////////////////////////////////////////////////
+@suppresswarnings
+<t> page<t> getfromcache long pageid
+synchronized writes
+pagewrite pagewrite   writes get pageid
+if  pagewrite    null
+return pagewrite page
+page<t> result   null
+if  enablepagecaching
+result   pagecache get pageid
+return result
+void addtocache page page
+if  enablepagecaching
+pagecache put page getpageid    page
+void removefromcache page page
+if  enablepagecaching
+pagecache remove page getpageid
+///////////////////////////////////////////////////////////////////
+// internal double write implementation follows...
+///////////////////////////////////////////////////////////////////
+/**
+*
+*/
+private void pollwrites
+try
+while   stopwriter get
+// wait for a notification...
+synchronized  writes
+writes notifyall
+// if there is not enough to write, wait for a notification...
+while  writes isempty      checkpointlatch  null     stopwriter get
+writes wait 100
+if  writes isempty
+releasecheckpointwaiter
+writebatch
+catch  throwable e
+e printstacktrace
+finally
+releasecheckpointwaiter
+/**
+*
+* @param timeout
+* @param unit
+* @return true if there are still pending writes to do.
+* @throws interruptedexception
+* @throws ioexception
+*/
+private void writebatch   throws ioexception
+countdownlatch checkpointlatch
+arraylist<pagewrite> batch
+synchronized  writes
+// if there is not enough to write, wait for a notification...
+batch   new arraylist<pagewrite> writes size
+// build a write batch from the current write cache.
+for  pagewrite write   writes values
+batch add write
+// move the current write to the diskbound write, this lets folks update the
+// page again without blocking for this write.
+write begin
+// grab on to the existing checkpoint latch cause once we do this write we can
+// release the folks that were waiting for those writes to hit disk.
+checkpointlatch   this checkpointlatch
+this checkpointlatch null
+if  enablerecoveryfile
+// using adler-32 instead of crc-32 because it's much faster and it's
+// weakness for short messages with few hundred bytes is not a factor in this case since we know
+// our write batches are going to much larger.
+checksum checksum   new adler32
+for  pagewrite w   batch
+checksum update w diskbound  0  pagesize
+// can we shrink the recovery buffer??
+if  recoverypagecount > recoveryfilemaxpagecount
+int t   math max recoveryfileminpagecount  batch size
+recoveryfile setlength recoveryfilesizeforpages t
+// record the page writes in the recovery buffer.
+recoveryfile seek 0
+// store the next tx id...
+recoveryfile writelong nexttxid get
+// store the checksum for thw write batch so that on recovery we know if we have a consistent
+// write batch on disk.
+recoveryfile writelong checksum getvalue
+// write the # of pages that will follow
+recoveryfile writeint batch size
+// write the pages.
+recoveryfile seek recovery_file_header_size
+for  pagewrite w   batch
+recoveryfile writelong w page getpageid
+recoveryfile write w diskbound  0  pagesize
+if  enabledisksyncs
+// sync to make sure recovery buffer writes land on disk..
+recoveryfile getfd   sync
+recoverypagecount   batch size
+for  pagewrite w   batch
+writefile seek tooffset w page getpageid
+writefile write w diskbound  0  pagesize
+// sync again
+if  enabledisksyncs
+writefile getfd   sync
+synchronized  writes
+for  pagewrite w   batch
+// if there are no more pending writes, then remove it from the write cache.
+if  w done
+writes remove w page getpageid
+if  checkpointlatch  null
+checkpointlatch countdown
+private long recoveryfilesizeforpages int pagecount
+return recovery_file_header_size   pagesize 8  pagecount
+private void releasecheckpointwaiter
+if  checkpointlatch  null
+checkpointlatch countdown
+checkpointlatch null
+/**
+* inspects the recovery buffer and re-applies any
+* partially applied page writes.
+*
+* @return the next transaction id that can be used.
+* @throws ioexception
+*/
+private long redorecoveryupdates   throws ioexception
+if   enablerecoveryfile
+return 0
+recoverypagecount 0
+// are we initializing the recovery file?
+if  recoveryfile length      0
+// write an empty header..
+recoveryfile write new byte
+// preallocate the minium size for better performance.
+recoveryfile setlength recoveryfilesizeforpages recoveryfileminpagecount
+return 0
+// how many recovery pages do we have in the recovery buffer?
+recoveryfile seek 0
+long nexttxid   readfile readlong
+long expectedchecksum   readfile readlong
+int pagecounter   readfile readint
+recoveryfile seek recovery_file_header_size
+checksum checksum   new adler32
+linkedhashmap<long  byte> batch   new linkedhashmap<long  byte>
+try
+for  int i   0  i < pagecounter  i
+long offset   recoveryfile readlong
+byte data   new byte
+if  recoveryfile read data  0  pagesize     pagesize
+// invalid recovery record, could not fully read the data". probably due to a partial write to the recovery buffer
+return nexttxid
+checksum update data  0  pagesize
+batch put offset  data
+catch  exception e
+// if an error occurred it was cause the redo buffer was not full written out correctly.. so don't redo it.
+// as the pages should still be consistent.
+log debug    e
+return nexttxid
+recoverypagecount   pagecounter
+// if the checksum is not valid then the recovery buffer was partially written to disk.
+if  checksum getvalue      expectedchecksum
+return nexttxid
+// re-apply all the writes in the recovery buffer.
+for  map entry<long  byte> e   batch entryset
+writefile seek e getkey
+e getvalue
+writefile write e getvalue
+// and sync it to disk
+writefile getfd   sync
+return nexttxid
+private void startwriter
+synchronized  writes
+if  enabledwritethread
+stopwriter set false
+writerthread   new thread
+@override
+public void run
+pollwrites
+writerthread setpriority thread max_priority
+writerthread setdaemon true
+writerthread start
+private void stopwriter   throws interruptedexception
+if  enabledwritethread
+stopwriter set true
+writerthread join
+public file getfile
+return getmainpagefile

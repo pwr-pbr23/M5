@@ -1,0 +1,553 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq broker region
+import java io ioexception
+import java util arraylist
+import java util iterator
+import java util list
+import java util concurrent copyonwritearraylist
+import java util concurrent countdownlatch
+import java util concurrent timeunit
+import javax jms invalidselectorexception
+import javax jms jmsexception
+import org apache activemq activemqmessageaudit
+import org apache activemq broker broker
+import org apache activemq broker connectioncontext
+import org apache activemq broker region cursors pendingmessagecursor
+import org apache activemq broker region cursors vmpendingmessagecursor
+import org apache activemq command consumercontrol
+import org apache activemq command consumerinfo
+import org apache activemq command message
+import org apache activemq command messageack
+import org apache activemq command messagedispatch
+import org apache activemq command messagedispatchnotification
+import org apache activemq command messageid
+import org apache activemq command messagepull
+import org apache activemq command response
+import org apache activemq thread scheduler
+import org apache activemq transaction synchronization
+import org apache activemq usage systemusage
+import org apache commons logging log
+import org apache commons logging logfactory
+/**
+* a subscription that honors the pre-fetch option of the consumerinfo.
+*
+* @version $revision: 1.15 $
+*/
+public abstract class prefetchsubscription extends abstractsubscription
+private static final log log   logfactory getlog prefetchsubscription class
+protected static final scheduler scheduler   scheduler getinstance
+protected pendingmessagecursor pending
+protected final list<messagereference> dispatched   new copyonwritearraylist<messagereference>
+protected int prefetchextension
+protected long enqueuecounter
+protected long dispatchcounter
+protected long dequeuecounter
+private int maxproducerstoaudit 32
+private int maxauditdepth 2048
+protected final systemusage usagemanager
+private final object pendinglock   new object
+private final object dispatchlock   new object
+protected activemqmessageaudit audit   new activemqmessageaudit
+private boolean slowconsumer
+private countdownlatch okforackasdispatchdone   new countdownlatch 1
+public prefetchsubscription broker broker  systemusage usagemanager  connectioncontext context  consumerinfo info  pendingmessagecursor cursor  throws invalidselectorexception
+super broker context  info
+this usagemanager usagemanager
+pending   cursor
+public prefetchsubscription broker broker systemusage usagemanager  connectioncontext context  consumerinfo info  throws invalidselectorexception
+this broker usagemanager context  info  new vmpendingmessagecursor
+/**
+* allows a message to be pulled on demand by a client
+*/
+public response pullmessage connectioncontext context  messagepull pull  throws exception
+// the slave should not deliver pull messages. todo: when the slave
+// becomes a master,
+// he should send a null message to all the consumers to 'wake them up'
+// in case
+// they were waiting for a message.
+if  getprefetchsize      0     isslave
+final long dispatchcounterbeforepull
+synchronized this
+prefetchextension
+dispatchcounterbeforepull   dispatchcounter
+// have the destination push us some messages.
+for  destination dest   destinations
+dest iterate
+dispatchpending
+synchronized this
+// if there was nothing dispatched.. we may need to setup a timeout.
+if  dispatchcounterbeforepull    dispatchcounter
+// immediate timeout used by receivenowait()
+if  pull gettimeout       1
+// send a null message.
+add queuemessagereference null_message
+dispatchpending
+if  pull gettimeout   > 0
+scheduler executeafterdelay new runnable
+public void run
+pulltimeout dispatchcounterbeforepull
+pull gettimeout
+return null
+/**
+* occurs when a pull times out. if nothing has been dispatched since the
+* timeout was setup, then send the null message.
+*/
+final void pulltimeout long dispatchcounterbeforepull
+synchronized  pendinglock
+if  dispatchcounterbeforepull    dispatchcounter
+try
+add queuemessagereference null_message
+dispatchpending
+catch  exception e
+context getconnection   serviceexception e
+public void add messagereference node  throws exception
+synchronized  pendinglock
+// the destination may have just been removed...
+if   destinations contains node getregiondestination       node  queuemessagereference null_message
+// perhaps we should inform the caller that we are no longer valid to dispatch to?
+return
+enqueuecounter
+pending addmessagelast node
+dispatchpending
+public void processmessagedispatchnotification messagedispatchnotification mdn  throws exception
+synchronized pendinglock
+try
+pending reset
+while  pending hasnext
+messagereference node   pending next
+if  node getmessageid   equals mdn getmessageid
+// synchronize between dispatched list and removal of messages from pending list
+// related to remove subscription action
+synchronized dispatchlock
+pending remove
+createmessagedispatch node  node getmessage
+dispatched add node
+ondispatch node  node getmessage
+return
+finally
+pending release
+throw new jmsexception
+mdn getmessageid
+mdn getconsumerid         mdn getdestination   getphysicalname
+public final void acknowledge final connectioncontext context final messageack ack  throws exception
+// handle the standard acknowledgment case.
+boolean calldispatchmatched   false
+destination destination   null
+if   isslave
+if   okforackasdispatchdone await 0l  timeunit milliseconds
+// suppress unexpected ack exception in this expected case
+log warn     ack
+return
+if  log istraceenabled
+log trace     ack
+synchronized dispatchlock
+if  ack isstandardack
+// first check if the ack matches the dispatched. when using failover this might
+// not be the case. we don't ever want to ack the wrong messages.
+assertackmatchesdispatched ack
+// acknowledge all dispatched messages up till the message id of
+// the acknowledgment.
+int index   0
+boolean inackrange   false
+list<messagereference> removelist   new arraylist<messagereference>
+for  final messagereference node   dispatched
+messageid messageid   node getmessageid
+if  ack getfirstmessageid      null
+ack getfirstmessageid   equals messageid
+inackrange   true
+if  inackrange
+// don't remove the nodes until we are committed.
+if   context isintransaction
+dequeuecounter
+node getregiondestination   getdestinationstatistics   getinflight   decrement
+removelist add node
+else
+// setup a synchronization to remove nodes from the
+// dispatched list.
+context gettransaction   addsynchronization
+new synchronization
+public void aftercommit
+throws exception
+synchronized dispatchlock
+dequeuecounter
+dispatched remove node
+node getregiondestination   getdestinationstatistics   getinflight   decrement
+public void afterrollback   throws exception
+synchronized dispatchlock
+node getregiondestination   getdestinationstatistics   getinflight   decrement
+index
+acknowledge context  ack  node
+if  ack getlastmessageid   equals messageid
+if  context isintransaction
+// extend prefetch window only if not a pulling
+// consumer
+if  getprefetchsize      0
+prefetchextension   math max
+prefetchextension  index
+else
+prefetchextension   math max 0
+prefetchextension   index
+destination   node getregiondestination
+calldispatchmatched   true
+break
+for  final messagereference node   removelist
+dispatched remove node
+// this only happens after a reconnect - get an ack which is not
+// valid
+if   calldispatchmatched
+log error
+ack
+else if  ack isindividualack
+// message was delivered and acknowledge - but only delete the
+// individual message
+for  final messagereference node   dispatched
+messageid messageid   node getmessageid
+if  ack getlastmessageid   equals messageid
+// this should never be within a transaction
+node getregiondestination   getdestinationstatistics   getinflight   decrement
+destination   node getregiondestination
+acknowledge context  ack  node
+dispatched remove node
+prefetchextension   math max 0  prefetchextension   1
+calldispatchmatched   true
+break
+else if  ack isdeliveredack
+// message was delivered but not acknowledged: update pre-fetch
+// counters.
+int index   0
+for  iterator<messagereference> iter   dispatched iterator    iter hasnext    index
+final messagereference node   iter next
+if  node isexpired
+if  broker isexpired node
+node getregiondestination   messageexpired context  this  node
+dispatched remove node
+node getregiondestination   getdestinationstatistics   getinflight   decrement
+if  ack getlastmessageid   equals node getmessageid
+prefetchextension   math max prefetchextension  index   1
+destination   node getregiondestination
+calldispatchmatched   true
+break
+if   calldispatchmatched
+throw new jmsexception
+ack
+else if  ack isredeliveredack
+// message was re-delivered but it was not yet considered to be
+// a dlq message.
+// acknowledge all dispatched messages up till the message id of
+// the ack.
+boolean inackrange   false
+for  final messagereference node   dispatched
+messageid messageid   node getmessageid
+if  ack getfirstmessageid      null
+ack getfirstmessageid   equals messageid
+inackrange   true
+if  inackrange
+if  ack getlastmessageid   equals messageid
+destination   node getregiondestination
+calldispatchmatched   true
+break
+if   calldispatchmatched
+throw new jmsexception
+ack
+else if  ack ispoisonack
+// todo: what if the message is already in a dlq???
+// handle the poison ack case: we need to send the message to a
+// dlq
+if  ack isintransaction
+throw new jmsexception
+ack
+// acknowledge all dispatched messages up till the message id of
+// the
+// acknowledgment.
+int index   0
+boolean inackrange   false
+list<messagereference> removelist   new arraylist<messagereference>
+for  final messagereference node   dispatched
+messageid messageid   node getmessageid
+if  ack getfirstmessageid      null
+ack getfirstmessageid   equals messageid
+inackrange   true
+if  inackrange
+sendtodlq context  node
+node getregiondestination   getdestinationstatistics
+getinflight   increment
+removelist add node
+dequeuecounter
+index
+acknowledge context  ack  node
+if  ack getlastmessageid   equals messageid
+prefetchextension   math max 0  prefetchextension
+index   1
+destination   node getregiondestination
+calldispatchmatched   true
+break
+for  final messagereference node   removelist
+dispatched remove node
+if   calldispatchmatched
+throw new jmsexception
+ack
+if  calldispatchmatched    destination    null
+destination wakeup
+dispatchpending
+else
+if  isslave
+throw new jmsexception
+ack
+dispatched
+else
+log debug
+ack
+/**
+* checks an ack versus the contents of the dispatched list.
+*
+* @param ack
+* @param firstackedmsg
+* @param lastackedmsg
+* @throws jmsexception if it does not match
+*/
+protected void assertackmatchesdispatched messageack ack  throws jmsexception
+messageid firstackedmsg   ack getfirstmessageid
+messageid lastackedmsg   ack getlastmessageid
+int checkcount   0
+boolean checkfoundstart   false
+boolean checkfoundend   false
+for  messagereference node   dispatched
+if  firstackedmsg    null
+checkfoundstart   true
+else if   checkfoundstart    firstackedmsg equals node getmessageid
+checkfoundstart   true
+if  checkfoundstart
+checkcount
+if  lastackedmsg    null    lastackedmsg equals node getmessageid
+checkfoundend   true
+break
+if   checkfoundstart    firstackedmsg    null
+throw new jmsexception     ack
+firstackedmsg
+if   checkfoundend    lastackedmsg    null
+throw new jmsexception     ack
+lastackedmsg
+if  ack getmessagecount      checkcount     ack isintransaction
+throw new jmsexception     ack
+ack getmessagecount
+checkcount
+/**
+* @param context
+* @param node
+* @throws ioexception
+* @throws exception
+*/
+protected void sendtodlq final connectioncontext context  final messagereference node  throws ioexception  exception
+broker sendtodeadletterqueue context  node
+public int getinflightsize
+return dispatched size
+/**
+* used to determine if the broker can dispatch to the consumer.
+*
+* @return
+*/
+public boolean isfull
+return dispatched size     prefetchextension >  info getprefetchsize
+/**
+* @return true when 60% or more room is left for dispatching messages
+*/
+public boolean islowwatermark
+return  dispatched size     prefetchextension  <   info getprefetchsize      4
+/**
+* @return true when 10% or less room is left for dispatching messages
+*/
+public boolean ishighwatermark
+return  dispatched size     prefetchextension  >   info getprefetchsize      9
+public int countbeforefull
+return info getprefetchsize     prefetchextension   dispatched size
+public int getpendingqueuesize
+return pending size
+public int getdispatchedqueuesize
+return dispatched size
+public long getdequeuecounter
+return dequeuecounter
+public long getdispatchedcounter
+return dispatchcounter
+public long getenqueuecounter
+return enqueuecounter
+public boolean isrecoveryrequired
+return pending isrecoveryrequired
+public pendingmessagecursor getpending
+return this pending
+public void setpending pendingmessagecursor pending
+this pending   pending
+if  this pending  null
+this pending setsystemusage usagemanager
+this pending setmemoryusagehighwatermark getcursormemoryhighwatermark
+public void add connectioncontext context  destination destination  throws exception
+synchronized pendinglock
+super add context  destination
+pending add context  destination
+public list<messagereference> remove connectioncontext context  destination destination  throws exception
+list<messagereference> rc   new arraylist<messagereference>
+synchronized pendinglock
+super remove context  destination
+// here is a potential problem concerning inflight stat:
+// messages not already committed or rolled back may not be removed from dispatched list at the moment
+// except if each commit or rollback callback action comes before remove of subscriber.
+rc addall pending remove context  destination
+// synchronized to dispatchlock
+synchronized dispatchlock
+for  messagereference r   dispatched
+if  r getregiondestination      destination
+rc add  queuemessagereference r
+destination getdestinationstatistics   getdispatched   subtract dispatched size
+destination getdestinationstatistics   getinflight   subtract dispatched size
+dispatched clear
+return rc
+protected void dispatchpending   throws ioexception
+if   isslave
+synchronized pendinglock
+try
+int numbertodispatch   countbeforefull
+if  numbertodispatch > 0
+slowconsumer false
+pending setmaxbatchsize numbertodispatch
+int count   0
+pending reset
+while  pending hasnext       isfull
+count < numbertodispatch
+messagereference node   pending next
+if  node    null
+break
+// synchronize between dispatched list and remove of message from pending list
+// related to remove subscription action
+synchronized dispatchlock
+pending remove
+if   isdropped node     candispatch node
+// message may have been sitting in the pending
+// list a while waiting for the consumer to ak the message.
+if  node  queuemessagereference null_message    node isexpired
+//increment number to dispatch
+numbertodispatch
+if  broker isexpired node
+node getregiondestination   messageexpired context  this  node
+continue
+dispatch node
+count
+else
+if   slowconsumer
+slowconsumer true
+connectioncontext c   new connectioncontext
+c setbroker context getbroker
+for  destination dest  destinations
+dest slowconsumer c this
+finally
+pending release
+protected boolean dispatch final messagereference node  throws ioexception
+final message message   node getmessage
+if  message    null
+return false
+okforackasdispatchdone countdown
+// no reentrant lock - patch needed to indirectmessagereference on method lock
+if   isslave
+messagedispatch md   createmessagedispatch node  message
+// null messages don't count... they don't get acked.
+if  node    queuemessagereference null_message
+dispatchcounter
+dispatched add node
+else
+prefetchextension   math max 0  prefetchextension   1
+if  info isdispatchasync
+md settransmitcallback new runnable
+public void run
+// since the message gets queued up in async dispatch,
+// we don't want to
+// decrease the reference count until it gets put on the
+// wire.
+ondispatch node  message
+context getconnection   dispatchasync md
+else
+context getconnection   dispatchsync md
+ondispatch node  message
+return true
+else
+return false
+protected void ondispatch final messagereference node  final message message
+if  node getregiondestination      null
+if  node    queuemessagereference null_message
+node getregiondestination   getdestinationstatistics   getdispatched   increment
+node getregiondestination   getdestinationstatistics   getinflight   increment
+if  log istraceenabled
+log trace info getdestination   getphysicalname         message getmessageid
+node getregiondestination   getdestinationstatistics   getdispatched   getcount
+node getregiondestination   getdestinationstatistics   getinflight   getcount
+if  info isdispatchasync
+try
+dispatchpending
+catch  ioexception e
+context getconnection   serviceexceptionasync e
+/**
+* inform the messageconsumer on the client to change it's prefetch
+*
+* @param newprefetch
+*/
+public void updateconsumerprefetch int newprefetch
+if  context    null    context getconnection      null    context getconnection   ismanageable
+consumercontrol cc   new consumercontrol
+cc setconsumerid info getconsumerid
+cc setprefetch newprefetch
+context getconnection   dispatchasync cc
+/**
+* @param node
+* @param message
+* @return messagedispatch
+*/
+protected messagedispatch createmessagedispatch messagereference node  message message
+if  node    queuemessagereference null_message
+messagedispatch md   new messagedispatch
+md setmessage null
+md setconsumerid info getconsumerid
+md setdestination null
+return md
+else
+messagedispatch md   new messagedispatch
+md setconsumerid info getconsumerid
+md setdestination node getregiondestination   getactivemqdestination
+md setmessage message
+md setredeliverycounter node getredeliverycounter
+return md
+/**
+* use when a matched message is about to be dispatched to the client.
+*
+* @param node
+* @return false if the message should not be dispatched to the client
+*         (another sub may have already dispatched it for example).
+* @throws ioexception
+*/
+protected abstract boolean candispatch messagereference node  throws ioexception
+protected abstract boolean isdropped messagereference node
+/**
+* used during acknowledgment to remove the message.
+*
+* @throws ioexception
+*/
+protected abstract void acknowledge connectioncontext context  final messageack ack  final messagereference node  throws ioexception
+public int getmaxproducerstoaudit
+return maxproducerstoaudit
+public void setmaxproducerstoaudit int maxproducerstoaudit
+this maxproducerstoaudit   maxproducerstoaudit
+public int getmaxauditdepth
+return maxauditdepth
+public void setmaxauditdepth int maxauditdepth
+this maxauditdepth   maxauditdepth

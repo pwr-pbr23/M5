@@ -1,0 +1,1321 @@
+/*
+derby - class org.apache.derby.impl.sql.compile.fromtable
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package	org apache derby impl sql compile
+import org apache derby iapi services context contextmanager
+import org apache derby iapi sql compile optimizable
+import org apache derby iapi sql compile optimizablepredicate
+import org apache derby iapi sql compile optimizablepredicatelist
+import org apache derby iapi sql compile optimizer
+import org apache derby iapi sql compile costestimate
+import org apache derby iapi sql compile joinstrategy
+import org apache derby iapi sql compile accesspath
+import org apache derby iapi sql compile rowordering
+import org apache derby iapi sql compile c_nodetypes
+import org apache derby iapi sql dictionary
+import org apache derby iapi types datatypedescriptor
+import org apache derby iapi error standardexception
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi reference sqlstate
+import org apache derby iapi error standardexception
+import org apache derby impl sql execute hashscanresultset
+import org apache derby iapi util jbitset
+import org apache derby iapi services io formatablebitset
+import org apache derby iapi util stringutil
+import org apache derby catalog uuid
+import java util enumeration
+import java util properties
+import java util vector
+import java util hashmap
+/**
+* a fromtable represents a table in the from clause of a dml statement.
+* it can be either a base table, a subquery or a project restrict.
+*
+* @see frombasetable
+* @see fromsubquery
+* @see projectrestrictnode
+*
+*/
+abstract class fromtable extends resultsetnode implements optimizable
+{
+properties		tableproperties
+string		correlationname
+tablename	corrtablename
+int			tablenumber
+/* (query block) level is 0-based. */
+/* resolve - view resolution will have to update the level within
+* the view tree.
+*/
+int			level
+// hashkeycolumns are 0-based column #s within the row returned by the store for hash scans
+int			hashkeycolumns
+// overrides for hash join
+int				initialcapacity   hashscanresultset default_initial_capacity
+float			loadfactor   hashscanresultset default_loadfactor
+int				maxcapacity   hashscanresultset default_max_capacity
+accesspathimpl			currentaccesspath
+accesspathimpl			bestaccesspath
+accesspathimpl			bestsortavoidancepath
+accesspathimpl			trulythebestaccesspath
+private int		joinstrategynumber
+protected string userspecifiedjoinstrategy
+protected costestimate bestcostestimate
+private formatablebitset refcols
+private double perrowusage    1
+private boolean considersortavoidancepath
+/**
+set of object->trulythebestaccesspath mappings used to keep track
+of which of this optimizable's "trulythebestaccesspath" was the best
+with respect to a specific outer query or ancestor node.  in the case
+of an outer query, the object key will be an instance of optimizerimpl.
+in the case of an ancestor node, the object key will be that node itself.
+each ancestor node or outer query could potentially have a different
+idea of what this optimizable's "best access path" is, so we have to
+keep track of them all.
+*/
+private hashmap bestplanmap
+/** operations that can be performed on bestplanmap. */
+protected static final short remove_plan   0
+protected static final short add_plan   1
+protected static final short load_plan   2
+/** the original unbound table name */
+protected tablename origtablename
+/**
+* initializer for a table in a from list.
+*
+* @param correlationname	the correlation name
+* @param tableproperties	properties list associated with the table
+*/
+public void init object correlationname  object tableproperties
+{
+this correlationname    string  correlationname
+this tableproperties    properties  tableproperties
+tablenumber    1
+bestplanmap   null
+}
+/**
+* get this table's correlation name, if any.
+*/
+public	string	getcorrelationname     return correlationname
+/*
+*  optimizable interface
+*/
+/**
+* @see org.apache.derby.iapi.sql.compile.optimizable#optimizeit
+*
+* @exception standardexception		thrown on error
+*
+*/
+public costestimate optimizeit
+optimizer optimizer
+optimizablepredicatelist predlist
+costestimate outercost
+rowordering rowordering
+throws standardexception
+{
+// it's possible that a call to optimize the left/right will cause
+// a new "truly the best" plan to be stored in the underlying base
+// tables.  if that happens and then we decide to skip that plan
+// (which we might do if the call to "considercost()" below decides
+// the current path is infeasible or not the best) we need to be
+// able to revert back to the "truly the best" plans that we had
+// saved before we got here.  so with this next call we save the
+// current plans using "this" node as the key.  if needed, we'll
+// then make the call to revert the plans in optimizerimpl's
+// getnextdecoratedpermutation() method.
+updatebestplanmap add_plan  this
+costestimate singlescancost   estimatecost predlist
+conglomeratedescriptor  null
+outercost
+optimizer
+rowordering
+/* make sure there is a cost estimate to set */
+getcostestimate optimizer
+setcostestimate singlescancost
+/* optimize any subqueries that need to get optimized and
+* are not optimized any where else.  (like those
+* in a rowresultsetnode.)
+*/
+optimizesubqueries getdatadictionary    costestimate rowcount
+/*
+** get the cost of this result set in the context of the whole plan.
+*/
+getcurrentaccesspath
+getjoinstrategy
+estimatecost
+this
+predlist
+conglomeratedescriptor  null
+outercost
+optimizer
+getcostestimate
+optimizer considercost this  predlist  getcostestimate    outercost
+return getcostestimate
+}
+/**
+@see optimizable#nextaccesspath
+@exception standardexception	thrown on error
+*/
+public boolean nextaccesspath optimizer optimizer
+optimizablepredicatelist predlist
+rowordering rowordering
+throws standardexception
+{
+int	numstrat   optimizer getnumberofjoinstrategies
+boolean found   false
+accesspath ap   getcurrentaccesspath
+/*
+** most optimizables have no ordering, so tell the rowordering that
+** this optimizable is unordered, if appropriate.
+*/
+if  userspecifiedjoinstrategy    null
+{
+/*
+** user specified a join strategy, so we should look at only one
+** strategy.  if there is a current strategy, we have already
+** looked at the strategy, so go back to null.
+*/
+if  ap getjoinstrategy      null
+{
+ap setjoinstrategy  joinstrategy  null
+found   false
+}
+else
+{
+ap setjoinstrategy
+optimizer getjoinstrategy userspecifiedjoinstrategy
+if  ap getjoinstrategy      null
+{
+throw standardexception newexception sqlstate lang_invalid_join_strategy
+userspecifiedjoinstrategy  getbasetablename
+}
+found   true
+}
+}
+else if  joinstrategynumber < numstrat
+{
+/* step through the join strategies. */
+ap setjoinstrategy optimizer getjoinstrategy joinstrategynumber
+joinstrategynumber
+found   true
+optimizer trace optimizer considering_join_strategy  tablenumber  0  0 0
+ap getjoinstrategy
+}
+/*
+** tell the rowordering about columns that are equal to constant
+** expressions.
+*/
+tellroworderingaboutconstantcolumns rowordering  predlist
+return found
+}
+/** most optimizables cannot be ordered */
+protected boolean canbeordered
+{
+return false
+}
+/** @see optimizable#getcurrentaccesspath */
+public accesspath getcurrentaccesspath
+{
+return currentaccesspath
+}
+/** @see optimizable#getbestaccesspath */
+public accesspath getbestaccesspath
+{
+return bestaccesspath
+}
+/** @see optimizable#getbestsortavoidancepath */
+public accesspath getbestsortavoidancepath
+{
+return bestsortavoidancepath
+}
+/** @see optimizable#gettrulythebestaccesspath */
+public accesspath gettrulythebestaccesspath
+{
+return trulythebestaccesspath
+}
+/** @see optimizable#remembersortavoidancepath */
+public void remembersortavoidancepath
+{
+considersortavoidancepath   true
+}
+/** @see optimizable#considersortavoidancepath */
+public boolean considersortavoidancepath
+{
+return considersortavoidancepath
+}
+/** @see optimizable#rememberjoinstrategyasbest */
+public void rememberjoinstrategyasbest accesspath ap
+{
+optimizer optimizer   ap getoptimizer
+ap setjoinstrategy getcurrentaccesspath   getjoinstrategy
+optimizer trace optimizer remembering_join_strategy  tablenumber  0  0 0
+getcurrentaccesspath   getjoinstrategy
+if  ap    bestaccesspath
+{
+optimizer trace optimizer remembering_best_access_path_substring
+tablenumber  0  0 0  ap
+}
+else if  ap    bestsortavoidancepath
+{
+optimizer trace optimizer remembering_best_sort_avoidance_access_path_substring
+tablenumber  0  0 0  ap
+}
+else
+{
+/* we currently get here when optimizing an outer join.
+* (problem predates optimizer trace change.)
+* resolve - fix this at some point.
+if (sanitymanager.debug)
+{
+sanitymanager.throwassert(
+"unknown access path type");
+}
+*/
+optimizer trace optimizer remembering_best_unknown_access_path_substring
+tablenumber  0  0 0  ap
+}
+}
+/** @see optimizable#gettabledescriptor */
+public tabledescriptor gettabledescriptor
+{
+if (sanitymanager.debug)
+{
+sanitymanager.throwassert(
+getclass   tostring
+}
+return null
+}
+/**
+* @see org.apache.derby.iapi.sql.compile.optimizable#pushoptpredicate
+*
+* @exception standardexception		thrown on error
+*/
+public boolean pushoptpredicate optimizablepredicate optimizablepredicate
+throws standardexception
+{
+return false
+}
+/**
+* @see optimizable#pulloptpredicates
+*
+* @exception standardexception		thrown on error
+*/
+public void pulloptpredicates
+optimizablepredicatelist optimizablepredicates
+throws standardexception
+{
+/* for most types of optimizable, do nothing */
+return
+}
+/**
+* @see optimizable#modifyaccesspath
+*
+* @exception standardexception		thrown on error
+*/
+public optimizable modifyaccesspath jbitset outertables  throws standardexception
+{
+/* for most types of optimizable, do nothing */
+return this
+}
+/**
+* @see optimizable#iscoveringindex
+* @exception standardexception		thrown on error
+*/
+public boolean iscoveringindex conglomeratedescriptor cd  throws standardexception
+{
+return false
+}
+/** @see optimizable#getproperties */
+public properties getproperties
+{
+return tableproperties
+}
+/** @see optimizable#setproperties */
+public void setproperties properties tableproperties
+{
+this tableproperties   tableproperties
+}
+/** @see optimizable#verifyproperties
+* @exception standardexception		thrown on error
+*/
+public void verifyproperties datadictionary ddictionary
+throws standardexception
+{
+if  tableproperties    null
+{
+return
+}
+/* check here for:
+*		invalid properties key
+*		invalid joinstrategy
+*		invalid value for hashinitialcapacity
+*		invalid value for hashloadfactor
+*		invalid value for hashmaxcapacity
+*/
+boolean indexspecified   false
+enumeration e   tableproperties keys
+while  e hasmoreelements
+{
+string key    string  e nextelement
+string value    string  tableproperties get key
+if  key equals
+{
+userspecifiedjoinstrategy   stringutil sqltouppercase value
+}
+else if  key equals
+{
+initialcapacity   getintproperty value  key
+// verify that the specified value is valid
+if  initialcapacity <  0
+{
+throw standardexception newexception sqlstate lang_invalid_hash_initial_capacity
+string valueof initialcapacity
+}
+}
+else if  key equals
+{
+try
+{
+loadfactor   float valueof value  floatvalue
+}
+catch  numberformatexception nfe
+{
+throw standardexception newexception sqlstate lang_invalid_number_format_for_override
+value  key
+}
+// verify that the specified value is valid
+if  loadfactor <  0 0    loadfactor > 1 0
+{
+throw standardexception newexception sqlstate lang_invalid_hash_load_factor
+value
+}
+}
+else if  key equals
+{
+maxcapacity   getintproperty value  key
+// verify that the specified value is valid
+if  maxcapacity <  0
+{
+throw standardexception newexception sqlstate lang_invalid_hash_max_capacity
+string valueof maxcapacity
+}
+}
+else
+{
+// no other "legal" values at this time
+throw standardexception newexception sqlstate lang_invalid_from_table_property  key
+}
+}
+}
+/** @see optimizable#getname
+* @exception standardexception		thrown on error
+*/
+public string getname   throws standardexception
+{
+return getexposedname
+}
+/** @see optimizable#getbasetablename */
+public string getbasetablename
+{
+return
+}
+/** @see optimizable#convertabsolutetorelativecolumnposition */
+public int convertabsolutetorelativecolumnposition int absoluteposition
+{
+return absoluteposition
+}
+/** @see optimizable#updatebestplanmap */
+public void updatebestplanmap short action
+object plankey  throws standardexception
+{
+if  action    remove_plan
+{
+if  bestplanmap    null
+{
+bestplanmap remove plankey
+if  bestplanmap size      0
+bestplanmap   null
+}
+return
+}
+accesspath bestpath   gettrulythebestaccesspath
+accesspathimpl ap   null
+if  action    add_plan
+{
+// if we get to this method before ever optimizing this node, then
+// there will be no best path--so there's nothing to do.
+if  bestpath    null
+return
+// if the bestplanmap already exists, search for an
+// accesspath for the received key and use that if we can.
+if  bestplanmap    null
+bestplanmap   new hashmap
+else
+ap    accesspathimpl bestplanmap get plankey
+// if we don't already have an accesspath for the key,
+// create a new one.  if the key is an optimizerimpl then
+// we might as well pass it in to the accesspath constructor;
+// otherwise just pass null.
+if  ap    null
+{
+if  plankey instanceof optimizer
+ap   new accesspathimpl  optimizer plankey
+else
+ap   new accesspathimpl  optimizer null
+}
+ap copy bestpath
+bestplanmap put plankey  ap
+return
+}
+// if we get here, we want to load the best plan from our map
+// into this optimizable's trulythebestaccesspath field.
+// if we don't have any plans saved, then there's nothing to load.
+// this can happen if the key is an optimizerimpl that tried some
+// join order for which there was no valid plan.
+if  bestplanmap    null
+return
+ap    accesspathimpl bestplanmap get plankey
+// it might be the case that there is no plan stored for
+// the key, in which case there's nothing to load.
+if   ap    null      ap getcostestimate      null
+return
+// we found a best plan in our map, so load it into this optimizable's
+// trulythebestaccesspath field.
+bestpath copy ap
+return
+}
+/** @see optimizable#rememberasbest */
+public void rememberasbest int plantype  optimizer optimizer
+throws standardexception
+{
+accesspath bestpath   null
+switch  plantype
+{
+case optimizer normal_plan
+bestpath   getbestaccesspath
+break
+case optimizer sort_avoidance_plan
+bestpath   getbestsortavoidancepath
+break
+default
+if (sanitymanager.debug)
+{
+sanitymanager.throwassert(
+plantype
+}
+}
+gettrulythebestaccesspath   copy bestpath
+// since we just set trulythebestaccesspath for the current
+// join order of the received optimizer, take note of what
+// that path is, in case we need to "revert" back to this
+// path later.  see optimizable.updatebestplanmap().
+// note: since this call descends all the way down to base
+// tables, it can be relatively expensive when we have deeply
+// nested subqueries.  so in an attempt to save some work, we
+// skip the call if this node is a projectrestrictnode whose
+// child is an optimizable--in that case the projectrestrictnode
+// will in turn call "rememberasbest" on its child and so
+// the required call to updatebestplanmap() will be
+// made at that time.  if we did it here, too, then we would
+// just end up duplicating the work.
+if    this instanceof projectrestrictnode
+updatebestplanmap add_plan  optimizer
+else
+{
+projectrestrictnode prn    projectrestrictnode this
+if    prn getchildresult   instanceof optimizable
+updatebestplanmap add_plan  optimizer
+}
+/* also store the name of the access path; i.e index name/constraint
+* name if we're using an index to access the base table.
+*/
+conglomeratedescriptor cd  	bestpath getconglomeratedescriptor
+if  isbasetable
+{
+datadictionary dd   getdatadictionary
+tabledescriptor td   gettabledescriptor
+gettrulythebestaccesspath   initializeaccesspathname dd  td
+}
+setcostestimate bestpath getcostestimate
+bestpath getoptimizer   trace optimizer remembering_best_access_path
+tablenumber  plantype  0 0  bestpath
+}
+/** @see optimizable#startoptimizing */
+public void startoptimizing optimizer optimizer  rowordering rowordering
+{
+resetjoinstrategies optimizer
+considersortavoidancepath   false
+/*
+** if there are costs associated with the best and sort access
+** paths, set them to their maximum values, so that any legitimate
+** access path will look cheaper.
+*/
+costestimate ce   getbestaccesspath   getcostestimate
+if  ce    null
+ce setcost double max_value  double max_value  double max_value
+ce   getbestsortavoidancepath   getcostestimate
+if  ce    null
+ce setcost double max_value  double max_value  double max_value
+if    canbeordered
+rowordering addunorderedoptimizable this
+}
+/**
+* this method is called when this table is placed in a potential
+* join order, or when a new conglomerate is being considered.
+* set this join strategy number to 0 to indicate that
+* no join strategy has been considered for this table yet.
+*/
+protected void resetjoinstrategies optimizer optimizer
+{
+joinstrategynumber   0
+getcurrentaccesspath   setjoinstrategy  joinstrategy  null
+}
+/**
+* @see optimizable#estimatecost
+*
+* @exception standardexception		thrown on error
+*/
+public costestimate estimatecost optimizablepredicatelist predlist
+conglomeratedescriptor cd
+costestimate outercost
+optimizer optimizer
+rowordering rowordering
+throws standardexception
+{
+if (sanitymanager.debug)
+{
+sanitymanager.throwassert(
+getclass   tostring
+}
+return null
+}
+/**
+* get the final costestimate for this fromtable.
+*
+* @return	the final costestimate for this fromtable, which is
+*  the costestimate of trulythebestaccesspath if there is one.
+*  if there's no trulythebestaccesspath for this node, then
+*  we just return the value stored in costestimate as a default.
+*/
+public costestimate getfinalcostestimate
+throws standardexception
+{
+// if we already found it, just return it.
+if  finalcostestimate    null
+return finalcostestimate
+if  gettrulythebestaccesspath      null
+finalcostestimate   costestimate
+else
+finalcostestimate   gettrulythebestaccesspath   getcostestimate
+return finalcostestimate
+}
+/** @see optimizable#isbasetable */
+public boolean isbasetable
+{
+return false
+}
+/** @see optimizable#ismaterializable
+*
+* @exception standardexception		thrown on error
+*/
+public boolean ismaterializable
+throws standardexception
+{
+/* derived tables are materializable
+* iff they are not correlated with an outer query block.
+*/
+hascorrelatedcrsvisitor visitor   new hascorrelatedcrsvisitor
+accept visitor
+return   visitor hascorrelatedcrs
+}
+/** @see optimizable#supportsmultipleinstantiations */
+public boolean supportsmultipleinstantiations
+{
+return true
+}
+/** @see optimizable#gettablenumber */
+public int gettablenumber
+{
+return tablenumber
+}
+/** @see optimizable#hastablenumber */
+public boolean hastablenumber
+{
+return tablenumber >  0
+}
+/** @see optimizable#forupdate */
+public boolean forupdate
+{
+return false
+}
+/** @see optimizable#initialcapacity */
+public int initialcapacity
+{
+if (sanitymanager.debug)
+{
+sanitymanager throwassert
+}
+return 0
+}
+/** @see optimizable#loadfactor */
+public float loadfactor
+{
+if (sanitymanager.debug)
+{
+sanitymanager throwassert
+}
+return 0 0f
+}
+/** @see optimizable#maxcapacity */
+public int maxcapacity  joinstrategy joinstrategy  int maxmemorypertable  throws standardexception
+{
+return joinstrategy maxcapacity  maxcapacity  maxmemorypertable  getperrowusage
+}
+private double getperrowusage   throws standardexception
+{
+if  perrowusage < 0
+{
+// do not use getrefcols() because the cached refcols may no longer be valid.
+formatablebitset refcols   resultcolumns getreferencedformatablebitset cursortargettable    true  false
+perrowusage   0 0
+/* add up the memory usage for each referenced column */
+for  int i   0  i < refcols size    i
+{
+if  refcols isset i
+{
+resultcolumn rc    resultcolumn  resultcolumns elementat i
+datatypedescriptor expressiontype   rc getexpression   gettypeservices
+if  expressiontype    null
+perrowusage    expressiontype estimatedmemoryusage
+}
+}
+/*
+** if the proposed conglomerate is a non-covering index, add the
+** size of the rowlocation column to the total.
+**
+** note: we don't have a datatypedescriptor representing a
+** ref column here, so just add a constant here.
+*/
+conglomeratedescriptor cd
+getcurrentaccesspath   getconglomeratedescriptor
+if  cd    null
+{
+if  cd isindex          iscoveringindex cd
+{
+perrowusage     12 0
+}
+}
+}
+return perrowusage
+end of getperrowusage
+/** @see optimizable#hashkeycolumns */
+public int hashkeycolumns
+{
+if (sanitymanager.debug)
+{
+sanitymanager assert hashkeycolumns    null
+}
+return hashkeycolumns
+}
+/** @see optimizable#sethashkeycolumns */
+public void sethashkeycolumns int columnnumbers
+{
+hashkeycolumns   columnnumbers
+}
+/**
+* @see optimizable#feasiblejoinstrategy
+*
+* @exception standardexception		thrown on error
+*/
+public boolean feasiblejoinstrategy optimizablepredicatelist predlist
+optimizer optimizer
+throws standardexception
+{
+return getcurrentaccesspath   getjoinstrategy
+feasible this  predlist  optimizer
+}
+/** @see optimizable#memoryusageok */
+public boolean memoryusageok  double rowcount  int maxmemorypertable
+throws standardexception
+{
+/*
+** don't enforce maximum memory usage for a user-specified join
+** strategy.
+*/
+if  userspecifiedjoinstrategy    null
+return true
+int introwcount    rowcount > integer max_value  ? integer max_value    int  rowcount
+return introwcount <  maxcapacity  getcurrentaccesspath   getjoinstrategy    maxmemorypertable
+}
+/**
+* @see optimizable#legaljoinorder
+*/
+public boolean legaljoinorder jbitset assignedtablemap
+{
+// only those subclasses with dependencies need to override this.
+return true
+}
+/**
+* @see optimizable#getnumcolumnsreturned
+*/
+public int getnumcolumnsreturned
+{
+return resultcolumns size
+}
+/**
+* @see optimizable#istargettable
+*/
+public boolean istargettable
+{
+return false
+}
+/**
+* @see optimizable#isonerowscan
+*
+* @exception standardexception		thrown on error
+*/
+public boolean isonerowscan
+throws standardexception
+{
+/* we simply return isonerowresultset() for all
+* subclasses except for exists fbt where
+* the semantics differ between 1 row per probe
+* and whether or not there can be more than 1
+* rows that qualify on a scan.
+*/
+return isonerowresultset
+}
+/**
+* @see optimizable#initaccesspaths
+*/
+public void initaccesspaths optimizer optimizer
+{
+if  currentaccesspath    null
+{
+currentaccesspath   new accesspathimpl optimizer
+}
+if  bestaccesspath    null
+{
+bestaccesspath   new accesspathimpl optimizer
+}
+if  bestsortavoidancepath    null
+{
+bestsortavoidancepath   new accesspathimpl optimizer
+}
+if  trulythebestaccesspath    null
+{
+trulythebestaccesspath   new accesspathimpl optimizer
+}
+}
+/**
+* @see optimizable#uniquejoin
+*
+* @exception standardexception		thrown on error
+*/
+public double uniquejoin optimizablepredicatelist predlist
+throws standardexception
+{
+return  1 0
+}
+private formatablebitset getrefcols
+{
+if  refcols    null
+refcols   resultcolumns getreferencedformatablebitset cursortargettable    true  false
+return refcols
+}
+/**
+* return the user specified join strategy, if any for this table.
+*
+* @return the user specified join strategy, if any for this table.
+*/
+string getuserspecifiedjoinstrategy
+{
+if  tableproperties    null
+{
+return null
+}
+return tableproperties getproperty
+}
+/**
+* is this a table that has a for update
+* clause.  overridden by frombasetable.
+*
+* @return true/false
+*/
+protected boolean cursortargettable
+{
+return false
+}
+protected costestimate getcostestimate optimizer optimizer
+{
+if  costestimate    null
+{
+costestimate   optimizer newcostestimate
+}
+return costestimate
+}
+/*
+** this gets a cost estimate for doing scratch calculations.  typically,
+** it will hold the estimated cost of a conglomerate.  if the optimizer
+** decides the scratch cost is lower than the best cost estimate so far,
+** it will copy the scratch cost to the non-scratch cost estimate,
+** which is allocated above.
+*/
+protected costestimate getscratchcostestimate optimizer optimizer
+{
+if  scratchcostestimate    null
+{
+scratchcostestimate   optimizer newcostestimate
+}
+return scratchcostestimate
+}
+/**
+* set the cost estimate in this node to the given cost estimate.
+*/
+protected void setcostestimate costestimate newcostestimate
+{
+costestimate   getcostestimate
+costestimate setcost newcostestimate
+}
+/**
+* assign the cost estimate in this node to the given cost estimate.
+*/
+protected void assigncostestimate costestimate newcostestimate
+{
+costestimate   newcostestimate
+}
+/**
+* convert this object to a string.  see comments in querytreenode.java
+* for how this should be done for tree printing.
+*
+* @return	this object as a string
+*/
+public string tostring
+{
+if (sanitymanager.debug)
+{
+return     correlationname
+corrtablename    null ?
+corrtablename tostring
+tablenumber
+level
+super tostring
+}
+else
+{
+return
+}
+}
+/**
+* return a resultcolumnlist with all of the columns in this table.
+* (used in expanding '*'s.)
+* note: since this method is for expanding a "*" in the select list,
+* resultcolumn.expression will be a columnreference.
+*
+* @param alltablename		the qualifier on the "*"
+*
+* @return resultcolumnlist	list of result columns from this table.
+*
+* @exception standardexception		thrown on error
+*/
+public resultcolumnlist getresultcolumnsforlist tablename alltablename
+resultcolumnlist inputrcl
+tablename tablename
+throws standardexception
+{
+resultcolumnlist rclist   null
+resultcolumn	 resultcolumn
+valuenode		 valuenode
+string			 columnname
+tablename		 exposedname
+tablename        tocompare
+/* if alltablename is non-null, then we must check to see if it matches
+* our exposed name.
+*/
+if correlationname    null
+tocompare   tablename
+else
+if alltablename    null
+tocompare   maketablename alltablename getschemaname   correlationname
+else
+tocompare   maketablename null correlationname
+}
+if   alltablename    null
+alltablename equals tocompare
+{
+return null
+}
+/* cache exposed name for this table.
+* the exposed name becomes the qualifier for each column
+* in the expanded list.
+*/
+if  correlationname    null
+{
+exposedname   tablename
+}
+else
+{
+exposedname   maketablename null  correlationname
+}
+rclist    resultcolumnlist  getnodefactory   getnode
+c_nodetypes result_column_list
+getcontextmanager
+/* build a new result column list based off of resultcolumns.
+* note: this method will capture any column renaming due to
+* a derived column list.
+*/
+int inputsize   inputrcl size
+for  int index   0  index < inputsize  index
+{
+// build a resultcolumn/columnreference pair for the column //
+columnname     resultcolumn  inputrcl elementat index   getname
+valuenode    valuenode  getnodefactory   getnode
+c_nodetypes column_reference
+columnname
+exposedname
+getcontextmanager
+resultcolumn    resultcolumn  getnodefactory   getnode
+c_nodetypes result_column
+columnname
+valuenode
+getcontextmanager
+// build the resultcolumnlist to return //
+rclist addresultcolumn resultcolumn
+}
+return rclist
+}
+/**
+* push expressions down to the first resultsetnode which can do expression
+* evaluation and has the same referenced table map.
+* resolve - this means only pushing down single table expressions to
+* projectrestrictnodes today.  once we have a better understanding of how
+* the optimizer will work, we can push down join clauses.
+*
+* @param predicatelist	the predicatelist.
+*
+* @exception standardexception		thrown on error
+*/
+void pushexpressions predicatelist predicatelist
+throws standardexception
+{
+if (sanitymanager.debug)
+{
+sanitymanager assert predicatelist    null
+}
+}
+/**
+* get the exposed name for this table, which is the name that can
+* be used to refer to it in the rest of the query.
+*
+* @return	the exposed name of this table.
+*
+* @exception standardexception		thrown on error
+*/
+public string getexposedname   throws standardexception
+{
+if (sanitymanager.debug)
+sanitymanager.throwassert(
+this getclass   getname
+return null
+}
+/**
+* set the table # for this table.
+*
+* @param tablenumber	the table # for this table.
+*/
+public void settablenumber int tablenumber
+{
+/* this should only be called if the tablenumber has not been set yet */
+if (sanitymanager.debug)
+sanitymanager assert this tablenumber     1
+this tablenumber   tablenumber
+}
+/**
+* return a tablename node representing this fromtable.
+* expect this to be overridden (and used) by subclasses
+* that may set correlationname to null.
+*
+* @return a tablename node representing this fromtable.
+* @exception standardexception		thrown on error
+*/
+public tablename gettablename
+throws standardexception
+{
+if  correlationname    null  return null
+if  corrtablename    null
+{
+corrtablename   maketablename null  correlationname
+}
+return corrtablename
+}
+/**
+* set the (query block) level (0-based) for this fromtable.
+*
+* @param level		the query block level for this fromtable.
+*/
+public void setlevel int level
+{
+this level   level
+}
+/**
+* get the (query block) level (0-based) for this fromtable.
+*
+* @return int	the query block level for this fromtable.
+*/
+public int getlevel
+{
+return level
+}
+/**
+* decrement (query block) level (0-based) for this fromtable.
+* this is useful when flattening a subquery.
+*
+* @param decrement	the amount to decrement by.
+*/
+void decrementlevel int decrement
+{
+if (sanitymanager.debug)
+{
+/* note: level doesn't get propagated
+* to nodes generated after binding.
+*/
+if  level < decrement    level    0
+{
+sanitymanager.throwassert(
+level
+decrement
+}
+}
+/* note: level doesn't get propagated
+* to nodes generated after binding.
+*/
+if  level > 0
+{
+level    decrement
+}
+}
+/**
+* get a schema descriptor for the given table.
+* uses this.corrtablename.
+*
+* @return schema descriptor
+*
+* @exception	standardexception	throws on schema name
+*						that doesn't exist
+*/
+public schemadescriptor getschemadescriptor   throws standardexception
+{
+return getschemadescriptor corrtablename
+}
+/**
+* get a schema descriptor for the given table.
+*
+* @param	tablename the table name
+*
+* @return schema descriptor
+*
+* @exception	standardexception	throws on schema name
+*						that doesn't exist
+*/
+public schemadescriptor getschemadescriptor tablename tablename  throws standardexception
+{
+schemadescriptor		sd
+sd   getschemadescriptor tablename getschemaname
+return sd
+}
+/**
+* determine whether or not the specified name is an exposed name in
+* the current query block.
+*
+* @param name	the specified name to search for as an exposed name.
+* @param schemaname	schema name, if non-null.
+* @param exactmatch	whether or not we need an exact match on specified schema and table
+*						names or match on table id.
+*
+* @return the fromtable, if any, with the exposed name.
+*
+* @exception standardexception		thrown on error
+*/
+protected fromtable getfromtablebyname string name  string schemaname  boolean exactmatch
+throws standardexception
+{
+// only frombasetables have schema names
+if  schemaname    null
+{
+return null
+}
+if  getexposedname   equals name
+{
+return this
+}
+return null
+}
+/**
+* is this fromtable a joinnode which can be flattened into
+* the parents fromlist.
+*
+* @return boolean		whether or not this fromtable can be flattened.
+*/
+public boolean isflattenablejoinnode
+{
+return false
+}
+/**
+* no loj reordering for this fromtable.
+*/
+public boolean loj_reorderable int numtables
+throws standardexception
+{
+return false
+}
+/**
+* transform any outer join into an inner join where applicable.
+* (based on the existence of a null intolerant
+* predicate on the inner table.)
+*
+* @param predicatetree	the predicate tree for the query block
+*
+* @return the new tree top (outerjoin or innerjoin).
+*
+* @exception standardexception		thrown on error
+*/
+public fromtable transformouterjoins valuenode predicatetree  int numtables
+throws standardexception
+{
+return this
+}
+/**
+* fill the referencedtablemap with this resultsetnode.
+*
+* @param passedmap	the table map to fill in.
+*/
+public void fillinreferencedtablemap jbitset passedmap
+{
+if  tablenumber     1
+{
+passedmap set tablenumber
+}
+}
+/**
+* mark as updatable all the columns in the result column list of this
+* frombasetable that match the columns in the given update column list.
+* if the list is null, it means all the columns are updatable.
+*
+* @param updatecolumns		a vector representing the columns
+*							that can be updated.
+*/
+protected void markupdatablebycursor vector updatecolumns
+{
+resultcolumns markupdatablebycursor updatecolumns
+}
+/**
+* flatten this fromtable into the outer query block. the steps in
+* flattening are:
+*	o  mark all resultcolumns as redundant, so that they are "skipped over"
+*	   at generate().
+*	o  append the wherepredicates to the outer list.
+*	o  return the fromlist so that the caller will merge the 2 lists
+*
+* @param rcl				the rcl from the outer query
+* @param outerplist	predicatelist to append wherepredicates to.
+* @param sql				the subquerylist from the outer query
+* @param gbl				the group by list, if any
+*
+* @return fromlist		the fromlist from the underlying selectnode.
+*
+* @exception standardexception		thrown on error
+*/
+public fromlist flatten resultcolumnlist rcl
+predicatelist outerplist
+subquerylist sql
+groupbylist gbl
+throws standardexception
+{
+if (sanitymanager.debug)
+{
+sanitymanager.throwassert(
+this
+}
+return null
+}
+/**
+* optimize any subqueries that haven't been optimized any where
+* else.  this is useful for a rowresultsetnode as a derived table
+* because it doesn't get optimized otherwise.
+*
+* @exception standardexception		thrown on error
+*/
+void optimizesubqueries datadictionary dd  double rowcount
+throws standardexception
+{
+}
+/**
+* tell the given rowordering about any columns that are constant
+* due to their being equality comparisons with constant expressions.
+*/
+protected void tellroworderingaboutconstantcolumns
+rowordering	rowordering
+optimizablepredicatelist predlist
+{
+/*
+** tell the rowordering about columns that are equal to constant
+** expressions.
+*/
+if  predlist    null
+{
+for  int i   0  i < predlist size    i
+{
+predicate pred    predicate  predlist getoptpredicate i
+/* is it an = comparison with a constant expression? */
+if  pred equalscomparisonwithconstantexpression this
+{
+/* get the column being compared to the constant */
+columnreference cr   pred getrelop   getcolumnoperand this
+if  cr    null
+{
+/* tell rowordering that the column is always ordered */
+rowordering columnalwaysordered this  cr getcolumnnumber
+}
+}
+}
+}
+}
+public boolean needsspecialrclbinding
+{
+return false
+}
+/**
+* sets the original or unbound table name for this fromtable.
+*
+* @param tablename the unbound table name
+*
+*/
+public void setorigtablename tablename tablename
+{
+this origtablename   tablename
+}
+/**
+* gets the original or unbound table name for this fromtable.
+* the tablename field can be changed due to synonym resolution.
+* use this method to retrieve the actual unbound tablename.
+*
+* @return tablename the original or unbound tablename
+*
+*/
+public tablename getorigtablename
+{
+return this origtablename
+}
+}

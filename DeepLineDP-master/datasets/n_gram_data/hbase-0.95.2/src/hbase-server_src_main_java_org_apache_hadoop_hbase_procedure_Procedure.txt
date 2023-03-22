@@ -1,0 +1,313 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase procedure
+import java io ioexception
+import java util arraylist
+import java util list
+import java util concurrent callable
+import java util concurrent countdownlatch
+import java util concurrent timeunit
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop classification interfacestability
+import org apache hadoop hbase errorhandling foreignexception
+import org apache hadoop hbase errorhandling foreignexceptiondispatcher
+import org apache hadoop hbase errorhandling foreignexceptionlistener
+import org apache hadoop hbase errorhandling foreignexceptionsnare
+import org apache hadoop hbase errorhandling timeoutexceptioninjector
+import com google common collect lists
+/**
+* a globally-barriered distributed procedure.  this class encapsulates state and methods for
+* tracking and managing a distributed procedure, as well as aborting if any member encounters
+* a problem or if a cancellation is requested.
+* <p>
+* all procedures first attempt to reach a barrier point with the {@link #sendglobalbarrierstart()}
+* method.  the procedure contacts all members and waits for all subprocedures to execute
+* {@link subprocedure#acquirebarrier} to acquire its local piece of the global barrier and then
+* send acquisition info back to the coordinator.  if all acquisitions at subprocedures succeed,
+* the coordinator then will call {@link #sendglobalbarrierreached()}.  this notifies members to
+* execute the {@link subprocedure#insidebarrier()} method.  the procedure is blocked until all
+* {@link subprocedure#insidebarrier} executions complete at the members.  when
+* {@link subprocedure#insidebarrier} completes at each member, the member sends notification to
+* the coordinator.  once all members complete, the coordinator calls
+* {@link #sendglobalbarriercomplete()}.
+* <p>
+* if errors are encountered remotely, they are forwarded to the coordinator, and
+* {@link subprocedure#cleanup(exception)} is called.
+* <p>
+* each procedure and each subprocedure enforces a time limit on the execution time. if the time
+* limit expires before the procedure completes the {@link timeoutexceptioninjector} will trigger
+* an {@link foreignexception} to abort the procedure.  this is particularly useful for situations
+* when running a distributed {@link subprocedure} so participants can avoid blocking for extreme
+* amounts of time if one of the participants fails or takes a really long time (e.g. gc pause).
+* <p>
+* users should generally not directly create or subclass instances of this.  they are created
+* for them implicitly via {@link procedurecoordinator#startprocedure(foreignexceptiondispatcher,
+* string, byte[], list)}}
+*/
+@interfaceaudience public
+@interfacestability evolving
+public class procedure implements callable<void>  foreignexceptionlistener
+private static final log log   logfactory getlog procedure class
+//
+// arguments and naming
+//
+// name of the procedure
+final private string procname
+// arguments for this procedure execution
+final private byte args
+//
+// execution state
+//
+/** latch for waiting until all members have acquire in barrier state */
+final countdownlatch acquiredbarrierlatch
+/** latch for waiting until all members have executed and released their in barrier state */
+final countdownlatch releasedbarrierlatch
+/** latch for waiting until a procedure has completed */
+final countdownlatch completedlatch
+/** monitor to check for errors */
+private final foreignexceptiondispatcher monitor
+//
+// execution timeout handling.
+//
+/** frequency to check for errors (ms) */
+protected final long wakefrequency
+protected final timeoutexceptioninjector timeoutinjector
+//
+// members' and coordinator's state
+//
+/** lock to prevent nodes from acquiring and then releasing before we can track them */
+private object joinbarrierlock   new object
+private final list<string> acquiringmembers
+private final list<string> inbarriermembers
+private procedurecoordinator coord
+/**
+* creates a procedure. (for testing)
+*
+* {@link procedure} state to be run by a {@link procedurecoordinator}.
+* @param coord coordinator to call back to for general errors (e.g.
+*          {@link procedurecoordinator#rpcconnectionfailure(string, ioexception)}).
+* @param monitor error monitor to check for external errors
+* @param wakefreq frequency to check for errors while waiting
+* @param timeout amount of time to allow the procedure to run before cancelling
+* @param procname name of the procedure instance
+* @param args argument data associated with the procedure instance
+* @param expectedmembers names of the expected members
+*/
+public procedure procedurecoordinator coord  foreignexceptiondispatcher monitor  long wakefreq
+long timeout  string procname  byte args  list<string> expectedmembers
+this coord   coord
+this acquiringmembers   new arraylist<string> expectedmembers
+this inbarriermembers   new arraylist<string> acquiringmembers size
+this procname   procname
+this args   args
+this monitor   monitor
+this wakefrequency   wakefreq
+int count   expectedmembers size
+this acquiredbarrierlatch   new countdownlatch count
+this releasedbarrierlatch   new countdownlatch count
+this completedlatch   new countdownlatch 1
+this timeoutinjector   new timeoutexceptioninjector monitor  timeout
+/**
+* create a procedure.
+*
+* users should generally not directly create instances of this.  they are created them
+* implicitly via {@link procedurecoordinator#createprocedure(foreignexceptiondispatcher,
+* string, byte[], list)}}
+*
+* @param coord coordinator to call back to for general errors (e.g.
+*          {@link procedurecoordinator#rpcconnectionfailure(string, ioexception)}).
+* @param wakefreq frequency to check for errors while waiting
+* @param timeout amount of time to allow the procedure to run before cancelling
+* @param procname name of the procedure instance
+* @param args argument data associated with the procedure instance
+* @param expectedmembers names of the expected members
+*/
+public procedure procedurecoordinator coord  long wakefreq  long timeout
+string procname  byte args  list<string> expectedmembers
+this coord  new foreignexceptiondispatcher    wakefreq  timeout  procname  args
+expectedmembers
+public string getname
+return procname
+/**
+* @return string of the procedure members both trying to enter the barrier and already in barrier
+*/
+public string getstatus
+string waiting  done
+synchronized  joinbarrierlock
+waiting   acquiringmembers tostring
+done   inbarriermembers tostring
+return     procname       waiting      done
+/**
+* get the foreignexceptiondispatcher
+* @return the procedure's monitor.
+*/
+public foreignexceptiondispatcher geterrormonitor
+return monitor
+/**
+* this call is the main execution thread of the barriered procedure.  it sends messages and
+* essentially blocks until all procedure members acquire or later complete but periodically
+* checks for foreign exceptions.
+*/
+@override
+@suppresswarnings
+final public void call
+log info     procname
+// start the timer
+timeoutinjector start
+// run the procedure
+try
+// start by checking for error first
+monitor rethrowexception
+log debug     procname
+sendglobalbarrierstart
+// wait for all the members to report acquisition
+log debug
+waitforlatch acquiredbarrierlatch  monitor  wakefrequency
+monitor rethrowexception
+log debug     procname
+sendglobalbarrierreached
+// wait for all members to report barrier release
+waitforlatch releasedbarrierlatch  monitor  wakefrequency
+// make sure we didn't get an error during in barrier execution and release
+monitor rethrowexception
+log info     procname
+catch  exception e
+if  e instanceof interruptedexception
+thread currentthread   interrupt
+string msg       procname
+log error msg  e
+receive new foreignexception getname    e
+finally
+log debug
+sendglobalbarriercomplete
+completedlatch countdown
+// tell the timer we are done, if we get here successfully
+timeoutinjector complete
+return null
+/**
+* sends a message to members to create a new {@link subprocedure} for this procedure and execute
+* the {@link subprocedure#acquirebarrier} step.
+* @throws foreignexception
+*/
+public void sendglobalbarrierstart   throws foreignexception
+// start the procedure
+log debug     procname
+try
+// send procedure barrier start to specified list of members. cloning the list to avoid
+// concurrent modification from the controller setting the prepared nodes
+coord getrpcs   sendglobalbarrieracquire this  args  lists newarraylist this acquiringmembers
+catch  ioexception e
+coord rpcconnectionfailure    e
+catch  illegalargumentexception e
+throw new foreignexception getname    e
+/**
+* sends a message to all members that the global barrier condition has been satisfied.  this
+* should only be executed after all members have completed its
+* {@link subprocedure#acquirebarrier()} call successfully.  this triggers the member
+* {@link subprocedure#insidebarrier} method.
+* @throws foreignexception
+*/
+public void sendglobalbarrierreached   throws foreignexception
+try
+// trigger to have member run {@link subprocedure#insidebarrier}
+coord getrpcs   sendglobalbarrierreached this  lists newarraylist inbarriermembers
+catch  ioexception e
+coord rpcconnectionfailure    e
+/**
+* sends a message to members that all {@link subprocedure#insidebarrier} calls have completed.
+* after this executes, the coordinator can assume that any state resources about this barrier
+* procedure state has been released.
+*/
+public void sendglobalbarriercomplete
+log debug
+try
+coord getrpcs   resetmembers this
+catch  ioexception e
+coord rpcconnectionfailure     procname  e
+//
+// call backs from other external processes.
+//
+/**
+* call back triggered by an individual member upon successful local barrier acquisition
+* @param member
+*/
+public void barrieracquiredbymember string member
+log debug     member       procname
+if  this acquiringmembers contains member
+synchronized  joinbarrierlock
+if  this acquiringmembers remove member
+this inbarriermembers add member
+acquiredbarrierlatch countdown
+log debug     acquiredbarrierlatch
+else
+log warn     member
+/**
+* call back triggered by a individual member upon successful local in-barrier execution and
+* release
+* @param member
+*/
+public void barrierreleasedbymember string member
+boolean removed   false
+synchronized  joinbarrierlock
+removed   this inbarriermembers remove member
+if  removed
+releasedbarrierlatch countdown
+if  removed
+log debug     member       procname
+releasedbarrierlatch getcount
+else
+log warn     member       procname
+/**
+* waits until the entire procedure has globally completed, or has been aborted.  if an
+* exception is thrown the procedure may or not have run cleanup to trigger the completion latch
+* yet.
+* @throws foreignexception
+* @throws interruptedexception
+*/
+public void waitforcompleted   throws foreignexception  interruptedexception
+waitforlatch completedlatch  monitor  wakefrequency  procname
+/**
+* a callback that handles incoming foreignexceptions.
+*/
+@override
+public void receive foreignexception e
+monitor receive e
+/**
+* wait for latch to count to zero, ignoring any spurious wake-ups, but waking periodically to
+* check for errors
+* @param latch latch to wait on
+* @param monitor monitor to check for errors while waiting
+* @param wakefrequency frequency to wake up and check for errors (in
+*          {@link timeunit#milliseconds})
+* @param latchdescription description of the latch, for logging
+* @throws foreignexception type of error the monitor can throw, if the task fails
+* @throws interruptedexception if we are interrupted while waiting on latch
+*/
+public static void waitforlatch countdownlatch latch  foreignexceptionsnare monitor
+long wakefrequency  string latchdescription  throws foreignexception
+interruptedexception
+boolean released   false
+while   released
+if  monitor    null
+monitor rethrowexception
+/*
+foreignexceptiondispatcher.log.debug("waiting for '" + latchdescription + "' latch. (sleep:"
++ wakefrequency + " ms)"); */
+released   latch await wakefrequency  timeunit milliseconds

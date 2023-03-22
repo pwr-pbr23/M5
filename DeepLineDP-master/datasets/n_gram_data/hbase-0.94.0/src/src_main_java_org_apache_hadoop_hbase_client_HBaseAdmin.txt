@@ -1,0 +1,1375 @@
+/**
+* copyright 2011 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase client
+import java io closeable
+import java io ioexception
+import java io interruptedioexception
+import java lang reflect undeclaredthrowableexception
+import java net sockettimeoutexception
+import java util arrays
+import java util linkedlist
+import java util list
+import java util concurrent atomic atomicinteger
+import java util regex pattern
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop hbase abortable
+import org apache hadoop hbase clusterstatus
+import org apache hadoop hbase hbaseconfiguration
+import org apache hadoop hbase hcolumndescriptor
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase hregionlocation
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase masternotrunningexception
+import org apache hadoop hbase notservingregionexception
+import org apache hadoop hbase regionexception
+import org apache hadoop hbase remoteexceptionhandler
+import org apache hadoop hbase servername
+import org apache hadoop hbase tableexistsexception
+import org apache hadoop hbase tablenotfoundexception
+import org apache hadoop hbase unknownregionexception
+import org apache hadoop hbase zookeeperconnectionexception
+import org apache hadoop hbase catalog catalogtracker
+import org apache hadoop hbase catalog metareader
+import org apache hadoop hbase client metascanner metascannervisitor
+import org apache hadoop hbase ipc hmasterinterface
+import org apache hadoop hbase ipc hregioninterface
+import org apache hadoop hbase regionserver wal failedlogcloseexception
+import org apache hadoop hbase util addressing
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util pair
+import org apache hadoop hbase util writables
+import org apache hadoop ipc remoteexception
+import org apache hadoop util stringutils
+/**
+* provides an interface to manage hbase database table metadata + general
+* administrative functions.  use hbaseadmin to create, drop, list, enable and
+* disable tables. use it also to add and drop table column families.
+*
+* <p>see {@link htable} to add, update, and delete data from an individual table.
+* <p>currently hbaseadmin instances are not expected to be long-lived.  for
+* example, an hbaseadmin instance will not ride over a master restart.
+*/
+public class hbaseadmin implements abortable  closeable
+private final log log   logfactory getlog this getclass   getname
+//  private final hconnection connection;
+private hconnection connection
+private volatile configuration conf
+private final long pause
+private final int numretries
+// some operations can take a long time such as disable of big table.
+// numretries is for 'normal' stuff... mutliply by this factor when
+// want to wait a long time.
+private final int retrylongermultiplier
+private boolean aborted
+/**
+* constructor
+*
+* @param c configuration object
+* @throws masternotrunningexception if the master is not running
+* @throws zookeeperconnectionexception if unable to connect to zookeeper
+*/
+public hbaseadmin configuration c
+throws masternotrunningexception  zookeeperconnectionexception
+this conf   hbaseconfiguration create c
+this connection   hconnectionmanager getconnection this conf
+this pause   this conf getlong    1000
+this numretries   this conf getint    10
+this retrylongermultiplier   this conf getint
+10
+int tries   0
+while   true
+try
+this connection getmaster
+return
+catch  masternotrunningexception mnre
+hconnectionmanager deletestaleconnection this connection
+this connection   hconnectionmanager getconnection this conf
+tries
+if  tries >  numretries
+// we should delete connection between client and zookeeper
+hconnectionmanager deletestaleconnection this connection
+throw new masternotrunningexception     numretries
+try
+thread sleep getpausetime tries
+catch  interruptedexception e
+thread currentthread   interrupt
+// we should delete connection between client and zookeeper
+hconnectionmanager deletestaleconnection this connection
+throw new masternotrunningexception
+tries
+/**
+* constructor for externally managed hconnections.
+* this constructor fails fast if the hmaster is not running.
+* the hconnection can be re-used again in another attempt.
+* this constructor fails fast.
+*
+* @param connection the hconnection instance to use
+* @throws masternotrunningexception if the master is not running
+* @throws zookeeperconnectionexception if unable to connect to zookeeper
+*/
+public hbaseadmin hconnection connection
+throws masternotrunningexception  zookeeperconnectionexception
+this conf   connection getconfiguration
+this connection   connection
+this pause   this conf getlong    1000
+this numretries   this conf getint    10
+this retrylongermultiplier   this conf getint
+10
+this connection getmaster
+/**
+* @return a new catalogtracker instance; call {@link #cleanupcatalogtracker(catalogtracker)}
+* to cleanup the returned catalog tracker.
+* @throws zookeeperconnectionexception
+* @throws ioexception
+* @see #cleanupcatalogtracker(catalogtracker)
+*/
+private synchronized catalogtracker getcatalogtracker
+throws zookeeperconnectionexception  ioexception
+catalogtracker ct   null
+try
+ct   new catalogtracker this conf
+ct start
+catch  interruptedexception e
+// let it out as an ioe for now until we redo all so tolerate ies
+thread currentthread   interrupt
+throw new ioexception    e
+return ct
+private void cleanupcatalogtracker final catalogtracker ct
+ct stop
+@override
+public void abort string why  throwable e
+// currently does nothing but throw the passed message and exception
+this aborted   true
+throw new runtimeexception why  e
+@override
+public boolean isaborted
+return this aborted
+/** @return hconnection used by this object. */
+public hconnection getconnection
+return connection
+/**
+* get a connection to the currently set master.
+* @return proxy connection to master server for this instance
+* @throws masternotrunningexception if the master is not running
+* @throws zookeeperconnectionexception if unable to connect to zookeeper
+* @deprecated  master is an implementation detail for hbaseadmin.
+* deprecated in hbase 0.94
+*/
+@deprecated
+public hmasterinterface getmaster
+throws masternotrunningexception  zookeeperconnectionexception
+return this connection getmaster
+/** @return - true if the master server is running
+* @throws zookeeperconnectionexception
+* @throws masternotrunningexception */
+public boolean ismasterrunning
+throws masternotrunningexception  zookeeperconnectionexception
+return this connection ismasterrunning
+/**
+* @param tablename table to check.
+* @return true if table exists already.
+* @throws ioexception
+*/
+public boolean tableexists final string tablename
+throws ioexception
+boolean b   false
+catalogtracker ct   getcatalogtracker
+try
+b   metareader tableexists ct  tablename
+finally
+cleanupcatalogtracker ct
+return b
+/**
+* @param tablename table to check.
+* @return true if table exists already.
+* @throws ioexception
+*/
+public boolean tableexists final byte  tablename
+throws ioexception
+return tableexists bytes tostring tablename
+/**
+* list all the userspace tables.  in other words, scan the meta table.
+*
+* if we wanted this to be really fast, we could implement a special
+* catalog table that just contains table names and their descriptors.
+* right now, it only exists as part of the meta table's region info.
+*
+* @return - returns an array of htabledescriptors
+* @throws ioexception if a remote or network exception occurs
+*/
+public htabledescriptor listtables   throws ioexception
+return this connection listtables
+/**
+* list all the userspace tables matching the given pattern.
+*
+* @param pattern the compiled regular expression to match against
+* @return - returns an array of htabledescriptors
+* @throws ioexception if a remote or network exception occurs
+* @see #listtables()
+*/
+public htabledescriptor listtables pattern pattern  throws ioexception
+list<htabledescriptor> matched   new linkedlist<htabledescriptor>
+htabledescriptor tables   listtables
+for  htabledescriptor table   tables
+if  pattern matcher table getnameasstring    matches
+matched add table
+return matched toarray new htabledescriptor
+/**
+* list all the userspace tables matching the given regular expression.
+*
+* @param regex the regular expression to match against
+* @return - returns an array of htabledescriptors
+* @throws ioexception if a remote or network exception occurs
+* @see #listtables(java.util.regex.pattern)
+*/
+public htabledescriptor listtables string regex  throws ioexception
+return listtables pattern compile regex
+/**
+* method for getting the tabledescriptor
+* @param tablename as a byte []
+* @return the tabledescriptor
+* @throws tablenotfoundexception
+* @throws ioexception if a remote or network exception occurs
+*/
+public htabledescriptor gettabledescriptor final byte  tablename
+throws tablenotfoundexception  ioexception
+return this connection gethtabledescriptor tablename
+private long getpausetime int tries
+int triescount   tries
+if  triescount >  hconstants retry_backoff length
+triescount   hconstants retry_backoff length   1
+return this pause   hconstants retry_backoff
+/**
+* creates a new table.
+* synchronous operation.
+*
+* @param desc table descriptor for table
+*
+* @throws illegalargumentexception if the table name is reserved
+* @throws masternotrunningexception if master is not running
+* @throws tableexistsexception if table already exists (if concurrent
+* threads, the table may have been created between test-for-existence
+* and attempt-at-creation).
+* @throws ioexception if a remote or network exception occurs
+*/
+public void createtable htabledescriptor desc
+throws ioexception
+createtable desc  null
+/**
+* creates a new table with the specified number of regions.  the start key
+* specified will become the end key of the first region of the table, and
+* the end key specified will become the start key of the last region of the
+* table (the first region has a null start key and the last region has a
+* null end key).
+*
+* biginteger math will be used to divide the key range specified into
+* enough segments to make the required number of total regions.
+*
+* synchronous operation.
+*
+* @param desc table descriptor for table
+* @param startkey beginning of key range
+* @param endkey end of key range
+* @param numregions the total number of regions to create
+*
+* @throws illegalargumentexception if the table name is reserved
+* @throws masternotrunningexception if master is not running
+* @throws tableexistsexception if table already exists (if concurrent
+* threads, the table may have been created between test-for-existence
+* and attempt-at-creation).
+* @throws ioexception
+*/
+public void createtable htabledescriptor desc  byte  startkey
+byte  endkey  int numregions
+throws ioexception
+htabledescriptor islegaltablename desc getname
+if numregions < 3
+throw new illegalargumentexception
+else if bytes compareto startkey  endkey  >  0
+throw new illegalargumentexception
+byte  splitkeys   bytes split startkey  endkey  numregions   3
+if splitkeys    null    splitkeys length    numregions   1
+throw new illegalargumentexception
+createtable desc  splitkeys
+/**
+* creates a new table with an initial set of empty regions defined by the
+* specified split keys.  the total number of regions created will be the
+* number of split keys plus one. synchronous operation.
+* note : avoid passing empty split key.
+*
+* @param desc table descriptor for table
+* @param splitkeys array of split keys for the initial regions of the table
+*
+* @throws illegalargumentexception if the table name is reserved, if the split keys
+* are repeated and if the split key has empty byte array.
+* @throws masternotrunningexception if master is not running
+* @throws tableexistsexception if table already exists (if concurrent
+* threads, the table may have been created between test-for-existence
+* and attempt-at-creation).
+* @throws ioexception
+*/
+public void createtable final htabledescriptor desc  byte  splitkeys
+throws ioexception
+htabledescriptor islegaltablename desc getname
+try
+createtableasync desc  splitkeys
+catch  sockettimeoutexception ste
+log warn     desc getnameasstring        ste
+int numregs   splitkeys    null ? 1   splitkeys length   1
+int prevregcount   0
+for  int tries   0  tries < this numretries   this retrylongermultiplier
+tries
+// wait for new table to come on-line
+final atomicinteger actualregcount   new atomicinteger 0
+metascannervisitor visitor   new metascannervisitor
+@override
+public boolean processrow result rowresult  throws ioexception
+hregioninfo info   writables gethregioninfoornull
+rowresult getvalue hconstants catalog_family
+hconstants regioninfo_qualifier
+//if regioninfo is null, skip this row
+if  null    info
+return true
+if    bytes equals info gettablename    desc getname
+return false
+string hostandport   null
+byte  value   rowresult getvalue hconstants catalog_family
+hconstants server_qualifier
+// make sure that regions are assigned to server
+if  value    null    value length > 0
+hostandport   bytes tostring value
+if    info isoffline      info issplit       hostandport    null
+actualregcount incrementandget
+return true
+metascanner metascan conf  visitor  desc getname
+if  actualregcount get      numregs
+if  tries    this numretries   this retrylongermultiplier   1
+throw new regionofflineexception     actualregcount get
+numregs
+try      sleep
+thread sleep getpausetime tries
+catch  interruptedexception e
+throw new interruptedioexception
+actualregcount get         numregs
+if  actualregcount get   > prevregcount       making progress
+prevregcount   actualregcount get
+tries    1
+else
+return
+/**
+* creates a new table but does not block and wait for it to come online.
+* asynchronous operation.  to check if the table exists, use
+* {@link: #istableavailable} -- it is not safe to create an htable
+* instance to this table before it is available.
+* note : avoid passing empty split key.
+* @param desc table descriptor for table
+*
+* @throws illegalargumentexception bad table name, if the split keys
+* are repeated and if the split key has empty byte array.
+* @throws masternotrunningexception if master is not running
+* @throws tableexistsexception if table already exists (if concurrent
+* threads, the table may have been created between test-for-existence
+* and attempt-at-creation).
+* @throws ioexception
+*/
+public void createtableasync htabledescriptor desc  byte  splitkeys
+throws ioexception
+htabledescriptor islegaltablename desc getname
+if splitkeys    null    splitkeys length > 0
+arrays sort splitkeys  bytes bytes_comparator
+// verify there are no duplicate split keys
+byte  lastkey   null
+for byte  splitkey   splitkeys
+if  bytes compareto splitkey  hconstants empty_byte_array     0
+throw new illegalargumentexception
+if lastkey    null    bytes equals splitkey  lastkey
+throw new illegalargumentexception
+bytes tostringbinary splitkey
+bytes tostringbinary lastkey
+lastkey   splitkey
+try
+getmaster   createtable desc  splitkeys
+catch  remoteexception e
+throw e unwrapremoteexception
+/**
+* deletes a table.
+* synchronous operation.
+*
+* @param tablename name of table to delete
+* @throws ioexception if a remote or network exception occurs
+*/
+public void deletetable final string tablename  throws ioexception
+deletetable bytes tobytes tablename
+/**
+* deletes a table.
+* synchronous operation.
+*
+* @param tablename name of table to delete
+* @throws ioexception if a remote or network exception occurs
+*/
+public void deletetable final byte  tablename  throws ioexception
+ismasterrunning
+htabledescriptor islegaltablename tablename
+hregionlocation firstmetaserver   getfirstmetaserverfortable tablename
+try
+getmaster   deletetable tablename
+catch  remoteexception e
+throw remoteexceptionhandler decoderemoteexception e
+// wait until all regions deleted
+hregioninterface server
+connection gethregionconnection firstmetaserver gethostname    firstmetaserver getport
+for  int tries   0  tries <  this numretries   this retrylongermultiplier   tries
+long scannerid    1l
+try
+scan scan   metareader getscanfortablename tablename
+scan addcolumn hconstants catalog_family
+hconstants regioninfo_qualifier
+scannerid   server openscanner
+firstmetaserver getregioninfo   getregionname    scan
+// get a batch at a time.
+result values   server next scannerid
+// let us wait until .meta. table is updated and
+// hmaster removes the table from its htabledescriptors
+if  values    null
+boolean tableexists   false
+htabledescriptor htds   getmaster   gethtabledescriptors
+if  htds    null    htds length > 0
+for  htabledescriptor htd  htds
+if  bytes equals tablename  htd getname
+tableexists   true
+break
+if   tableexists
+break
+catch  ioexception ex
+if tries    numretries   1                 no more tries left
+if  ex instanceof remoteexception
+ex   remoteexceptionhandler decoderemoteexception  remoteexception  ex
+throw ex
+finally
+if  scannerid     1l
+try
+server close scannerid
+catch  exception ex
+log warn ex
+try
+thread sleep getpausetime tries
+catch  interruptedexception e
+// continue
+// delete cached information to prevent clients from using old locations
+this connection clearregioncache tablename
+log info     bytes tostring tablename
+/**
+* deletes tables matching the passed in pattern and wait on completion.
+*
+* warning: use this method carefully, there is no prompting and the effect is
+* immediate. consider using {@link #listtables(java.lang.string)} and
+* {@link #deletetable(byte[])}
+*
+* @param regex the regular expression to match table names against
+* @return table descriptors for tables that couldn't be deleted
+* @throws ioexception
+* @see #deletetables(java.util.regex.pattern)
+* @see #deletetable(java.lang.string)
+*/
+public htabledescriptor deletetables string regex  throws ioexception
+return deletetables pattern compile regex
+/**
+* delete tables matching the passed in pattern and wait on completion.
+*
+* warning: use this method carefully, there is no prompting and the effect is
+* immediate. consider using {@link #listtables(java.util.regex.pattern) } and
+* {@link #deletetable(byte[])}
+*
+* @param pattern the pattern to match table names against
+* @return table descriptors for tables that couldn't be deleted
+* @throws ioexception
+*/
+public htabledescriptor deletetables pattern pattern  throws ioexception
+list<htabledescriptor> failed   new linkedlist<htabledescriptor>
+for  htabledescriptor table   listtables pattern
+try
+deletetable table getname
+catch  ioexception ex
+log info     table getnameasstring    ex
+failed add table
+return failed toarray new htabledescriptor
+public void enabletable final string tablename
+throws ioexception
+enabletable bytes tobytes tablename
+/**
+* enable a table.  may timeout.  use {@link #enabletableasync(byte[])}
+* and {@link #istableenabled(byte[])} instead.
+* the table has to be in disabled state for it to be enabled.
+* @param tablename name of the table
+* @throws ioexception if a remote or network exception occurs
+* there could be couple types of ioexception
+* tablenotfoundexception means the table doesn't exist.
+* tablenotdisabledexception means the table isn't in disabled state.
+* @see #istableenabled(byte[])
+* @see #disabletable(byte[])
+* @see #enabletableasync(byte[])
+*/
+public void enabletable final byte  tablename
+throws ioexception
+enabletableasync tablename
+// wait until all regions are enabled
+boolean enabled   false
+for  int tries   0  tries <  this numretries   this retrylongermultiplier   tries
+enabled   istableenabled tablename
+if  enabled
+break
+long sleep   getpausetime tries
+if  log isdebugenabled
+log debug     sleep
+bytes tostring tablename
+try
+thread sleep sleep
+catch  interruptedexception e
+thread currentthread   interrupt
+// do this conversion rather than let it out because do not want to
+// change the method signature.
+throw new ioexception    e
+if   enabled
+throw new ioexception
+bytes tostring tablename
+log info     bytes tostring tablename
+public void enabletableasync final string tablename
+throws ioexception
+enabletableasync bytes tobytes tablename
+/**
+* brings a table on-line (enables it).  method returns immediately though
+* enable of table may take some time to complete, especially if the table
+* is large (all regions are opened as part of enabling process).  check
+* {@link #istableenabled(byte[])} to learn when table is fully online.  if
+* table is taking too long to online, check server logs.
+* @param tablename
+* @throws ioexception
+* @since 0.90.0
+*/
+public void enabletableasync final byte  tablename
+throws ioexception
+ismasterrunning
+try
+getmaster   enabletable tablename
+catch  remoteexception e
+throw e unwrapremoteexception
+log info     bytes tostring tablename
+/**
+* enable tables matching the passed in pattern and wait on completion.
+*
+* warning: use this method carefully, there is no prompting and the effect is
+* immediate. consider using {@link #listtables(java.lang.string)} and
+* {@link #enabletable(byte[])}
+*
+* @param regex the regular expression to match table names against
+* @throws ioexception
+* @see #enabletables(java.util.regex.pattern)
+* @see #enabletable(java.lang.string)
+*/
+public htabledescriptor enabletables string regex  throws ioexception
+return enabletables pattern compile regex
+/**
+* enable tables matching the passed in pattern and wait on completion.
+*
+* warning: use this method carefully, there is no prompting and the effect is
+* immediate. consider using {@link #listtables(java.util.regex.pattern) } and
+* {@link #enabletable(byte[])}
+*
+* @param pattern the pattern to match table names against
+* @throws ioexception
+*/
+public htabledescriptor enabletables pattern pattern  throws ioexception
+list<htabledescriptor> failed   new linkedlist<htabledescriptor>
+for  htabledescriptor table   listtables pattern
+if  istabledisabled table getname
+try
+enabletable table getname
+catch  ioexception ex
+log info     table getnameasstring    ex
+failed add table
+return failed toarray new htabledescriptor
+public void disabletableasync final string tablename  throws ioexception
+disabletableasync bytes tobytes tablename
+/**
+* starts the disable of a table.  if it is being served, the master
+* will tell the servers to stop serving it.  this method returns immediately.
+* the disable of a table can take some time if the table is large (all
+* regions are closed as part of table disable operation).
+* call {@link #istabledisabled(byte[])} to check for when disable completes.
+* if table is taking too long to online, check server logs.
+* @param tablename name of table
+* @throws ioexception if a remote or network exception occurs
+* @see #istabledisabled(byte[])
+* @see #istableenabled(byte[])
+* @since 0.90.0
+*/
+public void disabletableasync final byte  tablename  throws ioexception
+ismasterrunning
+try
+getmaster   disabletable tablename
+catch  remoteexception e
+throw e unwrapremoteexception
+log info     bytes tostring tablename
+public void disabletable final string tablename
+throws ioexception
+disabletable bytes tobytes tablename
+/**
+* disable table and wait on completion.  may timeout eventually.  use
+* {@link #disabletableasync(byte[])} and {@link #istabledisabled(string)}
+* instead.
+* the table has to be in enabled state for it to be disabled.
+* @param tablename
+* @throws ioexception
+* there could be couple types of ioexception
+* tablenotfoundexception means the table doesn't exist.
+* tablenotenabledexception means the table isn't in enabled state.
+*/
+public void disabletable final byte  tablename
+throws ioexception
+disabletableasync tablename
+// wait until table is disabled
+boolean disabled   false
+for  int tries   0  tries <  this numretries   this retrylongermultiplier   tries
+disabled   istabledisabled tablename
+if  disabled
+break
+long sleep   getpausetime tries
+if  log isdebugenabled
+log debug     sleep
+bytes tostring tablename
+try
+thread sleep sleep
+catch  interruptedexception e
+// do this conversion rather than let it out because do not want to
+// change the method signature.
+thread currentthread   interrupt
+throw new ioexception    e
+if   disabled
+throw new regionexception
+bytes tostring tablename
+log info     bytes tostring tablename
+/**
+* disable tables matching the passed in pattern and wait on completion.
+*
+* warning: use this method carefully, there is no prompting and the effect is
+* immediate. consider using {@link #listtables(java.lang.string)} and
+* {@link #disabletable(byte[])}
+*
+* @param regex the regular expression to match table names against
+* @return table descriptors for tables that couldn't be disabled
+* @throws ioexception
+* @see #disabletables(java.util.regex.pattern)
+* @see #disabletable(java.lang.string)
+*/
+public htabledescriptor disabletables string regex  throws ioexception
+return disabletables pattern compile regex
+/**
+* disable tables matching the passed in pattern and wait on completion.
+*
+* warning: use this method carefully, there is no prompting and the effect is
+* immediate. consider using {@link #listtables(java.util.regex.pattern) } and
+* {@link #disabletable(byte[])}
+*
+* @param pattern the pattern to match table names against
+* @return table descriptors for tables that couldn't be disabled
+* @throws ioexception
+*/
+public htabledescriptor disabletables pattern pattern  throws ioexception
+list<htabledescriptor> failed   new linkedlist<htabledescriptor>
+for  htabledescriptor table   listtables pattern
+if  istableenabled table getname
+try
+disabletable table getname
+catch  ioexception ex
+log info     table getnameasstring    ex
+failed add table
+return failed toarray new htabledescriptor
+/**
+* @param tablename name of table to check
+* @return true if table is on-line
+* @throws ioexception if a remote or network exception occurs
+*/
+public boolean istableenabled string tablename  throws ioexception
+return istableenabled bytes tobytes tablename
+/**
+* @param tablename name of table to check
+* @return true if table is on-line
+* @throws ioexception if a remote or network exception occurs
+*/
+public boolean istableenabled byte tablename  throws ioexception
+htabledescriptor islegaltablename tablename
+return connection istableenabled tablename
+/**
+* @param tablename name of table to check
+* @return true if table is off-line
+* @throws ioexception if a remote or network exception occurs
+*/
+public boolean istabledisabled final string tablename  throws ioexception
+return istabledisabled bytes tobytes tablename
+/**
+* @param tablename name of table to check
+* @return true if table is off-line
+* @throws ioexception if a remote or network exception occurs
+*/
+public boolean istabledisabled byte tablename  throws ioexception
+htabledescriptor islegaltablename tablename
+return connection istabledisabled tablename
+/**
+* @param tablename name of table to check
+* @return true if all regions of the table are available
+* @throws ioexception if a remote or network exception occurs
+*/
+public boolean istableavailable byte tablename  throws ioexception
+return connection istableavailable tablename
+/**
+* @param tablename name of table to check
+* @return true if all regions of the table are available
+* @throws ioexception if a remote or network exception occurs
+*/
+public boolean istableavailable string tablename  throws ioexception
+return connection istableavailable bytes tobytes tablename
+/**
+* get the status of alter command - indicates how many regions have received
+* the updated schema asynchronous operation.
+*
+* @param tablename
+*          name of the table to get the status of
+* @return pair indicating the number of regions updated pair.getfirst() is the
+*         regions that are yet to be updated pair.getsecond() is the total number
+*         of regions of the table
+* @throws ioexception
+*           if a remote or network exception occurs
+*/
+public pair<integer  integer> getalterstatus final byte tablename
+throws ioexception
+htabledescriptor islegaltablename tablename
+try
+return getmaster   getalterstatus tablename
+catch  remoteexception e
+throw remoteexceptionhandler decoderemoteexception e
+/**
+* add a column to an existing table.
+* asynchronous operation.
+*
+* @param tablename name of the table to add column to
+* @param column column descriptor of column to be added
+* @throws ioexception if a remote or network exception occurs
+*/
+public void addcolumn final string tablename  hcolumndescriptor column
+throws ioexception
+addcolumn bytes tobytes tablename   column
+/**
+* add a column to an existing table.
+* asynchronous operation.
+*
+* @param tablename name of the table to add column to
+* @param column column descriptor of column to be added
+* @throws ioexception if a remote or network exception occurs
+*/
+public void addcolumn final byte  tablename  hcolumndescriptor column
+throws ioexception
+htabledescriptor islegaltablename tablename
+try
+getmaster   addcolumn tablename  column
+catch  remoteexception e
+throw remoteexceptionhandler decoderemoteexception e
+/**
+* delete a column from a table.
+* asynchronous operation.
+*
+* @param tablename name of table
+* @param columnname name of column to be deleted
+* @throws ioexception if a remote or network exception occurs
+*/
+public void deletecolumn final string tablename  final string columnname
+throws ioexception
+deletecolumn bytes tobytes tablename   bytes tobytes columnname
+/**
+* delete a column from a table.
+* asynchronous operation.
+*
+* @param tablename name of table
+* @param columnname name of column to be deleted
+* @throws ioexception if a remote or network exception occurs
+*/
+public void deletecolumn final byte  tablename  final byte  columnname
+throws ioexception
+try
+getmaster   deletecolumn tablename  columnname
+catch  remoteexception e
+throw remoteexceptionhandler decoderemoteexception e
+/**
+* modify an existing column family on a table.
+* asynchronous operation.
+*
+* @param tablename name of table
+* @param descriptor new column descriptor to use
+* @throws ioexception if a remote or network exception occurs
+*/
+public void modifycolumn final string tablename  hcolumndescriptor descriptor
+throws ioexception
+modifycolumn bytes tobytes tablename   descriptor
+/**
+* modify an existing column family on a table.
+* asynchronous operation.
+*
+* @param tablename name of table
+* @param descriptor new column descriptor to use
+* @throws ioexception if a remote or network exception occurs
+*/
+public void modifycolumn final byte  tablename  hcolumndescriptor descriptor
+throws ioexception
+try
+getmaster   modifycolumn tablename  descriptor
+catch  remoteexception re
+// convert re exceptions in here; client shouldn't have to deal with them,
+// at least w/ the type of exceptions that come out of this method:
+// tablenotfoundexception, etc.
+throw remoteexceptionhandler decoderemoteexception re
+/**
+* close a region. for expert-admins.  runs close on the regionserver.  the
+* master will not be informed of the close.
+* @param regionname region name to close
+* @param servername if supplied, we'll use this location rather than
+* the one currently in <code>.meta.</code>
+* @throws ioexception if a remote or network exception occurs
+*/
+public void closeregion final string regionname  final string servername
+throws ioexception
+closeregion bytes tobytes regionname   servername
+/**
+* close a region.  for expert-admins  runs close on the regionserver.  the
+* master will not be informed of the close.
+* @param regionname region name to close
+* @param servername the servername of the regionserver.  if passed null we
+* will use servername found in the .meta. table. a server name
+* is made of host, port and startcode.  here is an example:
+* <code> host187.example.com,60020,1289493121758</code>
+* @throws ioexception if a remote or network exception occurs
+*/
+public void closeregion final byte  regionname  final string servername
+throws ioexception
+catalogtracker ct   getcatalogtracker
+try
+if  servername    null
+pair<hregioninfo  servername> pair   metareader getregion ct  regionname
+if  pair    null    pair getfirst      null
+log info
+bytes tostringbinary regionname        pair
+else
+closeregion new servername servername   pair getfirst
+else
+pair<hregioninfo  servername> pair   metareader getregion ct  regionname
+if  pair    null    pair getsecond      null
+log info
+bytes tostringbinary regionname        pair
+else
+closeregion pair getsecond    pair getfirst
+finally
+cleanupcatalogtracker ct
+/**
+* for expert-admins. runs close on the regionserver. closes a region based on
+* the encoded region name. the region server name is mandatory. if the
+* servername is provided then based on the online regions in the specified
+* regionserver the specified region will be closed. the master will not be
+* informed of the close. note that the regionname is the encoded regionname.
+*
+* @param encodedregionname
+*          the encoded region name; i.e. the hash that makes up the region
+*          name suffix: e.g. if regionname is
+*          <code>testtable,0094429456,1289497600452.527db22f95c8a9e0116f0cc13c680396.</code>
+*          , then the encoded region name is:
+*          <code>527db22f95c8a9e0116f0cc13c680396</code>.
+* @param servername
+*          the servername of the regionserver. a server name is made of host,
+*          port and startcode. this is mandatory. here is an example:
+*          <code> host187.example.com,60020,1289493121758</code>
+* @return true if the region was closed, false if not.
+* @throws ioexception
+*           if a remote or network exception occurs
+*/
+public boolean closeregionwithencodedregionname final string encodedregionname
+final string servername  throws ioexception
+byte encodedregionnameinbytes   bytes tobytes encodedregionname
+if  null    servername        equals servername trim
+throw new illegalargumentexception
+servername sn   new servername servername
+hregioninterface rs   this connection gethregionconnection
+sn gethostname    sn getport
+// close the region without updating zk state.
+boolean isregionclosed   rs closeregion encodedregionnameinbytes  false
+if  false    isregionclosed
+log error     encodedregionname
+return isregionclosed
+/**
+* close a region.  for expert-admins  runs close on the regionserver.  the
+* master will not be informed of the close.
+* @param sn
+* @param hri
+* @throws ioexception
+*/
+public void closeregion final servername sn  final hregioninfo hri
+throws ioexception
+hregioninterface rs
+this connection gethregionconnection sn gethostname    sn getport
+// close the region without updating zk state.
+rs closeregion hri  false
+/**
+* flush a table or an individual region.
+* asynchronous operation.
+*
+* @param tablenameorregionname table or region to flush
+* @throws ioexception if a remote or network exception occurs
+* @throws interruptedexception
+*/
+public void flush final string tablenameorregionname
+throws ioexception  interruptedexception
+flush bytes tobytes tablenameorregionname
+/**
+* flush a table or an individual region.
+* asynchronous operation.
+*
+* @param tablenameorregionname table or region to flush
+* @throws ioexception if a remote or network exception occurs
+* @throws interruptedexception
+*/
+public void flush final byte  tablenameorregionname
+throws ioexception  interruptedexception
+catalogtracker ct   getcatalogtracker
+boolean isregionname   isregionname tablenameorregionname  ct
+try
+if  isregionname
+pair<hregioninfo  servername> pair
+metareader getregion ct  tablenameorregionname
+if  pair    null    pair getsecond      null
+log info
+bytes tostringbinary tablenameorregionname        pair
+else
+flush pair getsecond    pair getfirst
+else
+final string tablename   tablenamestring tablenameorregionname  ct
+list<pair<hregioninfo  servername>> pairs
+metareader gettableregionsandlocations ct
+tablename
+for  pair<hregioninfo  servername> pair  pairs
+if  pair getfirst   isoffline    continue
+if  pair getsecond      null  continue
+try
+flush pair getsecond    pair getfirst
+catch  notservingregionexception e
+if  log isdebugenabled
+log debug     pair getfirst
+stringutils stringifyexception e
+finally
+cleanupcatalogtracker ct
+private void flush final servername sn  final hregioninfo hri
+throws ioexception
+hregioninterface rs
+this connection gethregionconnection sn gethostname    sn getport
+rs flushregion hri
+/**
+* compact a table or an individual region.
+* asynchronous operation.
+*
+* @param tablenameorregionname table or region to compact
+* @throws ioexception if a remote or network exception occurs
+* @throws interruptedexception
+*/
+public void compact final string tablenameorregionname
+throws ioexception  interruptedexception
+compact bytes tobytes tablenameorregionname
+/**
+* compact a table or an individual region.
+* asynchronous operation.
+*
+* @param tablenameorregionname table or region to compact
+* @throws ioexception if a remote or network exception occurs
+* @throws interruptedexception
+*/
+public void compact final byte  tablenameorregionname
+throws ioexception  interruptedexception
+compact tablenameorregionname  false
+/**
+* major compact a table or an individual region.
+* asynchronous operation.
+*
+* @param tablenameorregionname table or region to major compact
+* @throws ioexception if a remote or network exception occurs
+* @throws interruptedexception
+*/
+public void majorcompact final string tablenameorregionname
+throws ioexception  interruptedexception
+majorcompact bytes tobytes tablenameorregionname
+/**
+* major compact a table or an individual region.
+* asynchronous operation.
+*
+* @param tablenameorregionname table or region to major compact
+* @throws ioexception if a remote or network exception occurs
+* @throws interruptedexception
+*/
+public void majorcompact final byte  tablenameorregionname
+throws ioexception  interruptedexception
+compact tablenameorregionname  true
+/**
+* compact a table or an individual region.
+* asynchronous operation.
+*
+* @param tablenameorregionname table or region to compact
+* @param major true if we are to do a major compaction.
+* @throws ioexception if a remote or network exception occurs
+* @throws interruptedexception
+*/
+private void compact final byte  tablenameorregionname  final boolean major
+throws ioexception  interruptedexception
+catalogtracker ct   getcatalogtracker
+try
+if  isregionname tablenameorregionname  ct
+pair<hregioninfo  servername> pair
+metareader getregion ct  tablenameorregionname
+if  pair    null    pair getsecond      null
+log info
+bytes tostringbinary tablenameorregionname        pair
+else
+compact pair getsecond    pair getfirst    major
+else
+final string tablename   tablenamestring tablenameorregionname  ct
+list<pair<hregioninfo  servername>> pairs
+metareader gettableregionsandlocations ct
+tablename
+for  pair<hregioninfo  servername> pair  pairs
+if  pair getfirst   isoffline    continue
+if  pair getsecond      null  continue
+try
+compact pair getsecond    pair getfirst    major
+catch  notservingregionexception e
+if  log isdebugenabled
+log debug      major ?
+pair getfirst
+stringutils stringifyexception e
+finally
+cleanupcatalogtracker ct
+private void compact final servername sn  final hregioninfo hri
+final boolean major
+throws ioexception
+hregioninterface rs
+this connection gethregionconnection sn gethostname    sn getport
+rs compactregion hri  major
+/**
+* move the region <code>r</code> to <code>dest</code>.
+* @param encodedregionname the encoded region name; i.e. the hash that makes
+* up the region name suffix: e.g. if regionname is
+* <code>testtable,0094429456,1289497600452.527db22f95c8a9e0116f0cc13c680396.</code>,
+* then the encoded region name is: <code>527db22f95c8a9e0116f0cc13c680396</code>.
+* @param destservername the servername of the destination regionserver.  if
+* passed the empty byte array we'll assign to a random server.  a server name
+* is made of host, port and startcode.  here is an example:
+* <code> host187.example.com,60020,1289493121758</code>
+* @throws unknownregionexception thrown if we can't find a region named
+* <code>encodedregionname</code>
+* @throws zookeeperconnectionexception
+* @throws masternotrunningexception
+*/
+public void move final byte  encodedregionname  final byte  destservername
+throws unknownregionexception  masternotrunningexception  zookeeperconnectionexception
+getmaster   move encodedregionname  destservername
+/**
+* @param regionname
+*          region name to assign.
+* @throws masternotrunningexception
+* @throws zookeeperconnectionexception
+* @throws ioexception
+*/
+public void assign final byte regionname  throws masternotrunningexception
+zookeeperconnectionexception  ioexception
+getmaster   assign regionname
+/**
+* unassign a region from current hosting regionserver.  region will then be
+* assigned to a regionserver chosen at random.  region could be reassigned
+* back to the same server.  use {@link #move(byte[], byte[])} if you want
+* to control the region movement.
+* @param regionname region to unassign. will clear any existing regionplan
+* if one found.
+* @param force if true, force unassign (will remove region from
+* regions-in-transition too if present. if results in double assignment
+* use hbck -fix to resolve. to be used by experts).
+* @throws masternotrunningexception
+* @throws zookeeperconnectionexception
+* @throws ioexception
+*/
+public void unassign final byte  regionname  final boolean force
+throws masternotrunningexception  zookeeperconnectionexception  ioexception
+getmaster   unassign regionname  force
+/**
+* turn the load balancer on or off.
+* @param b if true, enable balancer. if false, disable balancer.
+* @return previous balancer value
+*/
+public boolean balanceswitch final boolean b
+throws masternotrunningexception  zookeeperconnectionexception
+return getmaster   balanceswitch b
+/**
+* invoke the balancer.  will run the balancer and if regions to move, it will
+* go ahead and do the reassignments.  can not run for various reasons.  check
+* logs.
+* @return true if balancer ran, false otherwise.
+*/
+public boolean balancer
+throws masternotrunningexception  zookeeperconnectionexception
+return getmaster   balance
+/**
+* split a table or an individual region.
+* asynchronous operation.
+*
+* @param tablenameorregionname table or region to split
+* @throws ioexception if a remote or network exception occurs
+* @throws interruptedexception
+*/
+public void split final string tablenameorregionname
+throws ioexception  interruptedexception
+split bytes tobytes tablenameorregionname
+/**
+* split a table or an individual region.  implicitly finds an optimal split
+* point.  asynchronous operation.
+*
+* @param tablenameorregionname table to region to split
+* @throws ioexception if a remote or network exception occurs
+* @throws interruptedexception
+*/
+public void split final byte  tablenameorregionname
+throws ioexception  interruptedexception
+split tablenameorregionname  null
+public void split final string tablenameorregionname
+final string splitpoint  throws ioexception  interruptedexception
+split bytes tobytes tablenameorregionname   bytes tobytes splitpoint
+/**
+* split a table or an individual region.
+* asynchronous operation.
+*
+* @param tablenameorregionname table to region to split
+* @param splitpoint the explicit position to split on
+* @throws ioexception if a remote or network exception occurs
+* @throws interruptedexception interrupt exception occurred
+*/
+public void split final byte  tablenameorregionname
+final byte  splitpoint  throws ioexception  interruptedexception
+catalogtracker ct   getcatalogtracker
+try
+if  isregionname tablenameorregionname  ct
+// its a possible region name.
+pair<hregioninfo  servername> pair
+metareader getregion ct  tablenameorregionname
+if  pair    null    pair getsecond      null
+log info
+bytes tostringbinary tablenameorregionname        pair
+else
+split pair getsecond    pair getfirst    splitpoint
+else
+final string tablename   tablenamestring tablenameorregionname  ct
+list<pair<hregioninfo  servername>> pairs
+metareader gettableregionsandlocations ct
+tablename
+for  pair<hregioninfo  servername> pair  pairs
+// may not be a server for a particular row
+if  pair getsecond      null  continue
+hregioninfo r   pair getfirst
+// check for parents
+if  r issplitparent    continue
+// if a split point given, only split that particular region
+if  splitpoint    null     r containsrow splitpoint   continue
+// call out to region server to do split now
+split pair getsecond    pair getfirst    splitpoint
+finally
+cleanupcatalogtracker ct
+private void split final servername sn  final hregioninfo hri
+byte splitpoint  throws ioexception
+hregioninterface rs
+this connection gethregionconnection sn gethostname    sn getport
+rs splitregion hri  splitpoint
+/**
+* modify an existing table, more irb friendly version.
+* asynchronous operation.  this means that it may be a while before your
+* schema change is updated across all of the table.
+*
+* @param tablename name of table.
+* @param htd modified description of the table
+* @throws ioexception if a remote or network exception occurs
+*/
+public void modifytable final byte  tablename  htabledescriptor htd
+throws ioexception
+try
+getmaster   modifytable tablename  htd
+catch  remoteexception re
+// convert re exceptions in here; client shouldn't have to deal with them,
+// at least w/ the type of exceptions that come out of this method:
+// tablenotfoundexception, etc.
+throw remoteexceptionhandler decoderemoteexception re
+/**
+* @param tablenameorregionname name of a table or name of a region.
+* @param ct a {@link #catalogtracker} instance (caller of this method usually has one).
+* @return true if <code>tablenameorregionname</code> is a verified region
+* name (we call {@link #metareader.getregion(catalogtracker catalogtracker,
+* byte [] regionname)};) else false.
+* throw an exception if <code>tablenameorregionname</code> is null.
+* @throws ioexception
+*/
+private boolean isregionname final byte tablenameorregionname
+catalogtracker ct
+throws ioexception
+if  tablenameorregionname    null
+throw new illegalargumentexception
+return  metareader getregion ct  tablenameorregionname     null
+/**
+* convert the table name byte array into a table name string and check if table
+* exists or not.
+* @param tablenamebytes name of a table.
+* @param ct a {@link #catalogtracker} instance (caller of this method usually has one).
+* @return tablename in string form.
+* @throws ioexception if a remote or network exception occurs.
+* @throws tablenotfoundexception if table does not exist.
+*/
+private string tablenamestring final byte tablenamebytes  catalogtracker ct
+throws ioexception
+string tablenamestring   bytes tostring tablenamebytes
+if   metareader tableexists ct  tablenamestring
+throw new tablenotfoundexception tablenamestring
+return tablenamestring
+/**
+* shuts down the hbase cluster
+* @throws ioexception if a remote or network exception occurs
+*/
+public synchronized void shutdown   throws ioexception
+ismasterrunning
+try
+getmaster   shutdown
+catch  remoteexception e
+throw remoteexceptionhandler decoderemoteexception e
+/**
+* shuts down the current hbase master only.
+* does not shutdown the cluster.
+* @see #shutdown()
+* @throws ioexception if a remote or network exception occurs
+*/
+public synchronized void stopmaster   throws ioexception
+ismasterrunning
+try
+getmaster   stopmaster
+catch  remoteexception e
+throw remoteexceptionhandler decoderemoteexception e
+/**
+* stop the designated regionserver
+* @param hostnameport hostname and port delimited by a <code>:</code> as in
+* <code>example.org:1234</code>
+* @throws ioexception if a remote or network exception occurs
+*/
+public synchronized void stopregionserver final string hostnameport
+throws ioexception
+string hostname   addressing parsehostname hostnameport
+int port   addressing parseport hostnameport
+hregioninterface rs
+this connection gethregionconnection hostname  port
+rs stop     this connection tostring
+/**
+* @return cluster status
+* @throws ioexception if a remote or network exception occurs
+*/
+public clusterstatus getclusterstatus   throws ioexception
+return getmaster   getclusterstatus
+private hregionlocation getfirstmetaserverfortable final byte  tablename
+throws ioexception
+return connection locateregion hconstants meta_table_name
+hregioninfo createregionname tablename  null  hconstants nines  false
+/**
+* @return configuration used by the instance.
+*/
+public configuration getconfiguration
+return this conf
+/**
+* check to see if hbase is running. throw an exception if not.
+*
+* @param conf system configuration
+* @throws masternotrunningexception if the master is not running
+* @throws zookeeperconnectionexception if unable to connect to zookeeper
+*/
+public static void checkhbaseavailable configuration conf
+throws masternotrunningexception  zookeeperconnectionexception
+configuration copyofconf   hbaseconfiguration create conf
+copyofconf setint    1
+hbaseadmin admin   new hbaseadmin copyofconf
+try
+admin close
+catch  ioexception ioe
+admin log info    ioe
+/**
+* get the regions of a given table.
+*
+* @param tablename the name of the table
+* @return ordered list of {@link hregioninfo}.
+* @throws ioexception
+*/
+public list<hregioninfo> gettableregions final byte tablename
+throws ioexception
+catalogtracker ct   getcatalogtracker
+list<hregioninfo> regions   null
+try
+regions   metareader gettableregions ct  tablename  true
+finally
+cleanupcatalogtracker ct
+return regions
+public void close   throws ioexception
+if  this connection    null
+this connection close
+/**
+* get tabledescriptors
+* @param tablenames list of table names
+* @return htd[] the tabledescriptor
+* @throws ioexception if a remote or network exception occurs
+*/
+public htabledescriptor gettabledescriptors list<string> tablenames
+throws ioexception
+return this connection gethtabledescriptors tablenames
+/**
+* roll the log writer. that is, start writing log messages to a new file.
+*
+* @param servername
+*          the servername of the regionserver. a server name is made of host,
+*          port and startcode. this is mandatory. here is an example:
+*          <code> host187.example.com,60020,1289493121758</code>
+* @return if lots of logs, flush the returned regions so next time through
+* we can clean logs. returns null if nothing to flush.  names are actual
+* region names as returned by {@link hregioninfo#getencodedname()}
+* @throws ioexception if a remote or network exception occurs
+* @throws failedlogcloseexception
+*/
+public synchronized  byte rollhlogwriter string servername
+throws ioexception  failedlogcloseexception
+servername sn   new servername servername
+hregioninterface rs   this connection gethregionconnection
+sn gethostname    sn getport
+return rs rollhlogwriter
+public string getmastercoprocessors
+try
+return getclusterstatus   getmastercoprocessors
+catch  ioexception e
+log error   e
+return null

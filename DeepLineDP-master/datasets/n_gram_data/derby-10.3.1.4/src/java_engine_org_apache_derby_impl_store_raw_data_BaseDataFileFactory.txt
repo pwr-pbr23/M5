@@ -1,0 +1,1858 @@
+/*
+derby - class org.apache.derby.impl.store.raw.data.basedatafilefactory
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store raw data
+import org apache derby iapi reference sqlstate
+import org apache derby iapi reference messageid
+import org apache derby impl store raw data allocationactions
+import org apache derby impl store raw data basecontainerhandle
+import org apache derby impl store raw data basepage
+import org apache derby impl store raw data directactions
+import org apache derby impl store raw data loggableactions
+import org apache derby impl store raw data pageactions
+import org apache derby impl store raw data recordid
+import org apache derby impl store raw data reclaimspace
+import org apache derby iapi services info productversionholder
+import org apache derby iapi services info productgenusnames
+import org apache derby iapi services cache cachefactory
+import org apache derby iapi services cache cachemanager
+import org apache derby iapi services cache cacheable
+import org apache derby iapi services cache cacheablefactory
+import org apache derby iapi services context contextmanager
+import org apache derby iapi services daemon daemonservice
+import org apache derby iapi services daemon serviceable
+import org apache derby iapi services monitor modulecontrol
+import org apache derby iapi services monitor modulesupportable
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services monitor persistentservice
+import org apache derby iapi services diag performance
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services io formatidutil
+import org apache derby iapi services stream headerprintwriter
+import org apache derby iapi error standardexception
+import org apache derby iapi services i18n messageservice
+import org apache derby iapi store access accessfactoryglobals
+import org apache derby iapi store access fileresource
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi store raw data datafactory
+import org apache derby iapi store raw data rawcontainerhandle
+import org apache derby iapi store raw log logfactory
+import org apache derby iapi store raw log loginstant
+import org apache derby iapi store raw containerhandle
+import org apache derby iapi store raw containerkey
+import org apache derby iapi store raw lockingpolicy
+import org apache derby iapi store raw page
+import org apache derby iapi store raw rawstorefactory
+import org apache derby iapi store raw recordhandle
+import org apache derby iapi store raw streamcontainerhandle
+import org apache derby iapi store raw transaction
+import org apache derby iapi store raw xact rawtransaction
+import org apache derby iapi store access rowsource
+import org apache derby io storagefactory
+import org apache derby io writablestoragefactory
+import org apache derby io storagefile
+import org apache derby io storagerandomaccessfile
+import org apache derby iapi services uuid uuidfactory
+import org apache derby catalog uuid
+import org apache derby iapi reference attribute
+import org apache derby iapi reference property
+import org apache derby iapi reference sqlstate
+import org apache derby iapi util bytearray
+import org apache derby iapi services io fileutil
+import org apache derby iapi util cheapdateformatter
+import org apache derby iapi util privilegedfileops
+import org apache derby iapi util reusefactory
+import org apache derby iapi services property propertyutil
+import java util properties
+import java util hashtable
+import java util enumeration
+import java io file
+import java io filepermission
+import java io outputstream
+import java io ioexception
+import java security accesscontroller
+import java security privilegedaction
+import java security privilegedexceptionaction
+import java security privilegedactionexception
+/**
+provides the abstract class with most of the implementation of datafactory and
+modulecontrol shared by all the different filesystem implementations.
+<p>
+resolve (mikem - 2/19/98) -
+currently only getcontainerclass() is abstract, there are probably more
+routines which should be abstract.  also the other implementations should
+probably inherit from the abstract class, rather than from the datafilefactory
+class.  also there probably should be a generic directory and the rest of the
+filesystem implementations parallel to it.
+i wanted to limit the changes going into the branch and then fix
+inheritance stuff in main.
+<p>
+the code in this class was moved over from datafilefactory.java and then
+that file was made to inherit from this one.
+**/
+public class basedatafilefactory
+implements datafactory  cacheablefactory  modulecontrol  modulesupportable  privilegedexceptionaction
+storagefactory storagefactory
+/* writablestoragefactory == (writablestoragefactory) storagefactory if
+* storagefactory also implements writablestoragefactory, null if the
+* storagefactory is read-only.
+*/
+writablestoragefactory writablestoragefactory
+private     long		    nextcontainerid   system currenttimemillis
+private     boolean         databaseencrypted
+private     cachemanager	pagecache
+private     cachemanager	containercache
+private     logfactory	    logfactory
+private     productversionholder jbmsversion
+private     rawstorefactory	rawstorefactory     associated raw store factory
+private     string			datadirectory 	    root directory of files
+private     boolean         throwdblckexception     if true throw db lck
+// exception, even on systems
+// where lock file is not
+// guaranteed.
+private     uuid            identifier          unique id for locking
+private     object          freezesemaphore
+// is the data store frozen - protected by freezesemaphore
+private     boolean         isfrozen
+// how many writers are currently active in the data store -
+// protected by freezesemaphore
+private     int             writersinprogress
+private boolean removestubsok
+private boolean iscorrupt
+// the database is being created, no logging
+private boolean increatenolog
+// lock against other jbms opening the same database
+private storagerandomaccessfile filelockondb
+private storagefile exfilelock    file handle to get exclusive lock
+private headerprintwriter istream
+private static final string line
+// disable syncing of data during page allocation.  derby-888 changes
+// the system to not require data syncing at allocation.
+boolean datanotsyncedatallocation   true
+// disable syncing of data during checkpoint.
+boolean datanotsyncedatcheckpoint   false
+// these fields can be accessed directly by subclasses if it needs a
+// different set of actions
+private pageactions       loggablepageactions
+private allocationactions loggableallocactions
+private boolean		    readonly  		   is this a read only data store
+private boolean supportsrandomaccess
+private fileresource	    filehandler 	   my file handler  set by a
+// sub-class in its boot method.
+//hash table to keep track of information about dropped containers stubs
+private hashtable droppedtablestubinfo
+private hashtable postrecoveryremovedfiles
+private encryptdata containerencrypter
+// privilegedaction actions
+private int actioncode
+private static final int get_temp_directory_action                1
+private static final int remove_temp_directory_action             2
+private static final int get_container_path_action                3
+private static final int get_alternate_container_path_action      4
+private static final int find_max_container_id_action             5
+private static final int delete_if_exists_action                  6
+private static final int get_path_action                          7
+private static final int post_recovery_remove_action              8
+private static final int remove_stubs_action                      9
+private static final int boot_action                              10
+private static final int get_lock_on_db_action                    11
+private static final int release_lock_on_db_action                12
+private static final int restore_data_directory_action            13
+private static final int get_container_names_action               14
+private containerkey    containerid
+private boolean         stub
+private storagefile     actionfile
+private uuid            myuuid
+private uuidfactory     uuidfactory
+private string          databasedirectory
+private string          backuppath
+private file            backuproot
+private string        bfilelist
+/*
+** constructor
+*/
+public basedatafilefactory
+/*
+** methods of modulecontrol
+*/
+public boolean cansupport properties startparams
+string servicetype   startparams getproperty persistentservice type
+if  servicetype    null
+return false
+if   handleservicetype servicetype
+return false
+if  startparams getproperty persistentservice root     null
+return false
+return true
+public void	boot boolean create  properties startparams
+throws standardexception
+jbmsversion   monitor getmonitor   getengineversion
+datadirectory   startparams getproperty persistentservice root
+uuidfactory uf   monitor getmonitor   getuuidfactory
+identifier   uf createuuid
+persistentservice ps   monitor getmonitor   getservicetype this
+try
+storagefactory
+ps getstoragefactoryinstance
+true
+datadirectory
+startparams getproperty
+property storage_temp_directory
+propertyutil getsystemproperty
+property storage_temp_directory
+identifier toansiidentifier
+catch ioexception ioe
+if  create
+throw standardexception newexception
+sqlstate service_directory_create_error
+ioe  datadirectory
+else
+throw standardexception newexception
+sqlstate database_not_found  ioe  datadirectory
+if  storagefactory instanceof writablestoragefactory
+writablestoragefactory    writablestoragefactory  storagefactory
+actioncode   boot_action
+try
+accesscontroller doprivileged  this
+catch  privilegedactionexception pae
+// boot_action does not throw any exceptions.
+string value
+startparams getproperty property force_database_lock
+propertyutil getsystemproperty property force_database_lock
+throwdblckexception
+boolean valueof
+value    null ? value trim     value   booleanvalue
+if   isreadonly   		   read only db  not interested in filelock
+getjbmslockondb identifier  uf  datadirectory
+//if the database is being restored/created from backup
+//the restore the data directory(seg*) from backup
+string restorefrom  null
+restorefrom   startparams getproperty attribute create_from
+if restorefrom    null
+restorefrom   startparams getproperty attribute restore_from
+if restorefrom    null
+restorefrom   startparams getproperty attribute roll_forward_recovery_from
+if  restorefrom   null
+try
+// restorefrom and createfrom operations also need to know if database
+// is encrypted
+string dataencryption
+startparams getproperty attribute data_encryption
+databaseencrypted   boolean valueof dataencryption  booleanvalue
+restoredatadirectory restorefrom
+catch standardexception se
+releasejbmslockondb
+throw se
+logmsg line
+long boottime   system currenttimemillis
+string readonlymsg    isreadonly
+? messageservice gettextmessage messageid store_boot_readonly_msg
+logmsg cheapdateformatter formatdate boottime
+messageservice gettextmessage messageid store_boot_msg
+jbmsversion
+identifier
+datadirectory
+readonlymsg
+uf   null
+cachefactory cf    cachefactory
+monitor startsystemmodule
+org apache derby iapi reference module cachefactory
+int pagecachesize   getintparameter
+rawstorefactory page_cache_size_parameter
+
+rawstorefactory page_cache_size_default
+rawstorefactory page_cache_size_minimum
+rawstorefactory page_cache_size_maximum
+pagecache
+cf newcachemanager this
+pagecachesize   2
+pagecachesize
+int filecachesize   getintparameter
+
+100
+2
+100
+containercache
+cf newcachemanager
+this     filecachesize   2  filecachesize
+if  create
+string nolog
+startparams getproperty property create_with_no_log
+increatenolog
+nolog    null    boolean valueof nolog  booleanvalue
+freezesemaphore   new object
+droppedtablestubinfo   new hashtable
+// if derby.system.durability=test then set flags to disable sync of
+// data pages at allocation when file is grown, disable sync of data
+// writes during checkpoint
+if  property durability_testmode_no_sync equalsignorecase
+propertyutil getsystemproperty property durability_property
+// - disable syncing of data during checkpoint.
+datanotsyncedatcheckpoint   true
+// log message stating that derby.system.durability
+// is set to a mode, where syncs wont be forced and the
+// possible consequences of setting this mode
+monitor logmessage messageservice gettextmessage
+messageid store_durability_testmode_no_sync
+property durability_property
+property durability_testmode_no_sync
+else if  performance measure
+// development build only feature, must by hand set the
+// performance.measure variable and rebuild.  useful during
+// development to compare/contrast effect of syncing, release
+// users can use the above relaxed durability option to disable
+// all syncing.
+// debug only flag - disable syncing of data during checkpoint.
+datanotsyncedatcheckpoint
+propertyutil getsystemboolean
+property storage_data_not_synced_at_checkpoint
+if  datanotsyncedatcheckpoint
+monitor logmessage
+property storage_data_not_synced_at_checkpoint
+filehandler   new rfresource  this
+end of boot
+public void	stop
+boolean ok   false
+if  rawstorefactory    null
+daemonservice rawstoredaemon   rawstorefactory getdaemon
+if  rawstoredaemon    null
+rawstoredaemon stop
+long shutdowntime   system currenttimemillis
+logmsg     cheapdateformatter formatdate shutdowntime
+messageservice gettextmessage
+messageid store_shutdown_msg
+getidentifier
+istream println line
+if   iscorrupt
+try
+if  pagecache    null    containercache    null
+pagecache shutdown
+containercache shutdown
+ok   true
+catch  standardexception se
+se printstacktrace istream getprintwriter
+removetempdirectory
+if  isreadonly   		   do enough to close all files  then return
+storagefactory shutdown
+return
+// re-enable stub removal until a better method can be found.
+// only remove stub if caches are cleaned
+if  removestubsok    ok
+removestubs
+releasejbmslockondb
+writablestoragefactory shutdown
+end of stop
+/*
+** cacheablefactory
+*/
+public cacheable newcacheable cachemanager cm
+if  cm    pagecache
+storedpage sp   new storedpage
+sp setfactory this
+return sp
+// container cache
+return newcontainerobject
+/**
+database creation finished
+@exception standardexception standard derby exception policy.
+*/
+public void createfinished   throws standardexception
+if   increatenolog
+throw standardexception newexception
+sqlstate file_database_not_in_create
+// the changes in cache are not logged, they have to be flushed to disk
+checkpoint
+increatenolog   false
+/*
+** methods of datafactory
+*/
+public containerhandle opencontainer
+rawtransaction  t
+containerkey    containerid
+lockingpolicy   locking
+int             mode
+throws standardexception
+return opencontainer
+t  containerid  locking  mode  false    is not dropped
+/**
+@see datafactory#opendroppedcontainer
+@exception standardexception standard derby error policy
+*/
+public rawcontainerhandle opendroppedcontainer
+rawtransaction  t
+containerkey    containerid
+lockingpolicy   locking
+int             mode
+throws standardexception
+// since we are opening a possible dropped container
+// lets not add any actions that will take palce on a commit.
+mode    containerhandle mode_no_actions_on_commit
+return opencontainer
+t  containerid  locking  mode  true    droppedok
+/**
+@see datafactory#opencontainer
+@exception standardexception standard derby error policy
+*/
+private rawcontainerhandle opencontainer
+rawtransaction  t
+containerkey    identity
+lockingpolicy   locking
+int             mode
+boolean         droppedok
+throws standardexception
+if  sanitymanager debug
+if   mode    containerhandle mode_readonly   containerhandle mode_forupdate
+containerhandle mode_readonly   containerhandle mode_forupdate
+sanitymanager throwassert
+boolean waitforlock     mode   containerhandle mode_lock_nowait     0
+if   mode   containerhandle mode_open_for_lock_only     0
+// open a container for lock only, we don't care if it exists, is
+// deleted or anything about it. the container handle we return is
+// closed and cannot be used for fetch or update etc.
+basecontainerhandle lockonlyhandle
+new basecontainerhandle
+getidentifier    t  identity  locking  mode
+if  lockonlyhandle usecontainer true  waitforlock
+return lockonlyhandle
+else
+return null
+basecontainerhandle c
+// see if the container exists
+filecontainer container    filecontainer  containercache find identity
+if  container    null
+return null
+if  identity getsegmentid      containerhandle temporary_segment
+if  sanitymanager debug
+sanitymanager assert container instanceof temprafcontainer
+if   mode   containerhandle mode_temp_is_kept
+containerhandle mode_temp_is_kept
+// if the mode is kept, then, we do not want to truncate
+mode    containerhandle mode_unlogged
+else
+// this should be ok even if the table was opened read-only
+mode
+containerhandle mode_unlogged
+containerhandle mode_truncate_on_rollback
+locking
+t newlockingpolicy
+lockingpolicy mode_none
+transactioncontroller isolation_nolock  true
+else
+// real tables
+if  increatenolog
+mode
+containerhandle mode_unlogged
+containerhandle mode_create_unlogged
+else
+// make sure everything is logged if logarchived is turn on
+// clear all unlogged flag
+if  logfactory logarchived
+mode    ~ containerhandle mode_unlogged
+containerhandle mode_create_unlogged
+else
+// block the online backup if the container is being
+// opened in unlogged mode, if the backup is already
+// running then convert all unlogged opens to logged ones,
+// otherwise online backup copy will be inconsistent.
+if    mode   containerhandle mode_unlogged
+containerhandle mode_unlogged
+mode   containerhandle mode_create_unlogged
+containerhandle mode_create_unlogged
+if   t blockbackup false
+// when a backup is in progress transaction can not
+// block the backup, so convert  unlogged opens
+// to logged mode.
+mode    ~ containerhandle mode_unlogged
+containerhandle mode_create_unlogged
+// if mode is unlogged but not create_unlogged, then force the
+// container from cache when the transaction commits.  for
+// create_unlogged, client has the responsibility of forcing the
+// cache.
+if    mode   containerhandle mode_unlogged
+containerhandle mode_unlogged
+mode   containerhandle mode_create_unlogged     0
+mode    containerhandle mode_flush_on_commit
+pageactions       pageactions    null
+allocationactions allocactions   null
+if   mode   containerhandle mode_forupdate
+containerhandle mode_forupdate
+if   mode   containerhandle mode_unlogged     0
+// get the current loggable actions
+pageactions    getloggablepageactions
+allocactions   getloggableallocationactions
+else
+// unlogged
+pageactions    new directactions
+allocactions   new directallocactions
+c   new basecontainerhandle
+getidentifier    t  pageactions
+allocactions  locking  container  mode
+// see if we can use the container
+try
+if   c usecontainer droppedok  waitforlock
+containercache release container
+return null
+catch  standardexception se
+containercache release container
+throw se
+return c
+/** add a container with a specified page size to a segment.
+@exception standardexception standard derby error policy
+*/
+public long addcontainer
+rawtransaction  t
+long            segmentid
+long            input_containerid
+int             mode
+properties      tableproperties
+int             temporaryflag
+throws standardexception
+if  sanitymanager debug
+if   mode   containerhandle mode_create_unlogged     0
+sanitymanager assert
+mode   containerhandle mode_unlogged     0
+// if client has provided a containerid then use it, else use the
+// internally generated one from getnextid().
+long containerid
+input_containerid    containerhandle default_assign_id  ?
+input_containerid   getnextid
+containerkey identity   new containerkey segmentid  containerid
+boolean tmpcontainer    segmentid    containerhandle temporary_segment
+containerhandle ch   null
+lockingpolicy   cl   null
+if   tmpcontainer
+// lock the container before we create it.
+if  isreadonly
+throw standardexception newexception
+sqlstate data_container_read_only
+cl   t newlockingpolicy lockingpolicy mode_container
+transactioncontroller isolation_serializable  true
+if  sanitymanager debug
+sanitymanager assert cl    null
+ch   t opencontainer identity  cl
+containerhandle mode_forupdate
+containerhandle mode_open_for_lock_only
+filecontainer container
+filecontainer  containercache create identity  tableproperties
+// create the first alloc page and the first user page,
+// if this fails for any reason the transaction
+// will roll back and the container will be dropped (removed)
+containerhandle containerhdl   null
+page            firstpage      null
+try
+// if opening a temporary container with is_kept flag set,
+// make sure to open it with is_kept too.
+if  tmpcontainer
+temporaryflag   transactioncontroller is_kept
+transactioncontroller is_kept
+mode    containerhandle mode_temp_is_kept
+// open no-locking as we already have the container locked
+containerhdl
+t opencontainer
+identity  null   containerhandle mode_forupdate   mode
+// we just added it, containerhdl should not be null
+if  sanitymanager debug
+sanitymanager assert containerhdl    null
+if   tmpcontainer
+// make it persistent (in concept if not in reality)
+rawcontainerhandle rch    rawcontainerhandle containerhdl
+containeroperation lop
+new containeroperation rch  containeroperation create
+// mark the container as pre-dirtied so that if a checkpoint
+// happens after the log record is sent to the log stream, the
+// cache cleaning will wait for this change.
+rch predirty true
+try
+t loganddo lop
+// flush the log to reduce the window between where
+// the container is created & synced and the log record
+// for it makes it to disk. if we fail in this
+// window we will leave a stranded container file.
+flush t getlastloginstant
+finally
+// in case loganddo fail, make sure the container is not
+// stuck in predirty state.
+rch predirty false
+firstpage   containerhdl addpage
+finally
+if  firstpage    null
+firstpage unlatch
+firstpage   null
+containercache release container
+if  containerhdl    null
+containerhdl close
+containerhdl   null
+if   tmpcontainer
+// this should do nothing, since we requested isolation 3
+// but we can't assume that, so call the policy correctly.
+cl unlockcontainer t  ch
+return containerid
+/** add and load a stream container
+@exception standardexception standard derby error policy
+*/
+public long addandloadstreamcontainer
+rawtransaction  t
+long            segmentid
+properties      tableproperties
+rowsource       rowsource
+throws standardexception
+long containerid   getnextid
+containerkey identity   new containerkey segmentid  containerid
+// create and load the stream container
+streamfilecontainer scontainer
+new streamfilecontainer identity  this  tableproperties
+scontainer load rowsource
+return containerid
+/**
+open an exsisting streamcontainer
+@see datafactory#openstreamcontainer
+@exception standardexception standard derby error policy
+*/
+public streamcontainerhandle openstreamcontainer
+rawtransaction  t
+long            segmentid
+long            containerid
+boolean         hold
+throws standardexception
+containerkey identity   new containerkey segmentid  containerid
+streamfilecontainerhandle c
+// open the container with the identity
+streamfilecontainer container   new streamfilecontainer identity  this
+container   container open false
+if  container    null
+return null
+c   new streamfilecontainerhandle getidentifier    t  container  hold
+// see if we can use the container
+if  c usecontainer
+return c
+else
+return null
+/**
+drop a stream container.
+<p><b>synchronisation</b>
+<p>
+this call will remove the container.
+@exception standardexception standard derby error policy
+*/
+public void dropstreamcontainer
+rawtransaction  t
+long            segmentid
+long            containerid
+throws standardexception
+boolean tmpcontainer    segmentid    containerhandle temporary_segment
+streamcontainerhandle containerhdl   null
+try
+containerkey ckey   new containerkey segmentid  containerid
+// close all open containers and 'oncommit' objects of the container
+t notifyobservers ckey
+containerhdl   t openstreamcontainer segmentid  containerid  false
+if  tmpcontainer     containerhdl    null
+containerhdl removecontainer
+return
+finally
+if  containerhdl    null
+containerhdl close
+/**
+re-create a container during redo recovery.
+called only during recovery load tran.
+@exception standardexception standard derby error policy
+*/
+public void recreatecontainerforredorecovery
+rawtransaction  t
+long            segmentid
+long            containerid
+bytearray       containerinfo
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert segmentid    containerhandle temporary_segment
+containerkey identity   new containerkey segmentid  containerid
+// no need to lock container during load tran
+// no need to create any page for the container, they will be created
+// as their log records are encountered later in load tran
+filecontainer container
+filecontainer containercache create identity  containerinfo
+containercache release container
+/**
+drop a container.
+<p><b>synchronisation</b>
+<p>
+this call will mark the container as dropped and then obtain an cx lock
+(table level exclusive lock) on the container. once a container has
+been marked as dropped it cannot be retrieved by an opencontainer()
+call unless explicitly with droppedok.
+<p>
+once the exclusive lock has been obtained the container is removed
+and all its pages deallocated. the container will be fully removed
+at the commit time of the transaction.
+@exception standardexception standard derby error policy
+*/
+public void dropcontainer
+rawtransaction  t
+containerkey    ckey
+throws standardexception
+boolean tmpcontainer
+ckey getsegmentid      containerhandle temporary_segment
+lockingpolicy cl   null
+if   tmpcontainer
+if  isreadonly
+throw standardexception newexception
+sqlstate data_container_read_only
+cl
+t newlockingpolicy
+lockingpolicy mode_container
+transactioncontroller isolation_serializable  true
+if  sanitymanager debug
+sanitymanager assert cl    null
+// close all open containers and 'oncommit' objects of this container
+t notifyobservers ckey
+rawcontainerhandle containerhdl    rawcontainerhandle
+t opencontainer ckey  cl  containerhandle mode_forupdate
+// if container is already dropped or is no longer there, throw
+// containervanished exception unless container is temporary, in that
+// case just return.  upper layer is supposed to prevent such from
+// happening thru some means other than the lock we are getting here.
+try
+if  containerhdl    null
+containerhdl getcontainerstatus      rawcontainerhandle normal
+// if we are a temp container, don't worry about it.
+if  tmpcontainer
+if  containerhdl    null
+containerhdl removecontainer  loginstant null
+return
+else
+throw standardexception newexception
+sqlstate data_container_vanished  ckey
+// container exist, is updatable and we got the lock.
+if  tmpcontainer
+containerhdl dropcontainer  loginstant null  true
+containerhdl removecontainer  loginstant null
+else
+containeroperation lop
+new containeroperation
+containerhdl  containeroperation drop
+// mark the container as pre-dirtied so that if a checkpoint
+// happens after the log record is sent to the log stream, the
+// cache cleaning will wait for this change.
+containerhdl predirty true
+try
+t loganddo lop
+finally
+// in case loganddo fail, make sure the container is not
+// stuck in predirty state.
+containerhdl predirty false
+// remember this as a post commit work item
+serviceable p
+new reclaimspace
+reclaimspace container
+ckey
+this
+true    service asap
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug
+daemonservice daemontrace
+p
+t addpostcommitwork p
+finally
+if  containerhdl    null
+containerhdl close
+/**
+* implement checkpoint operation, write/sync all pages in cache.
+* <p>
+* the derby write ahead log algorithm uses checkpoint of the data
+* cache to determine points of the log no longer required by
+* restart recovery.
+* <p>
+* this implementation uses the 2 cache interfaces to force all dirty
+* pages to disk:
+*
+* write dirty pages to os:
+* in the first step all pages in the page cache
+* are written, but not synced (pagecache.cleanall).  the cachemanager
+* cleanall() interface guarantees that every dirty page that exists
+* when this call is first made will have it's clean() method called.
+* the data cache (cachedpage.clean()), will call writepage but not
+* sync the page.
+* by using the java write then sync, the checkpoint is
+* usually doing async i/o, allowing the os to schedule multiple i/o's
+* to the file as efficiently as it can.
+* note that it has been observed that checkpoints
+* can flood the i/o system because these writes are not synced, see
+* derby-799 - checkpoint should probably somehow restrict the rate
+* it sends out those i/o's - it was observed a simple sleep every
+* n writes fixed most of the problem.
+*
+* force those dirty writes to disk:
+* to force the i/o's to disk, the system calls each open dirty file
+* and uses the java interface to sync any outstanding dirty pages to
+* disk (containercache.cleanall()).  the open container cache does
+* this work in rafcontainer.clean() by writing it's header out and
+* syncing the file.  (note if any change is made to checkpoint to
+* sync the writes vs. syncing the file, one probably still needs to
+* write the container header out and sync it).
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void checkpoint   throws standardexception
+pagecache cleanall
+containercache cleanall
+public void idle   throws standardexception
+pagecache ageout
+containercache ageout
+public void setrawstorefactory
+rawstorefactory rsf
+boolean         create
+properties      startparams
+throws standardexception
+rawstorefactory   rsf
+/*
+* boot the log factory here because different implementation of the
+* data	factory wants different types of log factory
+*/
+bootlogfactory create  startparams
+/**
+return my unique identifier
+@see datafactory#getidentifier
+*/
+public uuid getidentifier
+return identifier
+/*
+** called by post commit daemon, calling reclaimspace.performwork()
+*/
+public int reclaimspace
+serviceable     work
+contextmanager  contextmgr
+throws standardexception
+if  work    null
+return serviceable done
+transaction tran
+rawstorefactory findusertransaction
+contextmgr  accessfactoryglobals sys_trans_name
+if  sanitymanager debug
+sanitymanager assert tran    null
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+work
+return reclaimspacehelper reclaimspace this   rawtransaction tran
+reclaimspace work
+/**
+really this is just a convience routine for callers that might not
+have access to a log factory.
+*/
+public standardexception markcorrupt standardexception originalerror
+boolean firsttime    iscorrupt
+iscorrupt   true
+if  getlogfactory      null
+getlogfactory   markcorrupt originalerror
+// if firsttime markcorrupt is called, release the jbms lock so user
+// can move the database if so desired.
+if  firsttime
+// get rid of everything from the cache without first cleaning them
+if  pagecache    null
+pagecache discard null
+if  containercache    null
+containercache discard null
+// don't read in any more pages
+pagecache   null
+containercache   null
+releasejbmslockondb
+return originalerror
+public fileresource getfilehandler
+return filehandler
+public void removestubsok
+removestubsok   true
+/*
+** implementation specific methods
+*/
+public int getintparameter
+string      parametername
+properties  properties
+int         defaultvalue
+int         minimumvalue
+int         maximumvalue
+int newvalue
+string parameter   null
+if  properties    null
+parameter   properties getproperty parametername
+if  parameter    null
+parameter   propertyutil getsystemproperty parametername
+if  parameter    null
+try
+newvalue   integer parseint parameter
+if   newvalue >  minimumvalue      newvalue <  maximumvalue
+return newvalue
+catch  numberformatexception nfe
+// just leave the size at the default.
+return defaultvalue
+cachemanager getcontainercache
+return containercache
+cachemanager getpagecache
+return pagecache
+public long getcachestats string cachename
+if  cachename    null
+// cache name is not specified, return the default.
+return getpagecache   getcachestats
+if  cachename equals
+return getpagecache   getcachestats
+else
+// return default set of cache.
+return getpagecache   getcachestats
+public void resetcachestats string cachename
+if  cachename    null
+// cache name is not specified, return the default.
+getpagecache   resetcachestats
+return
+if  cachename equals
+getpagecache   resetcachestats
+else
+// default
+getpagecache   resetcachestats
+/**
+ask the log factory to flush up to this log instant.
+@exception standardexception cannot sync log file
+*/
+void flush loginstant instant
+throws standardexception
+getlogfactory   flush instant
+/**
+ask the log factory to flush the side log up to this bip location
+not implemented in this class - subclass who deals with side log must
+override this.
+@exception standardexception derby standard error policy
+*/
+private void syncsidelog long biplocation
+throws standardexception
+return
+logfactory getlogfactory
+return logfactory
+rawstorefactory getrawstorefactory
+return rawstorefactory
+/**
+get the root directory of the data storage area. is always guaranteed
+to be an absolute path.
+*/
+public string getrootdirectory
+return datadirectory
+/**
+* produces new container objects.
+* <p>
+* concrete implementations of a datafactory must implement this routine
+* to indicate what kind of containers are produced. this class produces
+* file-based containers - rafcontainer objects for files that support
+* random access and inputstreamcontainer object for others, such as data
+* files in jars.
+* <p>
+* @return a new file container object.
+*
+**/
+cacheable newcontainerobject
+if  supportsrandomaccess
+return newrafcontainer this
+else
+return new inputstreamcontainer  this
+/**
+* creates a rafcontainer object.
+* this method is overridden in basedatafilefactoryj4 to produce
+* rafcontainer4 objects instead of rafcontainer objects.
+*/
+protected cacheable newrafcontainer basedatafilefactory factory
+return new rafcontainer factory
+/**
+*	this page is going from clean to dirty, this is a chance for the
+*	sub class to do something if so desired
+*
+* @exception standardexception standard derby error policy
+*/
+private void pagetodirty rawtransaction t  storedpage page
+throws standardexception
+return 					   this implementation does nothing
+/*
+* get the loggable page action that is associated with this implementation
+*
+* @return the pageactions
+* @exception standardexceptions standard derby error policy
+*/
+private pageactions getloggablepageactions   throws standardexception
+if  loggablepageactions    null
+loggablepageactions   new loggableactions
+return loggablepageactions
+/**
+* get the loggable allocation action associated with this implementation
+*
+* @return the pageactions
+*/
+private allocationactions getloggableallocationactions
+if  loggableallocactions    null
+loggableallocactions   new loggableallocactions
+return loggableallocactions
+synchronized storagefile gettempdirectory
+actioncode   get_temp_directory_action
+try
+return  storagefile  accesscontroller doprivileged  this
+catch  privilegedactionexception pae
+// gettempdirectory does not actually throw an exception
+return null
+private synchronized void removetempdirectory
+if  storagefactory    null
+actioncode   remove_temp_directory_action
+try
+accesscontroller doprivileged  this
+catch  privilegedactionexception pae
+// removetempdirectory does not throw an exception
+/**
+* return the path to a container file.
+* <p>
+* return the path to a container file that is relative to the root
+* directory.
+* <p>
+* the format of the name of an existing container file is:
+*     segnnn/cxxx.dat
+* the format of the name of a stub describing a dropped container file is:
+*     segnnn/dxxx.dat
+*
+* nnn = segment number, currently 0 is where normal db files are found.
+* xxx = the hex representation of the container number
+*
+* the store will always create containers with this format name, but
+* the store will also recognize the following two formats when attempting
+* to open files - as some copy tools have uppercased our filesnames when
+* moving across operating systems:
+*
+* the format of the name of an existing container file is:
+*     segnnn/cxxx.dat
+* the format of the name of a stub describing a dropped container file is:
+*     segnnn/dxxx.dat
+* <p>
+*
+*
+* @param containerid the container being opened/created
+* @param stub        true if the file name for the stub is requested,
+*                      otherwise the file name for the data file
+*
+* @return the storagefile representing path to container relative to root.
+*
+**/
+public storagefile getcontainerpath
+containerkey    containerid
+boolean         stub
+return getcontainerpath containerid  stub  get_container_path_action
+private synchronized storagefile getcontainerpath
+containerkey    containerid
+boolean         stub
+int             code
+actioncode   code
+try
+this containerid   containerid
+this stub   stub
+try
+return  storagefile  accesscontroller doprivileged  this
+catch  privilegedactionexception pae
+// getcontainerpath does not throw an exception
+return null
+finally
+this containerid   null
+/**
+return an alternate path to container file relative to the root directory.
+the alternate path uses upper case 'c','d', and 'dat' instead of
+lower case - there have been cases of people copying the database and
+somehow upper casing all the file names.
+the intended use is as a bug fix for track 3444.
+@param containerid the container being opened/created
+@param stub true if the file name for the stub is requested, otherwise the file name for the data file
+*/
+public storagefile getalternatecontainerpath
+containerkey    containerid
+boolean         stub
+return getcontainerpath
+containerid  stub  get_alternate_container_path_action
+/**
+remove stubs in this database.  stubs are committed deleted containers
+*/
+private synchronized void removestubs
+actioncode   remove_stubs_action
+try
+accesscontroller doprivileged  this
+catch  privilegedactionexception pae
+// removestubs does not throw an exception
+/**
+* keeps track of information about the stub files of the  committed deleted
+* containers. we use the info to delete them at checkpoints.
+* in addition to the file info , we also keep track of the identity of the
+* container; which helps to remove entry in the cache and the log instant
+* when the stub was created, which helps us to figure out whether we
+* require the stub file for the crash recovery.
+* we maintain the information in a hashtable:
+* key(log instant) values: file handle , and containeridentity.
+**/
+public void stubfiletoremoveaftercheckpoint
+storagefile file
+loginstant  loginstant
+object      identity
+if droppedtablestubinfo    null
+object removeinfo   new object
+removeinfo         file
+removeinfo         identity
+droppedtablestubinfo put loginstant  removeinfo
+/**
+* delete the stub files that are not required for recovery. a stub file
+* is not required to be around if the recovery is not going to see
+* any log record that belongs to that container. since the stub files
+* are created as a post commit operation, they are not necessary during
+* undo operation of the recovery.
+*
+* to remove a stub file we have to be sure that it was created before the
+* redolwm in the check point record. we can be sure that the stub is not
+* required if the log instant when it was created is less than the redolwm.
+*/
+public void removedroppedcontainerfilestubs
+loginstant redolwm
+throws standardexception
+if  droppedtablestubinfo    null
+synchronized droppedtablestubinfo
+for  enumeration e   droppedtablestubinfo keys
+e hasmoreelements
+loginstant loginstant     loginstant  e nextelement
+if loginstant lessthan redolwm
+object removeinfo
+object  droppedtablestubinfo get loginstant
+object identity   removeinfo
+//delete the entry in the container cache.
+cacheable ccentry  	containercache findcached identity
+if ccentry  null
+containercache remove ccentry
+//delete the stub we don't require it during recovery
+synchronized  this
+actionfile    storagefile removeinfo
+actioncode   delete_if_exists_action
+try
+if  accesscontroller doprivileged this     null
+//if we successfuly delete the file remove
+//it from the hash table.
+droppedtablestubinfo remove loginstant
+catch  privilegedactionexception pae
+// delete_if_exists does not throw an exception
+/**
+* find the largest containerid is seg 0.
+* <p>
+* do a file list of the files in seg0 and return the highest numbered
+* file found.
+* <p>
+* until i figure out some reliable place to store this information across
+* a boot of the system, this is what is used following a boot to assign
+* the next conglomerate id when a new conglomerate is created.  it is
+* only called at most once, and then the value is cached by calling store
+* code.
+* <p>
+*
+* @return the largest containerid in seg0.
+**/
+private synchronized long findmaxcontainerid
+actioncode   find_max_container_id_action
+try
+return   long  accesscontroller doprivileged  this   longvalue
+catch  privilegedactionexception pae
+// findmaxcontainerid does not throw an exception
+return 0
+private void bootlogfactory
+boolean     create
+properties  startparams
+throws standardexception
+if  isreadonly
+startparams put
+logfactory runtime_attributes  logfactory rt_readonly
+logfactory    logfactory
+monitor bootservicemodule
+create  this
+rawstorefactory getlogfactorymodule    startparams
+/**
+does this factory support this service type.
+*/
+private boolean handleservicetype
+string      type
+try
+persistentservice ps
+monitor getmonitor   getserviceprovider type
+return ps    null    ps hasstoragefactory
+catch  standardexception se
+return false
+/**
+check to see if we are the only jbms opened against this database.
+<br>this method does nothing if this database is read only or we cannot
+access files directly on the database directory.
+<br>we first see if a file named db.lck exists on the top database
+directory (i.e., the directory where service.properties lives).  if it
+doesn't exist, we create it and write to it our identity which is
+generated per boot of the jbms.
+<br>if the db.lck file already exists when we boot this database, we
+try to delete it first, assuming that an opened randomaccessfile can
+act as a file lock against delete.  if that succeeds, we may hold a
+file lock against subsequent jbms that tries to attach to this
+database before we exit.
+<br>we test to see if we think an opened file will prevent it from
+being deleted, if so, we will hold on to the open file descriptor and
+use it as a filelock.  if not, and we started out deleting an existing
+db.lck file, we issue a warning message to the info stream that we are
+about to attached to a database which may already have another jbms
+attached to it. then we overwrite that db.lck file with our identity.
+<br>upon shutdown, we delete the db.lck file.  if the system crash
+instead of shutdown cleanly, it will be cleaned up the next time the
+system boots
+@exception standardexception another jbms is already attached to the
+database at this directory
+*/
+private void getjbmslockondb
+uuid        myuuid
+uuidfactory uuidfactory
+string      databasedirectory
+throws standardexception
+if  filelockondb    null     i already got the lock
+return
+if  isreadonly
+return
+if  sanitymanager debug
+if  myuuid    null
+sanitymanager throwassert
+synchronized  this
+actioncode   get_lock_on_db_action
+this myuuid   myuuid
+this uuidfactory   uuidfactory
+this databasedirectory   databasedirectory
+try
+accesscontroller doprivileged  this
+catch  privilegedactionexception pae
+throw  standardexception  pae getexception
+finally
+this myuuid   null
+this uuidfactory   null
+this databasedirectory   null
+// ok file lock is reliable, we think... keep the filelockondb file
+// descriptor open to prevent other jbms from booting
+// filelockondb is not null in this case
+// called from within a privilege block
+private void privgetjbmslockondb   throws standardexception
+boolean filelockexisted   false
+string blownuuid   null
+storagefile filelock   storagefactory newstoragefile  db_lockfile_name
+try
+// assume we are not read only
+// security permission mp1
+if  filelock exists
+filelockexisted   true
+// see what it says in case we cannot count on delete failing
+// when someone else have an opened file descriptor.
+// i may be blowing this jbms's lock away
+// security permission mp1
+// security permission op4
+filelockondb   filelock getrandomaccessfile
+try
+blownuuid   filelockondb readutf
+catch  ioexception ioe
+// the previous owner of the lock may have died before
+// finish writing its uuid down.
+filelockexisted   false
+filelockondb close
+filelockondb   null
+// security permission op5
+if   filelock delete
+throw standardexception newexception
+sqlstate data_multiple_jbms_on_db
+databasedirectory
+// if file does not exists, we grab it immediately - there is a
+// possibility that some other jbms got to it sooner than we do,
+// check the uuid after we write it to make sure
+// security permission mp1
+// security permission op5
+filelockondb   filelock getrandomaccessfile
+// write it out for future reference
+filelockondb writeutf myuuid tostring
+filelockondb sync  false
+filelockondb seek 0
+// check the uuid
+uuid checkuuid   uuidfactory recreateuuid filelockondb readutf
+if   checkuuid equals myuuid
+throw standardexception newexception
+sqlstate data_multiple_jbms_on_db  databasedirectory
+catch  ioexception ioe
+// probably a read only db, don't do anything more
+readonly   true
+try
+if  filelockondb    null
+filelockondb close
+catch  ioexception ioe2
+did the best i could
+filelockondb   null
+return
+if  filelock delete
+// if i can delete it while i am holding a opened file descriptor,
+// then the file lock is unreliable - send out a warning if i
+// have blown off another jbms's lock on the db
+object args   new object
+args   myuuid
+args   databasedirectory
+args   blownuuid
+//try the exlcusive file lock method approach available in jdk1.4 or
+//above jvms where delete machanism  does not reliably prevent
+//double booting of derby databases. if we don't get a reliable
+//exclusive lock still we send out a warning.
+int exlockstatus   storagefile no_file_lock_support
+//if user has chosen to force lock option don't bother
+//about applying exclusive file lock mechanism
+if  throwdblckexception
+exfilelock
+storagefactory newstoragefile  db_ex_lockfile_name
+exlockstatus   exfilelock getexclusivefilelock
+if  exlockstatus    storagefile no_file_lock_support
+if  filelockexisted     throwdblckexception
+standardexception multiplejbmswarning
+standardexception newexception
+sqlstate data_multiple_jbms_warning  args
+string warningmsg
+messageservice getcompletemessage
+sqlstate data_multiple_jbms_warning  args
+logmsg warningmsg
+// resolve - need warning support.  output to
+// system.err.println rather than just send warning
+// message to derby.log.
+system err println warningmsg
+// filelock is unreliable, but we should at least leave a file
+// there to warn the next person
+try
+// the existing filelockondb file descriptor may already be
+// deleted by the delete call, close it and create the file
+// again
+if filelockondb    null
+filelockondb close
+filelockondb   filelock getrandomaccessfile
+// write it out for future reference
+filelockondb writeutf myuuid tostring
+filelockondb sync  false
+filelockondb close
+catch  ioexception ioe
+try
+filelockondb close
+catch  ioexception ioe2
+/* did the best i could */
+finally
+filelockondb   null
+if  filelockexisted    throwdblckexception
+// user has chosen that we always throw exception, throw it
+// now that we have reinstated the lock file.
+throw standardexception newexception
+sqlstate data_multiple_jbms_force_lock  args
+if exlockstatus    storagefile exclusive_file_lock_not_available
+throw standardexception newexception
+sqlstate data_multiple_jbms_on_db
+databasedirectory
+end of privgetjbmslockondb
+private void releasejbmslockondb
+if  isreadonly
+return
+synchronized  this
+actioncode   release_lock_on_db_action
+try
+accesscontroller doprivileged  this
+catch  privilegedactionexception pae
+// do nothing - it may be read only medium, who knows what the
+// problem is
+finally
+filelockondb   null
+private void privreleasejbmslockondb   throws ioexception
+if  filelockondb    null
+filelockondb close
+if  storagefactory    null
+storagefile filelock
+storagefactory newstoragefile db_lockfile_name
+filelock delete
+//release the lock that is acquired using trylock() to prevent
+//multiple jvm booting the same database on unix environments.
+if exfilelock    null
+exfilelock releaseexclusivefilelock
+return
+end of privreleasejbmslockondb
+private void logmsg string msg
+if  istream    null
+istream   monitor getstream
+istream println msg
+public final boolean databaseencrypted
+return databaseencrypted
+public void setdatabaseencrypted
+databaseencrypted   true
+public int encrypt
+byte  cleartext
+int     offset
+int     length
+byte  ciphertext
+int     outputoffset
+boolean newengine
+throws standardexception
+return rawstorefactory encrypt
+cleartext  offset  length
+ciphertext  outputoffset
+newengine
+public int decrypt
+byte  ciphertext
+int     offset
+int     length
+byte  cleartext
+int     outputoffset
+throws standardexception
+return rawstorefactory decrypt
+ciphertext  offset  length  cleartext  outputoffset
+public void encryptallcontainers rawtransaction t  throws standardexception
+containerencrypter   new encryptdata this
+// encrypt all the conatiners in the databse
+containerencrypter encryptallcontainers t
+/*
+* remover old versions of the containers after (re)encryption
+* of the  database.
+* @param inrecovery  <code> true </code>, if cleanup is
+*                     happening during recovery.
+*/
+public void removeoldversionofcontainers boolean inrecovery
+throws standardexception
+// check if old containers are being during recovery
+// because of a crash after successful completion of
+// (re)encryption of the  dataabase, but before the
+// (re)encryption cleanup  was complete.
+if  inrecovery
+containerencrypter   new encryptdata this
+containerencrypter removeoldversionofcontainers inrecovery
+containerencrypter   null
+/**
+returns the encryption block size used by the algorithm at time of
+creation of an encrypted database
+*/
+public int getencryptionblocksize
+return rawstorefactory getencryptionblocksize
+public string getversionedname string name  long generationid
+return name concat   concat long tostring generationid
+/**
+* return an id which can be used to create a container.
+* <p>
+* return an id number with is greater than any existing container
+* in the current database.  caller will use this to allocate future
+* container numbers - most likely caching the value and then incrementing
+* it as it is used.
+* <p>
+*
+* @return the an id which can be used to create a container.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public long getmaxcontainerid
+throws standardexception
+return findmaxcontainerid
+synchronized long getnextid
+return nextcontainerid
+/** return a secure random number */
+int random
+return databaseencrypted ? rawstorefactory random     0
+/**
+add a file to the list of files to be removed post recovery.
+*/
+void filetoremove  storagefile file  boolean remove
+if  postrecoveryremovedfiles    null
+postrecoveryremovedfiles   new hashtable
+string path   null
+synchronized  this
+actioncode   get_path_action
+actionfile   file
+try
+path    string  accesscontroller doprivileged  this
+catch  privilegedactionexception pae
+// get_path does not throw an exception
+finally
+actionfile   null
+if  remove      to be removed
+postrecoveryremovedfiles put path  file
+else
+postrecoveryremovedfiles remove path
+/**
+called after recovery is performed.
+@exception standardexception standard derby error policy
+*/
+public void postrecovery   throws standardexception
+// hook up the cache cleaner daemon after recovery is finished
+daemonservice daemon   rawstorefactory getdaemon
+if  daemon    null
+return
+containercache usedaemonservice daemon
+pagecache usedaemonservice daemon
+if  postrecoveryremovedfiles    null
+synchronized  this
+actioncode   post_recovery_remove_action
+try
+accesscontroller doprivileged  this
+catch  privilegedactionexception pae
+// post_recovery_remove does not throw an exception
+postrecoveryremovedfiles   null
+public void freezepersistentstore   throws standardexception
+synchronized freezesemaphore
+if  isfrozen
+throw standardexception newexception
+sqlstate rawstore_nested_freeze
+// set this to true first to stop all writes from starting after
+// this.
+isfrozen   true
+// wait for all in progress write to finish
+try
+while writersinprogress > 0
+try
+freezesemaphore wait
+catch  interruptedexception ie
+// make sure we are not stuck in frozen state if we
+// caught an interrupt exception and the calling
+// thread may not have a chance to call unfreeze
+isfrozen   false
+freezesemaphore notifyall
+throw standardexception interrupt ie
+catch  runtimeexception rte
+// make sure we are not stuck in frozen state if we
+// caught a run time exception and the calling thread may not
+// have a chance to call unfreeze
+isfrozen   false
+freezesemaphore notifyall
+throw rte 		   rethrow run time exception
+if  sanitymanager debug
+sanitymanager assert writersinprogress    0
+isfrozen    true
+public void unfreezepersistentstore
+synchronized freezesemaphore
+isfrozen   false
+freezesemaphore notifyall
+public void writeinprogress   throws standardexception
+synchronized freezesemaphore
+// do not start write, the persistent store is frozen
+while isfrozen
+try
+freezesemaphore wait
+catch  interruptedexception ie
+throw standardexception interrupt ie
+// store is not frozen, proceed to write - do this last
+writersinprogress
+public void writefinished
+synchronized freezesemaphore
+if  sanitymanager debug
+sanitymanager assert writersinprogress > 0
+writersinprogress
+freezesemaphore notifyall       wake up the freezer
+/*
+*  find all the all the containers stored in the seg0 directory and
+*  backup each container to the specified backup location.
+*/
+public void backupdatafiles transaction rt  file backupdir  throws standardexception
+/*
+* list of containers that needs to be backed up are identified by
+* simply reading the list of files in seg0.
+* all container that are created after the container list is created
+* when backup is in progress are recreated on restore using the
+* transaction log.
+*/
+string files   getcontainernames
+if  files    null
+// no user visible locks are acquired to backup the database. a stable backup
+// is made by latching the pages and internal synchronization
+// mechanisms.
+lockingpolicy lockpolicy   	rt newlockingpolicy lockingpolicy mode_none
+transactioncontroller isolation_nolock
+false
+long segmentid   0
+// loop through all the files in seg0 and backup all valid containers.
+for  int f   files length 1  f >  0   f
+long containerid
+try
+containerid
+long parselong files substring 1   files length    4    16
+catch  throwable t
+// ignore errors from parse, it just means that someone put
+// a file in seg0 that we didn't expect.  continue with the
+// next one.
+continue
+containerkey identity   new containerkey segmentid  containerid
+/* not necessary to get the container thru the transaction.
+* backup opens in container in read only mode , no need to
+* transition the transaction to active state.
+*
+*  dropped container stubs also has to be backed up
+*  for restore to work correctly. that is
+*  why we are using a open call that let us
+*  open dropped containers.
+*/
+containerhandle containerhdl   opendroppedcontainer  rawtransaction rt
+identity  lockpolicy
+containerhandle mode_readonly
+/*
+* note 1:
+* if a container creation is  in progress , open call will wait
+* until it is complete; it will never return a handle to a
+* container that is partially created. (see cache manager code
+* for more details)
+*
+* note 2:
+* if a container creation failed in the middle after the list
+* of the names are read from seg0, it will not exist in
+* the database any more, so nothing to backup.  attempt
+* to open such container will return null.
+*
+*/
+if  containerhdl     null
+containerhdl backupcontainer backupdir getpath
+containerhdl close
+else
+if  sanitymanager debug
+sanitymanager throwassert
+/**
+* get all the names of the files in seg 0.
+* mt - this method needs to be synchronized to avoid conflicts
+* with other privileged actions execution in this class.
+* @return an array of all the file names in seg0.
+**/
+synchronized string getcontainernames
+actioncode   get_container_names_action
+try
+return  string  accesscontroller doprivileged  this
+catch  privilegedactionexception pae   return null
+/**
+* removes the data directory(seg*) from database home directory and
+* restores it from backup location.
+* this function gets called only when any of the folling attributes
+* are specified on connection url:
+* attribute.create_from (create database from backup if it does not exist)
+* attribute.restore_from (delete the whole database if it exists and
+*     then restore * it from backup)
+* attribute.roll_forward_recovery_from:(perform rollforward recovery;
+* except for the log directory everthing else is replced  by the copy  from
+* backup. log files in the backup are copied to the existing online log
+* directory.
+*
+* in all the cases, data directory(seg*) is replaced by the data directory
+* directory from backup when this function is called.
+*/
+private void restoredatadirectory string backuppath
+throws standardexception
+file bsegdir      segment directory in the backup
+file backuproot   new java io file backuppath  	  root dir of backup db
+/* to be safe we first check if the backup directory exist and it has
+* atleast one seg* directory before removing the current data directory.
+*
+* this will fail with a security exception unless the database engine
+* and all its callers have permission to read the backup directory.
+*/
+string bfilelist   privilegedfileops list backuproot
+if bfilelist   null
+boolean segmentexist   false
+for  int i   0  i < bfilelist length  i
+//check if it is a  seg* directory
+if bfilelist startswith
+bsegdir   new file backuproot   bfilelist
+if privilegedfileops exists bsegdir
+privilegedfileops isdirectory bsegdir
+segmentexist   true
+break
+if  segmentexist
+throw
+standardexception newexception
+sqlstate data_directory_not_found_in_backup  backuproot
+else
+throw standardexception newexception
+sqlstate data_directory_not_found_in_backup  backuproot
+synchronized  this
+actioncode   restore_data_directory_action
+this backuppath   backuppath
+this backuproot   backuproot
+this bfilelist   bfilelist
+try
+accesscontroller doprivileged  this
+catch  privilegedactionexception pae
+throw  standardexception  pae getexception
+finally
+this backuppath   null
+this backuproot   null
+this bfilelist   null
+private void privrestoredatadirectory   throws standardexception
+storagefile csegdir 	  segment directory in the current db home
+storagefile dataroot
+storagefactory newstoragefile  null     root dir of db
+//remove the seg* directories in the current database home directory
+string cfilelist   dataroot list
+if cfilelist  null
+for  int i   0  i < cfilelist length  i
+//delete only the seg* directories in the database home
+if cfilelist startswith
+csegdir   storagefactory newstoragefile  cfilelist
+if  csegdir deleteall
+throw
+standardexception newexception
+sqlstate unable_to_remove_data_directory
+csegdir
+//copy the seg* directories from backup to current database home
+for  int i   0  i < bfilelist length  i
+//copy only the seg* directories and copy them from backup
+if  bfilelist startswith
+csegdir   storagefactory newstoragefile  bfilelist
+file bsegdir1   new java io file backuproot  bfilelist
+if   fileutil copydirectory
+writablestoragefactory  bsegdir1  csegdir
+throw
+standardexception newexception
+sqlstate unable_to_copy_data_directory
+bsegdir1  csegdir
+else if  databaseencrypted
+bfilelist startswith
+attribute crypto_external_key_verify_file
+// case of encrypted database and usage of an external
+// encryption key, there is an extra file with name given by
+// attribute.crypto_external_key_verify_file that needs to be
+// copied over during createfrom/restore operations.
+//copy the file
+file        fromfile   new file backuproot bfilelist
+storagefile tofile
+storagefactory newstoragefile bfilelist
+if   fileutil copyfile writablestoragefactory fromfile tofile
+throw standardexception newexception
+sqlstate unable_to_copy_data_directory
+bfilelist  tofile
+end of privrestoredatadirectory
+/**
+is the store read-only.
+*/
+public boolean isreadonly
+// return what the basedatafilefactory thinks
+return readonly
+/**
+* @return the storagefactory used by this datafactory
+*/
+public storagefactory getstoragefactory
+return storagefactory
+// privilegedexceptionaction method
+public final object run   throws exception
+switch  actioncode
+case boot_action
+readonly   storagefactory isreadonlydatabase
+supportsrandomaccess   storagefactory supportsrandomaccess
+return null
+case get_temp_directory_action
+return storagefactory gettempdir
+case remove_temp_directory_action
+storagefile tempdir   storagefactory gettempdir
+if  tempdir    null
+tempdir deleteall
+return null
+case get_container_path_action
+case get_alternate_container_path_action
+stringbuffer sb   new stringbuffer
+sb append containerid getsegmentid
+sb append storagefactory getseparator
+if  actioncode    get_container_path_action
+sb append stub ?
+sb append long tohexstring containerid getcontainerid
+sb append
+else
+sb append stub ?
+sb append long tohexstring containerid getcontainerid
+sb append
+return storagefactory newstoragefile  sb tostring
+end of cases get_container_path_action   get_alternate_container_path_action
+case remove_stubs_action
+char separator   storagefactory getseparator
+storagefile root   storagefactory newstoragefile  null
+// get all the non-temporary data segment, they start with "seg"
+string segs   root list
+for  int s   segs length 1  s >  0  s
+if  segs startswith
+storagefile seg
+storagefactory newstoragefile root  segs
+if  seg exists      seg isdirectory
+string files   seg list
+for  int f   files length 1  f >  0   f
+// stub
+if  files startswith
+files startswith
+storagefile stub
+storagefactory newstoragefile
+root  segs   separator   files
+boolean delete_status   stub delete
+if  sanitymanager debug
+// delete should always work, code which
+// created the storagefactory already
+// checked for existence.
+if   delete_status
+sanitymanager throwassert
+stub
+break
+end of case remove_stubs_action
+case find_max_container_id_action
+long maxnum   1
+storagefile seg   storagefactory newstoragefile
+if  seg exists      seg isdirectory
+// create an array with names of all files in seg0
+string files   seg list
+// loop through array looking for maximum containerid.
+for  int f   files length 1  f >  0   f
+try
+long filenumber
+long parselong
+files substring
+1   files length    4    16
+if  filenumber > maxnum
+maxnum   filenumber
+catch  throwable t
+// ignore errors from parse, it just means that someone
+// put a file in seg0 that we didn't expect.  continue
+// with the next one.
+return reusefactory getlong  maxnum
+end of case find_max_container_id_action
+case delete_if_exists_action
+boolean ret   actionfile exists      actionfile delete
+actionfile   null
+return ret ? this   null
+end of case delete_if_exists_action
+case get_path_action
+string path   actionfile getpath
+actionfile   null
+return path
+end of case get_path_action
+case post_recovery_remove_action
+for  enumeration e   postrecoveryremovedfiles elements
+e hasmoreelements
+storagefile f    storagefile  e nextelement
+if  f exists
+boolean delete_status   f delete
+if  sanitymanager debug
+// delete should always work, code which
+// created the storagefactory already
+// checked for existence.
+if   delete_status
+sanitymanager throwassert
+stub
+return null
+case get_lock_on_db_action
+privgetjbmslockondb
+return null
+case release_lock_on_db_action
+privreleasejbmslockondb
+return null
+case restore_data_directory_action
+privrestoredatadirectory
+return null
+case get_container_names_action
+storagefile seg   storagefactory newstoragefile
+if  seg exists      seg isdirectory
+// return the  names of all files in seg0
+return seg list
+return null
+end of case get_container_names_action
+return null
+end of run

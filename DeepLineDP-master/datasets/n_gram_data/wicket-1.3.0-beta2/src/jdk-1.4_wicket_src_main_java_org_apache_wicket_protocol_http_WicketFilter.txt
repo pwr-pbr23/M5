@@ -1,0 +1,652 @@
+/*
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache wicket protocol http
+import java io ioexception
+import java io inputstream
+import java io unsupportedencodingexception
+import java text parseexception
+import java util arraylist
+import javax servlet filter
+import javax servlet filterchain
+import javax servlet filterconfig
+import javax servlet servletexception
+import javax servlet servletrequest
+import javax servlet servletresponse
+import javax servlet http httpservletrequest
+import javax servlet http httpservletresponse
+import org apache wicket abortexception
+import org apache wicket application
+import org apache wicket requestcycle
+import org apache wicket resource
+import org apache wicket session
+import org apache wicket wicketruntimeexception
+import org apache wicket markup parser xmlpullparser
+import org apache wicket markup parser xmltag
+import org apache wicket protocol http request webrequestcodingstrategy
+import org apache wicket session isessionstore
+import org apache wicket settings irequestcyclesettings
+import org apache wicket util resource iresourcestream
+import org apache wicket util resource resourcestreamnotfoundexception
+import org apache wicket util string strings
+import org apache wicket util time time
+import org slf4j logger
+import org slf4j loggerfactory
+/**
+* filter for initiating handling of wicket requests.
+*
+* @author jcompagner
+*/
+public class wicketfilter implements filter
+{
+/**
+* the name of the context parameter that specifies application factory
+* class
+*/
+public static final string app_fact_param
+/**
+* the name of the root path parameter that specifies the root dir of the
+* app.
+*/
+public static final string filter_mapping_param
+/** log. */
+private static final logger log   loggerfactory getlogger wicketfilter class
+/**
+* the servlet path holder when the wicketserlvet is used. so that the
+* filter path will be computed with the first request. note: this variable
+* is by purpose package protected. see wicketservlet
+*/
+static final string servlet_path_holder
+/** see javax.servlet.filterconfig */
+private filterconfig filterconfig
+/**
+* this is the filter path that can be specified in the filter config. or it
+* is the servlet path if the wicket servlet it used. both are without any /
+* (start or end)
+*/
+private string filterpath
+/** the wicket application associated with the filter */
+private webapplication webapplication
+private boolean servletmode   false
+/**
+* servlet cleanup.
+*/
+public void destroy
+{
+if  this webapplication    null
+{
+this webapplication internaldestroy
+this webapplication   null
+}
+}
+/**
+* @see javax.servlet.filter#dofilter(javax.servlet.servletrequest,
+*      javax.servlet.servletresponse, javax.servlet.filterchain)
+*/
+public void dofilter servletrequest request  servletresponse response  filterchain chain
+throws ioexception  servletexception
+{
+httpservletrequest httpservletrequest    httpservletrequest request
+string relativepath   getrelativepath httpservletrequest
+if  iswicketrequest relativepath
+{
+httpservletresponse httpservletresponse    httpservletresponse response
+long lastmodified   getlastmodified httpservletrequest
+if  lastmodified     1
+{
+// servlet doesn't support if-modified-since, no reason
+// to go through further expensive logic
+doget httpservletrequest  httpservletresponse
+}
+else
+{
+long ifmodifiedsince   httpservletrequest getdateheader
+if  ifmodifiedsince <  lastmodified   1000   1000
+{
+// if the servlet mod time is later, call doget()
+// round down to the nearest second for a proper compare
+// a ifmodifiedsince of -1 will always be less
+maybesetlastmodified httpservletresponse  lastmodified
+doget httpservletrequest  httpservletresponse
+}
+else
+{
+httpservletresponse setstatus httpservletresponse sc_not_modified
+}
+}
+}
+else
+{
+chain dofilter request  response
+}
+}
+/**
+* handles servlet page requests.
+*
+* @param servletrequest
+*            servlet request object
+* @param servletresponse
+*            servlet response object
+* @throws servletexception
+*             thrown if something goes wrong during request handling
+* @throws ioexception
+*/
+public final void doget final httpservletrequest servletrequest
+final httpservletresponse servletresponse  throws servletexception  ioexception
+{
+string relativepath   getrelativepath servletrequest
+// special-case for home page - we redirect to add a trailing slash.
+if  relativepath length      0
+strings stripjsessionid servletrequest getrequesturi    endswith
+{
+final string redirecturl   servletrequest getrequesturi
+servletresponse sendredirect redirecturl
+return
+}
+final classloader previousclassloader   thread currentthread   getcontextclassloader
+final classloader newclassloader   getclassloader
+try
+{
+if  previousclassloader    newclassloader
+{
+thread currentthread   setcontextclassloader newclassloader
+}
+// if the request does not provide information about the encoding of
+// its body (which includes post parameters), than assume the
+// default encoding as defined by the wicket application. bear in
+// mind that the encoding of the request usually is equal to the
+// previous response.
+// however it is a known bug of ie that it does not provide this
+// information. please see the wiki for more details and why all
+// other browser deliberately copied that bug.
+if  servletrequest getcharacterencoding      null
+{
+try
+{
+// the encoding defined by the wicket settings is used to
+// encode the responses. thus, it is reasonable to assume
+// the request has the same encoding. this is especially
+// important for forms and form parameters.
+servletrequest setcharacterencoding webapplication getrequestcyclesettings
+getresponserequestencoding
+}
+catch  unsupportedencodingexception ex
+{
+throw new wicketruntimeexception ex getmessage
+}
+}
+// create a new webrequest
+final webrequest request   webapplication newwebrequest servletrequest
+// are we using redirect_to_buffer?
+if  webapplication getrequestcyclesettings   getrenderstrategy      irequestcyclesettings redirect_to_buffer
+{
+string querystring   servletrequest getquerystring
+if   strings isempty querystring
+{
+// try to see if there is a redirect stored
+isessionstore sessionstore   webapplication getsessionstore
+string sessionid   sessionstore getsessionid request  false
+if  sessionid    null
+{
+bufferedhttpservletresponse bufferedresponse   webapplication
+popbufferedresponse sessionid  querystring
+if  bufferedresponse    null
+{
+bufferedresponse writeto servletresponse
+// redirect responses are ignored for the request
+// logger...
+return
+}
+}
+}
+}
+// first, set the webapplication for this thread
+application.set(webapplication);
+// create a response object and set the output encoding according to
+// wicket's application setttings.
+final webresponse response   webapplication newwebresponse servletresponse
+response setajax request isajax
+response setcharacterencoding webapplication getrequestcyclesettings
+getresponserequestencoding
+try
+{
+// create request cycle
+requestcycle cycle   webapplication newrequestcycle request  response
+try
+{
+// process request
+cycle request
+}
+catch  abortexception e
+{
+// noop
+}
+}
+finally
+{
+// close response
+response close
+// clean up thread local session
+session unset
+// clean up thread local application
+application.unset();
+}
+}
+finally
+{
+if (newclassloader != previousclassloader)
+{
+thread.currentthread().setcontextclassloader(previousclassloader);
+}
+}
+}
+/**
+* @return the filter config of this wicketfilter
+*/
+public filterconfig getfilterconfig
+{
+return filterconfig
+}
+/**
+* returns a relative path from an httpservletrequest use this to resolve a
+* wicket request.
+*
+* @param request
+* @return path requested, minus query string, context path, and filterpath.
+*         relative, no leading '/'.
+*/
+public string getrelativepath httpservletrequest request
+{
+string path   strings stripjsessionid request getrequesturi
+string contextpath   request getcontextpath
+path   path substring contextpath length
+if  servletmode
+{
+string servletpath   request getservletpath
+path   path substring servletpath length
+}
+filterpath   getfilterpath request
+if  path length   > 0
+{
+path   path substring 1
+}
+// we should always be under the rootpath, except
+// for the special case of someone landing on the
+// home page without a trailing slash.
+if   path startswith filterpath
+{
+if  filterpath equals path
+{
+path
+}
+}
+if  path startswith filterpath
+{
+path   path substring filterpath length
+}
+return path
+}
+/**
+*
+* @see javax.servlet.filter#init(javax.servlet.filterconfig)
+*/
+public void init filterconfig filterconfig  throws servletexception
+{
+this filterconfig   filterconfig
+if  servlet_path_holder equals filterconfig getinitparameter filter_mapping_param
+{
+servletmode   true
+}
+final classloader previousclassloader   thread currentthread   getcontextclassloader
+final classloader newclassloader   getclassloader
+try
+{
+if  previousclassloader    newclassloader
+{
+thread currentthread   setcontextclassloader newclassloader
+}
+// try to configure filterpath from web.xml if it's not specified as
+// an init-param.
+string filtermapping   filterconfig getinitparameter wicketfilter filter_mapping_param
+if  filtermapping    null    filtermapping equals wicketfilter servlet_path_holder
+{
+inputstream is   filterconfig getservletcontext   getresourceasstream
+if  is    null
+{
+try
+{
+filterpath   getfilterpath filterconfig getfiltername    is
+}
+catch  servletexception e
+{
+log error    e
+}
+catch  securityexception e
+{
+// swallow this at info.
+log
+info
+e getmessage
+}
+if  filterpath    null
+{
+log info
+filterconfig getfiltername
+filter_mapping_param
+}
+}
+}
+iwebapplicationfactory factory = getapplicationfactory();
+// construct webapplication subclass
+this.webapplication = factory.createapplication(this);
+// set this wicketfilter as the filter for the web application
+this.webapplication.setwicketfilter(this);
+// store instance of this application object in servlet context to
+// make integration with outside world easier
+string contextkey = "wicket:" + filterconfig.getfiltername();
+filterconfig.getservletcontext().setattribute(contextkey, this.webapplication);
+application.set(webapplication);
+// call internal init method of web application for default
+// initialisation
+this.webapplication.internalinit();
+// call init method of web application
+this.webapplication.init();
+// we initialize components here rather than in the constructor or
+// in the internal init, because in the init method class aliases
+// can be added, that would be used in installing resources in the
+// component.
+this.webapplication.initializecomponents();
+// give the application the option to log that it is started
+this.webapplication.logstarted();
+}
+finally
+{
+application.unset();
+if (newclassloader != previousclassloader)
+{
+thread.currentthread().setcontextclassloader(previousclassloader);
+}
+}
+}
+private string getfilterpath(string filtername, inputstream is) throws servletexception
+{
+string prefix = servletmode ? "servlet" : "filter";
+string mapping = prefix + "-mapping";
+string name = prefix + "-name";
+// filter mappings look like this:
+//
+// <filter-mapping> <filter-name>wicketfilter</filter-name>
+// <url-pattern>/*</url-pattern> <...> <filter-mapping>
+try
+{
+arraylist urlpatterns = new arraylist();
+xmlpullparser parser = new xmlpullparser();
+parser.parse(is);
+while (true)
+{
+xmltag elem;
+do
+{
+elem = (xmltag)parser.nexttag();
+}
+while (elem != null && (!(elem.getname().equals(mapping) && elem.isopen())));
+if (elem == null)
+break;
+string encounteredfiltername = null, urlpattern = null;
+do
+{
+elem = (xmltag)parser.nexttag();
+if (elem.isopen())
+{
+parser.setpositionmarker();
+}
+else if (elem.isclose() && elem.getname().equals(name))
+{
+encounteredfiltername = parser.getinputfrompositionmarker(elem.getpos())
+.tostring();
+}
+else if (elem.isclose() && elem.getname().equals("url-pattern"))
+{
+urlpattern = parser.getinputfrompositionmarker(elem.getpos()).tostring();
+}
+}
+while (urlpattern == null || encounteredfiltername == null);
+if (filtername.equals(encounteredfiltername))
+urlpatterns.add(urlpattern);
+}
+string prefixuppered = character.touppercase(prefix.charat(0)) + prefix.substring(1);
+// by the time we get here, we have a list of urlpatterns we match
+// this filter against.
+// in all likelihood, we will only have one. if we have none, we
+// have an error.
+// if we have more than one, we pick the first one to use for any
+// 302 redirects that require absolute urls.
+if (urlpatterns.size() == 0)
+{
+throw new illegalargumentexception("error initialising wicket" + prefixuppered
++ " - you have no <" + mapping + "> element with a url-pattern that uses "
++ prefix + ": " + filtername);
+}
+string urlpattern = (string)urlpatterns.get(0);
+// check for leading '/' and trailing '*'.
+if (!urlpattern.startswith("/") || !urlpattern.endswith("*"))
+{
+throw new illegalargumentexception("<" + mapping + "> for wicket" + prefixuppered
++ " \"" + filtername + "\" must start with '/' and end with '*'.");
+}
+// strip trailing '*' and leading '/'.
+return urlpattern.substring(1, urlpattern.length() - 1);
+}
+catch (ioexception e)
+{
+throw new servletexception("error finding <" + prefix + "> " + filtername
++ " in web.xml", e);
+}
+catch (parseexception e)
+{
+throw new servletexception("error finding <" + prefix + "> " + filtername
++ " in web.xml", e);
+}
+catch (resourcestreamnotfoundexception e)
+{
+throw new servletexception("error finding <" + prefix + "> " + filtername
++ " in web.xml", e);
+}
+}
+/**
+* is this a wicket request?
+*
+* @param relativepath
+*            the relativepath
+* @return true if this is a wicket request
+*/
+private boolean iswicketrequest string relativepath
+{
+// default location, like
+// /wicket-examples/forminput/?wicket:interface=:0::::
+// the relative path here is empty (wicket-examples is the web
+// application and the filter is mapped to /forminput/*
+if (relativepath.equals(""))
+{
+return true;
+}
+// resources
+if (relativepath.startswith(webrequestcodingstrategy.resources_path_prefix))
+{
+return true;
+}
+// mounted page
+return webapplication.getrequestcycleprocessor().getrequestcodingstrategy()
+.urlcodingstrategyforpath(relativepath) != null;
+}
+/**
+* if the response has not already a 'lastmodified' header set and if
+* 'lastmodified' >= 0 than set the response header accordingly.
+*
+* @param resp
+* @param lastmodified
+*/
+private void maybesetlastmodified final httpservletresponse resp  final long lastmodified
+{
+if  resp containsheader
+{
+return
+}
+if  lastmodified >  0
+{
+resp setdateheader    lastmodified
+}
+}
+/**
+* creates the web application factory instance.
+*
+* if no app_fact_param is specified in web.xml
+* contextparamwebapplicationfactory will be used by default.
+*
+* @see contextparamwebapplicationfactory
+*
+* @return application factory instance
+*/
+protected iwebapplicationfactory getapplicationfactory
+{
+final string appfactoryclassname   filterconfig getinitparameter app_fact_param
+if  appfactoryclassname    null
+{
+// if no context param was specified we return the default factory
+return new contextparamwebapplicationfactory
+}
+else
+{
+try
+{
+// try to find the specified factory class
+final class factoryclass   thread currentthread   getcontextclassloader
+loadclass appfactoryclassname
+// instantiate the factory
+return  iwebapplicationfactory factoryclass newinstance
+}
+catch  classcastexception e
+{
+throw new wicketruntimeexception     appfactoryclassname
+}
+catch  classnotfoundexception e
+{
+throw new webapplicationfactorycreationexception appfactoryclassname  e
+}
+catch  instantiationexception e
+{
+throw new webapplicationfactorycreationexception appfactoryclassname  e
+}
+catch  illegalaccessexception e
+{
+throw new webapplicationfactorycreationexception appfactoryclassname  e
+}
+catch  securityexception e
+{
+throw new webapplicationfactorycreationexception appfactoryclassname  e
+}
+}
+}
+/**
+* @return the class loader
+*/
+protected classloader getclassloader
+{
+return thread currentthread   getcontextclassloader
+}
+protected string getfilterpath httpservletrequest request
+{
+if  filterpath    null
+{
+return filterpath
+}
+if  servletmode
+{
+return filterpath   request getservletpath
+}
+string result
+// legacy migration check.
+// todo: remove this after 1.3 is released and everyone's upgraded.
+if  filterconfig getinitparameter       null
+{
+throw new wicketruntimeexception
+filter_mapping_param
+app
+}
+result = filterconfig.getinitparameter(filter_mapping_param);
+if (result == null || result.equals("/*"))
+{
+return "";
+}
+else if (!result.startswith("/") || !result.endswith("/*"))
+{
+throw new wicketruntimeexception("your " + filter_mapping_param
++ " must start with \"/\" and end with \"/*\". it is: " + result);
+}
+return filterpath = result.substring(1, result.length() - 2);
+}
+/**
+* gets the last modified time stamp for the given request.
+*
+* @param request
+* @return the last modified time stamp
+*/
+long getlastmodified final httpservletrequest request
+{
+final string pathinfo   getrelativepath request
+if  pathinfo startswith webrequestcodingstrategy resources_path_prefix
+{
+final string resourcereferencekey   pathinfo
+substring webrequestcodingstrategy resources_path_prefix length
+// try to find shared resource
+resource resource   webapplication getsharedresources   get resourcereferencekey
+// if resource found and it is cacheable
+if   resource    null     resource iscacheable
+{
+try
+{
+application.set(webapplication);
+final webrequest webrequest   webapplication newwebrequest request
+// set parameters from servlet request
+resource setparameters webrequest getparametermap
+// get resource stream
+iresourcestream stream   resource getresourcestream
+// get last modified time from stream
+time time   stream lastmodifiedtime
+try
+{
+stream close
+}
+catch (ioexception e)
+{
+// ignore
+}
+return time    null ? time getmilliseconds      1
+}
+catch  abortexception e
+{
+return  1
+}
+finally
+{
+resource setparameters null
+application.unset();
+}
+}
+}
+return  1
+}
+}

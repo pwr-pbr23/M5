@@ -1,0 +1,644 @@
+/*
+derby - class org.apache.derby.impl.store.access.sort.mergesort
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store access sort
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services io formatablebitset
+import org apache derby iapi services io storable
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby iapi store access conglomerate scancontrollerrowsource
+import org apache derby iapi store access conglomerate sort
+import org apache derby iapi store access conglomerate sortfactory
+import org apache derby iapi store access conglomerate transactionmanager
+import org apache derby iapi types cloneableobject
+import org apache derby iapi store access columnordering
+import org apache derby iapi store access conglomeratecontroller
+import org apache derby iapi store access qualifier
+import org apache derby iapi store access rowutil
+import org apache derby iapi store access scancontroller
+import org apache derby iapi store access sortobserver
+import org apache derby iapi store access sortcontroller
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi store raw streamcontainerhandle
+import org apache derby iapi store raw rawstorefactory
+import org apache derby iapi store raw transaction
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi types orderable
+import org apache derby iapi types rowlocation
+import java util enumeration
+import java util properties
+import java util vector
+/**
+a sort implementation which does the sort in-memory if it can,
+but which can do an external merge sort so that it can sort an
+arbitrary number of rows.
+**/
+public final class mergesort implements sort
+{
+/*
+* fields
+*/
+/**
+**/
+static final int state_closed   0
+/**
+**/
+static final int state_initialized   1
+/**
+**/
+static final int state_inserting   2
+/**
+**/
+static final int state_done_inserting   3
+/**
+**/
+static final int state_scanning   4
+/**
+**/
+static final int state_done_scanning   5
+/**
+maintains the current state of the sort as defined in
+the preceding values.  sorts start off and end up closed.
+**/
+protected int state   state_closed
+/**
+the template as passed in on create.  valid when the state
+is initialized through scanning, null otherwise.
+**/
+protected datavaluedescriptor template
+/**
+the column ordering as passed in on create.  valid when
+the state is initialized through scanning, null otherwise.
+may be null if there is no column ordering - this means
+that all rows are considered to be duplicates, and the
+sort will only emit a single row.
+**/
+protected columnordering columnordering
+/**
+a lookup table to speed up lookup of a column associated with the i'th
+column to compare.  to find the column id to compare as the i'th column
+look in columnorderingmap[i].
+**/
+protected int columnorderingmap
+/**
+a lookup table to speed up lookup of ascending state of a column,
+**/
+protected boolean columnorderingascendingmap
+/**
+the sort observer.  may be null.  used as a callback.
+**/
+protected sortobserver sortobserver
+/**
+whether the rows are expected to be in order on insert,
+as passed in on create.
+**/
+protected boolean alreadyinorder
+/**
+the inserter that's being used to insert rows into the sort.
+this field is only valid when the state is inserting.
+**/
+protected mergeinserter inserter   null
+/**
+the scan that's being used to return rows from the sort.
+this field is only valid when the state is scanning.
+**/
+protected scan scan   null
+/**
+a vector of merge runs, produced by the mergeinserter.
+might be null if no merge runs were produced.
+it is a vector of container ids.
+**/
+protected vector mergeruns   null
+/**
+an ordered set of the leftover rows that didn't go
+in the last merge run (might be all the rows if there
+are no merge runs).
+**/
+protected sortbuffer sortbuffer   null
+/**
+the maximum number of entries a sort buffer can hold.
+**/
+protected int sortbuffermax
+/**
+the minimum number of entries a sort buffer can hold.
+**/
+protected int sortbuffermin
+/**
+properties for mergesort
+**/
+static properties properties   null
+/**
+static initializer for mergesort, to initialize once the properties
+for the sortbuffer.
+**/
+static
+{
+properties   new properties
+properties put rawstorefactory stream_file_buffer_size_parameter
+}
+/*
+* methods of sort
+*/
+/**
+open a sort controller.
+<p>
+this implementation only supports a single sort controller
+per sort.
+@see sort#open
+**/
+public sortcontroller open transactionmanager tran
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert state    state_initialized
+// ready to start inserting rows.
+state   state_inserting
+// create and initialize an inserter.  when the caller
+// closes it, it will call back to inserterisclosed().
+this inserter   new mergeinserter
+if  this inserter initialize this  tran     false
+{
+throw standardexception newexception sqlstate sort_could_not_init
+}
+return this inserter
+}
+/**
+open a scan controller.
+@see sort#opensortscan
+**/
+public scancontroller opensortscan
+transactionmanager tran
+boolean            hold
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert state    state_done_inserting
+if  mergeruns    null    mergeruns size      0
+{
+// there were no merge runs so we can just return
+// the rows from the sort buffer.
+scan   new sortbufferscan this  tran  sortbuffer  hold
+// the scan now owns the sort buffer
+sortbuffer   null
+}
+else
+{
+// dump the rows in the sort buffer to a merge run.
+long containerid   createmergerun tran  sortbuffer
+mergeruns addelement new long containerid
+// if there are more merge runs than we can sort
+// at once with our sort buffer, we have to reduce
+// the number of merge runs
+if  mergeruns size   > externalsortfactory default_max_merge_run
+mergeruns size   > sortbuffer capacity
+multistagemerge tran
+// there are now few enough merge runs to sort
+// at once, so create a scan for them.
+mergescan mscan
+new mergescan
+this  tran  sortbuffer  mergeruns  sortobserver  hold
+if   mscan init tran
+{
+throw standardexception newexception
+sqlstate sort_could_not_init
+}
+scan   mscan
+// the scan now owns the sort buffer and merge runs.
+sortbuffer   null
+mergeruns   null
+}
+// ready to start retrieving rows.
+this state   state_scanning
+return scan
+}
+/**
+open a row source to get rows out of the sorter.
+@see sort#opensortrowsource
+**/
+public scancontrollerrowsource opensortrowsource transactionmanager tran
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert state    state_done_inserting
+scancontrollerrowsource rowsource   null
+if  mergeruns    null    mergeruns size      0
+{
+// there were no merge runs so we can just return
+// the rows from the sort buffer.
+scan   new sortbufferrowsource sortbuffer  tran  sortobserver  false  sortbuffermax
+rowsource    scancontrollerrowsource scan
+// the scan now owns the sort buffer
+sortbuffer   null
+}
+else
+{
+// dump the rows in the sort buffer to a merge run.
+long containerid   createmergerun tran  sortbuffer
+mergeruns addelement new long containerid
+// if there are more merge runs than we can sort
+// at once with our sort buffer, we have to reduce
+// the number of merge runs
+if  mergeruns size   > externalsortfactory default_max_merge_run
+mergeruns size   > sortbuffer capacity
+multistagemerge tran
+// there are now few enough merge runs to sort
+// at once, so create a rowsource for them.
+mergescanrowsource msrowsource
+new mergescanrowsource this  tran  sortbuffer  mergeruns  sortobserver  false
+if   msrowsource init tran
+{
+throw standardexception newexception
+sqlstate sort_could_not_init
+}
+scan   msrowsource
+rowsource   msrowsource
+// the scan now owns the sort buffer and merge runs.
+sortbuffer   null
+mergeruns   null
+}
+// ready to start retrieving rows.
+this state   state_scanning
+return rowsource
+}
+/**
+drop the sort.
+@see sort#drop
+**/
+public void drop transactioncontroller tran
+throws standardexception
+{
+// make sure the inserter is closed.  note this
+// will cause the callback to doneinserting()
+// which will give us any in-progress merge
+// runs, if there are any.
+if  inserter    null
+inserter close
+inserter   null
+// make sure the scan is closed, if there is one.
+// this will cause the callback to donescanning().
+if  scan    null
+{
+scan close
+scan   null
+}
+// if we have a row set, get rid of it.
+if  sortbuffer    null
+{
+sortbuffer close
+sortbuffer   null
+}
+// clean out the rest of the objects.
+template   null
+columnordering   null
+sortobserver   null
+// if there are any merge runs, drop them.
+dropmergeruns  transactionmanager tran
+// whew!
+state   state_closed
+}
+/*
+* methods of mergesort.  arranged alphabetically.
+*/
+/**
+check the column ordering against the template, making
+sure that each column is present in the template,
+implements orderable, and is not mentioned more than
+once.  intended to be called as part of a sanity check.
+**/
+protected boolean checkcolumnordering
+datavaluedescriptor   template
+columnordering          columnordering
+{
+// allocate an array to check that each column mentioned only once.
+int templatencolumns   template length
+boolean seen   new boolean
+// check each column ordering.
+for  int i   0  i < columnordering length  i
+{
+int colid   columnordering getcolumnid
+// check that the column id is valid.
+if  colid < 0    colid >  templatencolumns
+return false
+// check that the column isn't mentioned more than once.
+if  seen
+return false
+seen   true
+object columnval
+rowutil getcolumn template   formatablebitset  null  colid
+if    columnval instanceof orderable
+return false
+}
+return true
+}
+/**
+check that the columns in the row agree with the columns
+in the template, both in number and in type.
+<p>
+xxx (nat) currently checks that the classes implementing
+each column are the same -- is this right?
+**/
+void checkcolumntypes datavaluedescriptor row
+throws standardexception
+{
+int ncols   row length
+if  template length    ncols
+{
+if  sanitymanager debug
+{
+sanitymanager throwassert
+template length
+ncols
+}
+throw standardexception newexception
+sqlstate sort_type_mismatch
+}
+if  sanitymanager debug
+{
+for  int colid   0  colid < ncols  colid
+{
+object col1   row
+object col2   template
+if  col1    null
+{
+sanitymanager throwassert
+colid
+}
+if    col1 instanceof cloneableobject
+{
+sanitymanager throwassert
+colid      col1 getclass   getname
+}
+if  col1 getclass      col2 getclass
+{
+sanitymanager throwassert
+col1 getclass
+col2 getclass
+}
+}
+}
+}
+int compare
+datavaluedescriptor r1
+datavaluedescriptor r2
+throws standardexception
+{
+// get the number of columns we have to compare.
+int colstocompare   this columnordering length
+int r
+// compare the columns specified in the column
+// ordering array.
+for  int i   0  i < colstocompare  i
+{
+// get columns to compare.
+int colid   this columnorderingmap
+// if the columns don't compare equal, we're done.
+// return the sense of the comparison.
+if   r   r1 compare r2
+0
+{
+if  this columnorderingascendingmap
+return r
+else
+return  r
+}
+}
+// we made it through all the columns, and they must have
+// all compared equal.  so return that the rows compare equal.
+return 0
+}
+/**
+go from the closed to the initialized state.
+**/
+public void initialize
+datavaluedescriptor   template
+columnordering          columnordering
+sortobserver            sortobserver
+boolean                 alreadyinorder
+long                    estimatedrows
+int                     sortbuffermax
+throws standardexception
+{
+if  sanitymanager debug
+{
+sanitymanager assert state    state_closed
+}
+// make sure the column ordering makes sense
+if  sanitymanager debug
+{
+sanitymanager assert checkcolumnordering template  columnordering
+}
+// set user-defined parameters.
+this template   template
+this columnordering   columnordering
+this sortobserver   sortobserver
+this alreadyinorder   alreadyinorder
+// cache results of columnordering calls, results are not allowed
+// to change throughout a sort.
+columnorderingmap            new int
+columnorderingascendingmap   new boolean
+for  int i   0  i < columnordering length  i
+{
+columnorderingmap   columnordering getcolumnid
+columnorderingascendingmap   columnordering getisascending
+}
+// no inserter or scan yet.
+this inserter   null
+this scan   null
+// we don't have any merge runs.
+this mergeruns   null
+this sortbuffer   null
+this sortbuffermax   sortbuffermax
+if  estimatedrows > sortbuffermax
+sortbuffermin   sortbuffermax
+else
+sortbuffermin    int estimatedrows
+if  sanitymanager debug
+{
+if  sanitymanager debug_on
+sortbuffermin   sortbuffermax
+}
+this state   state_initialized
+}
+/**
+an inserter is closing.
+**/
+void doneinserting mergeinserter inserter
+sortbuffer sortbuffer  vector mergeruns
+{
+if  sanitymanager debug
+{
+sanitymanager assert state    state_inserting
+}
+this sortbuffer   sortbuffer
+this mergeruns   mergeruns
+this inserter   null
+this state   state_done_inserting
+}
+void donescanning scan scan  sortbuffer sortbuffer
+{
+if  sanitymanager debug
+{
+// make sure the scan we're getting back is the one we gave out
+if  this scan    scan
+sanitymanager throwassert     this scan
+scan
+}
+this sortbuffer   sortbuffer
+this scan   null
+this state   state_done_scanning
+}
+void donescanning scan scan  sortbuffer sortbuffer
+vector mergeruns
+{
+this mergeruns   mergeruns
+donescanning scan  sortbuffer
+}
+/**
+get rid of the merge runs, if there are any.
+must not cause any errors because it's called
+during error processing.
+**/
+void dropmergeruns transactionmanager tran
+{
+if  mergeruns    null
+{
+enumeration e   mergeruns elements
+try
+{
+transaction rawtran   tran getrawstorexact
+long segmentid   streamcontainerhandle temporary_segment
+while (e.hasmoreelements())
+{
+long containerid     long  e nextelement    longvalue
+rawtran dropstreamcontainer segmentid  containerid
+}
+}
+catch  standardexception se
+{
+// ignore problems with dropping, worst case
+// the raw store will clean up at reboot.
+}
+mergeruns   null
+}
+}
+/* debug (nat)
+void printruninfo(transactioncontroller tran)
+throws standardexception
+{
+java.util.enumeration e = mergeruns.elements();
+while (e.hasmoreelements())
+{
+long conglomid = ((long) e.nextelement()).longvalue();
+scancontroller sc = tran.openscan(conglomid, false,
+false, null, null, 0, null,
+null, 0);
+system.out.println("merge run: conglomid=" + conglomid);
+while (sc.next())
+{
+sc.fetch(template);
+system.out.println(template);
+}
+sc.close();
+}
+}
+*/
+private void multistagemerge transactionmanager tran
+throws standardexception
+{
+enumeration e
+//int iterations = 0; // debug (nat)
+int maxmergeruns   sortbuffer capacity
+if  maxmergeruns > externalsortfactory default_max_merge_run
+maxmergeruns   externalsortfactory default_max_merge_run
+vector subset
+vector leftovers
+while  mergeruns size   > maxmergeruns
+{
+// move maxmergeruns elements from the merge runs
+// vector into a subset, leaving the rest.
+subset   new vector maxmergeruns
+leftovers   new vector mergeruns size     maxmergeruns
+e   mergeruns elements
+while (e.hasmoreelements())
+{
+long containerid    long  e nextelement
+if  subset size   < maxmergeruns
+subset addelement containerid
+else
+leftovers addelement containerid
+}
+/* debug (nat)
+iterations++;
+system.out.println(subset.size() + " elements in subset");
+system.out.println(leftovers.size() + " elements in leftovers");
+system.out.println(mergeruns.size() + " elements in mergeruns");
+system.out.println("maxmergeruns is " + maxmergeruns);
+system.out.println("iterations = " + iterations);
+if (subset.size() == 0)
+{
+system.exit(1);
+}
+*/
+mergeruns   leftovers
+// open a merge scan on the subset.
+mergescanrowsource msrowsource
+new mergescanrowsource this  tran  sortbuffer  subset  sortobserver  false
+if   msrowsource init tran
+{
+throw standardexception newexception
+sqlstate sort_could_not_init
+}
+// create and open another temporary stream conglomerate
+// which will become
+// a merge run made up with the merged runs from the subset.
+transaction rawtran   tran getrawstorexact
+int segmentid   streamcontainerhandle temporary_segment
+long id   rawtran addandloadstreamcontainer segmentid
+properties  msrowsource
+mergeruns addelement new long id
+// drop the conglomerates in the merge subset
+e   subset elements
+while (e.hasmoreelements())
+{
+long containerid    long  e nextelement
+rawtran dropstreamcontainer segmentid  containerid longvalue
+}
+}
+}
+/**
+remove all the rows from the sort buffer and store them
+in a temporary conglomerate.  the temporary conglomerate
+is a "merge run".  returns the container id of the
+merge run.
+**/
+long createmergerun transactionmanager tran  sortbuffer sortbuffer
+throws standardexception
+{
+// this sort buffer is not a scan and is not tracked by any
+// transactionmanager.
+sortbufferrowsource rowsource
+new sortbufferrowsource sortbuffer   transactionmanager null  sortobserver  true  sortbuffermax
+// create a temporary stream conglomerate...
+transaction rawtran   tran getrawstorexact        get raw transaction
+int segmentid   streamcontainerhandle temporary_segment
+long id   rawtran addandloadstreamcontainer segmentid
+properties  rowsource
+// don't close the sortbuffer, we just emptied it, the caller may reuse
+// that sortbuffer for the next run.
+rowsource   null
+return id
+}
+}

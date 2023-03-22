@@ -1,0 +1,1712 @@
+/*
+derby - class org.apache.derby.impl.sql.compile.selectnode
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package	org apache derby impl sql compile
+import org apache derby iapi sql compile costestimate
+import org apache derby iapi sql compile optimizer
+import org apache derby iapi sql compile visitable
+import org apache derby iapi sql compile visitor
+import org apache derby iapi sql compile c_nodetypes
+import org apache derby iapi sql conn authorizer
+import org apache derby iapi sql dictionary datadictionary
+import org apache derby iapi sql dictionary tabledescriptor
+import org apache derby iapi reference limits
+import org apache derby iapi reference sqlstate
+import org apache derby iapi error standardexception
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi util jbitset
+import java util vector
+import java util hashset
+/**
+* a selectnode represents the result set for any of the basic dml
+* operations: select, insert, update, and delete.  (a rowresultsetnode
+* will be used for an insert with a values clause.)  for insert - select,
+* any of the fields in a selectnode can be used (the selectnode represents
+* the select statement in the insert - select).  for update and
+* delete, there will be one table in the fromlist, and the groupbylist
+* fields will be null. for both insert and update,
+* the resultcolumns in the selectlist will contain the names of the columns
+* being inserted into or updated.
+*
+*/
+public class selectnode extends resultsetnode
+/**
+* list of tables in the from clause of this select
+*/
+fromlist	fromlist
+fromtable targettable
+/* aggregate vectors for select and where clauses */
+vector	selectaggregates
+vector	whereaggregates
+vector  havingaggregates
+/**
+* the valuenode for the where clause must represent a boolean
+* expression.  the binding phase will enforce this - the parser
+* does not have enough information to enforce it in all cases
+* (for example, user methods that return boolean).
+*/
+valuenode	whereclause
+valuenode	originalwhereclause
+/**
+* list of result columns in group by clause
+*/
+groupbylist	groupbylist
+/** user specified a group by without aggregates and we turned
+* it into a select distinct
+*/
+private boolean wasgroupby
+/* list of columns in order by list */
+orderbylist orderbylist
+boolean		orderbyquery
+/* predicatelists for where clause */
+predicatelist wherepredicates
+/* subquerylists for select where and having clauses */
+subquerylist  selectsubquerys
+subquerylist  wheresubquerys
+subquerylist  havingsubquerys
+/* whether or not we are only binding the target list */
+private boolean bindtargetlistonly
+private boolean isdistinct
+private boolean orderbyanddistinctmerged
+boolean originalwhereclausehadsubqueries
+/* copy of fromlist prior to generating join tree */
+private fromlist prejoinfl
+valuenode havingclause
+private int nestinglevel
+public void init object selectlist
+object aggregatevector
+object fromlist
+object whereclause
+object groupbylist
+object havingclause
+throws standardexception
+/* resolve - remove aggregatelist from constructor.
+* consider adding selectaggregates and whereaggregates
+*/
+resultcolumns    resultcolumnlist  selectlist
+if  resultcolumns    null
+resultcolumns markinitialsize
+this fromlist    fromlist  fromlist
+this whereclause    valuenode  whereclause
+this originalwhereclause    valuenode  whereclause
+this groupbylist    groupbylist  groupbylist
+this havingclause    valuenode havingclause
+bindtargetlistonly   false
+this originalwhereclausehadsubqueries   false
+if  this whereclause    null
+collectnodesvisitor cnv
+new collectnodesvisitor subquerynode class  subquerynode class
+this whereclause accept cnv
+if   cnv getlist   isempty
+this originalwhereclausehadsubqueries   true
+/**
+* convert this object to a string.  see comments in querytreenode.java
+* for how this should be done for tree printing.
+*
+* @return	this object as a string
+*/
+public string tostring
+if  sanitymanager debug
+return    isdistinct
+groupbylist    null ? groupbylist tostring
+orderbylist    null ? orderbylist tostring
+super tostring
+else
+return
+public string statementtostring
+return
+public void makedistinct
+isdistinct   true
+public void cleardistinct
+isdistinct   false
+boolean hasdistinct
+return isdistinct
+/**
+* prints the sub-nodes of this object.  see querytreenode.java for
+* how tree printing is supposed to work.
+*
+* @param depth		the depth of this node in the tree
+*/
+public void printsubnodes int depth
+if  sanitymanager debug
+super printsubnodes depth
+if  selectsubquerys    null
+printlabel depth
+selectsubquerys treeprint depth   1
+printlabel depth
+if  fromlist    null
+fromlist treeprint depth   1
+if  whereclause    null
+printlabel depth
+whereclause treeprint depth   1
+if   wherepredicates    null    wherepredicates size   > 0
+printlabel depth
+wherepredicates treeprint depth   1
+if  wheresubquerys    null
+printlabel depth
+wheresubquerys treeprint depth   1
+printlabel depth
+if  prejoinfl    null
+prejoinfl treeprint depth   1
+/**
+* return the fromlist for this selectnode.
+*
+* @return fromlist	the fromlist for this selectnode.
+*/
+public fromlist getfromlist
+return fromlist
+/**
+* find colname in the result columns and return underlying columnreference.
+* note that this function returns null if there are more than one fromtable
+* for this selectnode and the columnreference needs to be directly under
+* the resultcolumn. so having an expression under the resultset would cause
+* returning null.
+*
+* @param	colname		name of the column
+*
+* @return	columnreference	columnreference to the column, if found
+*/
+public columnreference findcolumnreferenceinresult string colname
+throws standardexception
+if  fromlist size      1
+return null
+// this logic is similar to subquerynode.singlefrombasetable(). refactor
+fromtable ft    fromtable  fromlist elementat 0
+if      ft instanceof projectrestrictnode
+projectrestrictnode  ft  getchildresult   instanceof frombasetable
+ft instanceof frombasetable
+return null
+// loop through the result columns looking for a match
+int rclsize   resultcolumns size
+for  int index   0  index < rclsize  index
+resultcolumn rc    resultcolumn  resultcolumns elementat index
+if     rc getexpression   instanceof columnreference
+return null
+columnreference crnode    columnreference  rc getexpression
+if  crnode columnname equals colname
+return  columnreference  crnode getclone
+return null
+/**
+* return the whereclause for this selectnode.
+*
+* @return valuenode	the whereclause for this selectnode.
+*/
+public valuenode getwhereclause
+return whereclause
+/**
+* return the wherepredicates for this selectnode.
+*
+* @return predicatelist	the wherepredicates for this selectnode.
+*/
+public predicatelist getwherepredicates
+return wherepredicates
+/**
+* return the selectsubquerys for this selectnode.
+*
+* @return subquerylist	the selectsubquerys for this selectnode.
+*/
+public subquerylist getselectsubquerys
+return selectsubquerys
+/**
+* return the wheresubquerys for this selectnode.
+*
+* @return subquerylist	the wheresubquerys for this selectnode.
+*/
+public subquerylist getwheresubquerys
+return wheresubquerys
+/**
+* bind the tables in this selectnode.  this includes getting their
+* tabledescriptors from the datadictionary and numbering the fromtables.
+* note: because this node represents the top of a new query block, we bind
+* both the non vti and vti tables under this node in this method call.
+*
+* @param datadictionary	the datadictionary to use for binding
+* @param fromlistparam		fromlist to use/append to.
+*
+* @return	resultsetnode
+*
+* @exception standardexception		thrown on error
+*/
+public resultsetnode bindnonvtitables datadictionary datadictionary
+fromlist fromlistparam
+throws standardexception
+int fromlistsize   fromlist size
+wherepredicates    predicatelist  getnodefactory   getnode
+c_nodetypes predicate_list
+getcontextmanager
+prejoinfl    fromlist  getnodefactory   getnode
+c_nodetypes from_list
+getnodefactory   dojoinorderoptimization
+getcontextmanager
+/* set the nesting level in the fromlist */
+if  fromlistparam size      0
+nestinglevel   0
+else
+nestinglevel     fromtable  fromlistparam elementat 0   getlevel     1
+fromlist setlevel nestinglevel
+/* splice a clone of our fromlist on to the beginning of fromlistparam, before binding
+* the tables, for correlated column resolution in vtis.
+*/
+for  int index   0  index < fromlistsize  index
+fromlistparam insertelementat fromlist elementat index   0
+// now bind our from list
+fromlist bindtables datadictionary  fromlistparam
+/* restore fromlistparam */
+for  int index   0  index < fromlistsize  index
+fromlistparam removeelementat 0
+return this
+/**
+* bind the expressions in this selectnode.  this means binding the
+* sub-expressions, as well as figuring out what the return type is
+* for each expression.
+*
+* @param fromlistparam		fromlist to use/append to.
+*
+* @exception standardexception		thrown on error
+*/
+public void bindexpressions fromlist fromlistparam
+throws standardexception
+int fromlistparamsize   fromlistparam size
+int fromlistsize   fromlist size
+int numdistinctaggs
+if  sanitymanager debug
+sanitymanager assert fromlist    null    resultcolumns    null
+/* note - a lot of this code would be common to bindtargetexpression(),
+* so we use a private boolean to share the code instead of duplicating
+* it.  bindtargetexpression() is responsible for toggling the boolean.
+*/
+if    bindtargetlistonly
+/* bind the expressions in fromsubquerys, joinnodes, etc. */
+fromlist bindexpressions  fromlistparam
+selectsubquerys    subquerylist  getnodefactory   getnode
+c_nodetypes subquery_list
+getcontextmanager
+selectaggregates   new vector
+/* splice our fromlist on to the beginning of fromlistparam, before binding
+* the expressions, for correlated column resolution.
+*/
+for  int index   0  index < fromlistsize  index
+fromlistparam insertelementat fromlist elementat index   index
+resultcolumns bindexpressions fromlistparam
+selectsubquerys
+selectaggregates
+/* we're done if we're only binding the target list.
+* (after we restore the fromlist, of course.)
+*/
+if  bindtargetlistonly
+for  int index   0  index < fromlistsize  index
+fromlistparam removeelementat 0
+return
+whereaggregates   new vector
+wheresubquerys    subquerylist  getnodefactory   getnode
+c_nodetypes subquery_list
+getcontextmanager
+if  whereclause    null
+getcompilercontext   pushcurrentprivtype  authorizer select_priv
+whereclause   whereclause bindexpression fromlistparam
+wheresubquerys
+whereaggregates
+/* resolve - temporarily disable aggregates in the having clause.
+** (we may remove them in the parser anyway.)
+** resolve - disable aggregates in the where clause.  someday
+** aggregates will be allowed iff they are in a subquery
+** of the having clause and they correlate to an outer
+** query block.  for now, aggregates are not supported
+** in the where clause at all.
+** note: a similar check is made in joinnode.
+*/
+if  whereaggregates size   > 0
+throw standardexception newexception sqlstate lang_no_aggregates_in_where_clause
+/* if whereclause is a parameter, (where ?/where -?/where +?), then we should catch it and throw exception
+*/
+if  whereclause isparameternode
+throw standardexception newexception sqlstate lang_non_boolean_where_clause
+whereclause   whereclause checkisboolean
+getcompilercontext   popcurrentprivtype
+if  havingclause    null
+havingaggregates   new vector
+havingsubquerys    subquerylist  getnodefactory   getnode
+c_nodetypes subquery_list
+getcontextmanager
+havingclause bindexpression
+fromlistparam  havingsubquerys  havingaggregates
+havingclause   havingclause checkisboolean
+/* restore fromlist */
+for  int index   0  index < fromlistsize  index
+fromlistparam removeelementat 0
+if  sanitymanager debug
+sanitymanager assert fromlistparam size      fromlistparamsize
+fromlistparam size
+fromlistparamsize
+sanitymanager assert fromlist size      fromlistsize
+fromlist size
+fromlistsize
+/* if query is grouped, bind the group by list. */
+if  groupbylist    null
+vector gbaggregatevector   new vector
+groupbylist bindgroupbycolumns this
+gbaggregatevector
+/*
+** there should be no aggregates in the group by list.
+** we don't expect any, but just to be on the safe side
+** we will check under sanity.
+*/
+if  sanitymanager debug
+sanitymanager assert gbaggregatevector size      0
+/* if ungrouped query with aggregates in select list, verify
+* that all result columns are valid aggregate expressions -
+* no column references outside of an aggregate.
+* if grouped query with aggregates in select list, verify that all
+* result columns are either grouping expressions or valid
+* grouped aggregate expressions - the only column references
+* allowed outside of an aggregate are columns in expressions in
+* the group by list.
+*/
+if  groupbylist    null    selectaggregates size   > 0
+verifyaggregateexpressionsvisitor visitor
+new verifyaggregateexpressionsvisitor groupbylist
+resultcolumns accept visitor
+/*
+** resolve: for now, only one distinct aggregate is supported
+** in the select list.
+*/
+numdistinctaggs   numdistinctaggregates selectaggregates
+if  numdistinctaggs > 1
+throw standardexception newexception sqlstate lang_user_aggregate_multiple_distincts
+/**
+* bind the expressions in this resultsetnode if it has tables.  this means binding the
+* sub-expressions, as well as figuring out what the return type is for
+* each expression.
+*
+* @param fromlistparam		fromlist to use/append to.
+*
+* @exception standardexception		thrown on error
+*/
+public void bindexpressionswithtables fromlist fromlistparam
+throws standardexception
+/* we have tables, so simply call bindexpressions() */
+bindexpressions fromlistparam
+/**
+* bind the expressions in the target list.  this means binding the
+* sub-expressions, as well as figuring out what the return type is
+* for each expression.  this is useful for exists subqueries, where we
+* need to validate the target list before blowing it away and replacing
+* it with a select true.
+*
+* @exception standardexception		thrown on error
+*/
+public void bindtargetexpressions fromlist fromlistparam
+throws standardexception
+/*
+* with a fromsubquery in the fromlist we cannot bind target expressions
+* at this level (derby-3321)
+*/
+collectnodesvisitor cnv   new collectnodesvisitor fromsubquery class
+fromsubquery class
+fromlist accept cnv
+if   cnv getlist   isempty
+bindtargetlistonly   false
+else
+bindtargetlistonly   true
+bindexpressions fromlistparam
+bindtargetlistonly   false
+/**
+* bind the result columns of this resultsetnode when there is no
+* base table to bind them to.  this is useful for select statements,
+* where the result columns get their types from the expressions that
+* live under them.
+*
+* @param fromlistparam		fromlist to use/append to.
+*
+* @exception standardexception		thrown on error
+*/
+public void bindresultcolumns fromlist fromlistparam
+throws standardexception
+/* we first bind the resultcolumns for any fromtable which
+* needs its own binding, such as joinnodes.
+* we pass through the fromlistparam without adding our fromlist
+* to it, since the elements in our fromlist can only be correlated
+* with outer query blocks.
+*/
+fromlist bindresultcolumns fromlistparam
+super bindresultcolumns fromlistparam
+/* only 1012 elements allowed in select list */
+if  resultcolumns size   > limits db2_max_elements_in_select_list
+throw standardexception newexception sqlstate lang_too_many_elements
+/* fix nullability in case of any outer joins in the fromlist */
+if  fromlist hasouterjoins
+resultcolumns setnullability true
+/**
+* bind the result columns for this resultsetnode to a base table.
+* this is useful for insert and update statements, where the
+* result columns get their types from the table being updated or
+* inserted into.
+* if a result column list is specified, then the verification that the
+* result column list does not contain any duplicates will be done when
+* binding them by name.
+*
+* @param targettabledescriptor	the tabledescriptor for the table being
+*				updated or inserted into
+* @param targetcolumnlist	for insert statements, the user
+*					does not have to supply column
+*					names (for example, "insert into t
+*					values (1,2,3)".  when this
+*					parameter is null, it means that
+*					the user did not supply column
+*					names, and so the binding should
+*					be done based on order.  when it
+*					is not null, it means do the binding
+*					by name, not position.
+* @param statement			calling dmlstatementnode (insert or update)
+* @param fromlistparam		fromlist to use/append to.
+*
+* @exception standardexception		thrown on error
+*/
+public void bindresultcolumns tabledescriptor targettabledescriptor
+fromvti targetvti
+resultcolumnlist targetcolumnlist
+dmlstatementnode statement
+fromlist fromlistparam
+throws standardexception
+/* we first bind the resultcolumns for any fromtable which
+* needs its own binding, such as joinnodes.
+* we pass through the fromlistparam without adding our fromlist
+* to it, since the elements in our fromlist can only be correlated
+* with outer query blocks.
+*/
+fromlist bindresultcolumns fromlistparam
+super bindresultcolumns targettabledescriptor
+targetvti
+targetcolumnlist  statement
+fromlistparam
+/**
+* push an expression into this select (and possibly down into
+* one of the tables in the from list).  this is useful when
+* trying to push predicates into unflattened views or
+* derived tables.
+*
+* @param predicate	the predicate that we attempt to push
+*
+* @exception standardexception		thrown on error
+*/
+void pushexpressionsintoselect predicate predicate
+throws standardexception
+wherepredicates pullexpressions referencedtablemap size    predicate getandnode
+fromlist pushpredicates wherepredicates
+/**
+* verify that a select * is valid for this type of subquery.
+*
+* @param outerfromlist	the fromlist from the outer query block(s)
+* @param subquerytype	the subquery type
+*
+* @exception standardexception		thrown on error
+*/
+public void verifyselectstarsubquery fromlist outerfromlist  int subquerytype
+throws standardexception
+if      resultcolumn  resultcolumns elementat 0  instanceof allresultcolumn
+return
+/* select * currently only valid for exists/not exists.
+* not exists does not appear prior to preprocessing.
+*/
+if  subquerytype    subquerynode exists_subquery
+throw standardexception newexception sqlstate lang_cant_select_star_subquery
+/* if the allresultcolumn is qualified, then we have to verify
+* that the qualification is a valid exposed name.
+* note: the exposed name can come from an outer query block.
+*/
+string		fulltablename
+fulltablename     allresultcolumn  resultcolumns elementat 0   getfulltablename
+if  fulltablename    null
+if  fromlist getfromtablebyname fulltablename  null  true     null
+outerfromlist getfromtablebyname fulltablename  null  true     null
+if  fromlist getfromtablebyname fulltablename  null  false     null
+outerfromlist getfromtablebyname fulltablename  null  false     null
+throw standardexception newexception sqlstate lang_exposed_name_not_found  fulltablename
+/**
+* determine whether or not the specified name is an exposed name in
+* the current query block.
+*
+* @param name	the specified name to search for as an exposed name.
+* @param schemaname	schema name, if non-null.
+* @param exactmatch	whether or not we need an exact match on specified schema and table
+*						names or match on table id.
+*
+* @return the fromtable, if any, with the exposed name.
+*
+* @exception standardexception		thrown on error
+*/
+protected fromtable getfromtablebyname string name  string schemaname  boolean exactmatch
+throws standardexception
+return fromlist getfromtablebyname name  schemaname  exactmatch
+/**
+* check for (and reject) ? parameters directly under the resultcolumns.
+* this is done for select statements.
+*
+* @exception standardexception		thrown if a ? parameter found
+*									directly under a resultcolumn
+*/
+public void rejectparameters   throws standardexception
+super rejectparameters
+fromlist rejectparameters
+/**
+* push the order by list down from the cursor node
+* into its child result set so that the optimizer
+* has all of the information that it needs to
+* consider sort avoidance.
+*
+* @param orderbylist	the order by list
+*/
+void pushorderbylist orderbylist orderbylist
+this orderbylist   orderbylist
+// remember that there was an order by list
+orderbyquery   true
+/**
+* put a projectrestrictnode on top of each fromtable in the fromlist.
+* columnreferences must continue to point to the same resultcolumn, so
+* that resultcolumn must percolate up to the new prn.  however,
+* that resultcolumn will point to a new expression, a virtualcolumnnode,
+* which points to the fromtable and the resultcolumn that is the source for
+* the columnreference.
+* (the new prn will have the original of the resultcolumnlist and
+* the resultcolumns from that list.  the fromtable will get shallow copies
+* of the resultcolumnlist and its resultcolumns.  resultcolumn.expression
+* will remain at the fromtable, with the prn getting a new
+* virtualcolumnnode for each resultcolumn.expression.)
+* we then project out the non-referenced columns.  if there are no referenced
+* columns, then the prn's resultcolumnlist will consist of a single resultcolumn
+* whose expression is 1.
+*
+* @param numtables			the number of tables in the dml statement
+* @param gbl				the outer group by list, if any
+* @param fl			the from list, if any
+*
+* @return the generated projectrestrictnode atop the original fromtable.
+*
+* @exception standardexception		thrown on error
+*/
+public resultsetnode preprocess int numtables
+groupbylist gbl
+fromlist fl
+throws standardexception
+resultsetnode newtop   this
+/* put the expression trees in conjunctive normal form.
+* note - this needs to occur before we preprocess the subqueries
+* because the subquery transformations assume that any subquery operator
+* negation has already occurred.
+*/
+whereclause   normexpressions whereclause
+// derby-3257. we need to normalize the having clause as well, because
+// preprocess expects cnf.
+havingclause   normexpressions havingclause
+/**
+* this method determines if (1) the query is a loj, and (2) if the loj is a candidate for
+* reordering (i.e., linearization).  the condition for loj linearization is:
+* 1. either loj or roj in the fromlist, i.e., no inner, no full joins
+* 2. on clause must be equality join between left and right operands and in cnf (i.e., and is allowed)
+*/
+boolean anychange   fromlist loj_reorderable numtables
+if  anychange
+fromlist afromlist    fromlist  getnodefactory   getnode c_nodetypes from_list
+getnodefactory   dojoinorderoptimization
+getcontextmanager
+bindexpressions afromlist
+/* preprocess the fromlist.  for each fromtable, if it is a fromsubquery
+* then we will preprocess it, replacing the fromsubquery with a
+* projectrestrictnode. if it is a frombasetable, then we will generate
+* the projectrestrictnode above it.
+*/
+fromlist preprocess numtables  groupbylist  whereclause
+/* selectsubquerys is always allocated at bind() time */
+if  sanitymanager debug
+sanitymanager assert selectsubquerys    null
+/* preprocess the rcl after the from list so that
+* we can flatten/optimize any subqueries in the
+* select list.
+*/
+resultcolumns preprocess numtables
+fromlist  wheresubquerys
+wherepredicates
+/* preprocess the expressions.  (this is necessary for subqueries.
+* this is also where we do tranformations such as for like.)
+*
+* note: we do this after preprocessing the fromlist so that, for
+* quantified subqueries, the join expression with the outer
+* expression will be pushable (to be pushable, the columnreference
+* has to point to a virtualcolumnnode, and not to a basecolumnnode).
+*/
+if  whereclause    null
+// derby-3301
+// mark subqueries that are part of the where clause as such so
+// that we can avoid flattening later, particularly for nested
+// where exists subqueries.
+if  wheresubquerys    null
+wheresubquerys markwheresubqueries
+whereclause preprocess numtables
+fromlist  wheresubquerys
+wherepredicates
+/* preprocess the group by list too. we need to compare
+* expressions in the group by list with the select list and we
+* can't rewrite one and not the other.
+*/
+if  groupbylist    null
+groupbylist preprocess numtables  fromlist  wheresubquerys  wherepredicates
+if  havingclause    null
+// derby-3257
+// mark  subqueries that are part of the having clause as
+// such so we can avoid flattenning later. having subqueries
+// cannot be flattened because we cannot currently handle
+// column references at the same source level.
+// derby-3257 required we normalize the having clause which
+// triggered flattening because subquerynode.undertopandnode
+// became true after normalization.  we needed another way to
+// turn flattening off. perhaps the long term solution is
+// to avoid this restriction all together but that was beyond
+// the scope of this bugfix.
+havingsubquerys markhavingsubqueries
+havingclause   havingclause preprocess
+numtables  fromlist  havingsubquerys  wherepredicates
+/* pull apart the expression trees */
+if  whereclause    null
+wherepredicates pullexpressions numtables  whereclause
+whereclause   null
+/* resolve - where should we worry about expression pull up for
+* expensive predicates?
+*/
+// flatten any flattenable fromsubquerys or joinnodes
+fromlist flattenfromtables resultcolumns
+wherepredicates
+wheresubquerys
+groupbylist
+if  wherepredicates    null    wherepredicates size   > 0    fromlist size   > 0
+// perform various forms of transitive closure on wherepredicates
+if  fromlist size   > 1
+performtransitiveclosure numtables
+if  orderbylist    null
+// remove constant columns from order by list.  constant
+// columns are ones that have equality comparisons with
+// constant expressions (e.g. x = 3)
+orderbylist removeconstantcolumns wherepredicates
+/*
+** it's possible for the order by list to shrink to nothing
+** as a result of removing constant columns.  if this happens,
+** get rid of the list entirely.
+*/
+if  orderbylist size      0
+orderbylist   null
+resultcolumns removeorderbycolumns
+/* a valid group by without any aggregates or a having clause
+* is equivalent to a distinct without the group by.  we do the transformation
+* in order to simplify the group by code.
+*/
+if  groupbylist    null
+havingclause    null
+selectaggregates size      0
+whereaggregates size      0
+isdistinct   true
+groupbylist   null
+wasgroupby   true
+/* consider distinct elimination based on a uniqueness condition.
+* in order to do this:
+*	o  all top level columnreferences in the select list are
+*	   from the same base table.  (select t1.c1, t2.c2 + t3.c3 is
+*	   okay - t1 is the table of interest.)
+*  o  if the from list is a single table then the columns in the
+*	   select list plus the columns in the where clause that are
+*	   in = comparisons with constants or parameters must be a
+*	   superset of any unique index.
+*  o  if the from list has multiple tables then at least 1 table
+*	   meet the following - the set of columns in = comparisons
+*	   with constants or parameters is a superset of any unique
+*	   index on the table.  all of the other tables must meet
+*	   the following - the set of columns in = comparisons with
+*	   constants, parameters or join columns is a superset of
+*	   any unique index on the table.  if the table from which
+*	   the columns in the select list are coming from is in this
+*     later group then the rule for it is to also include
+*     the columns in the select list in the set of columns that
+*     needs to be a superset of the unique index.  whew!
+*/
+if  isdistinct    groupbylist    null
+int distincttable  	resultcolumns alltopcrsfromsametable
+if  distincttable     1
+if  fromlist returnsatmostsinglerow resultcolumns
+whereclause  wherepredicates
+getdatadictionary
+isdistinct   false
+/* if we were unable to eliminate the distinct and we have
+* an order by then we can consider eliminating the sort for the
+* order by.  all of the columns in the order by list must
+* be ascending in order to do this.  there are 2 cases:
+*	o	the order by list is an in order prefix of the columns
+*		in the select list.  in this case the output of the
+*		sort from the distinct will be in the right order
+*		so we simply eliminate the order by list.
+*	o	the order by list is a subset of the columns in the
+*		the select list.  in this case we need to reorder the
+*		columns in the select list so that the ordering columns
+*		are an in order prefix of the select list and put a prn
+*		above the select so that the shape of the result set
+*		is as expected.
+*/
+if  isdistinct    orderbylist    null    orderbylist allascending
+/* order by list currently restricted to columns in select
+* list, so we will always eliminate the order by here.
+*/
+if  orderbylist isinorderprefix resultcolumns
+orderbylist   null
+else
+/* order by list is not an in order prefix of the select list
+* so we must reorder the columns in the the select list to
+* match the order by list and generate the prn above us to
+* preserve the expected order.
+*/
+newtop   genprojectrestrictforreordering
+orderbylist resettosourcercs
+resultcolumns   orderbylist reorderrcl resultcolumns
+newtop getresultcolumns   removeorderbycolumns
+orderbylist   null
+orderbyanddistinctmerged   true
+/*
+* push predicates that are pushable.
+*
+* note: we pass the wherepredicates down to the new prns here,
+* so they can pull any clauses and possibily push them down further.
+* note: we wait until all of the fromtables have been preprocessed
+* until we attempt to push down predicates, because we cannot push down
+* a predicate if the immediate source of any of its column references
+* is not a columnreference or a virtualcolumnnode.
+*/
+fromlist pushpredicates wherepredicates
+/* set up the referenced table map */
+referencedtablemap   new jbitset numtables
+int flsize   fromlist size
+for  int index   0  index < flsize  index
+referencedtablemap or   fromtable  fromlist elementat index
+getreferencedtablemap
+/* copy the referenced table map to the new tree top, if necessary */
+if  newtop    this
+newtop setreferencedtablemap  jbitset  referencedtablemap clone
+return newtop
+/**
+* peform the various types of transitive closure on the where clause.
+* the 2 types are transitive closure on join clauses and on search clauses.
+* join clauses will be processed first to maximize benefit for search clauses.
+*
+* @param numtables		the number of tables in the query
+*
+* @exception standardexception		thrown on error
+*/
+private void performtransitiveclosure int numtables
+throws standardexception
+// join clauses
+wherepredicates joinclausetransitiveclosure numtables  fromlist  getcompilercontext
+// search clauses
+wherepredicates searchclausetransitiveclosure numtables  fromlist hashjoinspecified
+/** put the expression trees in conjunctive normal form
+*
+* @param boolclause clause to normalize
+*
+* @exception standardexception		thrown on error
+*/
+private valuenode normexpressions valuenode boolclause
+throws standardexception
+/* for each expression tree:
+*	o eliminate nots (eliminatenots())
+*	o ensure that there is an andnode on top of every
+*	  top level expression. (putandsontop())
+*	o finish the job (changetocnf())
+*/
+if  boolclause    null
+boolclause   boolclause eliminatenots false
+if  sanitymanager debug
+if    boolclause verifyeliminatenots
+boolclause treeprint
+sanitymanager throwassert
+boolclause
+boolclause   boolclause putandsontop
+if  sanitymanager debug
+if      boolclause instanceof andnode
+boolclause verifyputandsontop
+boolclause treeprint
+sanitymanager throwassert
+boolclause
+boolclause   boolclause changetocnf true
+if  sanitymanager debug
+if      boolclause instanceof andnode
+boolclause verifychangetocnf
+boolclause treeprint
+sanitymanager throwassert
+boolclause
+return boolclause
+/**
+* add a new predicate to the list.  this is useful when doing subquery
+* transformations, when we build a new predicate with the left side of
+* the subquery operator and the subquery's result column.
+*
+* @param predicate		the predicate to add
+*
+* @return resultsetnode	the new top of the tree.
+*
+* @exception standardexception		thrown on error
+*/
+public resultsetnode addnewpredicate predicate predicate
+throws standardexception
+wherepredicates addpredicate predicate
+return this
+/**
+* evaluate whether or not the subquery in a fromsubquery is flattenable.
+* currently, a fsqry is flattenable if all of the following are true:
+*		o  subquery is a selectnode. (ie, not a rowresultsetnode or a unionnode)
+*		o  it contains a single table in its from list.
+*		o  it contains no subqueries in the select list.
+*		o  it does not contain a group by or having clause
+*		o  it does not contain aggregates.
+*		o  it is not a distinct.
+*
+* @param fromlist	the outer from list
+*
+* @return boolean	whether or not the fromsubquery is flattenable.
+*/
+public boolean flattenableinfromsubquery fromlist fromlist
+if  isdistinct
+return false
+if  this fromlist size   > 1
+return false
+/* don't flatten (at least for now) if selectnode's select list contains a subquery */
+if   selectsubquerys    null
+selectsubquerys size   > 0
+return false
+/* don't flatten if selectnode contains a group by or having clause */
+if   groupbylist    null      havingclause    null
+return false
+/* don't flatten if select list contains something that isn't cloneable.
+*/
+if    resultcolumns iscloneable
+return false
+/* don't flatten if selectnode contains an aggregate */
+if   selectaggregates    null
+selectaggregates size   > 0
+return false
+return true
+/**
+* replace this selectnode with a projectrestrictnode,
+* since it has served its purpose.
+*
+* @param origfromlistsize	the size of the original from list, before
+*							generation of join tree.
+* @return resultsetnode	new resultsetnode atop the query tree.
+*
+* @exception standardexception		thrown on error
+*/
+public resultsetnode genprojectrestrict int origfromlistsize
+throws standardexception
+boolean				eliminatesort   false
+resultsetnode		prnrsn
+boolean				haswindowfunction   false
+resultcolumnlist	originalrcl   this resultcolumns copylistandobjects
+/*
+* even if we have a window function, we must do all projection and
+* restriction at this stage. restricting on a window function, i.e
+*    select ... <windowfunction> as w ... where w ...
+* is not allowed. restrictions need to be evaluated in an outer select
+* to achieve this.
+*/
+haswindowfunction   resultcolumns containswindowfunctionresultcolumn
+if  haswindowfunction
+/*
+* remove any window function columns now, and reinsert them from
+* the copy made above once grouping and ordering has been performed.
+*/
+resultcolumns removewindowfunctioncolumns
+if  orderbylist    null
+orderbylist adjustforwindowfunctioncolumns
+prnrsn    resultsetnode  getnodefactory   getnode
+c_nodetypes project_restrict_node
+fromlist elementat 0  	   child resultset
+resultcolumns 		   projection
+whereclause 			   restriction
+wherepredicates    restriction as predicatelist
+selectsubquerys    subquerys in projection
+wheresubquerys 	   subquerys in restriction
+
+getcontextmanager
+/*
+** if we have aggregates or a select list we want
+** to generate a groupbynode.  in the case of a
+** scalar aggregate we have no grouping columns.
+**
+** jresolve: what about correlated aggregates from another
+** block.
+*/
+if    selectaggregates    null      selectaggregates size   > 0
+groupbylist    null
+vector aggs   selectaggregates
+if  havingaggregates    null     havingaggregates isempty
+havingaggregates addall selectaggregates
+aggs   havingaggregates
+groupbynode gbn    groupbynode  getnodefactory   getnode
+c_nodetypes group_by_node
+prnrsn
+groupbylist
+aggs
+havingclause
+havingsubquerys
+
+new integer nestinglevel
+getcontextmanager
+gbn considerpostoptimizeoptimizations originalwhereclause    null
+gbn assigncostestimate optimizer getoptimizedcost
+groupbylist   null
+prnrsn    gbn getparent
+// remember whether or not we can eliminate the sort.
+eliminatesort   eliminatesort    gbn getisinsortedorder
+/*
+* if it is distinct, that must also be taken care of. but, if there is
+* a window function in the rcl we must delay duplicate elimination
+* until after the window function has been evaluated.
+*/
+if  isdistinct     haswindowfunction
+// we first verify that a distinct is valid on the
+// rcl.
+resultcolumns verifyallorderable
+/* see if we can push duplicate elimination into the store
+* via a hash scan.  this is possible iff:
+*	o  a single table query
+*	o  we haven't merged the order by and distinct sorts.
+*	   (results do not have to be in a particular order.)
+*	o  all entries in the select's rcl are columnreferences.
+*	o  no predicates (this is because we currently do not
+*	   differentiate between columns referenced in the select
+*	   list and columns referenced in other clauses.  in other
+*	   words, the store will do duplicate elimination based on
+*	   all referenced columns.)
+*	   resolve - we can change this to be all referenced columns
+*	   have to be in the select list.  in that case, we need to
+*	   refine which predicates are allowed.  basically, all predicates
+*	   must have been pushed down to the index/table scan.(if we make
+*	   this change, then we need to verify that non of the columns in
+*	   the predicates are correlated columns.)
+*	o  note: the implementation of ispossibledistinctscan() will return
+*	   false if there is an indexrowtobaserow above the
+*	   frombasetable.  this is because all of a table's columns must come
+*	   from the same conglomerate in order to get consistent data.
+*/
+boolean distinctscanpossible   false
+if  origfromlistsize    1     orderbyanddistinctmerged
+boolean simplecolumns   true
+hashset distinctcolumns   new hashset
+int size   resultcolumns size
+for  int i   1  i <  size  i
+basecolumnnode bc   resultcolumns getresultcolumn i  getbasecolumnnode
+if  bc    null
+simplecolumns   false
+break
+distinctcolumns add bc
+if  simplecolumns    prnrsn ispossibledistinctscan distinctcolumns
+prnrsn markfordistinctscan
+distinctscanpossible   true
+if   distinctscanpossible
+/* we can't do a distinct scan. determine if we can filter out
+* duplicates without a sorter.
+*/
+boolean insortedorder   isorderedresult resultcolumns  prnrsn    orderbyanddistinctmerged
+prnrsn    resultsetnode  getnodefactory   getnode
+c_nodetypes distinct_node
+prnrsn
+new boolean insortedorder
+
+getcontextmanager
+prnrsn costestimate   costestimate cloneme
+// remember whether or not we can eliminate the sort.
+eliminatesort   eliminatesort    insortedorder
+/* generate the orderbynode if a sort is still required for
+* the order by.
+*/
+if  orderbylist    null
+if  orderbylist getsortneeded
+prnrsn    resultsetnode  getnodefactory   getnode
+c_nodetypes order_by_node
+prnrsn
+orderbylist
+
+getcontextmanager
+prnrsn costestimate   costestimate cloneme
+// there may be columns added to the select projection list
+// a query like:
+// select a, b from t group by a,b order by a+b
+// the expr a+b is added to the select list.
+int orderbyselect   this getresultcolumns   getorderbyselect
+if  orderbyselect > 0
+resultcolumnlist selectrcs   prnrsn getresultcolumns   copylistandobjects
+selectrcs removeorderbycolumns
+selectrcs genvirtualcolumnnodes prnrsn  prnrsn getresultcolumns
+prnrsn    resultsetnode  getnodefactory   getnode
+c_nodetypes project_restrict_node
+prnrsn
+selectrcs
+
+
+
+
+
+getcontextmanager
+/*
+* remove added ordering columns from the saved original rcl
+*/
+originalrcl removeorderbycolumns
+if  wasgroupby    resultcolumns numgeneratedcolumnsforgroupby   > 0
+// this case takes care of columns generated for group by's which
+// will need to be removed from the final projection. note that the
+// groupbynode does remove generated columns but in certain cases
+// we dispense with a group by and replace it with a distinct instead.
+// so in a query like:
+// select c1 from t group by c1, c2
+// we would have added c2 to the projection list which will have to be
+// projected out.
+resultcolumnlist newselectlist   prnrsn getresultcolumns   copylistandobjects
+newselectlist removegeneratedgroupingcolumns
+newselectlist genvirtualcolumnnodes prnrsn  prnrsn getresultcolumns
+prnrsn    resultsetnode  getnodefactory   getnode
+c_nodetypes project_restrict_node
+prnrsn
+newselectlist
+
+
+
+
+
+getcontextmanager
+if    orderbylist    null    orderbylist getsortneeded       orderbyquery
+// remember whether or not we can eliminate the sort.
+eliminatesort   true
+/* if we were able to eliminate the sort during optimization then
+* we must tell the underlying tree.  at minimum, this means no
+* group fetch on an index under an indexrowtobaserow since that
+* that could lead to incorrect results.  (bug 2347.)
+*/
+if  eliminatesort
+prnrsn adjustforsortelimination orderbylist
+/* set the cost of this node in the generated node */
+prnrsn costestimate   costestimate cloneme
+/*
+* now that grouping and ordering has been performed, we can reinsert
+* the window function column(s), and pull the windownode(s) up from
+* under the window function resultcolumn(s).
+*/
+if  haswindowfunction
+/*
+* pull all windownodes up from under their window function column,
+* and place the windownode on top.
+*/
+int size   originalrcl size
+int windowfunctionlevel   0
+resultcolumnlist windowfunctionrcl   originalrcl copylistandobjects
+for  int index   0  index < size  index
+resultcolumn rc    resultcolumn  originalrcl elementat index
+/*
+* note: we only care about window function columns that appear
+* here, and not about references into subquerys or similar.
+*/
+if  rc expressioniswindowfunction
+windowfunctioncolumnnode wfcn    windowfunctioncolumnnode  rc getexpression
+windownode windownode   wfcn getwindownode
+windowfunctionlevel
+windownode setresultcolumns windowfunctionrcl
+windownode setchildresult  resultsetnode  prnrsn
+windownode setwindowfunctionlevel windowfunctionlevel
+/* set the cost of this node in the generated node */
+windownode costestimate   costestimate cloneme
+/* set the new top */
+prnrsn   windownode
+/*
+* after evaluation of the window function, we can do duplicate
+* elimination for distinct queries.
+*/
+if  isdistinct
+/* verify that a distinct is valid on the rcl. */
+prnrsn getresultcolumns   verifyallorderable
+/*
+* we cannot push duplicate elimination into store via a hash
+* scan when there is a window function in the rcl, but it may
+* be possible to filter out duplicates without a sorter.
+*/
+boolean insortedorder   isorderedresult prnrsn getresultcolumns
+prnrsn
+orderbyanddistinctmerged
+prnrsn    resultsetnode  getnodefactory   getnode
+c_nodetypes distinct_node
+prnrsn
+new boolean insortedorder
+
+getcontextmanager
+prnrsn costestimate   costestimate cloneme
+/*
+* top off with a prn as this is the intent of this method. even
+* though this prn is a noop and will never be generated, we should
+* leave it here as other parts of the code expects to find
+* prn -> wn, or prn -> dn -> wn.
+*/
+resultcolumnlist newrcl   prnrsn getresultcolumns   copylistandobjects
+newrcl genvirtualcolumnnodes prnrsn  prnrsn getresultcolumns
+prnrsn    resultsetnode  getnodefactory   getnode
+c_nodetypes project_restrict_node
+prnrsn     child resultset
+newrcl     projection
+null     restriction
+null     restriction as predicatelist
+null     subquerys in projection
+null     subquerys in restriction
+
+getcontextmanager
+/* set the cost of this node in the generated node */
+prnrsn costestimate   costestimate cloneme
+return prnrsn
+/**
+* is the result of this node an ordered result set.  an ordered result set
+* means that the results from this node will come in a known sorted order.
+* this means that the data is ordered according to the order of the elements in the rcl.
+* today, the data is considered ordered if:
+*		o the rcl is composed entirely of crs or constantnodes
+*		o the underlying tree is ordered on the crs in the order in which
+*			they appear in the rcl, taking equality predicates into account.
+* future enhancements:
+*		o the prefix will not be required to be in order.  (we will need to
+*		  reorder the rcl and generate a prn with an rcl in the expected order.)
+*
+* @return boolean	whether or not this node returns an ordered result set.
+*
+* @exception standardexception		thrown on error
+*/
+private boolean isorderedresult resultcolumnlist resultcolumns
+resultsetnode newtoprsn
+boolean permuteordering
+throws standardexception
+int rclsize   resultcolumns size
+/* not ordered if rcl contains anything other than a columnreference
+* or a constantnode.
+*/
+int numcrs   0
+for  int index   0  index < rclsize  index
+resultcolumn rc    resultcolumn  resultcolumns elementat index
+if  rc getexpression   instanceof columnreference
+numcrs
+else if     rc getexpression   instanceof constantnode
+return false
+// corner case, all constants
+if  numcrs    0
+return true
+columnreference crs   new columnreference
+// now populate the cr array and see if ordered
+int crsindex   0
+for  int index   0  index < rclsize  index
+resultcolumn rc    resultcolumn  resultcolumns elementat index
+if  rc getexpression   instanceof columnreference
+crs    columnreference  rc getexpression
+return newtoprsn isorderedon crs  permuteordering   vector null
+/**
+* ensure that the top of the rsn tree has a predicatelist.
+*
+* @param numtables			the number of tables in the query.
+* @return resultsetnode	a rsn tree with a node which has a predicatelist on top.
+*
+* @exception standardexception		thrown on error
+*/
+public resultsetnode ensurepredicatelist int numtables
+throws standardexception
+return this
+/**
+* optimize this selectnode.  this means choosing the best access path
+* for each table, among other things.
+*
+* @param datadictionary	the datadictionary to use for optimization
+* @param predicatelist		the predicate list to optimize against
+* @param outerrows			the number of outer joining rows
+*
+* @return	resultsetnode	the top of the optimized tree
+*
+* @exception standardexception		thrown on error
+*/
+public resultsetnode optimize datadictionary datadictionary
+predicatelist	predicatelist
+double outerrows
+throws standardexception
+optimizer		 optimizer
+/* optimize any subquerys before optimizing the underlying result set */
+/* selectsubquerys is always allocated at bind() time */
+if  sanitymanager debug
+sanitymanager assert selectsubquerys    null
+/* if this select node is the child of an outer node that is
+* being optimized, we can get here multiple times (once for
+* every permutation that is done for the outer node).  with
+* derby-805, we can add optimizable predicates to the where
+* list as part of this method; thus, before proceeding we
+* need go through and remove any opt predicates that we added
+* to our where list the last time we were here; if we don't
+* do that, we'll end up with the same predicates in our
+* where list multiple times, which can lead to incorrect
+* optimization.
+*/
+if  wherepredicates    null
+// iterate backwards because we might be deleting entries.
+for  int i   wherepredicates size     1  i >  0  i
+if    predicate wherepredicates elementat i   isscopedforpush
+wherepredicates removeoptpredicate i
+/* get a new optimizer */
+/* with derby-805 we take any optimizable predicates that
+* were pushed into this node and we add them to the list of
+* predicates that we pass to the optimizer, thus allowing
+* the optimizer to use them when choosing an access path
+* for this select node.  we do that by adding the predicates
+* to our where list, since the where predicate list is what
+* we pass to the optimizer for this select node (see below).
+* we have to pass the where list directly (as opposed to
+* passing a copy) because the optimizer is only created one
+* time; it then uses the list we pass it for the rest of the
+* optimization phase and finally for "modifyaccesspaths()".
+* since the optimizer can update/modify the list based on the
+* where predicates (such as by adding internal predicates or
+* by modifying the actual predicates themselves), we need
+* those changes to be applied to the where list directly for
+* subsequent processing (esp. for modification of the access
+* path).  note that by adding outer opt predicates directly
+* to the where list, we're changing the semantics of this
+* select node.  this is only temporary, though--once the
+* optimizer is done with all of its work, any predicates
+* that were pushed here will have been pushed even further
+* down and thus will have been removed from the where list
+* (if it's not possible to push them further down, then they
+* shouldn't have made it this far to begin with).
+*/
+if  predicatelist    null
+if  wherepredicates    null
+wherepredicates    predicatelist  getnodefactory   getnode
+c_nodetypes predicate_list
+getcontextmanager
+predicate pred   null
+int sz   predicatelist size
+for  int i   sz   1  i >  0  i
+// we can tell if a predicate was pushed into this select
+// node because it will have been "scoped" for this node
+// or for some result set below this one.
+pred    predicate predicatelist getoptpredicate i
+if  pred isscopedtosourceresultset
+// if we're pushing the predicate down here, we have to
+// remove it from the predicate list of the node above
+// this select, in order to keep in line with established
+// push 'protocol'.
+wherepredicates addoptpredicate pred
+predicatelist removeoptpredicate pred
+optimizer   getoptimizer fromlist
+wherepredicates
+datadictionary
+orderbylist
+optimizer setouterrows outerrows
+/* optimize this selectnode */
+while  optimizer getnextpermutation
+while  optimizer getnextdecoratedpermutation
+optimizer costpermutation
+/* when we're done optimizing, any scoped predicates that
+* we pushed down the tree should now be sitting again
+* in our wherepredicates list.  put those back in the
+* the list from which we received them, to allow them
+* to be "pulled" back up to where they came from.
+*/
+if  wherepredicates    null
+predicate pred   null
+for  int i   wherepredicates size     1  i >  0  i
+pred    predicate wherepredicates getoptpredicate i
+if  pred isscopedforpush
+predicatelist addoptpredicate pred
+wherepredicates removeoptpredicate pred
+/* get the cost */
+costestimate   optimizer getoptimizedcost
+/* update row counts if this is a scalar aggregate */
+if   selectaggregates    null      selectaggregates size   > 0
+costestimate setestimatedrowcount  long  outerrows
+costestimate setsinglescanrowcount 1
+selectsubquerys optimize datadictionary  costestimate rowcount
+if  wheresubquerys    null    wheresubquerys size   > 0
+wheresubquerys optimize datadictionary  costestimate rowcount
+if  havingsubquerys    null    havingsubquerys size   > 0
+havingsubquerys optimize datadictionary  costestimate rowcount
+return this
+/**
+* modify the access paths according to the decisions the optimizer
+* made.  this can include adding project/restrict nodes,
+* index-to-base-row nodes, etc.
+*
+* @param predlist a list of optimizable predicates that should
+*  be pushed to this resultsetnode, as determined by optimizer.
+* @return the modified query tree
+* @exception standardexception        thrown on error
+*/
+public resultsetnode modifyaccesspaths predicatelist predlist
+throws standardexception
+// take the received list of predicates and propagate them to the
+// predicate list for this node's optimizer.  then, when we call
+// optimizer.modifyaccesspaths(), the optimizer will have the
+// predicates and can push them down as necessary, according
+// the join order that it has chosen.
+if  sanitymanager debug
+sanitymanager assert optimizer    null
+optimizerimpl optimizer  addscopedpredicatestolist predlist
+return modifyaccesspaths
+/**
+* modify the access paths according to the choices the optimizer made.
+*
+* @return	a querytree with the necessary modifications made
+*
+* @exception standardexception		thrown on error
+*/
+public resultsetnode modifyaccesspaths   throws standardexception
+int				 origfromlistsize   fromlist size
+resultcolumnlist leftrclist
+resultcolumnlist rightrclist
+resultsetnode	 leftresultset
+resultsetnode	 rightresultset
+/*
+** modify the access path for each optimizable, as necessary
+**
+** this should be the same optimizer we got above.
+*/
+optimizer modifyaccesspaths
+// load the costestimate for the final "best" join order.
+costestimate   optimizer getfinalcost
+if  sanitymanager debug
+// when we optimized this select node, we may have added pushable
+// outer predicates to the wherepredicates list for this node
+// (see the optimize() method above).  when we did so, we said
+// that all such predicates should have been removed from the
+// where list by the time optimization was completed.   so we
+// check that here, just to be safe.  note: we do this _after_
+// calling optimizer.modifyaccesspaths(), because it's only in
+// that call that the scoped predicates are officially pushed
+// and thus removed from the list.
+if  wherepredicates    null
+predicate pred   null
+for  int i   wherepredicates size     1  i >  0  i
+pred    predicate wherepredicates getoptpredicate i
+if  pred isscopedforpush
+sanitymanager throwassert
+pred binaryrelopcolrefstostring
+selectsubquerys modifyaccesspaths
+if  wheresubquerys    null    wheresubquerys size   > 0
+wheresubquerys modifyaccesspaths
+if  havingsubquerys    null    havingsubquerys size   > 0
+havingsubquerys modifyaccesspaths
+/* build a temp copy of the current fromlist for sort elimination, etc. */
+prejoinfl removeallelements
+prejoinfl nondestructiveappend fromlist
+/* now we build a joinnode tree from the bottom up until there is only
+* a single entry in the fromlist and that entry points to the top of
+* the joinnode tree.
+*
+* while there is still more than 1 entry in the list, create a joinnode
+* which points to the 1st 2 entries in the list.  this joinnode becomes
+* the new 1st entry in the list and the 2nd entry is deleted.  the
+* old 1st and 2nd entries will get shallow copies of their
+* resultcolumnlists.  the joinnode's resultcolumnlist will be the
+* concatenation of the originals from the old 1st and 2nd entries.
+* the virtualcolumnids will be updated to reflect there new positions
+* and each resultcolumn.expression will be replaced with a new
+* virtualcolumnnode.
+*/
+while  fromlist size   > 1
+/* get left's resultcolumnlist, assign shallow copy back to it
+* and create new virtualcolumnnodes for the original's
+* resultcolumn.expressions.
+*/
+leftresultset    resultsetnode  fromlist elementat 0
+leftrclist   leftresultset getresultcolumns
+leftresultset setresultcolumns leftrclist copylistandobjects
+leftrclist genvirtualcolumnnodes leftresultset  leftresultset resultcolumns
+/* get right's resultcolumnlist, assign shallow copy back to it,
+* create new virtualcolumnnodes for the original's
+* resultcolumn.expressions and increment the virtualcolumnids.
+* (right gets appended to left, so only right's ids need updating.)
+*/
+rightresultset    resultsetnode  fromlist elementat 1
+rightrclist   rightresultset getresultcolumns
+rightresultset setresultcolumns rightrclist copylistandobjects
+rightrclist genvirtualcolumnnodes rightresultset  rightresultset resultcolumns
+rightrclist adjustvirtualcolumnids leftrclist size
+/* concatenate the 2 resultcolumnlists */
+leftrclist nondestructiveappend rightrclist
+/* now we're finally ready to generate the joinnode and have it
+* replace the 1st 2 entries in the fromlist.
+*/
+fromlist setelementat
+joinnode  getnodefactory   getnode
+c_nodetypes join_node
+leftresultset
+rightresultset
+
+
+leftrclist
+
+//user supplied optimizer overrides
+fromlist properties
+getcontextmanager
+0
+fromlist removeelementat 1
+return genprojectrestrict origfromlistsize
+/**
+* get the final costestimate for this selectnode.
+*
+* @return	the final costestimate for this selectnode, which is
+* 			the final cost estimate for the best join order of
+*          this selectnode's optimizer.
+*/
+public costestimate getfinalcostestimate
+throws standardexception
+return optimizer getfinalcost
+/**
+determine if this select is updatable or not, for a cursor.
+*/
+boolean isupdatablecursor datadictionary dd  throws standardexception
+tabledescriptor	targettabledescriptor
+if  isdistinct
+if  sanitymanager debug
+sanitymanager debug
+return false
+if   selectaggregates    null      selectaggregates size   > 0
+return false
+if  groupbylist    null    havingclause    null
+return false
+if  sanitymanager debug
+sanitymanager assert fromlist  null
+if  fromlist size      1
+if  sanitymanager debug
+sanitymanager debug
+return false
+targettable    fromtable  fromlist elementat 0
+if  targettable instanceof fromvti
+return   fromvti  targettable  isupdatablecursor
+if     targettable instanceof frombasetable
+if  sanitymanager debug
+sanitymanager debug
+return false
+/* get the tabledescriptor and verify that it is not for a
+* view or a system table.
+* note: we need to use the base table name for the table.
+*		 simplest way to get it is from a frombasetable.  we
+*		 know that targettable is a frombasetable because of check
+*		 just above us.
+* note: we also need to use the base table's schema name; otherwise
+*		we will think it is the default schema beetle 4417
+*/
+targettabledescriptor   gettabledescriptor
+frombasetable targettable  getbasetablename
+getschemadescriptor   frombasetable targettable  gettablenamefield   getschemaname
+if  targettabledescriptor gettabletype      tabledescriptor system_table_type
+if  sanitymanager debug
+sanitymanager debug
+return false
+if  targettabledescriptor gettabletype      tabledescriptor view_type
+if  sanitymanager debug
+sanitymanager debug
+return false
+if   getselectsubquerys      null
+getselectsubquerys   size      0
+if  sanitymanager debug
+sanitymanager debug
+return false
+if   getwheresubquerys      null
+getwheresubquerys   size      0
+if  sanitymanager debug
+sanitymanager debug
+return false
+return true
+/**
+assumes that iscursorupdatable has been called, and that it
+is only called for updatable cursors.
+*/
+fromtable getcursortargettable
+if  sanitymanager debug
+sanitymanager assert targettable  null
+return targettable
+/**
+* search to see if a query references the specifed table name.
+*
+* @param name		table name (string) to search for.
+* @param basetable	whether or not name is for a base table
+*
+* @return	true if found, else false
+*
+* @exception standardexception		thrown on error
+*/
+public boolean referencestarget string name  boolean basetable
+throws standardexception
+if  fromlist referencestarget name  basetable
+selectsubquerys    null    selectsubquerys referencestarget name  basetable
+wheresubquerys    null    wheresubquerys referencestarget name  basetable
+return true
+return false
+/**
+* @see querytreenode#disableprivilegecollection
+*/
+public void disableprivilegecollection
+super disableprivilegecollection
+int fromlistsize   fromlist size
+for  int i   0  i < fromlistsize  i
+fromtable  fromlist elementat i   disableprivilegecollection
+/**
+* return whether or not this resultsetnode contains a subquery with a
+* reference to the specified target table.
+*
+* @param name	the table name.
+* @param basetable	whether or not table is a base table.
+*
+* @return boolean	whether or not a reference to the table was found.
+*
+* @exception standardexception		thrown on error
+*/
+boolean subqueryreferencestarget string name  boolean basetable
+throws standardexception
+if   selectsubquerys    null    selectsubquerys referencestarget name  basetable
+wheresubquerys    null    wheresubquerys referencestarget name  basetable
+return true
+return false
+/**
+* bind any untyped null nodes to the types in the given resultcolumnlist.
+*
+* @param bindingrcl	the resultcolumnlist with the types to bind to.
+*
+* @exception standardexception		thrown on error
+*/
+public void binduntypednullstoresultcolumns resultcolumnlist bindingrcl
+throws standardexception
+fromlist binduntypednullstoresultcolumns bindingrcl
+/**
+* decrement (query block) level (0-based) for
+* all of the tables in this resultset tree.
+* this is useful when flattening a subquery.
+*
+* @param decrement	the amount to decrement by.
+*/
+void decrementlevel int decrement
+/* decrement the level in the tables */
+fromlist decrementlevel decrement
+selectsubquerys decrementlevel decrement
+wheresubquerys decrementlevel decrement
+/* decrement the level in any crs in predicates
+* that are interesting to transitive closure.
+*/
+wherepredicates decrementlevel fromlist  decrement
+/**
+* determine whether or not this subquery,
+* the selectnode is in a subquery, can be flattened
+* into the outer query block based on a uniqueness condition.
+* a uniqueness condition exists when we can guarantee
+* that at most 1 row will qualify in each table in the
+* subquery.  this is true if every table in the from list is
+* (a base table and the set of columns from the table that
+* are in equality comparisons with expressions that do not
+* include a column from the same table is a superset of any unique index
+* on the table) or an existsbasetable.
+*
+* @param additionaleq	whether or not the column returned
+*						by this select, if it is a columnreference,
+*						is in an equality comparison.
+*
+* @return	whether or not this subquery can be flattened based
+*			on a uniqueness condition.
+*
+* @exception standardexception		thrown on error
+*/
+boolean uniquesubquery boolean additionaleq
+throws standardexception
+columnreference additionalcr   null
+resultcolumn	rc    resultcolumn  getresultcolumns   elementat 0
+/* figure out if we have an additional columnreference
+* in an equality comparison.
+*/
+if  additionaleq
+rc getexpression   instanceof columnreference
+additionalcr    columnreference  rc getexpression
+/* columnreference only interesting if it is
+* not correlated.
+*/
+if  additionalcr getcorrelated
+additionalcr   null
+return fromlist returnsatmostsinglerow  additionalcr    null  ? null   getresultcolumns
+whereclause  wherepredicates
+getdatadictionary
+/**
+* get the lock mode for the target of an update statement
+* (a delete or update).  the update mode will always be row for
+* currentofnodes.  it will be table if there is no where clause.
+*
+* @see transactioncontroller
+*
+* @return	the lock mode
+*/
+public int updatetargetlockmode
+/* do row locking if there is a restriction */
+return fromlist updatetargetlockmode
+/**
+* return whether or not this resultset tree is guaranteed to return
+* at most 1 row based on heuristics.  (a rowresultsetnode and a
+* select with a non-grouped aggregate will return at most 1 row.)
+*
+* @return whether or not this resultset tree is guaranteed to return
+* at most 1 row based on heuristics.
+*/
+boolean returnsatmostonerow
+return  groupbylist    null    selectaggregates    null    selectaggregates size      0
+/**
+* return true if the node references session schema tables (temporary or permanent)
+*
+* @return	true if references session schema tables, else false
+*
+* @exception standardexception		thrown on error
+*/
+public boolean referencessessionschema
+throws standardexception
+if  fromlist referencessessionschema
+selectsubquerys    null    selectsubquerys referencessessionschema
+wheresubquerys    null    wheresubquerys referencessessionschema
+return true
+return false
+/**
+* accept a visitor, and call v.visit()
+* on child nodes as necessary.
+*
+* @param v the visitor
+*
+* @exception standardexception on error
+*/
+public visitable accept visitor v
+throws standardexception
+visitable returnnode   v visit this
+if  v skipchildren this
+return returnnode
+if   v stoptraversal
+super accept v
+if  fromlist    null     v stoptraversal
+fromlist    fromlist fromlist accept v
+if  whereclause    null     v stoptraversal
+whereclause    valuenode whereclause accept v
+if  wherepredicates    null     v stoptraversal
+wherepredicates    predicatelist wherepredicates accept v
+if  havingclause    null     v stoptraversal
+havingclause    valuenode havingclause accept v
+return returnnode
+/**
+* @return true if there are aggregates in the select list.
+*/
+public boolean hasaggregatesinselectlist
+return  selectaggregates isempty

@@ -1,0 +1,203 @@
+/**
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver wal
+import java io ioexception
+import java util arraylist
+import java util hashmap
+import java util list
+import java util map
+import java util concurrent atomic atomiclong
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop hbase tablename
+import org apache hadoop hbase donotretryioexception
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase hregionlocation
+import org apache hadoop hbase client action
+import org apache hadoop hbase client hconnection
+import org apache hadoop hbase client regionservercallable
+import org apache hadoop hbase client row
+import org apache hadoop hbase client rpcretryingcaller
+import org apache hadoop hbase client rpcretryingcallerfactory
+import org apache hadoop hbase protobuf protobufutil
+import org apache hadoop hbase protobuf requestconverter
+import org apache hadoop hbase protobuf generated adminprotos adminservice
+import org apache hadoop hbase protobuf generated clientprotos actionresult
+import org apache hadoop hbase protobuf generated clientprotos multirequest
+import org apache hadoop hbase protobuf generated clientprotos multiresponse
+import org apache hadoop hbase regionserver nosuchcolumnfamilyexception
+import org apache hadoop hbase util environmentedgemanager
+import org apache hadoop hbase util pair
+import com google protobuf serviceexception
+/**
+* this class is responsible for replaying the edits coming from a failed region server.
+* <p/>
+* this class uses the native hbase client in order to replay wal entries.
+* <p/>
+*/
+@interfaceaudience private
+public class waleditsreplaysink
+private static final log log   logfactory getlog waleditsreplaysink class
+private static final int max_batch_size   3000
+private final configuration conf
+private final hconnection conn
+private final tablename tablename
+private final metricswaleditsreplay metrics
+private final atomiclong totalreplayededits   new atomiclong
+private final boolean skiperrors
+private final int replaytimeout
+/**
+* create a sink for wal log entries replay
+* @param conf
+* @param tablename
+* @param conn
+* @throws ioexception
+*/
+public waleditsreplaysink configuration conf  tablename tablename  hconnection conn
+throws ioexception
+this conf   conf
+this metrics   new metricswaleditsreplay
+this conn   conn
+this tablename   tablename
+this skiperrors   conf getboolean hconstants hregion_edits_replay_skip_errors
+hconstants default_hregion_edits_replay_skip_errors
+// a single replay operation time out and default is 60 seconds
+this replaytimeout   conf getint    60000
+/**
+* replay an array of actions of the same region directly into the newly assigned region server
+* @param actions
+* @throws ioexception
+*/
+public void replayentries list<pair<hregionlocation  row>> actions  throws ioexception
+if  actions size      0
+return
+int batchsize   actions size
+int datasize   0
+map<hregioninfo  list<action<row>>> actionsbyregion
+new hashmap<hregioninfo  list<action<row>>>
+hregionlocation loc   null
+row row   null
+list<action<row>> regionactions   null
+// build the action list.
+for  int i   0  i < batchsize  i
+loc   actions get i  getfirst
+row   actions get i  getsecond
+if  actionsbyregion containskey loc getregioninfo
+regionactions   actionsbyregion get loc getregioninfo
+else
+regionactions   new arraylist<action<row>>
+actionsbyregion put loc getregioninfo    regionactions
+action<row> action   new action<row> row  i
+regionactions add action
+datasize    row getrow   length
+long starttime   environmentedgemanager currenttimemillis
+// replaying edits by region
+for  hregioninfo curregion   actionsbyregion keyset
+list<action<row>> allactions   actionsbyregion get curregion
+// send edits in chunks
+int totalactions   allactions size
+int replayedactions   0
+int curbatchsize   0
+for    replayedactions < totalactions
+curbatchsize    totalactions >  max_batch_size   replayedactions   ? max_batch_size
+totalactions   replayedactions
+replayedits loc  curregion  allactions sublist replayedactions
+replayedactions   curbatchsize
+replayedactions    curbatchsize
+long endtime   environmentedgemanager currenttimemillis     starttime
+log debug     actions size         endtime
+metrics updatereplaytime endtime
+metrics updatereplaybatchsize batchsize
+metrics updatereplaydatasize datasize
+this totalreplayededits addandget batchsize
+/**
+* get a string representation of this sink's metrics
+* @return string with the total replayed edits count
+*/
+public string getstats
+return this totalreplayededits get      0 ?
+this totalreplayededits
+private void replayedits final hregionlocation regionloc  final hregioninfo regioninfo
+final list<action<row>> actions  throws ioexception
+try
+rpcretryingcallerfactory factory   rpcretryingcallerfactory instantiate conf
+replayservercallable<multiresponse> callable   new replayservercallable<multiresponse>
+this conn  this tablename  regionloc  regioninfo  actions
+factory <multiresponse> newcaller   callwithretries callable  this replaytimeout
+catch  ioexception ie
+if  skiperrors
+log warn hconstants hregion_edits_replay_skip_errors
+ie getmessage
+else
+throw ie
+/**
+* callable that handles the <code>replay</code> method call going against a single regionserver
+* @param <r>
+*/
+class replayservercallable<r> extends regionservercallable<multiresponse>
+private hregioninfo regioninfo
+private list<action<row>> actions
+replayservercallable final hconnection connection  final tablename tablename
+final hregionlocation regionloc  final hregioninfo regioninfo
+final list<action<row>> actions
+super connection  tablename  null
+this actions   actions
+this regioninfo   regioninfo
+setlocation regionloc
+@override
+public multiresponse call   throws ioexception
+try
+replaytoserver this regioninfo  this actions
+catch  serviceexception se
+throw protobufutil getremoteexception se
+return null
+private void replaytoserver hregioninfo regioninfo  list<action<row>> actions
+throws ioexception  serviceexception
+adminservice blockinginterface remotesvr   conn getadmin getlocation   getservername
+multirequest request   requestconverter buildmultirequest regioninfo getregionname
+actions
+multiresponse protoresults   remotesvr replay null  request
+// check if it's a partial success
+list<actionresult> resultlist   protoresults getresultlist
+for  int i   0  n   resultlist size    i < n  i
+actionresult result   resultlist get i
+if  result hasexception
+throwable t   protobufutil toexception result getexception
+if   skiperrors
+ioexception ie   new ioexception
+ie initcause t
+// retry
+throw ie
+else
+log warn hconstants hregion_edits_replay_skip_errors
+t getmessage
+return
+@override
+public void prepare boolean reload  throws ioexception
+if   reload  return
+// relocate regions in case we have a new dead server or network hiccup
+// if not due to connection issue, the following code should run fast because it uses
+// cached location
+for  action<row> action   actions
+// use first row to relocate region because all actions are for one region
+setlocation conn locateregion tablename  action getaction   getrow
+break

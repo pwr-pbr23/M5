@@ -1,0 +1,734 @@
+/**
+* copyright 2004-2005 the apache software foundation.
+*
+* licensed under the apache license, version 2.0 (the "license");
+* you may not use this file except in compliance with the license.
+* you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache lucene search similar
+import org apache lucene util priorityqueue
+import org apache lucene index indexreader
+import org apache lucene index term
+import org apache lucene index termfreqvector
+import org apache lucene search booleanclause
+import org apache lucene search defaultsimilarity
+import org apache lucene search similarity
+import org apache lucene search termquery
+import org apache lucene search booleanquery
+import org apache lucene search indexsearcher
+import org apache lucene search query
+import org apache lucene search hits
+import org apache lucene analysis analyzer
+import org apache lucene analysis tokenstream
+import org apache lucene analysis standard standardanalyzer
+import org apache lucene document document
+import java util set
+import java util hashmap
+import java util map
+import java util collection
+import java util iterator
+import java io ioexception
+import java io reader
+import java io file
+import java io printstream
+import java io stringreader
+import java io filereader
+import java io inputstreamreader
+import java net url
+import java util arraylist
+/**
+* generate "more like this" similarity queries.
+* based on this mail:
+* <code><pre>
+* lucene does let you access the document frequency of terms, with indexreader.docfreq().
+* term frequencies can be computed by re-tokenizing the text, which, for a single document,
+* is usually fast enough.  but looking up the docfreq() of every term in the document is
+* probably too slow.
+*
+* you can use some heuristics to prune the set of terms, to avoid calling docfreq() too much,
+* or at all.  since you're trying to maximize a tf*idf score, you're probably most interested
+* in terms with a high tf. choosing a tf threshold even as low as two or three will radically
+* reduce the number of terms under consideration.  another heuristic is that terms with a
+* high idf (i.e., a low df) tend to be longer.  so you could threshold the terms by the
+* number of characters, not selecting anything less than, e.g., six or seven characters.
+* with these sorts of heuristics you can usually find small set of, e.g., ten or fewer terms
+* that do a pretty good job of characterizing a document.
+*
+* it all depends on what you're trying to do.  if you're trying to eek out that last percent
+* of precision and recall regardless of computational difficulty so that you can win a trec
+* competition, then the techniques i mention above are useless.  but if you're trying to
+* provide a "more like this" button on a search results page that does a decent job and has
+* good performance, such techniques might be useful.
+*
+* an efficient, effective "more-like-this" query generator would be a great contribution, if
+* anyone's interested.  i'd imagine that it would take a reader or a string (the document's
+* text), analyzer analyzer, and return a set of representative terms using heuristics like those
+* above.  the frequency and length thresholds could be parameters, etc.
+*
+* doug
+* </pre></code>
+*
+*
+* <p>
+* <h3>initial usage</h3>
+*
+* this class has lots of options to try to make it efficient and flexible.
+* see the body of {@link #main main()} below in the source for real code, or
+* if you want pseudo code, the simpliest possible usage is as follows. the bold
+* fragment is specific to this class.
+*
+* <code><pre>
+*
+* indexreader ir = ...
+* indexsearcher is = ...
+* <b>
+* morelikethis mlt = new morelikethis(ir);
+* reader target = ... </b><em>// orig source of doc you want to find similarities to</em><b>
+* query query = mlt.like( target);
+* </b>
+* hits hits = is.search(query);
+* <em>// now the usual iteration thru 'hits' - the only thing to watch for is to make sure
+* you ignore the doc if it matches your 'target' document, as it should be similar to itself </em>
+*
+* </pre></code>
+*
+* thus you:
+* <ol>
+* <li> do your normal, lucene setup for searching,
+* <li> create a morelikethis,
+* <li> get the text of the doc you want to find similaries to
+* <li> then call one of the like() calls to generate a similarity query
+* <li> call the searcher to find the similar docs
+* </ol>
+*
+* <h3>more advanced usage</h3>
+*
+* you may want to use {@link #setfieldnames setfieldnames(...)} so you can examine
+* multiple fields (e.g. body and title) for similarity.
+* <p>
+*
+* depending on the size of your index and the size and makeup of your documents you
+* may want to call the other set methods to control how the similarity queries are
+* generated:
+* <ul>
+* <li> {@link #setmintermfreq setmintermfreq(...)}
+* <li> {@link #setmindocfreq setmindocfreq(...)}
+* <li> {@link #setminwordlen setminwordlen(...)}
+* <li> {@link #setmaxwordlen setmaxwordlen(...)}
+* <li> {@link #setmaxqueryterms setmaxqueryterms(...)}
+* <li> {@link #setmaxnumtokensparsed setmaxnumtokensparsed(...)}
+* <li> {@link #setstopwords setstopword(...)}
+* </ul>
+*
+* <hr>
+* <pre>
+* changes: mark harwood 29/02/04
+* some bugfixing, some refactoring, some optimisation.
+*  - bugfix: retrieveterms(int docnum) was not working for indexes without a termvector -added missing code
+*  - bugfix: no significant terms being created for fields with a termvector - because
+*            was only counting one occurence per term/field pair in calculations(ie not including frequency info from termvector)
+*  - refactor: moved common code into isnoiseword()
+*  - optimise: when no termvector support available - used maxnumtermsparsed to limit amount of tokenization
+* </pre>
+*
+* @author david spencer
+* @author bruce ritchie
+* @author mark harwood
+*/
+public final class morelikethis
+/**
+* default maximum number of tokens to parse in each example doc field that is not stored with termvector support.
+* @see #getmaxnumtokensparsed
+*/
+public static final int default_max_num_tokens_parsed 5000
+/**
+* default analyzer to parse source doc with.
+* @see #getanalyzer
+*/
+public static final analyzer default_analyzer   new standardanalyzer
+/**
+* ignore terms with less than this frequency in the source doc.
+* @see #getmintermfreq
+* @see #setmintermfreq
+*/
+public static final int default_min_term_freq   2
+/**
+* ignore words which do not occur in at least this many docs.
+* @see #getmindocfreq
+* @see #setmindocfreq
+*/
+public static final int default_min_doc_freq   5
+/**
+* boost terms in query based on score.
+* @see #isboost
+* @see #setboost
+*/
+public static final boolean default_boost   false
+/**
+* default field names. null is used to specify that the field names should be looked
+* up at runtime from the provided reader.
+*/
+public static final string default_field_names   new string
+/**
+* ignore words less than this length or if 0 then this has no effect.
+* @see #getminwordlen
+* @see #setminwordlen
+*/
+public static final int default_min_word_length   0
+/**
+* ignore words greater than this length or if 0 then this has no effect.
+* @see #getmaxwordlen
+* @see #setmaxwordlen
+*/
+public static final int default_max_word_length   0
+/**
+* default set of stopwords.
+* if null means to allow stop words.
+*
+* @see #setstopwords
+* @see #getstopwords
+*/
+public static final set default_stop_words   null
+/**
+* current set of stop words.
+*/
+private set stopwords   default_stop_words
+/**
+* return a query with no more than this many terms.
+*
+* @see booleanquery#getmaxclausecount
+* @see #getmaxqueryterms
+* @see #setmaxqueryterms
+*/
+public static final int default_max_query_terms   25
+/**
+* analyzer that will be used to parse the doc.
+*/
+private analyzer analyzer   default_analyzer
+/**
+* ignore words less freqent that this.
+*/
+private int mintermfreq   default_min_term_freq
+/**
+* ignore words which do not occur in at least this many docs.
+*/
+private int mindocfreq   default_min_doc_freq
+/**
+* should we apply a boost to the query based on the scores?
+*/
+private boolean boost   default_boost
+/**
+* field name we'll analyze.
+*/
+private string fieldnames   default_field_names
+/**
+* the maximum number of tokens to parse in each example doc field that is not stored with termvector support
+*/
+private int maxnumtokensparsed default_max_num_tokens_parsed
+/**
+* ignore words if less than this len.
+*/
+private int minwordlen   default_min_word_length
+/**
+* ignore words if greater than this len.
+*/
+private int maxwordlen   default_max_word_length
+/**
+* don't return a query longer than this.
+*/
+private int maxqueryterms   default_max_query_terms
+/**
+* for idf() calculations.
+*/
+private similarity similarity   new defaultsimilarity
+/**
+* indexreader to use
+*/
+private final indexreader ir
+/**
+* constructor requiring an indexreader.
+*/
+public morelikethis indexreader ir
+this ir   ir
+/**
+* returns an analyzer that will be used to parse source doc with. the default analyzer
+* is the {@link #default_analyzer}.
+*
+* @return the analyzer that will be used to parse source doc with.
+* @see #default_analyzer
+*/
+public analyzer getanalyzer
+return analyzer
+/**
+* sets the analyzer to use. an analyzer is not required for generating a query with the
+* {@link #like(int)} method, all other 'like' methods require an analyzer.
+*
+* @param analyzer the analyzer to use to tokenize text.
+*/
+public void setanalyzer analyzer analyzer
+this analyzer   analyzer
+/**
+* returns the frequency below which terms will be ignored in the source doc. the default
+* frequency is the {@link #default_min_term_freq}.
+*
+* @return the frequency below which terms will be ignored in the source doc.
+*/
+public int getmintermfreq
+return mintermfreq
+/**
+* sets the frequency below which terms will be ignored in the source doc.
+*
+* @param mintermfreq the frequency below which terms will be ignored in the source doc.
+*/
+public void setmintermfreq int mintermfreq
+this mintermfreq   mintermfreq
+/**
+* returns the frequency at which words will be ignored which do not occur in at least this
+* many docs. the default frequency is {@link #default_min_doc_freq}.
+*
+* @return the frequency at which words will be ignored which do not occur in at least this
+* many docs.
+*/
+public int getmindocfreq
+return mindocfreq
+/**
+* sets the frequency at which words will be ignored which do not occur in at least this
+* many docs.
+*
+* @param mindocfreq the frequency at which words will be ignored which do not occur in at
+* least this many docs.
+*/
+public void setmindocfreq int mindocfreq
+this mindocfreq   mindocfreq
+/**
+* returns whether to boost terms in query based on "score" or not. the default is
+* {@link #default_boost}.
+*
+* @return whether to boost terms in query based on "score" or not.
+* @see #setboost
+*/
+public boolean isboost
+return boost
+/**
+* sets whether to boost terms in query based on "score" or not.
+*
+* @param boost true to boost terms in query based on "score", false otherwise.
+* @see #isboost
+*/
+public void setboost boolean boost
+this boost   boost
+/**
+* returns the field names that will be used when generating the 'more like this' query.
+* the default field names that will be used is {@link #default_field_names}.
+*
+* @return the field names that will be used when generating the 'more like this' query.
+*/
+public string getfieldnames
+return fieldnames
+/**
+* sets the field names that will be used when generating the 'more like this' query.
+* set this to null for the field names to be determined at runtime from the indexreader
+* provided in the constructor.
+*
+* @param fieldnames the field names that will be used when generating the 'more like this'
+* query.
+*/
+public void setfieldnames string fieldnames
+this fieldnames   fieldnames
+/**
+* returns the minimum word length below which words will be ignored. set this to 0 for no
+* minimum word length. the default is {@link #default_min_word_length}.
+*
+* @return the minimum word length below which words will be ignored.
+*/
+public int getminwordlen
+return minwordlen
+/**
+* sets the minimum word length below which words will be ignored.
+*
+* @param minwordlen the minimum word length below which words will be ignored.
+*/
+public void setminwordlen int minwordlen
+this minwordlen   minwordlen
+/**
+* returns the maximum word length above which words will be ignored. set this to 0 for no
+* maximum word length. the default is {@link #default_max_word_length}.
+*
+* @return the maximum word length above which words will be ignored.
+*/
+public int getmaxwordlen
+return maxwordlen
+/**
+* sets the maximum word length above which words will be ignored.
+*
+* @param maxwordlen the maximum word length above which words will be ignored.
+*/
+public void setmaxwordlen int maxwordlen
+this maxwordlen   maxwordlen
+/**
+* set the set of stopwords.
+* any word in this set is considered "uninteresting" and ignored.
+* even if your analyzer allows stopwords, you might want to tell the morelikethis code to ignore them, as
+* for the purposes of document similarity it seems reasonable to assume that "a stop word is never interesting".
+*
+* @param stopwords set of stopwords, if null it means to allow stop words
+*
+* @see org.apache.lucene.analysis.stopfilter#makestopset stopfilter.makestopset()
+* @see #getstopwords
+*/
+public void setstopwords set stopwords
+this stopwords   stopwords
+/**
+* get the current stop words being used.
+* @see #setstopwords
+*/
+public set getstopwords
+return stopwords
+/**
+* returns the maximum number of query terms that will be included in any generated query.
+* the default is {@link #default_max_query_terms}.
+*
+* @return the maximum number of query terms that will be included in any generated query.
+*/
+public int getmaxqueryterms
+return maxqueryterms
+/**
+* sets the maximum number of query terms that will be included in any generated query.
+*
+* @param maxqueryterms the maximum number of query terms that will be included in any
+* generated query.
+*/
+public void setmaxqueryterms int maxqueryterms
+this maxqueryterms   maxqueryterms
+/**
+* @return the maximum number of tokens to parse in each example doc field that is not stored with termvector support
+* @see #default_max_num_tokens_parsed
+*/
+public int getmaxnumtokensparsed
+return maxnumtokensparsed
+/**
+* @param i the maximum number of tokens to parse in each example doc field that is not stored with termvector support
+*/
+public void setmaxnumtokensparsed int i
+maxnumtokensparsed   i
+/**
+* return a query that will return docs like the passed lucene document id.
+*
+* @param docnum the documentid of the lucene doc to generate the 'more like this" query for.
+* @return a query that will return docs like the passed lucene document id.
+*/
+public query like int docnum  throws ioexception
+if  fieldnames    null
+// gather list of valid fields from lucene
+collection fields   ir getfieldnames  indexreader fieldoption indexed
+fieldnames    string  fields toarray new string
+return createquery retrieveterms docnum
+/**
+* return a query that will return docs like the passed file.
+*
+* @return a query that will return docs like the passed file.
+*/
+public query like file f  throws ioexception
+if  fieldnames    null
+// gather list of valid fields from lucene
+collection fields   ir getfieldnames  indexreader fieldoption indexed
+fieldnames    string  fields toarray new string
+return like new filereader f
+/**
+* return a query that will return docs like the passed url.
+*
+* @return a query that will return docs like the passed url.
+*/
+public query like url u  throws ioexception
+return like new inputstreamreader u openconnection   getinputstream
+/**
+* return a query that will return docs like the passed stream.
+*
+* @return a query that will return docs like the passed stream.
+*/
+public query like java io inputstream is  throws ioexception
+return like new inputstreamreader is
+/**
+* return a query that will return docs like the passed reader.
+*
+* @return a query that will return docs like the passed reader.
+*/
+public query like reader r  throws ioexception
+return createquery retrieveterms r
+/**
+* create the more like query from a priorityqueue
+*/
+private query createquery priorityqueue q
+booleanquery query   new booleanquery
+object cur
+int qterms   0
+float bestscore   0
+while    cur   q pop       null
+object ar    object  cur
+termquery tq   new termquery new term  string  ar   string  ar
+if  boost
+if  qterms    0
+bestscore     float  ar  floatvalue
+float myscore     float  ar  floatvalue
+tq setboost myscore   bestscore
+try
+query add tq  booleanclause occur should
+catch  booleanquery toomanyclauses ignore
+break
+qterms
+if  maxqueryterms > 0    qterms >  maxqueryterms
+break
+return query
+/**
+* create a priorityqueue from a word->tf map.
+*
+* @param words a map of words keyed on the word(string) with int objects as the values.
+*/
+private priorityqueue createqueue map words  throws ioexception
+// have collected all words in doc and their freqs
+int numdocs   ir numdocs
+freqq res   new freqq words size        will order words by score
+iterator it   words keyset   iterator
+while  it hasnext         for every word
+string word    string  it next
+int tf     int  words get word   x     term freq in the source doc
+if  mintermfreq > 0    tf < mintermfreq
+continue     filter out words that don't occur enough times in the source
+// go through all the fields and find the largest document frequency
+string topfield   fieldnames
+int docfreq   0
+for  int i   0  i < fieldnames length  i
+int freq   ir docfreq new term fieldnames  word
+topfield    freq > docfreq  ? fieldnames   topfield
+docfreq    freq > docfreq  ? freq   docfreq
+if  mindocfreq > 0    docfreq < mindocfreq
+continue     filter out words that don't occur in enough docs
+if  docfreq    0
+continue     index update problem?
+float idf   similarity idf docfreq  numdocs
+float score   tf   idf
+// only really need 1st 3 entries, other ones are for troubleshooting
+res insert new object word                       the word
+topfield                   the top field
+new float score            overall score
+new float idf              idf
+new integer docfreq        freq in all docs
+new integer tf
+return res
+/**
+* describe the parameters that control how the "more like this" query is formed.
+*/
+public string describeparams
+stringbuffer sb   new stringbuffer
+sb append         maxqueryterms
+sb append         minwordlen
+sb append         maxwordlen
+sb append
+string delim
+for  int i   0  i < fieldnames length  i
+string fieldname   fieldnames
+sb append delim  append fieldname
+delim
+sb append
+sb append         boost
+sb append         mintermfreq
+sb append         mindocfreq
+return sb tostring
+/**
+* test driver.
+* pass in "-i index" and then either "-fn file" or "-url url".
+*/
+public static void main string a  throws throwable
+string indexname
+string fn
+url url   null
+for  int i   0  i < a length  i
+if  a equals
+indexname   a
+else if  a equals
+fn   a
+else if  a equals
+url   new url a
+printstream o   system out
+indexreader r   indexreader open indexname
+o println     indexname       r numdocs
+morelikethis mlt   new morelikethis r
+o println
+o println mlt describeparams
+o println
+query query   null
+if  url    null
+o println     url
+query   mlt like url
+else if  fn    null
+o println     fn
+query   mlt like new file fn
+o println     query
+o println
+indexsearcher searcher   new indexsearcher indexname
+hits hits   searcher search query
+int len   hits length
+o println     len
+o println
+for  int i   0  i < math min 25  len   i
+document d   hits doc i
+string summary   d get
+o println     hits score i
+o println     d get
+o println     d get
+if   summary    null
+o println     d get
+o println
+/**
+* find words for a more-like-this query former.
+*
+* @param docnum the id of the lucene document from which to find terms
+*/
+private priorityqueue retrieveterms int docnum  throws ioexception
+map termfreqmap   new hashmap
+for  int i   0  i < fieldnames length  i
+string fieldname   fieldnames
+termfreqvector vector   ir gettermfreqvector docnum  fieldname
+// field does not store term vector info
+if  vector    null
+document d ir document docnum
+string text d getvalues fieldname
+if text  null
+for  int j   0  j < text length  j
+addtermfrequencies new stringreader text   termfreqmap  fieldname
+else
+addtermfrequencies termfreqmap  vector
+return createqueue termfreqmap
+/**
+* adds terms and frequencies found in vector into the map termfreqmap
+* @param termfreqmap a map of terms and their frequencies
+* @param vector list of terms and their frequencies for a doc/field
+*/
+private void addtermfrequencies map termfreqmap  termfreqvector vector
+string terms   vector getterms
+int freqs vector gettermfrequencies
+for  int j   0  j < terms length  j
+string term   terms
+if isnoiseword term
+continue
+// increment frequency
+int cnt    int  termfreqmap get term
+if  cnt    null
+cnt new int
+termfreqmap put term  cnt
+cnt x freqs
+else
+cnt x  freqs
+/**
+* adds term frequencies found by tokenizing text from reader into the map words
+* @param r a source of text to be tokenized
+* @param termfreqmap a map of terms and their frequencies
+* @param fieldname used by analyzer for any special per-field analysis
+*/
+private void addtermfrequencies reader r  map termfreqmap  string fieldname
+throws ioexception
+tokenstream ts   analyzer tokenstream fieldname  r
+org apache lucene analysis token token
+int tokencount 0
+while   token   ts next       null       for every token
+string word   token termtext
+tokencount
+if tokencount>maxnumtokensparsed
+break
+if isnoiseword word
+continue
+// increment frequency
+int cnt    int  termfreqmap get word
+if  cnt    null
+termfreqmap put word  new int
+else
+cnt x
+/** determines if the passed term is likely to be of interest in "more like" comparisons
+*
+* @param term the word being considered
+* @return true if should be ignored, false if should be used in further analysis
+*/
+private boolean isnoiseword string term
+int len   term length
+if  minwordlen > 0    len < minwordlen
+return true
+if  maxwordlen > 0    len > maxwordlen
+return true
+if  stopwords    null    stopwords contains  term
+return true
+return false
+/**
+* find words for a more-like-this query former.
+* the result is a priority queue of arrays with one entry for <b>every word</b> in the document.
+* each array has 6 elements.
+* the elements are:
+* <ol>
+* <li> the word (string)
+* <li> the top field that this word comes from (string)
+* <li> the score for this word (float)
+* <li> the idf value (float)
+* <li> the frequency of this word in the index (integer)
+* <li> the frequency of this word in the source document (integer)
+* </ol>
+* this is a somewhat "advanced" routine, and in general only the 1st entry in the array is of interest.
+* this method is exposed so that you can identify the "interesting words" in a document.
+* for an easier method to call see {@link #retrieveinterestingterms retrieveinterestingterms()}.
+*
+* @param r the reader that has the content of the document
+* @return the most intresting words in the document ordered by score, with the highest scoring, or best entry, first
+*
+* @see #retrieveinterestingterms
+*/
+public priorityqueue retrieveterms reader r  throws ioexception
+map words   new hashmap
+for  int i   0  i < fieldnames length  i
+string fieldname   fieldnames
+addtermfrequencies r  words  fieldname
+return createqueue words
+/**
+* convenience routine to make it easy to return the most interesting words in a document.
+* more advanced users will call {@link #retrieveterms(java.io.reader) retrieveterms()} directly.
+* @param r the source document
+* @return the most interesting words in the document
+*
+* @see #retrieveterms(java.io.reader)
+* @see #setmaxqueryterms
+*/
+public string retrieveinterestingterms  reader r  throws ioexception
+arraylist al   new arraylist  maxqueryterms
+priorityqueue pq   retrieveterms  r
+object cur
+int lim   maxqueryterms     have to be careful  retrieveterms returns all words but that's probably not useful to our caller
+// we just want to return the top words
+while    cur   pq pop       null     lim   > 0
+object ar    object  cur
+al add  ar      the 1st entry is the interesting word
+string res   new string
+return  string  al toarray  res
+/**
+* priorityqueue that orders words by score.
+*/
+private static class freqq extends priorityqueue
+freqq  int s
+initialize s
+protected boolean lessthan object a  object b
+object aa    object  a
+object bb    object  b
+float fa    float  aa
+float fb    float  bb
+return fa floatvalue   > fb floatvalue
+/**
+* use for frequencies and to avoid renewing integers.
+*/
+private static class int
+int x
+int
+x   1

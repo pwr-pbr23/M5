@@ -1,0 +1,2209 @@
+/*
+derby - class org.apache.derby.impl.store.raw.data.basepage
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store raw data
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services io formatablebitset
+import org apache derby iapi services io dynamicbytearrayoutputstream
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services io limitobjectinput
+import org apache derby iapi services io typedformat
+import org apache derby iapi error standardexception
+import org apache derby iapi store raw auxobject
+import org apache derby iapi store raw containerhandle
+import org apache derby iapi store raw containerkey
+import org apache derby iapi store raw fetchdescriptor
+import org apache derby iapi store raw page
+import org apache derby iapi store raw pagekey
+import org apache derby iapi store raw recordhandle
+import org apache derby iapi store raw xact rawtransaction
+import org apache derby iapi store raw log loginstant
+import org apache derby iapi store access conglomerate logicalundo
+import java io ioexception
+import java io outputstream
+import java io objectinput
+import java util observer
+import java util observable
+/**
+this class implements all the the generic locking behaviour for a page.
+it leaves method used to log and store the records up to sub-classes.
+it is intended that the object can represent multiple pages from different
+containers during its lifetime.
+<p>
+a page contains a set of records, which can be accessed by "slot",
+which defines the order of the records on the page, or by "id" which
+defines the identity of the records on the page.  clients access
+records by both slot and id, depending on their needs.
+<p>
+basepage implements observer to watch the containerhandle which notifies
+its observers when it is closing.
+<br>
+mt - mutable
+**/
+abstract class basepage implements page  observer  typedformat
+{
+/**
+auxiliary object
+mt - mutable - content dynamic : single thread required. this reference is
+set while the page is latched and returned to callers of page while the page is latched.
+for correct mt behaviour it is assumed that the caller discards any reference to an
+auxiliary object once the page is unlatched. the reference mya be cleared while
+the page is latched, or while the page is being cleaned from the cache. in the latter
+case the cache manager ensures that only a single thread can access this object.
+*/
+private auxobject auxobj
+/**
+this page's identity
+<br>
+mt - immutable - content dynamic : single thread required
+*/
+protected pagekey identity
+/**
+in-memory slot table, array of storedrecordheaders.
+<br>
+mt - immutable - content dynamic : single thread required.
+*/
+private storedrecordheader	headers 		   in memory slot table
+private int   recordcount
+/**
+page owner during exclusive access.
+mt - mutable : single thread required, provided by lockable single thread required.
+*/
+protected basecontainerhandle	owner
+/**
+count of times a latch is held nested during an abort
+*/
+private int nestedlatch
+protected boolean		inclean 	   is the page being cleaned
+/**
+* used to determine latch state of a page.
+*
+* mt - mutable
+*
+* there are 3 latch states for a page:
+*
+* unlatched - (owner == null)
+* prelatch  - (owner != null) && prelatch
+* latched   - (owner != null) && !prelatch
+*
+* a page may be "cleaned" while it is either unlatched, or prelatch, but
+* it must wait for it to be not latched.
+*
+* a page may move from unlatched to prelatch, while being cleaned.
+* a page must wait for !inclean before it can move from prelatch to
+* latched.
+**/
+protected boolean		prelatch
+/**
+instant of last log record that updated this page.
+<br> mt - mutable : latched
+*/
+private loginstant lastlog
+/**
+* the oldest version where we know that any record id that was on the
+* page at that version, must still be on the page. this is used by the
+* b-tree code to decide whether or not it needs to reposition when
+* resuming a scan.
+*/
+private long repositionneededafterversion
+/**
+version of the page.
+<br> mt - mutable : single thread required - the page must be latched to access
+this variable or the page muts be in the noidentiy state.
+*/
+private long	pageversion   0 	   version of the page
+/**
+status of the page
+*/
+private byte	pagestatus
+/**
+values for pagestatus flag
+page goes thru the following transition:
+valid_page <-> deallocated page -> free page <-> valid_page
+deallocated and free page are both invalid_page as far as basepage is concerned.
+when a page is deallocated, it transitioned from valid to invalid.
+when a page is allocated, it trnasitioned from invalid to valid.
+*/
+public static final byte valid_page   1
+public static final byte invalid_page   2
+/**
+init page flag.
+init_page_reuse - set if page is being initialized for reuse
+init_page_overflow - set if page will be an overflow page
+init_page_reuse_recordid - set if page is being reused and its record
+id can be reset to recordhandle.first_record_id, rather
+to 1+ next recordid on the page
+*/
+public static final int init_page_reuse   0x1
+public static final int init_page_overflow   0x2
+public static final int init_page_reuse_recordid   0x4
+/**
+log record flag.  why the before image of this record is being logged
+log_record_for_update - set if the record is being logged for update.
+log_record_default - for non update.
+log_record_for_purge - set if the record is being logged for purges
+and no data required to ve logged.
+the other cases (copy, purge, delete), we don't need to distinguish,
+leave no bit set.
+*/
+public static final int log_record_default   0x0
+public static final int log_record_for_update   0x1
+public static final int log_record_for_purge   0x2
+/**
+** create a new, empty page.
+**/
+protected basepage
+{
+}
+/**
+initialized the basepage.
+<p>
+initialize the object, ie. perform work normally perfomed in
+constructor.  called by setidentity() and createidentity().
+*/
+protected void initialize
+{
+setauxobject null
+identity   null
+recordcount   0
+clearlastloginstant
+repositionneededafterversion   0
+if  sanitymanager debug
+{
+if  nestedlatch    0
+sanitymanager throwassert     nestedlatch
+if  inclean
+sanitymanager throwassert
+if  prelatch
+sanitymanager throwassert
+}
+}
+/**
+must be called by a sub-class before calling setheaderatslot.
+*/
+protected void initializeheaders int numrecords
+{
+if  sanitymanager debug
+{
+if  recordcount    0
+sanitymanager throwassert
+recordcount
+}
+headers   new storedrecordheader
+}
+/*
+** cacheable methods
+*/
+protected void fillinidentity pagekey key
+if  sanitymanager debug
+sanitymanager assert identity    null
+sanitymanager assert repositionneededafterversion    0
+}
+identity   key
+repositionneededafterversion   pageversion
+}
+public void clearidentity
+if  sanitymanager debug
+sanitymanager assert  islatched
+}
+identity   null
+cleanpageforreuse
+}
+/**
+initialized this page for reuse or first use
+*/
+protected void cleanpageforreuse
+{
+setauxobject null
+recordcount   0
+repositionneededafterversion   0
+}
+/**
+ok to hand object outside to cache..
+*/
+public object getidentity
+return identity
+}
+/*
+** methods of page
+*/
+private static final recordhandle invalidrecordhandle
+new recordid
+new pagekey
+new containerkey 0 0   containerhandle invalid_page_number
+recordhandle invalid_record_handle
+public final recordhandle getinvalidrecordhandle
+{
+// a static invalid record handle
+return invalidrecordhandle
+}
+public static final recordhandle makerecordhandle pagekey pkey  int recordhandleconstant
+throws standardexception
+{
+if  recordhandleconstant >  recordhandle first_record_id
+{
+throw standardexception newexception
+sqlstate data_cannot_make_record_handle
+new long recordhandleconstant
+}
+return new recordid pkey  recordhandleconstant
+}
+public final recordhandle makerecordhandle int recordhandleconstant
+throws standardexception
+{
+return makerecordhandle getpageid    recordhandleconstant
+}
+/** @see page#getpagenumber */
+public final long getpagenumber
+if  sanitymanager debug
+sanitymanager assert islatched
+sanitymanager assert identity    null
+}
+return identity getpagenumber
+}
+public final recordhandle getrecordhandle int recordid
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+int slot   findrecordbyid recordid  first_slot_number
+if  slot < 0
+return null
+return getrecordhandleatslot slot
+}
+public final recordhandle getrecordhandleatslot int slot
+return getheaderatslot slot  gethandle getpageid    slot
+}
+/**
+@see page#recordexists
+@exception standardexception recordhandle is not a valid record handle
+*/
+public final boolean recordexists recordhandle handle  boolean ignoredelete
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+if  handle getid   < recordhandle first_record_id
+{
+throw standardexception newexception
+sqlstate data_invalid_record_handle  handle
+}
+if  handle getpagenumber      getpagenumber
+return false
+int slot   findrecordbyid handle getid    handle getslotnumberhint
+return  slot >  first_slot_number
+ignoredelete     isdeletedatslot slot
+}
+public recordhandle fetchfromslot
+recordhandle            rh
+int                     slot
+object                row
+fetchdescriptor         fetchdesc
+boolean                 ignoredelete
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+if  rh    null
+sanitymanager assert getslotnumber rh     slot
+}
+checkslotonpage slot
+storedrecordheader recordheader   getheaderatslot slot
+if  rh    null
+rh   recordheader gethandle getpageid    slot
+if   ignoredelete    recordheader isdeleted
+return null
+/*
+sanitymanager.debug_print("fetchfromslot", "before.");
+sanitymanager.showtrace(new throwable());
+sanitymanager.debug_print("fetchfromslot", "fetchdesc = " + fetchdesc);
+if (fetchdesc != null)
+{
+sanitymanager.debug_print("fetchfromslot",
+";fetchdesc.getmaxfetchcolumnid() = " +
+fetchdesc.getmaxfetchcolumnid() +
+";fetchdesc.getvalidcolumns() = " +
+fetchdesc.getvalidcolumns() +
+";fetchdesc.getqualifierlist() = " +
+fetchdesc.getqualifierlist()
+);
+}
+*/
+return
+restorerecordfromslot
+slot  row  fetchdesc  rh  recordheader  true  ? rh   null
+}
+/**
+@exception standardexception	standard derby error policy
+@see page#fetchfieldfromslot
+*/
+public final recordhandle fetchfieldfromslot
+int                 slot
+int                 fieldid
+object column
+throws standardexception
+{
+// need to allocate row with fieldid cols because of sparse row change
+// needs to be resolved
+object row   new object
+row   column
+fetchdescriptor fetchdesc
+new fetchdescriptor fieldid   1  fieldid
+return fetchfromslot null  slot  row  fetchdesc  true
+}
+/**
+@exception standardexception record does not exist on this page.
+@see page#getslotnumber
+*/
+public final int getslotnumber recordhandle handle
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+int slot   findrecordbyid handle getid    handle getslotnumberhint
+if  slot < 0
+{
+throw standardexception newexception
+sqlstate rawstore_record_vanished  handle
+}
+return slot
+}
+/**
+@exception standardexception record does not exist on this page.
+@see page#getnextslotnumber
+*/
+public final int getnextslotnumber recordhandle handle
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+int slot   findnextrecordbyid handle getid
+return slot
+}
+/** @see page#insertatslot
+@exception standardexception	standard derby error policy
+*/
+public recordhandle insertatslot
+int                     slot
+object   row
+formatablebitset                 validcolumns
+logicalundo             undo
+byte                    insertflag
+int                     overflowthreshold
+throws standardexception
+{
+if  sanitymanager debug
+if  overflowthreshold    0
+sanitymanager throwassert
+}
+if   insertflag   page insert_default     page insert_default
+return  insertnooverflow slot  row  validcolumns  undo  insertflag  overflowthreshold
+else
+if  sanitymanager debug
+if  undo    null
+sanitymanager throwassert     undo tostring
+}
+return  insertallowoverflow slot
+row  validcolumns  0  insertflag  overflowthreshold   recordhandle  null
+}
+}
+protected recordhandle insertnooverflow
+int                     slot
+object   row
+formatablebitset                 validcolumns
+logicalundo             undo
+byte                    insertflag
+int                     overflowthreshold
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+if   owner updateok
+{
+throw standardexception newexception
+sqlstate data_container_read_only
+}
+if  slot < first_slot_number    slot > recordcount
+{
+throw standardexception newexception
+sqlstate data_slot_not_on_page
+}
+if   allowinsert
+return null
+rawtransaction t   owner gettransaction
+// logical operations not allowed in internal transactions.
+if  undo    null
+t checklogicaloperationok
+}
+int recordid
+recordhandle handle
+do
+// loop until we get a new record id we can get a lock on.
+// if we can't get the lock without waiting then assume the record
+// id is owned by another xact.  the current heap overflow
+// algorithm makes this likely, as it first try's to insert a row
+// telling raw store to fail if it doesn't fit on the page getting
+// a lock on an id that never makes it to disk.   the inserting
+// transaction will hold a lock on this "unused" record id until
+// it commits.  the page can leave the cache at this point, and
+// the inserting transaction has not dirtied the page (it failed
+// after getting the lock but before logging anything), another
+// inserting transaction will then get the same id as the
+// previous inserter - thus the loop on lock waits.
+//
+// the lock we request indicates that this is a lock for insert,
+// which the locking policy may use to perform locking concurrency
+// optimizations.
+recordid   newrecordidandbump
+handle     new recordid getpageid    recordid  slot
+while  owner getlockingpolicy   lockrecordforwrite
+t  handle
+true     lock is for insert
+false    don't wait for grant
+owner getactionset   actioninsert t  this  slot  recordid  row  validcolumns
+undo  insertflag  0  false   1   dynamicbytearrayoutputstream  null   1  overflowthreshold
+// at this point the insert has been logged and made on the physical
+// page the in-memory manipulation of the slot table is also performed
+// by the pageactions object that implements actioninsert.
+return handle
+}
+/** @see page#insert
+@exception standardexception	standard derby error policy
+*/
+public final recordhandle insert
+object   row
+formatablebitset                 validcolumns
+byte                    insertflag
+int                     overflowthreshold
+throws standardexception
+{
+if  sanitymanager debug
+if  overflowthreshold    0
+sanitymanager throwassert
+}
+if    insertflag   page insert_default     page insert_default
+return  insertatslot recordcount  row  validcolumns
+logicalundo  null  insertflag  overflowthreshold
+else
+return  insertallowoverflow recordcount  row  validcolumns  0
+insertflag  overflowthreshold   recordhandle  null
+}
+}
+/**
+insert a row allowing overflow.
+if handle is supplied then the record at that hanlde will be updated
+to indicate it is a partial row and it has an overflow portion.
+@exception standardexception	standard derby error policy
+*/
+public recordhandle insertallowoverflow
+int                     slot
+object   row
+formatablebitset                 validcolumns
+int                     startcolumn
+byte                    insertflag
+int                     overflowthreshold
+recordhandle            nextportionhandle
+throws standardexception
+{
+basepage curpage   this
+if   curpage owner updateok
+{
+throw standardexception newexception
+sqlstate data_container_read_only
+}
+// handle of the first portion of the chain
+recordhandle headhandle   null
+recordhandle handletoupdate   null
+rawtransaction t   curpage owner gettransaction
+for
+if  sanitymanager debug
+sanitymanager assert curpage islatched
+}
+if   curpage allowinsert
+return null
+// 'this' is the head page
+if  curpage    this
+slot   curpage recordcount
+boolean islongcolumns     false
+int     realstartcolumn    1
+int     realspaceonpage    1
+dynamicbytearrayoutputstream logbuffer   null
+// allocate new record id and handle
+int          recordid   curpage newrecordidandbump
+recordhandle handle
+new recordid curpage getpageid    recordid  slot
+if  curpage    this
+// lock the row, if it is the very first portion of the record.
+if  handletoupdate    null
+while   owner getlockingpolicy   lockrecordforwrite
+t  handle
+true     lock is for insert
+false    don't wait for grant
+// loop until we get a new record id we can get a lock
+// on.  if we can't get the lock without waiting then
+// assume the record id is owned by another xact.  the
+// current heap overflow algorithm makes this likely,
+// as it first try's to insert a row telling raw store
+// to fail if it doesn't fit on the page getting a lock
+// on an id that never makes it to disk.   the
+// inserting transaction will hold a lock on this
+// "unused" record id until it commits.  the page can
+// leave the cache at this point, and the inserting
+// transaction has not dirtied the page (it failed
+// after getting the lock but before logging anything),
+// another inserting transaction will then get the
+// same id as the previous inserter - thus the loop on
+// lock waits.
+//
+// the lock we request indicates that this is a lock
+// for insert, which the locking policy may use to
+// perform locking concurrency optimizations.
+// allocate new record id and handle
+recordid   curpage newrecordidandbump
+handle
+new recordid curpage getpageid    recordid  slot
+}
+}
+headhandle   handle
+}
+do
+// do this loop at least once.  if we caught a long column,
+// then, we redo the insert with saved logbuffer.
+try
+startcolumn
+owner getactionset   actioninsert
+t  curpage  slot  recordid
+row  validcolumns   logicalundo  null
+insertflag  startcolumn  false
+realstartcolumn  logbuffer  realspaceonpage
+overflowthreshold
+islongcolumns   false
+catch  longcolumnexception lce
+// we caught a long column exception
+// three things should happen here:
+// 1. insert the long column into overflow pages.
+// 2. append the overflow field header in the main chain.
+// 3. continue the insert in the main data chain.
+logbuffer   new dynamicbytearrayoutputstream lce getlogbuffer
+// step 1: insert the long column ... use the same
+// insertflag as the rest of the row.
+recordhandle longcolumnhandle
+insertlongcolumn curpage  lce  insertflag
+// step 2: append the overflow field header to the log buffer
+int overflowfieldlen   0
+try
+overflowfieldlen
+appendoverflowfieldheader  dynamicbytearrayoutputstream logbuffer  longcolumnhandle
+catch  ioexception ioe
+// yyz: revisit...  ioexception, insert failed...
+return null
+}
+// step 3: continue the insert in the main data chain
+// need to pass the log buffer, and start column to the next insert.
+realstartcolumn   lce getnextcolumn     1
+realspaceonpage   lce getrealspaceonpage     overflowfieldlen
+islongcolumns   true
+}
+while  islongcolumns
+if  handletoupdate    null
+// update the recordheader on the previous page
+updateoverflowdetails handletoupdate  handle
+}
+// all done
+if  startcolumn     1
+if  curpage    this
+curpage unlatch
+if  nextportionhandle    null
+// need to update the overflow details of the last portion
+// to point to the existing portion
+updateoverflowdetails handle  nextportionhandle
+}
+return headhandle
+}
+handletoupdate   handle
+basepage nextpage
+curpage getoverflowpageforinsert
+slot  row  validcolumns startcolumn
+if  curpage    this
+curpage unlatch
+curpage   nextpage
+}
+}
+/**
+when we update a column, it turned into a long column.  need to change
+the update to effectively insert a new long column chain.
+@exception standardexception unexpected exception from the implementation
+*/
+protected recordhandle insertlongcolumn basepage mainchainpage
+longcolumnexception lce  byte insertflag
+throws standardexception
+{
+// object[] row = new object[1];
+// row[0] = (object) lce.getcolumn();
+object row   new object
+row   lce getcolumn
+recordhandle firsthandle   null
+recordhandle handle   null
+recordhandle prevhandle   null
+basepage curpage   mainchainpage
+basepage prevpage   null
+boolean isfirstpage   true
+// when inserting a long column startcolumn is just used
+// as a flag. -1 means the insert is complete, != -1 indicates
+// more inserts are required.
+int startcolumn   0
+rawtransaction t   curpage owner gettransaction
+do
+// in this loop, we do 3 things:
+// 1. get a new overflow page
+// 2. insert portion of a long column
+// 3. update previous handle, release latch on previous page
+if   isfirstpage
+prevpage   curpage
+prevhandle   handle
+}
+// step 1. get a new overflow page
+curpage    basepage  getnewoverflowpage
+if  sanitymanager debug
+sanitymanager assert curpage islatched
+sanitymanager assert curpage allowinsert
+}
+int slot   curpage recordcount
+int recordid   curpage newrecordid
+handle   new recordid curpage getpageid    recordid  slot
+if  isfirstpage
+firsthandle   handle
+// step 2: insert column portion
+startcolumn   owner getactionset   actioninsert t  curpage  slot  recordid
+row   formatablebitset null   logicalundo  null  insertflag
+startcolumn  true   1   dynamicbytearrayoutputstream  null   1  100
+// step 3: if it is not the first page, update previous page,
+// then release latch on prevpage
+if   isfirstpage
+// for the previous page, add an overflow field header,
+// and update the record header to show 2 fields
+prevpage updatefieldoverflowdetails prevhandle  handle
+prevpage unlatch
+prevpage   null
+else
+isfirstpage   false
+while  startcolumn      1
+if  curpage    null
+curpage unlatch
+curpage   null
+}
+return  firsthandle
+}
+/**
+the page or its header is about to be modified.
+loggable actions use this to make sure the page gets cleaned if a
+checkpoint is taken after any log record is sent to the log stream but
+before the page is actually dirtied.
+*/
+public abstract void predirty
+/**
+update the overflow pointer for a long row
+<br> mt - latched - page latch must be held
+@param handle			handle of the record for long row
+@param overflowhandle	the overflow (continuation) pointer for the long row
+@exception standardexception	standard derby error policy
+*/
+public abstract void updateoverflowdetails recordhandle handle  recordhandle overflowhandle
+throws standardexception
+/**
+update the overflow pointer for a long column
+<br> mt - latched - page latch must be held
+@param handle			handle of the record for long row
+@param overflowhandle	the overflow (continuation) pointer for the long row
+@exception standardexception	standard derby error policy
+*/
+public abstract void updatefieldoverflowdetails recordhandle handle  recordhandle overflowhandle
+throws standardexception
+/**
+append an overflow pointer to a partly logged row,
+to point to a long column that just been logged.
+<br> mt - latched - page latch must be held
+@param logbuffer		the buffer that contains the partially logged row.
+@param overflowhandle	the overflow (continuation) pointer
+to the beginning of the long column
+@exception standardexception	standard derby error policy
+*/
+public abstract int appendoverflowfieldheader dynamicbytearrayoutputstream logbuffer  recordhandle overflowhandle
+throws standardexception  ioexception
+public abstract basepage getoverflowpageforinsert
+int        slot
+object   row
+formatablebitset    validcolumns
+int        startcolumn
+throws standardexception
+protected abstract basepage getnewoverflowpage
+throws standardexception
+/** @see page#updateatslot
+@exception standardexception	standard derby error policy
+@exception standardexception	standardexception.newexception(sqlstate.update_deleted_record
+if the record is already deleted
+@exception standardexception	standardexception.newexception(sqlstate.container_read_only
+if the container is read only
+*/
+public final recordhandle updateatslot
+int                     slot
+object   row
+formatablebitset                 validcolumns
+throws	standardexception
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+if   owner updateok
+{
+throw standardexception newexception
+sqlstate data_container_read_only
+}
+if  isdeletedatslot slot
+{
+throw standardexception newexception
+sqlstate data_update_deleted_record
+}
+recordhandle handle   getrecordhandleatslot slot
+rawtransaction t   owner gettransaction
+doupdateatslot t  slot  handle getid    row  validcolumns
+return handle
+}
+public abstract void doupdateatslot
+rawtransaction          t
+int                     slot
+int                     id
+object   row
+formatablebitset                 validcolumns
+throws	standardexception
+/** @see page#updatefieldatslot
+@exception standardexception	standard derby error policy
+@exception standardexception	standardexception.newexception(sqlstate.update_deleted_record
+if the record is already deleted
+@exception standardexception	standardexception.newexception(sqlstate.container_read_only
+if the container is read only
+*/
+public recordhandle updatefieldatslot
+int                 slot
+int                 fieldid
+object newvalue
+logicalundo         undo
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+sanitymanager assert newvalue    null
+}
+if   owner updateok
+{
+throw standardexception newexception
+sqlstate data_container_read_only
+}
+if  isdeletedatslot slot
+{
+throw standardexception newexception
+sqlstate data_update_deleted_record
+}
+rawtransaction t   owner gettransaction
+recordhandle handle   getrecordhandleatslot slot
+owner getactionset   actionupdatefield t  this  slot
+handle getid    fieldid  newvalue  undo
+return handle
+}
+/** @see page#fetchnumfields
+@exception standardexception standard exception policy.
+*/
+public final int fetchnumfields recordhandle handle
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+return fetchnumfieldsatslot getslotnumber handle
+}
+/** @see page#fetchnumfieldsatslot
+@exception standardexception standard exception policy.
+*/
+public int fetchnumfieldsatslot int slot
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+return getheaderatslot slot  getnumberfields
+}
+/**
+@see page#deleteatslot
+@param slot		the slot number
+@param delete	true if this record is to be deleted, false if this
+deleted record is to be marked undeleted
+@param undo		logical undo logic if necessary
+@exception standardexception standard exception policy.
+@exception standardexception	standardexception.newexception(sqlstate.update_deleted_record
+if an attempt to delete a record that is already deleted
+@exception standardexception	standardexception.newexception(sqlstate.undelete_record
+if an attempt to undelete a record that is not deleted
+*/
+public recordhandle deleteatslot int slot  boolean delete  logicalundo undo
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+if   owner updateok
+{
+throw standardexception newexception
+sqlstate data_container_read_only
+}
+if  delete
+{
+if  isdeletedatslot slot
+{
+throw standardexception newexception
+sqlstate data_update_deleted_record
+}
+}
+else					   undelete a deleted record
+{
+if   isdeletedatslot slot
+{
+throw standardexception newexception
+sqlstate data_undelete_record
+}
+}
+rawtransaction t   owner gettransaction
+// logical operations not allowed in internal transactions.
+if  undo    null
+t checklogicaloperationok
+}
+recordhandle handle   getrecordhandleatslot slot
+owner getactionset   actiondelete t  this  slot  handle getid    delete  undo
+// delete/undelete the record in the stored version
+// and in the in memory version performed by the pageactions item
+return handle
+}
+/**
+purge one or more rows on a non-overflow page.
+@see page#purgeatslot
+@exception standardexception standard exception policy.
+*/
+public void purgeatslot int slot  int numpurges  boolean needdatalogged
+throws standardexception
+{
+if  sanitymanager debug
+{
+sanitymanager assert islatched
+if  isoverflowpage
+sanitymanager throwassert
+this
+}
+if  numpurges <  0
+return
+if   owner updateok
+{
+throw standardexception newexception
+sqlstate data_container_read_only
+}
+if   slot < 0       slot numpurges  > recordcount
+{
+throw standardexception newexception
+sqlstate data_slot_not_on_page
+}
+rawtransaction t   owner gettransaction
+// lock the records to be purged
+int recordids   new int
+pagekey pageid   getpageid       resolve  mt problem ?
+for  int i   0  i < numpurges  i
+{
+recordids   getheaderatslot slot   i  getid
+// get row lock on head row piece
+recordhandle handle   getrecordhandleatslot slot
+owner getlockingpolicy   lockrecordforwrite t  handle  false  true
+// before we purge these rows, we need to make sure they don't have
+// overflow rows and columns.  only clean up long rows and long
+// columns if this is not a temporary container, otherwise, just
+// loose the space.
+if  owner istemporarycontainer     	entirerecordonpage slot i
+continue
+// row[slot+i] has overflow rows and/or long columns, reclaim
+// them in a loop.
+recordhandle headrowhandle
+getheaderatslot slot i  gethandle pageid  slot i
+purgerowpieces t  slot i  headrowhandle  needdatalogged
+}
+owner getactionset   actionpurge t  this  slot  numpurges  recordids  needdatalogged
+}
+/**
+purge all the overflow columns and overflow rows of the record at slot.
+@exception standardexception standard exception policy.
+*/
+protected abstract void purgerowpieces rawtransaction t  int slot
+recordhandle headrowhandle
+boolean needdatalogged
+throws standardexception
+/** @see page#copyandpurge
+@exception standardexception standard exception policy.
+*/
+public void copyandpurge page destpage  int src_slot  int num_rows  int dest_slot
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+if  num_rows <  0
+{
+throw standardexception newexception sqlstate data_no_row_copied
+}
+if   owner updateok
+{
+throw standardexception newexception
+sqlstate data_container_read_only
+}
+if   src_slot < 0       src_slot   num_rows  > recordcount
+{
+throw standardexception newexception
+sqlstate data_slot_not_on_page
+}
+if  sanitymanager debug
+// first copy into the destination page, let it do the work
+// if no problem, then purge from this page
+sanitymanager assert  destpage instanceof basepage
+}
+basepage dpage    basepage destpage
+// make sure they are from the same container - this means they are of
+// the same size and have the same page and record format.
+pagekey pageid   getpageid       resolve  mt problem ?
+if   pageid getcontainerid   equals dpage getpageid   getcontainerid
+{
+throw standardexception newexception
+sqlstate data_different_container
+pageid getcontainerid
+dpage getpageid   getcontainerid
+}
+int recordids   new int
+rawtransaction t   owner gettransaction
+// lock the records to be purged and calculate total space needed
+for  int i   0  i < num_rows  i
+{
+recordhandle handle   getrecordhandleatslot src_slot i
+owner getlockingpolicy   lockrecordforwrite t  handle  false  true
+recordids   getheaderatslot src_slot   i  getid
+}
+// first copy num_rows into destination page
+dpage copyinto this  src_slot  num_rows  dest_slot
+// now purge num_rows from this page
+// do not purge overflow rows, if it has such a thing.  this operation
+// is called by split and if the key has overflow, spliting the head
+// page does not copy over the remaining pieces, i.e.,the new head page
+// still points to those pieces.
+owner getactionset   actionpurge
+t  this  src_slot  num_rows  recordids  true
+}
+/**
+unlatch the page.
+@see page#unlatch
+*/
+public void unlatch
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+releaseexclusive
+}
+/**
+* check whether the page is latched.
+*
+* @return <code>true</code> if the page is latched, <code>false</code>
+* otherwise
+* @see page#islatched
+*/
+public final synchronized boolean islatched
+if  sanitymanager debug
+sanitymanager assert identity    null
+}
+return owner    null
+}
+/** @see page#recordcount */
+public final int recordcount
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+return recordcount
+}
+/**
+get record count without checking for latch
+*/
+protected abstract int internaldeletedrecordcount
+/**
+get record count without checking for latch
+*/
+protected int internalnondeletedrecordcount
+{
+// deallocated or freed page, don't count
+if  pagestatus    valid_page
+return 0
+int deletedcount   internaldeletedrecordcount
+if  deletedcount     1
+int count   0
+int	maxslot   recordcount
+for  int slot   first_slot_number   slot < maxslot  slot
+if   isdeletedonpage slot
+count
+}
+return count
+else
+if  sanitymanager debug
+int delcount   0
+int	maxslot   recordcount
+for  int slot   first_slot_number   slot < maxslot  slot
+if  recordheaderondemand slot  isdeleted
+delcount
+}
+if  delcount    deletedcount
+sanitymanager throwassert
+delcount       deletedcount
+maxslot       recordcount
+}
+return  recordcount   deletedcount
+}
+}
+/** @see page#nondeletedrecordcount */
+public int nondeletedrecordcount
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+return internalnondeletedrecordcount
+}
+/**
+* is this page/deleted row a candidate for immediate reclaim space.
+* <p>
+* used by access methods after executing a delete on "slot_just_deleted"
+* to ask whether a post commit should be queued to try to reclaim space
+* after the delete commits.
+* <p>
+* will return true if the number of non-deleted rows on the page is
+* <= "num_non_deleted_rows".  for instance 0 means schedule reclaim
+* only if all rows are deleted, 1 if all rows but one are deleted.
+* <p>
+* will return true if the row just deleted is either a long row or long
+* column.  in this case doing a reclaim space on the single row may
+* reclaim multiple pages of free space, so better to do it now rather
+* than wait for all rows on page to be deleted.  this case is to address
+* the worst case scenario of all rows with long columns, but very short
+* rows otherwise.  in this case there could be 1000's of rows on the
+* main page with many gigabytes of data on overflow pages in deleted space
+* that would not be reclaimed until all rows on the page were deleted.
+*
+* @return true if a reclaim space should be scheduled post commit on this
+*         page, false otherwise.
+*
+* @param num_non_deleted_rows threshold number of non-deleted rows to
+*                             schedule reclaim space.
+* @param slot_just_deleted    row on page to check for long row/long column
+*
+* @exception  standardexception  standard exception policy.
+**/
+public boolean shouldreclaimspace
+int     num_non_deleted_rows
+int     slot_just_deleted
+throws standardexception
+{
+if  sanitymanager debug
+{
+sanitymanager assert islatched
+}
+boolean ret_val   false
+if  internalnondeletedrecordcount   <  num_non_deleted_rows
+{
+ret_val   true
+}
+else
+{
+if   entirerecordonpage slot_just_deleted
+{
+ret_val   true
+}
+}
+return ret_val
+}
+// no need to check for slot on page, call already checked
+protected final boolean isdeletedonpage int slot
+{
+return getheaderatslot slot  isdeleted
+}
+/** @see page#isdeletedatslot
+@exception standardexception standard exception policy.
+*/
+public boolean isdeletedatslot int slot
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+checkslotonpage slot
+return isdeletedonpage slot
+}
+/**
+set the aux object.
+<br> mt - single thread required. calls via the page interface will have the
+page latched, thus providing single threadedness. otherwise calls via this class
+are only made when the class has no-identity, thus only a single thread can see the object.
+@see page#setauxobject
+*/
+public void setauxobject auxobject obj
+{
+if  sanitymanager debug
+sanitymanager assert  identity    null     islatched
+}
+if  auxobj    null
+auxobj auxobjectinvalidated
+}
+auxobj   obj
+}
+/**
+get the aux object.
+<br> mt - latched - it is required the caller throws away the returned reference
+when the page is unlatched.
+@see page#getauxobject
+*/
+public auxobject getauxobject
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+return auxobj
+}
+/**
+* set a hint in this page to make b-tree scans positioned on it
+* reposition before they continue. this method is typically called
+* when rows are removed from a b-tree leaf page (for instance in a
+* page split).
+*/
+public void setrepositionneeded
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+repositionneededafterversion   getpageversion
+}
+/**
+* check if a b-tree scan positioned on this page needs to reposition.
+*
+* @param version the last version on which the b-tree scan had a valid
+* position on this page
+* @return {@code true} if a repositioning is needed because the row
+* on the current position may have been removed from this page after
+* the specified version; {@code false} otherwise
+*/
+public boolean isrepositionneeded long version
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+return repositionneededafterversion > version
+}
+/*
+** methods of observer.
+*/
+/**
+this object is set to observe the basecontainerhandle it was obtained by,
+that handle will notify its observers when it is being closed. in that case
+we will release the latch on the page held by that container.
+<br>
+mt - latched
+@see observer#update
+*/
+public void update observable obj  object arg
+if  sanitymanager debug
+sanitymanager assert islatched
+sanitymanager assert obj    owner
+}
+releaseexclusive
+}
+/*
+** implementation specific methods
+*/
+/**
+get the page identifer
+<br> mt - resolve
+*/
+public final pagekey getpageid
+if  sanitymanager debug
+sanitymanager assert identity    null
+}
+return identity
+}
+/**
+get an exclusive latch on the page.
+<br>
+mt - thread safe
+@exception standardexception standard derby policy.
+*/
+void setexclusive basecontainerhandle requester
+throws standardexception
+rawtransaction t   requester gettransaction
+// in some cases latches are held until after a commit or an abort
+// (currently internal and nested top transactions.
+// if this is the case then during an abort a latch
+// request will be made for a latch that is already held.
+// we do not allow the latch to be obtained multiple times
+// because i) latches are exclusive for simplicity and
+// performance, ii) holding a page latched means that the page is
+// on the container handle's obervers list, if we latched it twice
+// then the paeg would have to be on the list twice, which is not supported
+// since the page has value equality. to be on the list twice reference
+// equality would be required, which would mean pushing a referenceobservable
+// object for every latch; iii) other unknown reasons :-)
+synchronized  this
+{
+// need synchronized block because owner may be set to null in the
+// middle if another thread is in the process of unlatching the
+// page
+if   owner    null      t    owner gettransaction
+if  t inabort
+//
+nestedlatch
+return
+}
+// just deadlock out if a transaction tries to double latch the
+// page while not in abort
+if  sanitymanager debug
+sanitymanager throwassert
+}
+}
+while  owner    null
+try
+// expect notify from releaseexclusive().
+wait
+catch  interruptedexception ie
+throw standardexception interrupt ie
+}
+}
+prelatch requester
+// latch granted, but cleaner may "own" the page.
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+// latch will be granted, even if cleaner "owns" the page.
+// wait here unil cleaner is done.  this is safe as now we own the
+// latch, and have yet to do anything to the in-memory data
+// structures.
+//
+// previously we would wait in lockevent, but that caused the code
+// to block on i/o while holding the locking system monitor.
+while  inclean
+{
+try
+{
+// expect notify from clean() routine.
+wait
+}
+catch  interruptedexception ie
+{
+}
+}
+// no clean taking place, so safe to move to full latched state.
+prelatch   false
+}
+}
+/**
+get an exclusive latch on the page, but only if i don't have to wait.
+<br>
+mt - thread safe
+*/
+boolean setexclusivenowait basecontainerhandle requester  throws standardexception
+rawtransaction t   requester gettransaction
+// comment in setexclusive()
+synchronized  this
+{
+if   owner    null      t    owner gettransaction
+if  t inabort
+//
+nestedlatch
+return true
+}
+}
+// pre-latch the page if no one already has latched it or requested
+// a latch. otherwise, give up and return false.
+if  owner    null
+prelatch requester
+else
+return false
+}
+// latch will be granted, even if cleaner "owns" the page.
+// wait here unil cleaner is done.  this is safe as now we own the
+// latch, and have yet to do anything to the in-memory data
+// structures.
+//
+// previously we would wait in lockevent, but that caused the code
+// to block on i/o while holding the locking system monitor.
+while  inclean
+{
+//if (sanitymanager.debug)
+//   sanitymanager.debug_print("setexclusivenowait", "in while loop.");
+try
+{
+// expect notify from clean() routine.
+wait
+}
+catch  interruptedexception ie
+{
+}
+}
+// no clean taking place, so safe to move to full latched state.
+prelatch   false
+}
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+return true
+}
+/**
+release the exclusive latch on the page.
+<br>
+mt - latched
+*/
+protected synchronized void releaseexclusive
+if  sanitymanager debug
+if   islatched
+{
+sanitymanager throwassert
+nestedlatch
+}
+}
+if  nestedlatch > 0
+nestedlatch
+return
+}
+owner deleteobserver this
+owner   null
+notifyall
+}
+/**
+* move page state from unlatched to prelatch. setexclusive*() routines do
+* the work of completing the latch - using the prelatch status.
+*
+* @param requester handle to the container requesting ownership
+*/
+private void prelatch basecontainerhandle requester
+if  sanitymanager debug
+sanitymanager assert  islatched
+}
+owner   requester
+// make sure the latch is released if the container is closed
+requester addobserver this
+prelatch   true
+}
+/*
+** manipulation of the in-memory version of the slot table.
+*/
+/**
+must be called by any non-abstract sub-class to initialise the slot
+table.
+*/
+protected final void setheaderatslot int slot  storedrecordheader rh
+if  slot < headers length
+{
+// check that array "cache" of headers is big enough.
+if  rh    null
+{
+headers   rh
+}
+}
+else
+{
+// need to grow the array, just allocate new array and copy.
+storedrecordheader new_headers   new storedrecordheader
+system arraycopy headers  0  new_headers  0  headers length
+headers   new_headers
+headers   rh
+}
+}
+protected final void bumprecordcount int number
+recordcount    number
+}
+public final storedrecordheader getheaderatslot int slot
+if  slot < headers length
+{
+storedrecordheader rh   headers
+return  rh    null  ? rh   recordheaderondemand slot
+}
+else
+{
+return recordheaderondemand slot
+}
+}
+/**
+returns true if the entire record of that slot fits inside of this
+page.  returns false if part of the record on this slot overflows to
+other pages, either due to long row or long column.
+<br>
+mt - latched
+@exception standardexception standard derby error policy
+*/
+public abstract boolean entirerecordonpage int slot
+throws standardexception
+public abstract storedrecordheader recordheaderondemand int slot
+/**
+is the given slot number on the page?
+<br>
+mt - latched
+*/
+private final void checkslotonpage int slot
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+if  slot >  first_slot_number    slot < recordcount
+{
+return
+}
+throw standardexception newexception sqlstate data_slot_not_on_page
+}
+/**
+mark the record at the passed in slot as deleted.
+return code comes from storedrecordheader class:
+return	1, if delete status from not deleted to deleted
+return -1, if delete status from deleted to not deleted
+return  0, if status unchanged.
+<br>
+<b>any sub-class must call this method when deleting a record.</b>
+<br>
+mt - latched
+@exception standardexception standard derby error policy
+@exception ioexception io error accessing page
+*/
+public int setdeletestatus int slot  boolean delete  throws standardexception  ioexception
+if  sanitymanager debug
+// latch check performed in checkslotonpage
+checkslotonpage slot
+}
+return  getheaderatslot slot  setdeleted delete
+}
+/**
+mark this page as being deallocated
+@exception standardexception derby standard error policy
+*/
+public void deallocatepage   throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+if   owner updateok
+{
+throw standardexception newexception
+sqlstate data_container_read_only
+}
+rawtransaction t   owner gettransaction
+owner getactionset   actioninvalidatepage t  this
+}
+/**
+mark this page as being allocated and initialize it to a pristine page
+@exception standardexception derby standard error policy
+*/
+public void initpage int initflag  long pageoffset
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+if   owner updateok
+{
+throw standardexception newexception
+sqlstate data_container_read_only
+}
+rawtransaction t   owner gettransaction
+owner getactionset   actioninitpage
+t  this  initflag  gettypeformatid    pageoffset
+}
+/**
+find the slot for the record with the passed in identifier.
+<br>
+this method returns the record regardless of its deleted status.
+<br>
+the "slothint" argument is a hint about what slot the record id might
+be in.  callers may save the last slot where the record was across
+latch/unlatches to the page, and then pass that slot back as a hint -
+if the page has not shuffled slots since the last reference then the
+hint will succeed and a linear search is saved.  if the caller has
+no idea where it may be, then first_slot_number is passed in and a
+linear search is performed.
+<br>
+mt - latched
+@param recordid  record id of the record to search for.
+@param slothint "hint" about which slot the record might be in.
+*/
+public int findrecordbyid int recordid  int slothint
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+if  slothint    first_slot_number
+slothint   recordid   recordhandle first_record_id
+int	maxslot   recordcount
+if   slothint > first_slot_number
+slothint < maxslot
+recordid    getheaderatslot slothint  getid
+return slothint
+else
+for  int slot   first_slot_number  slot < maxslot  slot
+if  recordid    getheaderatslot slot  getid
+return slot
+}
+}
+}
+return  1
+}
+/**
+find the slot for the first record on the page with an id greater than
+the passed in identifier.
+<br>
+returns the slot of the first record on the page with an id greater
+than the one passed in.  usefulness of this functionality depends on the
+clients use of the raw store interfaces.  if all "new" records are
+always inserted at the end of the page, and the raw store continues
+to guarantee that all record id's will be allocated in increasing order
+on a given page, then a page is always sorted
+in record id order.  for instance current heap tables function this
+way.  if the client ever inserts at a particular slot number, rather
+than at the "end" then the record id's will not be sorted.
+<br>
+in the case where all record id's are always sorted on a page, then
+this routine can be used by scan's which "lose" their position because
+the row they have as a position was purged.  they can reposition their
+scan at the "next" row after the row that is now missing from the table.
+<br>
+this method returns the record regardless of its deleted status.
+<br>
+mt - latched
+@param recordid  record id of the first record on the page with a
+record id higher than the one passed in.  if no
+such record exists, -1 is returned.
+*/
+private int findnextrecordbyid int recordid
+{
+if  sanitymanager debug
+{
+sanitymanager assert islatched
+}
+int	maxslot   recordcount
+for  int slot   first_slot_number  slot < maxslot  slot
+{
+if  getheaderatslot slot  getid   > recordid
+{
+return slot
+}
+}
+return  1
+}
+/**
+copy num_rows from srcpage, src_slot into this page starting at dest_slot.
+this is destination page of the the copy half of copy and purge.
+@see page#copyandpurge
+*/
+private void copyinto basepage srcpage  int src_slot  int num_rows
+int dest_slot
+throws standardexception
+{
+if   dest_slot < 0     dest_slot > recordcount
+{
+throw standardexception newexception
+sqlstate data_slot_not_on_page
+}
+rawtransaction t   owner gettransaction
+// get num_rows row locks, need to predict what those recordids will be
+int recordids   new int
+pagekey pageid   getpageid       resolve   mt problem ?
+// get new recordids for the rows from this page
+// resolve: we should also record the amount of reserved space
+for  int i   0  i < num_rows  i
+{
+if  i    0
+recordids   newrecordid
+else
+recordids   newrecordid recordids
+recordhandle handle   new recordid pageid  recordids  i
+owner getlockingpolicy   lockrecordforwrite t  handle  false  true
+}
+// resolve: need try block here to invalidate self and crash the system
+owner getactionset   actioncopyrows t  this  srcpage
+dest_slot  num_rows  src_slot
+recordids
+}
+/**
+remove record at slot.
+<p>
+remove the slot at the in-memory slot table, i.e.,
+slots from 0 to deleteslot-1 is untouched, deleteslot is removed from
+in memory slot table, deleteslot+1 .. recordcount()-1 move to
+down one slot.
+<br>
+mt - latched
+*/
+protected void removeandshiftdown int slot
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+sanitymanager assert slot >  0    slot < recordcount
+}
+// just copy the records down in the array (copying over the slot
+// entry that is being eliminated) and null out the last entry,
+// it is ok for the array to be larger than necessary.
+//
+// source of copy: slot + 1
+// dest   of copy: slot
+// length of copy: (length of array - source of copy)
+system arraycopy
+headers  slot   1  headers  slot  headers length    slot   1
+headers   null
+recordcount
+}
+/**
+shift all records in the in-memory slot table up one slot,
+starting at and including the record in slot 'low'
+a new slot is added to accomdate the move.
+<br>
+mt - latched
+*/
+protected storedrecordheader shiftup int low
+{
+if  sanitymanager debug
+{
+sanitymanager assert islatched
+if   low < 0      low > recordcount
+{
+sanitymanager throwassert
+low       recordcount
+this
+}
+}
+if  low < headers length
+{
+// just copy the records up in the array (copying over the slot
+// entry that is being eliminated) and null out the entry at "low",
+// it is ok for the array to be shorter than necessary.
+//
+// this code throws away the "last" entry in
+// the array, which will cause a record header cache miss if it
+// is needed.  this delays the object allocation of a new array
+// object until we really need that entry, vs. doing it on the
+// insert.
+//
+// source of copy: low
+// dest   of copy: low + 1
+// length of copy: (length of array - dest of copy)
+// adding in the middle
+system arraycopy
+headers  low  headers  low   1  headers length    low   1
+headers   null
+}
+return null
+}
+/**
+try to compact this record.  deleted record are treated the same way as
+nondeleted record.  this page must not be an overflow page.  the record
+may already have been purged from the page.
+<p>
+<b>locking policy</b>
+<p>
+no locks are obtained.
+<br>
+mt - latched
+<p>
+<b>note : caveat </b><br>
+this operation will physically get rid of any reserved space this
+record may have, or it may compact the record by merging strung out row
+pieces together.  since the freed reserved space is immediately usable
+by other transactions which latched the page, it is only safe to use
+this operation if the caller knows that it has exclusive access to the
+page for the duration of the transaction, i.e., effectively holding a
+page lock on the page, and that the record has no uncommitted
+updates.
+@param handle handle to deleted or non-deleted record
+@see containerhandle#compactrecord
+@exception standardexception	standard derby error policy
+*/
+public void compactrecord recordhandle handle  throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+if   owner updateok
+{
+throw standardexception newexception
+sqlstate data_container_read_only
+}
+if  handle getid   < recordhandle first_record_id
+{
+throw standardexception newexception
+sqlstate data_invalid_record_handle  handle
+}
+if  handle getpagenumber      getpagenumber
+{
+throw standardexception newexception
+sqlstate data_wrong_page_for_handle  handle
+}
+if  isoverflowpage
+{
+throw standardexception newexception
+sqlstate data_unexpected_overflow_page  handle
+}
+int slot   findrecordbyid handle getid    handle getslotnumberhint
+if  slot >  0
+{
+compactrecord owner gettransaction    slot  handle getid
+}
+// else record gone, no compaction necessary
+}
+/*
+** methods that read/store records/fields based upon calling methods
+** a sub-calls provides to do the actual storage work.
+*/
+/*
+** page lastlog instant control
+*/
+public final loginstant getlastloginstant
+{
+return lastlog
+}
+protected final void clearlastloginstant
+lastlog   null
+}
+protected final void updatelastloginstant loginstant instant
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+// we should not null out the log instant even if this page is being
+// updated by a non-logged action, there may have been logged action
+// before this and we don't want to loose that pointer
+if  instant    null
+lastlog   instant
+}
+/*
+** page version control
+*/
+/**
+return the current page version.
+*/
+public final long getpageversion
+{
+return pageversion
+}
+/**
+increment the version by one and return the new version.
+*/
+protected final long bumppageversion
+{
+if  sanitymanager debug
+sanitymanager assert islatched
+}
+return   pageversion
+}
+/**
+set it when the page is read from disk.
+<br> mt - single thread required - only called while the page has no identity which
+requires that only a single caller can be accessing it.
+*/
+public final void setpageversion long v
+{
+pageversion   v
+}
+/**
+set page status based on passed in status flag.
+*/
+protected void setpagestatus byte status
+{
+pagestatus   status
+}
+/**
+get the page status, one of the values in the above page status flag
+*/
+public byte getpagestatus
+{
+return pagestatus
+}
+/*
+** abstract methods that an implementation must provide.
+**
+** <br> mt - latched, page is latched when these methods are called.
+*/
+/**
+* read the record at the given slot into the given row.
+* <p>
+* this reads and initializes the columns in the row array from the raw
+* bytes stored in the page associated with the given slot.  if validcolumns
+* is non-null then it will only read those columns indicated by the bit
+* set, otherwise it will try to read into every column in row[].
+* <p>
+* if there are more columns than entries in row[] then it just stops after
+* every entry in row[] is full.
+* <p>
+* if there are more entries in row[] than exist on disk, the requested
+* excess columns will be set to null by calling the column's object's
+* restoretonull() routine
+* (ie.  ((object) column).restoretonull() ).
+* <p>
+* if a qualifier list is provided then the row will only be read from
+* disk if all of the qualifiers evaluate true.  some of the columns may
+* have been read into row[] in the process of evaluating the qualifier.
+*
+* <br> mt - latched, page is latched when this methods is called.
+*
+*
+* @param slot              the slot number
+* @param row (out)         filled in sparse row
+* @param fetchdesc         a set of information about the fetch: what
+*                          columns to fetch, any qualifiers, ...
+* @param rh                the record handle for the row at top level,
+*                          and is used in overflowinputstream to lock the
+*                          row for blobs/clobs.
+* @param isheadrow         is the head row portion of the row, false if
+*                          a long row and the 2-n'th portion of the long
+*                          row.
+*
+* @return  false if a qualifier_list is provided and the row does not
+*          qualifier (no row read in that case), else true.
+*
+* @exception standardexception	standard derby error policy
+**/
+protected abstract boolean restorerecordfromslot
+int                     slot
+object                row
+fetchdescriptor         fetchdesc
+recordhandle            rh
+storedrecordheader      recordheader
+boolean                 isheadrow
+throws standardexception
+/**
+read portion of a log record at the given slot into the given byteholder.
+<br> mt - latched, page is latched when this methods is called.
+@exception standardexception	standard derby error policy
+*/
+protected abstract void restoreportionlongcolumn overflowinputstream fetchstream
+throws standardexception  ioexception
+/**
+create a new record identifier.
+<br> mt - latched, page is latched when this methods is called.
+@exception standardexception	standard derby error policy
+*/
+public abstract int newrecordid   throws standardexception
+/**
+create a new record identifier, and bump to next recordid.
+<br> mt - latched, page is latched when this methods is called.
+@exception standardexception	standard derby error policy
+*/
+public abstract int newrecordidandbump   throws standardexception
+/**
+create a new record identifier, the passed in one is the last one created.
+use this method to collect and reserve multiple recordids in one
+stroke.  given the same input recordid, the subclass must return the
+same recordid every time.
+<br> mt - latched, page is latched when this methods is called.
+@exception standardexception	standard derby error policy
+*/
+protected abstract int newrecordid int recordid  throws standardexception
+/**
+is there space for copying this many rows which takes this many bytes
+on the page
+<br> mt - latched, page is latched when this methods is called.
+@exception standardexception standard derby policy.
+*/
+public abstract boolean spaceforcopy int num_rows  int spaceneeded
+throws standardexception
+/**
+return the total number of bytes used, reserved, or wasted by the
+record at this slot.
+<br> mt - latched, page is latched when this methods is called.
+@exception standardexception standard derby policy.
+*/
+public abstract int gettotalspace int slot  throws standardexception
+/**
+return the total number of bytes reserved by the
+record at this slot.
+<br> mt - latched, page is latched when this methods is called.
+@exception ioexception thrown by inputstream methods potential i/o errors
+*/
+public abstract int getreservedcount int slot  throws ioexception
+/*
+** methods that our super-class (basepage) requires we implement.
+** here we only implement the methods that correspond to the logical
+** operations that require logging, any other methods that are storage
+** specific we leave to our sub-class.
+**
+** all operations that are logged must bump this page's version number
+** and update this page's last log instant.
+** these should be sanity checked on each loganddo (similarly, it should
+** be checked in compensationoperation.dome)
+*/
+/*
+** methods that any sub-class must implement. these allow generic log operations.
+*/
+/**
+get the stored length of a record. this must match the amount of data
+written by logcolumn and logfield.
+<br> mt - latched - page latch must be held
+*/
+public abstract int getrecordlength int slot  throws ioexception
+/**
+restore a storable row from a inputstream that was used to
+store the row after a logrecord call.
+<br> mt - latched - page latch must be held
+@exception standardexception	standard derby error policy
+@exception ioexception object exceeds the available data in the stream.
+*/
+public abstract void restorerecordfromstream
+limitobjectinput        in
+object   row
+throws standardexception  ioexception
+/**
+log a currently stored record to the output stream.
+the logged version of the record must be readable by storerecord.
+<br> mt - latched - page latch must be held
+@param slot		slot number the record is stored in.
+@param flag		log_record_*, the reason for logging the record.
+@param recordid record identifier of the record.
+@param validcolumns which columns needs to be logged
+@param out		where to write the logged form.
+@param headrowhandle	the recordhandle of the head row piece, used
+for post commit cleanup for update.
+@exception standardexception	standard derby error policy
+*/
+public abstract void logrecord int slot  int flag  int recordid
+formatablebitset validcolumns  outputstream out
+recordhandle headrowhandle
+throws standardexception  ioexception
+/**
+log the row that will be stored at the given slot to the given outputstream.
+the logged form of the row must be readable by storerecord.
+<br> mt - latched - page latch must be held
+@param slot				slot number the record will be stored in.
+@param forinsert		true if the row is being logged for an insert,
+false for an update.
+@param recordid			record identifier of the record.
+@param row				the row version of the record.
+@param validcolumns		formatablebitset of which columns in row are valid,
+null indicates all are valid
+@param out				where to write the logged form.
+@param startcolumn		the first column that is being logged in this row.
+this is used when logging portion of long rows.
+@param insertflag		to indicate whether the insert would allow overflow.
+@param realstartcolumn	this is used when a long column is detected.
+portion of the row may already be logged and stored
+in the 'out' buffer.  after we log the long column,
+the saved buffer was passed here, and we need to
+continue to log the row.  realstartcolumn is the starting
+column for the continuation of the logrow operation.
+pass in (-1) if realstartcolumn is not significant.
+@param realspaceonpage	being used in conjunction with realstartcolumn,
+to indicate the real free space left on the page.
+@exception standardexception	standard derby error policy
+*/
+public abstract int logrow
+int                     slot
+boolean                 forinsert
+int                     recordid
+object                row
+formatablebitset                 validcolumns
+dynamicbytearrayoutputstream  out
+int                     startcolumn
+byte                    insertflag
+int                     realstartcolumn
+int                     realspaceonpage
+int                     overflowthreshold
+throws standardexception  ioexception
+/**
+log a currently stored field.
+the logged version of the field must be readable by storefield.
+<br> mt - latched - page latch must be held
+@param slot		slot number the record is stored in.
+@param fieldnumber number of the field (starts at 0).
+@param out		where to write the logged form.
+@exception standardexception	standard derby error policy
+*/
+public abstract void logfield int slot  int fieldnumber  outputstream out
+throws standardexception  ioexception
+/**
+log a to be stored column.
+<br> mt - latched - page latch must be held
+@param slot		slot of the current record
+@param fieldid	field number of the column being updated
+@param column column version of the field.
+@param out		where to write the logged form.
+@exception standardexception	standard derby error policy
+*/
+public abstract void logcolumn
+int                     slot
+int                     fieldid
+object                  column
+dynamicbytearrayoutputstream  out
+int                     overflowthreshold
+throws standardexception  ioexception
+/**
+log a to be stored long column.  return -1 when done.
+<br> mt - latched - page latch must be held
+@param slot			slot of the current record
+@param recordid		the id of the long column record
+@param column		column version of the field.
+@param out			where to write the logged form.
+@exception standardexception	standard derby error policy
+*/
+public abstract int loglongcolumn
+int                     slot
+int                     recordid
+object                  column
+dynamicbytearrayoutputstream  out
+throws standardexception  ioexception
+/**
+read a previously stored record written by logrecord or logrow and store
+it on the data page at the given slot with the given record identifier.
+any previously stored record must be replaced.
+<br> mt - latched - page latch must be held
+@exception standardexception standard derby error policy
+@exception ioexception thrown by inputstream methods potential i/o errors
+while writing the page
+*/
+public abstract void storerecord loginstant instant  int slot  boolean forinsert  objectinput in
+throws standardexception  ioexception
+/**
+read a previously stored field written by logfield or logcolumn and store
+it on the data page at thge given slot with the given record identifier
+and field number. any previously stored field is replaced.
+<br> mt - latched - page latch must be held
+@exception standardexception standard derby error policy
+@exception ioexception thrown by inputstream methods and potential i/o errors
+while writing the page.
+*/
+public abstract void storefield loginstant instant  int slot
+int fieldid
+objectinput in
+throws standardexception  ioexception
+/**
+reserve the required number of bytes for the record in the specified slot.
+<br> mt - latched - page latch must be held
+@exception standardexception standard derby error policy
+@exception ioexception thrown by inputstream methods and potential i/o errors
+while writing the page.
+*/
+public abstract void reservespaceforslot loginstant instant  int slot  int spacetoreserve
+throws standardexception  ioexception
+/**
+skip a previously stored field written by logfield or logcolumn.
+<br> mt - latched - page latch must be held
+@exception standardexception standard derby error policy
+@exception ioexception thrown by inputstream methods
+*/
+public abstract void skipfield objectinput in
+throws standardexception  ioexception
+public abstract void skiprecord objectinput in  throws standardexception  ioexception
+/**
+set the delete status of a record from the page.
+<br> mt - latched - page latch must be held
+@param slot the slot to delete or undelete
+@param delete set delete status to this value
+@exception standardexception standard derby error policy
+@exception ioexception io error accessing page
+*/
+public abstract void setdeletestatus loginstant instant  int slot  boolean delete
+throws standardexception  ioexception
+/**
+purge a record from the page.
+<br> mt - latched - page latch must be held
+@param slot the slot to purge
+@param recordid the id of the record that is to be purged
+@exception standardexception standard derby error policy
+@exception ioexception thrown by potential i/o errors
+while writing the page.
+*/
+public abstract void purgerecord loginstant instant  int slot
+int recordid
+throws standardexception  ioexception
+/**
+subclass implementation of compactrecord.
+@see basepage#compactrecord
+@exception standardexception standard derby error policy
+*/
+protected abstract void compactrecord rawtransaction t  int slot  int recordid
+throws standardexception
+/**
+set the page status underneath a log record
+<br> mt - latched - page latch must be held
+@param instant the log instant of the log record
+@param status the page status
+@exception standardexception standard derby error policy
+*/
+public abstract void setpagestatus loginstant instant  byte status
+throws standardexception
+/**
+initialize a page for the first time or for reuse
+all subtypes are expected to overwrite this method if it has something to clean up
+@exception standardexception standard derby error policy
+*/
+public abstract void initpage loginstant instant  byte status
+int recordid  boolean overflow  boolean reuse
+throws standardexception
+/**
+set the reserved space for this row to value.
+@exception standardexception standard derby error policy
+*/
+public abstract void setreservedspace loginstant instant  int slot  int value
+throws standardexception  ioexception
+/**
+return true if the page is an overflow page, false if not.
+for implementation that don't have overflow pages, return false.
+*/
+public abstract boolean isoverflowpage
+/**
+returns false if an insert is not to be allowed in the page.
+*/
+public abstract boolean allowinsert
+/**
+returns true if an insert is allowed in the page and the page is
+relatively unfilled - let specific implementation decide what
+relatively unfilled means
+*/
+public abstract boolean unfilled
+/**
+set the number of rows in the container - the page uses this to decide
+whether it needs to aggressive set the container's row count when it
+changes.
+*/
+public abstract void setcontainerrowcount long count
+/*
+* returns the page data array, that is actually written to the disk.
+*/
+protected abstract byte getpagearray   throws standardexception
+/*
+** debugging methods
+*/
+/** debugging, print slot table information */
+protected string slottabletostring
+{
+string str   null
+if  sanitymanager debug
+{
+storedrecordheader rh
+str   new string
+for  int slot   first_slot_number  slot < recordcount  slot
+rh   getheaderatslot slot
+if  rh    null
+str        slot       rh getid
+else
+str        slot
+str
+}
+}
+return str
+}
+}

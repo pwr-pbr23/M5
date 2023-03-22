@@ -1,0 +1,1028 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq store kahadb
+import java io datainput
+import java io dataoutput
+import java io file
+import java io ioexception
+import java io inputstream
+import java io outputstream
+import java util arraylist
+import java util collection
+import java util date
+import java util hashmap
+import java util hashset
+import java util iterator
+import java util linkedhashmap
+import java util list
+import java util sortedset
+import java util treemap
+import java util treeset
+import java util map entry
+import java util concurrent atomic atomicboolean
+import org apache activemq command connectionid
+import org apache activemq command localtransactionid
+import org apache activemq command subscriptioninfo
+import org apache activemq command transactionid
+import org apache activemq command xatransactionid
+import org apache activemq store kahadb data kahaaddmessagecommand
+import org apache activemq store kahadb data kahacommitcommand
+import org apache activemq store kahadb data kahadestination
+import org apache activemq store kahadb data kahaentrytype
+import org apache activemq store kahadb data kahalocaltransactionid
+import org apache activemq store kahadb data kahapreparecommand
+import org apache activemq store kahadb data kaharemovedestinationcommand
+import org apache activemq store kahadb data kaharemovemessagecommand
+import org apache activemq store kahadb data kaharollbackcommand
+import org apache activemq store kahadb data kahasubscriptioncommand
+import org apache activemq store kahadb data kahatracecommand
+import org apache activemq store kahadb data kahatransactioninfo
+import org apache activemq store kahadb data kahaxatransactionid
+import org apache activemq util callback
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache kahadb index btreeindex
+import org apache kahadb index btreevisitor
+import org apache kahadb journal datafile
+import org apache kahadb journal journal
+import org apache kahadb journal location
+import org apache kahadb page page
+import org apache kahadb page pagefile
+import org apache kahadb page transaction
+import org apache kahadb util bytesequence
+import org apache kahadb util databytearrayinputstream
+import org apache kahadb util databytearrayoutputstream
+import org apache kahadb util lockfile
+import org apache kahadb util longmarshaller
+import org apache kahadb util marshaller
+import org apache kahadb util sequence
+import org apache kahadb util sequenceset
+import org apache kahadb util stringmarshaller
+import org apache kahadb util variablemarshaller
+public class messagedatabase
+public static final string property_log_slow_access_time
+public static final int log_slow_access_time   integer parseint system getproperty property_log_slow_access_time
+private static final log log   logfactory getlog messagedatabase class
+private static final int database_locked_wait_delay   10   1000
+public static final int closed_state   1
+public static final int open_state   2
+protected class metadata
+protected page<metadata> page
+protected int state
+protected btreeindex<string  storeddestination> destinations
+protected location lastupdate
+protected location firstinprogresstransactionlocation
+public void read datainput is  throws ioexception
+state   is readint
+destinations   new btreeindex<string  storeddestination> pagefile  is readlong
+if  is readboolean
+lastupdate   locationmarshaller instance readpayload is
+else
+lastupdate   null
+if  is readboolean
+firstinprogresstransactionlocation   locationmarshaller instance readpayload is
+else
+firstinprogresstransactionlocation   null
+public void write dataoutput os  throws ioexception
+os writeint state
+os writelong destinations getpageid
+if  lastupdate    null
+os writeboolean true
+locationmarshaller instance writepayload lastupdate  os
+else
+os writeboolean false
+if  firstinprogresstransactionlocation    null
+os writeboolean true
+locationmarshaller instance writepayload firstinprogresstransactionlocation  os
+else
+os writeboolean false
+class metadatamarshaller extends variablemarshaller<metadata>
+public metadata readpayload datainput datain  throws ioexception
+metadata rc   new metadata
+rc read datain
+return rc
+public void writepayload metadata object  dataoutput dataout  throws ioexception
+object write dataout
+protected pagefile pagefile
+protected journal journal
+protected metadata metadata   new metadata
+protected metadatamarshaller metadatamarshaller   new metadatamarshaller
+protected boolean failifdatabaseislocked
+protected boolean deleteallmessages
+protected file directory
+protected thread checkpointthread
+protected boolean enablejournaldisksyncs true
+long checkpointinterval   5 1000
+long cleanupinterval   30 1000
+int journalmaxfilelength   journal default_max_file_length
+int journalmaxwritebatchsize   journal default_max_write_batch_size
+boolean enableindexwriteasync   false
+int setindexwritebatchsize   pagefile default_write_batch_size
+protected atomicboolean started   new atomicboolean
+protected atomicboolean opened   new atomicboolean
+private lockfile lockfile
+private boolean ignoremissingjournalfiles   false
+private int indexcachesize   100
+private boolean checkforcorruptjournalfiles   false
+private boolean checksumjournalfiles   false
+public messagedatabase
+public void start   throws exception
+if  started compareandset false  true
+load
+public void stop   throws exception
+if  started compareandset true  false
+unload
+private void loadpagefile   throws ioexception
+synchronized  indexmutex
+final pagefile pagefile   getpagefile
+pagefile load
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+if  pagefile getpagecount      0
+// first time this is created.. initialize the metadata
+page<metadata> page   tx allocate
+assert page getpageid      0
+page set metadata
+metadata page   page
+metadata state   closed_state
+metadata destinations   new btreeindex<string  storeddestination> pagefile  tx allocate   getpageid
+tx store metadata page  metadatamarshaller  true
+else
+page<metadata> page   tx load 0  metadatamarshaller
+metadata   page get
+metadata page   page
+metadata destinations setkeymarshaller stringmarshaller instance
+metadata destinations setvaluemarshaller new storeddestinationmarshaller
+metadata destinations load tx
+pagefile flush
+// load up all the destinations since we need to scan all the indexes to figure out which journal files can be deleted.
+// perhaps we should just keep an index of file
+storeddestinations clear
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+for  iterator<entry<string  storeddestination>> iterator   metadata destinations iterator tx   iterator hasnext
+entry<string  storeddestination> entry   iterator next
+storeddestination sd   loadstoreddestination tx  entry getkey    entry getvalue   subscriptions  null
+storeddestinations put entry getkey    sd
+/**
+* @throws ioexception
+*/
+public void open   throws ioexception
+if  opened compareandset false  true
+getjournal   start
+loadpagefile
+checkpointthread   new thread
+public void run
+try
+long lastcleanup   system currenttimemillis
+long lastcheckpoint   system currenttimemillis
+// sleep for a short time so we can periodically check
+// to see if we need to exit this thread.
+long sleeptime   math min checkpointinterval  500
+while  opened get
+thread sleep sleeptime
+long now   system currenttimemillis
+if  now   lastcleanup >  cleanupinterval
+checkpointcleanup true
+lastcleanup   now
+lastcheckpoint   now
+else if  now   lastcheckpoint >  checkpointinterval
+checkpointcleanup false
+lastcheckpoint   now
+catch  interruptedexception e
+// looks like someone really wants us to exit this thread...
+checkpointthread setdaemon true
+checkpointthread start
+recover
+private void lock   throws ioexception
+if  lockfile    null
+file lockfilename   new file directory
+lockfile   new lockfile lockfilename  true
+if  failifdatabaseislocked
+lockfile lock
+else
+while  true
+try
+lockfile lock
+break
+catch  ioexception e
+log info   lockfilename      database_locked_wait_delay   1000        e
+try
+thread sleep database_locked_wait_delay
+catch  interruptedexception e1
+public void load   throws ioexception
+synchronized  indexmutex
+lock
+if  deleteallmessages
+getjournal   start
+getjournal   delete
+getjournal   close
+journal   null
+getpagefile   delete
+log info
+deleteallmessages   false
+open
+store new kahatracecommand   setmessage     new date
+public void close   throws ioexception  interruptedexception
+if  opened compareandset true  false
+synchronized  indexmutex
+pagefile unload
+metadata   new metadata
+journal close
+checkpointthread join
+lockfile unlock
+lockfile null
+public void unload   throws ioexception  interruptedexception
+synchronized  indexmutex
+if  pagefile    null    pagefile isloaded
+metadata state   closed_state
+metadata firstinprogresstransactionlocation   getfirstinprogresstxlocation
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+tx store metadata page  metadatamarshaller  true
+close
+/**
+* @return
+*/
+private location getfirstinprogresstxlocation
+location l   null
+if   inflighttransactions isempty
+l   inflighttransactions values   iterator   next   get 0  getlocation
+if   preparedtransactions isempty
+location t   preparedtransactions values   iterator   next   get 0  getlocation
+if  l  null    t compareto l  <  0
+l   t
+return l
+/**
+* move all the messages that were in the journal into long term storage. we
+* just replay and do a checkpoint.
+*
+* @throws ioexception
+* @throws ioexception
+* @throws illegalstateexception
+*/
+private void recover   throws illegalstateexception  ioexception
+synchronized  indexmutex
+long start   system currenttimemillis
+location recoveryposition   getrecoveryposition
+if  recoveryposition  null
+int redocounter   0
+while  recoveryposition    null
+journalcommand message   load recoveryposition
+metadata lastupdate   recoveryposition
+process message  recoveryposition
+redocounter
+recoveryposition   journal getnextlocation recoveryposition
+long end   system currenttimemillis
+log info     redocounter         end   start    1000 0f
+// we may have to undo some index updates.
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+recoverindex tx
+protected void recoverindex transaction tx  throws ioexception
+long start   system currenttimemillis
+// it is possible index updates got applied before the journal updates..
+// in that case we need to removed references to messages that are not in the journal
+final location lastappendlocation   journal getlastappendlocation
+long undocounter 0
+// go through all the destinations to see if they have messages past the lastappendlocation
+for  storeddestination sd   storeddestinations values
+final arraylist<long> matches   new arraylist<long>
+// find all the locations that are >= than the last append location.
+sd locationindex visit tx  new btreevisitor gtevisitor<location  long> lastappendlocation
+@override
+protected void matched location key  long value
+matches add value
+for  long sequenceid   matches
+messagekeys keys   sd orderindex remove tx  sequenceid
+sd locationindex remove tx  keys location
+sd messageidindex remove tx  keys messageid
+undocounter
+// todo: do we need to modify the ack positions for the pub sub case?
+long end   system currenttimemillis
+if  undocounter > 0
+// the rolledback operations are basically in flight journal writes.  to avoid getting these the end user
+// should do sync writes to the journal.
+log info     undocounter         end   start    1000 0f
+undocounter   0
+start   system currenttimemillis
+// lets be extra paranoid here and verify that all the datafiles being referenced
+// by the indexes still exists.
+final sequenceset ss   new sequenceset
+for  storeddestination sd   storeddestinations values
+// use a visitor to cut down the number of pages that we load
+sd locationindex visit tx  new btreevisitor<location  long>
+int last  1
+public boolean isinterestedinkeysbetween location first  location second
+if  first  null
+return  ss contains 0  second getdatafileid
+else if  second  null
+return true
+else
+return  ss contains first getdatafileid    second getdatafileid
+public void visit list<location> keys  list<long> values
+for  location l   keys
+int fileid   l getdatafileid
+if  last    fileid
+ss add fileid
+last   fileid
+hashset<integer> missingjournalfiles   new hashset<integer>
+while   ss isempty
+missingjournalfiles add   int ss removefirst
+missingjournalfiles removeall  journal getfilemap   keyset
+if   missingjournalfiles isempty
+log info   missingjournalfiles
+arraylist<btreevisitor predicate<location>> missingpredicates   new arraylist<btreevisitor predicate<location>>
+for  integer missing   missingjournalfiles
+missingpredicates add new btreevisitor betweenvisitor<location  long> new location missing 0   new location missing 1 0
+if   checkforcorruptjournalfiles
+collection<datafile> datafiles   journal getfilemap   values
+for  datafile datafile   datafiles
+int id   datafile getdatafileid
+missingpredicates add new btreevisitor betweenvisitor<location  long> new location id datafile getlength     new location id 1 0
+sequence seq   datafile getcorruptedblocks   gethead
+while  seq  null
+missingpredicates add new btreevisitor betweenvisitor<location  long> new location id   int  seq getfirst     new location id   int  seq getlast   1
+seq   seq getnext
+if   missingpredicates isempty
+for  storeddestination sd   storeddestinations values
+final arraylist<long> matches   new arraylist<long>
+sd locationindex visit tx  new btreevisitor orvisitor<location  long> missingpredicates
+protected void matched location key  long value
+matches add value
+// if somes message references are affected by the missing data files...
+if   matches isempty
+// we either 'gracefully' recover dropping the missing messages or
+// we error out.
+if  ignoremissingjournalfiles
+// update the index to remove the references to the missing data
+for  long sequenceid   matches
+messagekeys keys   sd orderindex remove tx  sequenceid
+sd locationindex remove tx  keys location
+sd messageidindex remove tx  keys messageid
+undocounter
+// todo: do we need to modify the ack positions for the pub sub case?
+else
+throw new ioexception   matches size
+end   system currenttimemillis
+if  undocounter > 0
+// the rolledback operations are basically in flight journal writes.  to avoid getting these the end user
+// should do sync writes to the journal.
+log info     undocounter         end   start    1000 0f
+private location nextrecoveryposition
+private location lastrecoveryposition
+public void incrementalrecover   throws ioexception
+synchronized  indexmutex
+if  nextrecoveryposition    null
+if  lastrecoveryposition  null
+nextrecoveryposition   getrecoveryposition
+else
+nextrecoveryposition   journal getnextlocation lastrecoveryposition
+while  nextrecoveryposition    null
+lastrecoveryposition   nextrecoveryposition
+metadata lastupdate   lastrecoveryposition
+journalcommand message   load lastrecoveryposition
+process message  lastrecoveryposition
+nextrecoveryposition   journal getnextlocation lastrecoveryposition
+public location getlastupdateposition   throws ioexception
+return metadata lastupdate
+private location getrecoveryposition   throws ioexception
+// if we need to recover the transactions..
+if  metadata firstinprogresstransactionlocation    null
+return metadata firstinprogresstransactionlocation
+// perhaps there were no transactions...
+if  metadata lastupdate  null
+// start replay at the record after the last one recorded in the index file.
+return journal getnextlocation metadata lastupdate
+// this loads the first position.
+return journal getnextlocation null
+protected void checkpointcleanup final boolean cleanup
+try
+long start   system currenttimemillis
+synchronized  indexmutex
+if   opened get
+return
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+checkpointupdate tx  cleanup
+long end   system currenttimemillis
+if  log_slow_access_time>0    end start > log_slow_access_time
+log info    end start
+catch  ioexception e
+e printstacktrace
+public void checkpoint callback closure  throws exception
+synchronized  indexmutex
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+checkpointupdate tx  false
+closure execute
+// /////////////////////////////////////////////////////////////////
+// methods call by the broker to update and query the store.
+// /////////////////////////////////////////////////////////////////
+public location store journalcommand data  throws ioexception
+return store data  false
+/**
+* all updated are are funneled through this method. the updates a converted
+* to a journalmessage which is logged to the journal and then the data from
+* the journalmessage is used to update the index just like it would be done
+* durring a recovery process.
+*/
+public location store journalcommand data  boolean sync  throws ioexception
+int size   data serializedsizeframed
+databytearrayoutputstream os   new databytearrayoutputstream size   1
+os writebyte data type   getnumber
+data writeframed os
+long start   system currenttimemillis
+location location   journal write os tobytesequence    sync
+long start2   system currenttimemillis
+process data  location
+long end   system currenttimemillis
+if  log_slow_access_time>0    end start > log_slow_access_time
+log info    start2 start     end start2
+synchronized  indexmutex
+metadata lastupdate   location
+return location
+/**
+* loads a previously stored journalmessage
+*
+* @param location
+* @return
+* @throws ioexception
+*/
+public journalcommand load location location  throws ioexception
+bytesequence data   journal read location
+databytearrayinputstream is   new databytearrayinputstream data
+byte readbyte   is readbyte
+kahaentrytype type   kahaentrytype valueof readbyte
+if  type    null
+throw new ioexception   location
+journalcommand message    journalcommand type createmessage
+message mergeframed is
+return message
+// /////////////////////////////////////////////////////////////////
+// journaled record processing methods. once the record is journaled,
+// these methods handle applying the index updates. these may be called
+// from the recovery method too so they need to be idempotent
+// /////////////////////////////////////////////////////////////////
+private void process journalcommand data  final location location  throws ioexception
+data visit new visitor
+@override
+public void visit kahaaddmessagecommand command  throws ioexception
+process command  location
+@override
+public void visit kaharemovemessagecommand command  throws ioexception
+process command  location
+@override
+public void visit kahapreparecommand command  throws ioexception
+process command  location
+@override
+public void visit kahacommitcommand command  throws ioexception
+process command  location
+@override
+public void visit kaharollbackcommand command  throws ioexception
+process command  location
+@override
+public void visit kaharemovedestinationcommand command  throws ioexception
+process command  location
+@override
+public void visit kahasubscriptioncommand command  throws ioexception
+process command  location
+private void process final kahaaddmessagecommand command  final location location  throws ioexception
+if  command hastransactioninfo
+synchronized  indexmutex
+arraylist<operation> inflighttx   getinflighttx command gettransactioninfo    location
+inflighttx add new addopperation command  location
+else
+synchronized  indexmutex
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+upadateindex tx  command  location
+protected void process final kaharemovemessagecommand command  final location location  throws ioexception
+if  command hastransactioninfo
+synchronized  indexmutex
+arraylist<operation> inflighttx   getinflighttx command gettransactioninfo    location
+inflighttx add new removeopperation command  location
+else
+synchronized  indexmutex
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+updateindex tx  command  location
+protected void process final kaharemovedestinationcommand command  final location location  throws ioexception
+synchronized  indexmutex
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+updateindex tx  command  location
+protected void process final kahasubscriptioncommand command  final location location  throws ioexception
+synchronized  indexmutex
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+updateindex tx  command  location
+protected void process kahacommitcommand command  location location  throws ioexception
+transactionid key   key command gettransactioninfo
+synchronized  indexmutex
+arraylist<operation> inflighttx   inflighttransactions remove key
+if  inflighttx    null
+inflighttx   preparedtransactions remove key
+if  inflighttx    null
+return
+final arraylist<operation> messagingtx   inflighttx
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+for  operation op   messagingtx
+op execute tx
+protected void process kahapreparecommand command  location location
+synchronized  indexmutex
+transactionid key   key command gettransactioninfo
+arraylist<operation> tx   inflighttransactions remove key
+if  tx    null
+preparedtransactions put key  tx
+protected void process kaharollbackcommand command  location location
+synchronized  indexmutex
+transactionid key   key command gettransactioninfo
+arraylist<operation> tx   inflighttransactions remove key
+if  tx    null
+preparedtransactions remove key
+// /////////////////////////////////////////////////////////////////
+// these methods do the actual index updates.
+// /////////////////////////////////////////////////////////////////
+protected final object indexmutex   new object
+private final hashset<integer> journalfilesbeingreplicated   new hashset<integer>
+private void upadateindex transaction tx  kahaaddmessagecommand command  location location  throws ioexception
+storeddestination sd   getstoreddestination command getdestination    tx
+// skip adding the message to the index if this is a topic and there are
+// no subscriptions.
+if  sd subscriptions    null    sd ackpositions isempty
+return
+// add the message.
+long id   sd nextmessageid
+long previous   sd locationindex put tx  location  id
+if  previous    null
+previous   sd messageidindex put tx  command getmessageid    id
+if  previous    null
+sd orderindex put tx  id  new messagekeys command getmessageid    location
+else
+// if the message id as indexed, then the broker asked us to store a dup
+// message.  bad boy!  don't do it, and log a warning.
+log warn   command getmessageid
+// todo: consider just rolling back the tx.
+sd messageidindex put tx  command getmessageid    previous
+else
+// restore the previous value.. looks like this was a redo of a previously
+// added message.  we don't want to assign it a new id as the other indexes would
+// be wrong..
+//
+// todo: consider just rolling back the tx.
+sd locationindex put tx  location  previous
+private void updateindex transaction tx  kaharemovemessagecommand command  location acklocation  throws ioexception
+storeddestination sd   getstoreddestination command getdestination    tx
+if   command hassubscriptionkey
+// in the queue case we just remove the message from the index..
+long sequenceid   sd messageidindex remove tx  command getmessageid
+if  sequenceid    null
+messagekeys keys   sd orderindex remove tx  sequenceid
+sd locationindex remove tx  keys location
+else
+// in the topic case we need remove the message once it's been acked
+// by all the subs
+long sequence   sd messageidindex get tx  command getmessageid
+// make sure it's a valid message id...
+if  sequence    null
+string subscriptionkey   command getsubscriptionkey
+long prev   sd subscriptionacks put tx  subscriptionkey  sequence
+// the following method handles deleting un-referenced messages.
+removeacklocation tx  sd  subscriptionkey  prev
+// add it to the new location set.
+addacklocation sd  sequence  subscriptionkey
+private void updateindex transaction tx  kaharemovedestinationcommand command  location location  throws ioexception
+storeddestination sd   getstoreddestination command getdestination    tx
+sd orderindex clear tx
+sd orderindex unload tx
+tx free sd orderindex getpageid
+sd locationindex clear tx
+sd locationindex unload tx
+tx free sd locationindex getpageid
+sd messageidindex clear tx
+sd messageidindex unload tx
+tx free sd messageidindex getpageid
+if  sd subscriptions    null
+sd subscriptions clear tx
+sd subscriptions unload tx
+tx free sd subscriptions getpageid
+sd subscriptionacks clear tx
+sd subscriptionacks unload tx
+tx free sd subscriptionacks getpageid
+string key   key command getdestination
+storeddestinations remove key
+metadata destinations remove tx  key
+private void updateindex transaction tx  kahasubscriptioncommand command  location location  throws ioexception
+storeddestination sd   getstoreddestination command getdestination    tx
+// if set then we are creating it.. otherwise we are destroying the sub
+if  command hassubscriptioninfo
+string subscriptionkey   command getsubscriptionkey
+sd subscriptions put tx  subscriptionkey  command
+long acklocation  1
+if   command getretroactive
+acklocation   sd nextmessageid 1
+sd subscriptionacks put tx  subscriptionkey  acklocation
+addacklocation sd  acklocation  subscriptionkey
+else
+// delete the sub...
+string subscriptionkey   command getsubscriptionkey
+sd subscriptions remove tx  subscriptionkey
+long prev   sd subscriptionacks remove tx  subscriptionkey
+if  prev  null
+removeacklocation tx  sd  subscriptionkey  prev
+/**
+* @param tx
+* @throws ioexception
+*/
+private void checkpointupdate transaction tx  boolean cleanup  throws ioexception
+log debug
+metadata state   open_state
+metadata firstinprogresstransactionlocation   getfirstinprogresstxlocation
+tx store metadata page  metadatamarshaller  true
+pagefile flush
+if  cleanup
+final treeset<integer> gccandidateset   new treeset<integer> journal getfilemap   keyset
+// don't gc files under replication
+if  journalfilesbeingreplicated  null
+gccandidateset removeall journalfilesbeingreplicated
+// don't gc files after the first in progress tx
+location firsttxlocation   metadata lastupdate
+if  metadata firstinprogresstransactionlocation  null
+firsttxlocation   metadata firstinprogresstransactionlocation
+if  firsttxlocation  null
+while   gccandidateset isempty
+integer last   gccandidateset last
+if  last >  firsttxlocation getdatafileid
+gccandidateset remove last
+else
+break
+// go through all the destinations to see if any of them can remove gc candidates.
+for  storeddestination sd   storeddestinations values
+if  gccandidateset isempty
+break
+// use a visitor to cut down the number of pages that we load
+sd locationindex visit tx  new btreevisitor<location  long>
+int last  1
+public boolean isinterestedinkeysbetween location first  location second
+if  first  null
+sortedset<integer> subset   gccandidateset headset second getdatafileid   1
+if   subset isempty      subset last      second getdatafileid
+subset remove second getdatafileid
+return  subset isempty
+else if  second  null
+sortedset<integer> subset   gccandidateset tailset first getdatafileid
+if   subset isempty      subset first      first getdatafileid
+subset remove first getdatafileid
+return  subset isempty
+else
+sortedset<integer> subset   gccandidateset subset first getdatafileid    second getdatafileid   1
+if   subset isempty      subset first      first getdatafileid
+subset remove first getdatafileid
+if   subset isempty      subset last      second getdatafileid
+subset remove second getdatafileid
+return  subset isempty
+public void visit list<location> keys  list<long> values
+for  location l   keys
+int fileid   l getdatafileid
+if  last    fileid
+gccandidateset remove fileid
+last   fileid
+if   gccandidateset isempty
+log debug   gccandidateset
+journal removedatafiles gccandidateset
+log debug
+public hashset<integer> getjournalfilesbeingreplicated
+return journalfilesbeingreplicated
+// /////////////////////////////////////////////////////////////////
+// storeddestination related implementation methods.
+// /////////////////////////////////////////////////////////////////
+private final hashmap<string  storeddestination> storeddestinations   new hashmap<string  storeddestination>
+class storedsubscription
+subscriptioninfo subscriptioninfo
+string lastackid
+location lastacklocation
+location cursor
+static class messagekeys
+final string messageid
+final location location
+public messagekeys string messageid  location location
+this messageid messageid
+this location location
+@override
+public string tostring
+return   messageid   location
+static protected class messagekeysmarshaller extends variablemarshaller<messagekeys>
+static final messagekeysmarshaller instance   new messagekeysmarshaller
+public messagekeys readpayload datainput datain  throws ioexception
+return new messagekeys datain readutf    locationmarshaller instance readpayload datain
+public void writepayload messagekeys object  dataoutput dataout  throws ioexception
+dataout writeutf object messageid
+locationmarshaller instance writepayload object location  dataout
+static class storeddestination
+long nextmessageid
+btreeindex<long  messagekeys> orderindex
+btreeindex<location  long> locationindex
+btreeindex<string  long> messageidindex
+// these bits are only set for topics
+btreeindex<string  kahasubscriptioncommand> subscriptions
+btreeindex<string  long> subscriptionacks
+hashmap<string  long> subscriptioncursors
+treemap<long  hashset<string>> ackpositions
+protected class storeddestinationmarshaller extends variablemarshaller<storeddestination>
+public storeddestination readpayload datainput datain  throws ioexception
+storeddestination value   new storeddestination
+value orderindex   new btreeindex<long  messagekeys> pagefile  datain readlong
+value locationindex   new btreeindex<location  long> pagefile  datain readlong
+value messageidindex   new btreeindex<string  long> pagefile  datain readlong
+if  datain readboolean
+value subscriptions   new btreeindex<string  kahasubscriptioncommand> pagefile  datain readlong
+value subscriptionacks   new btreeindex<string  long> pagefile  datain readlong
+return value
+public void writepayload storeddestination value  dataoutput dataout  throws ioexception
+dataout writelong value orderindex getpageid
+dataout writelong value locationindex getpageid
+dataout writelong value messageidindex getpageid
+if  value subscriptions    null
+dataout writeboolean true
+dataout writelong value subscriptions getpageid
+dataout writelong value subscriptionacks getpageid
+else
+dataout writeboolean false
+static class locationmarshaller implements marshaller<location>
+final static locationmarshaller instance   new locationmarshaller
+public location readpayload datainput datain  throws ioexception
+location rc   new location
+rc setdatafileid datain readint
+rc setoffset datain readint
+return rc
+public void writepayload location object  dataoutput dataout  throws ioexception
+dataout writeint object getdatafileid
+dataout writeint object getoffset
+public int getfixedsize
+return 8
+public location deepcopy location source
+return new location source
+public boolean isdeepcopysupported
+return true
+static class kahasubscriptioncommandmarshaller extends variablemarshaller<kahasubscriptioncommand>
+final static kahasubscriptioncommandmarshaller instance   new kahasubscriptioncommandmarshaller
+public kahasubscriptioncommand readpayload datainput datain  throws ioexception
+kahasubscriptioncommand rc   new kahasubscriptioncommand
+rc mergeframed  inputstream datain
+return rc
+public void writepayload kahasubscriptioncommand object  dataoutput dataout  throws ioexception
+object writeframed  outputstream dataout
+protected storeddestination getstoreddestination kahadestination destination  transaction tx  throws ioexception
+string key   key destination
+storeddestination rc   storeddestinations get key
+if  rc    null
+boolean topic   destination gettype      kahadestination destinationtype topic    destination gettype      kahadestination destinationtype temp_topic
+rc   loadstoreddestination tx  key  topic
+// cache it. we may want to remove/unload destinations from the
+// cache that are not used for a while
+// to reduce memory usage.
+storeddestinations put key  rc
+return rc
+/**
+* @param tx
+* @param key
+* @param topic
+* @return
+* @throws ioexception
+*/
+private storeddestination loadstoreddestination transaction tx  string key  boolean topic  throws ioexception
+// try to load the existing indexes..
+storeddestination rc   metadata destinations get tx  key
+if  rc    null
+// brand new destination.. allocate indexes for it.
+rc   new storeddestination
+rc orderindex   new btreeindex<long  messagekeys> pagefile  tx allocate
+rc locationindex   new btreeindex<location  long> pagefile  tx allocate
+rc messageidindex   new btreeindex<string  long> pagefile  tx allocate
+if  topic
+rc subscriptions   new btreeindex<string  kahasubscriptioncommand> pagefile  tx allocate
+rc subscriptionacks   new btreeindex<string  long> pagefile  tx allocate
+metadata destinations put tx  key  rc
+// configure the marshalers and load.
+rc orderindex setkeymarshaller longmarshaller instance
+rc orderindex setvaluemarshaller messagekeysmarshaller instance
+rc orderindex load tx
+// figure out the next key using the last entry in the destination.
+entry<long  messagekeys> lastentry   rc orderindex getlast tx
+if  lastentry  null
+rc nextmessageid   lastentry getkey   1
+rc locationindex setkeymarshaller locationmarshaller instance
+rc locationindex setvaluemarshaller longmarshaller instance
+rc locationindex load tx
+rc messageidindex setkeymarshaller stringmarshaller instance
+rc messageidindex setvaluemarshaller longmarshaller instance
+rc messageidindex load tx
+// if it was a topic...
+if  topic
+rc subscriptions setkeymarshaller stringmarshaller instance
+rc subscriptions setvaluemarshaller kahasubscriptioncommandmarshaller instance
+rc subscriptions load tx
+rc subscriptionacks setkeymarshaller stringmarshaller instance
+rc subscriptionacks setvaluemarshaller longmarshaller instance
+rc subscriptionacks load tx
+rc ackpositions   new treemap<long  hashset<string>>
+rc subscriptioncursors   new hashmap<string  long>
+for  iterator<entry<string  long>> iterator   rc subscriptionacks iterator tx   iterator hasnext
+entry<string  long> entry   iterator next
+addacklocation rc  entry getvalue    entry getkey
+return rc
+/**
+* @param sd
+* @param messagesequence
+* @param subscriptionkey
+*/
+private void addacklocation storeddestination sd  long messagesequence  string subscriptionkey
+hashset<string> hs   sd ackpositions get messagesequence
+if  hs    null
+hs   new hashset<string>
+sd ackpositions put messagesequence  hs
+hs add subscriptionkey
+/**
+* @param tx
+* @param sd
+* @param subscriptionkey
+* @param sequenceid
+* @throws ioexception
+*/
+private void removeacklocation transaction tx  storeddestination sd  string subscriptionkey  long sequenceid  throws ioexception
+// remove the sub from the previous location set..
+if  sequenceid    null
+hashset<string> hs   sd ackpositions get sequenceid
+if  hs    null
+hs remove subscriptionkey
+if  hs isempty
+hashset<string> firstset   sd ackpositions values   iterator   next
+sd ackpositions remove sequenceid
+// did we just empty out the first set in the
+// ordered list of ack locations? then it's time to
+// delete some messages.
+if  hs    firstset
+// find all the entries that need to get deleted.
+arraylist<entry<long  messagekeys>> deletes   new arraylist<entry<long  messagekeys>>
+for  iterator<entry<long  messagekeys>> iterator   sd orderindex iterator tx   iterator hasnext
+entry<long  messagekeys> entry   iterator next
+if  entry getkey   compareto sequenceid  <  0
+// we don't do the actually delete while we are
+// iterating the btree since
+// iterating would fail.
+deletes add entry
+// do the actual deletes.
+for  entry<long  messagekeys> entry   deletes
+sd locationindex remove tx  entry getvalue   location
+sd messageidindex remove tx entry getvalue   messageid
+sd orderindex remove tx entry getkey
+private string key kahadestination destination
+return destination gettype   getnumber         destination getname
+// /////////////////////////////////////////////////////////////////
+// transaction related implementation methods.
+// /////////////////////////////////////////////////////////////////
+protected final linkedhashmap<transactionid  arraylist<operation>> inflighttransactions   new linkedhashmap<transactionid  arraylist<operation>>
+protected final linkedhashmap<transactionid  arraylist<operation>> preparedtransactions   new linkedhashmap<transactionid  arraylist<operation>>
+private arraylist<operation> getinflighttx kahatransactioninfo info  location location
+transactionid key   key info
+arraylist<operation> tx   inflighttransactions get key
+if  tx    null
+tx   new arraylist<operation>
+inflighttransactions put key  tx
+return tx
+private transactionid key kahatransactioninfo transactioninfo
+if  transactioninfo haslocaltransacitonid
+kahalocaltransactionid tx   transactioninfo getlocaltransacitonid
+localtransactionid rc   new localtransactionid
+rc setconnectionid new connectionid tx getconnectionid
+rc setvalue tx gettransacitonid
+return rc
+else
+kahaxatransactionid tx   transactioninfo getxatransacitonid
+xatransactionid rc   new xatransactionid
+rc setbranchqualifier tx getbranchqualifier   tobytearray
+rc setglobaltransactionid tx getglobaltransactionid   tobytearray
+rc setformatid tx getformatid
+return rc
+abstract class operation
+final location location
+public operation location location
+this location   location
+public location getlocation
+return location
+abstract public void execute transaction tx  throws ioexception
+class addopperation extends operation
+final kahaaddmessagecommand command
+public addopperation kahaaddmessagecommand command  location location
+super location
+this command   command
+public void execute transaction tx  throws ioexception
+upadateindex tx  command  location
+public kahaaddmessagecommand getcommand
+return command
+class removeopperation extends operation
+final kaharemovemessagecommand command
+public removeopperation kaharemovemessagecommand command  location location
+super location
+this command   command
+public void execute transaction tx  throws ioexception
+updateindex tx  command  location
+public kaharemovemessagecommand getcommand
+return command
+// /////////////////////////////////////////////////////////////////
+// initialization related implementation methods.
+// /////////////////////////////////////////////////////////////////
+private pagefile createpagefile
+pagefile index   new pagefile directory
+index setenablewritethread isenableindexwriteasync
+index setwritebatchsize getindexwritebatchsize
+index setpagecachesize indexcachesize
+return index
+private journal createjournal
+journal manager   new journal
+manager setdirectory directory
+manager setmaxfilelength getjournalmaxfilelength
+manager setcheckforcorruptiononstartup checkforcorruptjournalfiles
+manager setchecksum checksumjournalfiles    checkforcorruptjournalfiles
+manager setwritebatchsize getjournalmaxwritebatchsize
+return manager
+public int getjournalmaxwritebatchsize
+return journalmaxwritebatchsize
+public void setjournalmaxwritebatchsize int journalmaxwritebatchsize
+this journalmaxwritebatchsize   journalmaxwritebatchsize
+public file getdirectory
+return directory
+public void setdirectory file directory
+this directory   directory
+public boolean isdeleteallmessages
+return deleteallmessages
+public void setdeleteallmessages boolean deleteallmessages
+this deleteallmessages   deleteallmessages
+public void setindexwritebatchsize int setindexwritebatchsize
+this setindexwritebatchsize   setindexwritebatchsize
+public int getindexwritebatchsize
+return setindexwritebatchsize
+public void setenableindexwriteasync boolean enableindexwriteasync
+this enableindexwriteasync   enableindexwriteasync
+boolean isenableindexwriteasync
+return enableindexwriteasync
+public boolean isenablejournaldisksyncs
+return enablejournaldisksyncs
+public void setenablejournaldisksyncs boolean syncwrites
+this enablejournaldisksyncs   syncwrites
+public long getcheckpointinterval
+return checkpointinterval
+public void setcheckpointinterval long checkpointinterval
+this checkpointinterval   checkpointinterval
+public long getcleanupinterval
+return cleanupinterval
+public void setcleanupinterval long cleanupinterval
+this cleanupinterval   cleanupinterval
+public void setjournalmaxfilelength int journalmaxfilelength
+this journalmaxfilelength   journalmaxfilelength
+public int getjournalmaxfilelength
+return journalmaxfilelength
+public pagefile getpagefile
+if  pagefile    null
+pagefile   createpagefile
+return pagefile
+public journal getjournal
+if  journal    null
+journal   createjournal
+return journal
+public boolean isfailifdatabaseislocked
+return failifdatabaseislocked
+public void setfailifdatabaseislocked boolean failifdatabaseislocked
+this failifdatabaseislocked   failifdatabaseislocked
+public boolean isignoremissingjournalfiles
+return ignoremissingjournalfiles
+public void setignoremissingjournalfiles boolean ignoremissingjournalfiles
+this ignoremissingjournalfiles   ignoremissingjournalfiles
+public int getindexcachesize
+return indexcachesize
+public void setindexcachesize int indexcachesize
+this indexcachesize   indexcachesize
+public boolean ischeckforcorruptjournalfiles
+return checkforcorruptjournalfiles
+public void setcheckforcorruptjournalfiles boolean checkforcorruptjournalfiles
+this checkforcorruptjournalfiles   checkforcorruptjournalfiles
+public boolean ischecksumjournalfiles
+return checksumjournalfiles
+public void setchecksumjournalfiles boolean checksumjournalfiles
+this checksumjournalfiles   checksumjournalfiles

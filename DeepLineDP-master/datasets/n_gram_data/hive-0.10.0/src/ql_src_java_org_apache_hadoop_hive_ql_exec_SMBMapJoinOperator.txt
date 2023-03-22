@@ -1,0 +1,538 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.you may obtain a copy of the license at
+*
+* http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql exec
+import java io ioexception
+import java io serializable
+import java util arraylist
+import java util arrays
+import java util collections
+import java util hashmap
+import java util list
+import java util map
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs path
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive ql exec persistence rowcontainer
+import org apache hadoop hive ql metadata hiveexception
+import org apache hadoop hive ql plan bucketmapjoincontext
+import org apache hadoop hive ql plan fetchwork
+import org apache hadoop hive ql plan mapjoindesc
+import org apache hadoop hive ql plan mapredlocalwork
+import org apache hadoop hive ql plan operatordesc
+import org apache hadoop hive ql plan smbjoindesc
+import org apache hadoop hive ql plan api operatortype
+import org apache hadoop hive ql util objectpair
+import org apache hadoop hive serde2 columnprojectionutils
+import org apache hadoop hive serde2 objectinspector inspectableobject
+import org apache hadoop hive serde2 objectinspector objectinspector
+import org apache hadoop io writablecomparable
+import org apache hadoop io writablecomparator
+import org apache hadoop mapred jobconf
+import org apache hadoop util priorityqueue
+import org apache hadoop util reflectionutils
+/**
+* sorted merge map join operator.
+*/
+public class smbmapjoinoperator extends abstractmapjoinoperator<smbjoindesc> implements
+serializable
+private static final long serialversionuid   1l
+private static final log log   logfactory getlog smbmapjoinoperator class
+getname
+private mapredlocalwork localwork   null
+private map<string  mergequeue> aliastomergequeue   collections emptymap
+transient arraylist<object> keywritables
+transient arraylist<object> nextkeywritables
+rowcontainer<arraylist<object>> nextgroupstorage
+rowcontainer<arraylist<object>> candidatestorage
+transient map<byte  string> tagtoalias
+private transient boolean fetchdone
+private transient boolean foundnextkeygroup
+transient boolean firstfetchhappened   false
+private transient boolean inputfilechanged   false
+transient boolean localworkinited   false
+public smbmapjoinoperator
+public smbmapjoinoperator abstractmapjoinoperator<? extends mapjoindesc> mapjoinop
+super mapjoinop
+@override
+protected void initializeop configuration hconf  throws hiveexception
+super initializeop hconf
+firstrow   true
+closecalled   false
+this firstfetchhappened   false
+this inputfilechanged   false
+// get the largest table alias from order
+int maxalias   0
+for  byte alias  order
+if  alias > maxalias
+maxalias   alias
+maxalias    1
+nextgroupstorage   new rowcontainer
+candidatestorage   new rowcontainer
+keywritables   new arraylist
+nextkeywritables   new arraylist
+fetchdone   new boolean
+foundnextkeygroup   new boolean
+int bucketsize   hiveconf getintvar hconf
+hiveconf confvars hivemapjoinbucketcachesize
+byte storepos    byte  0
+for  byte alias   order
+rowcontainer rc   joinutil getrowcontainer hconf
+rowcontainerstandardobjectinspectors get storepos
+alias  bucketsize spilltabledesc  conf   hasfilter storepos
+reporter
+nextgroupstorage   rc
+rowcontainer candidaterc   joinutil getrowcontainer hconf
+rowcontainerstandardobjectinspectors get  byte storepos
+alias bucketsize spilltabledesc  conf   hasfilter storepos
+reporter
+candidatestorage   candidaterc
+storepos
+tagtoalias   conf gettagtoalias
+for  byte alias   order
+if alias     byte  posbigtable
+fetchdone   false
+foundnextkeygroup   false
+@override
+public void initializelocalwork configuration hconf  throws hiveexception
+initializemapredlocalwork this getconf    hconf  this getconf   getlocalwork    log
+super initializelocalwork hconf
+public void initializemapredlocalwork mapjoindesc conf  configuration hconf
+mapredlocalwork localwork  log l4j  throws hiveexception
+if  localwork    null    localworkinited
+return
+localworkinited   true
+this localwork   localwork
+aliastomergequeue   new hashmap<string  mergequeue>
+// create map local operators
+map<string fetchwork> aliastofetchwork   localwork getaliastofetchwork
+map<string  operator<? extends operatordesc>> aliastowork   localwork getaliastowork
+for  map entry<string  fetchwork> entry   aliastofetchwork entryset
+string alias   entry getkey
+fetchwork fetchwork   entry getvalue
+operator<? extends operatordesc> forwardop   aliastowork get alias
+forwardop setexeccontext getexeccontext
+jobconf jobclone   clonejobconf hconf  forwardop
+fetchoperator fetchop   new fetchoperator fetchwork  jobclone
+forwardop initialize jobclone  new objectinspector fetchop getoutputobjectinspector
+fetchop clearfetchcontext
+mergequeue mergequeue   new mergequeue alias  fetchwork  jobclone
+aliastomergequeue put alias  mergequeue
+l4j info     alias
+private jobconf clonejobconf configuration hconf  operator<?> op
+jobconf jobclone   new jobconf hconf
+if  op instanceof tablescanoperator
+list<integer> list     tablescanoperator op  getneededcolumnids
+if  list    null
+columnprojectionutils appendreadcolumnids jobclone  list
+else
+columnprojectionutils setfullyreadcolumns jobclone
+return jobclone
+private byte tagforalias string alias
+for  map entry<byte  string> entry   tagtoalias entryset
+if  entry getvalue   equals alias
+return entry getkey
+return  1
+// the input file has changed - load the correct hash bucket
+@override
+public void cleanupinputfilechangedop   throws hiveexception
+inputfilechanged   true
+@override
+public void processop object row  int tag  throws hiveexception
+if  tag    posbigtable
+if  inputfilechanged
+if  firstfetchhappened
+// we need to first join and flush out data left by the previous file.
+joinfinalleftdata
+// set up the fetch operator for the new input file.
+for  map entry<string  mergequeue> entry   aliastomergequeue entryset
+string alias   entry getkey
+mergequeue mergequeue   entry getvalue
+setupfetchcontexts alias  mergequeue
+firstfetchhappened   false
+inputfilechanged   false
+if   firstfetchhappened
+firstfetchhappened   true
+// fetch the first group for all small table aliases
+for  byte t   order
+if t     byte posbigtable
+fetchnextgroup t
+byte alias    byte  tag
+// compute keys and values as standardobjects
+arraylist<object> key   joinutil computekeys row  joinkeys get alias
+joinkeysobjectinspectors get alias
+arraylist<object> value   joinutil computevalues row  joinvalues get alias
+joinvaluesobjectinspectors get alias   joinfilters get alias
+joinfilterobjectinspectors get alias
+filtermap    null ? null   filtermap
+//have we reached a new key group?
+boolean nextkeygroup   processkey alias  key
+if  nextkeygroup
+//assert this.nextgroupstorage.get(alias).size() == 0;
+this nextgroupstorage add value
+foundnextkeygroup   true
+if  tag    posbigtable
+return
+reportprogress
+nummaprowsread
+// the big table has reached a new key group. try to let the small tables
+// catch up with the big table.
+if  nextkeygroup
+assert tag     byte posbigtable
+list<byte> smallestpos   null
+do
+smallestpos   joinonegroup
+//jump out the loop if we need input from the big table
+while  smallestpos    null    smallestpos size   > 0
+smallestpos contains  byte this posbigtable
+return
+assert  nextkeygroup
+candidatestorage add value
+/*
+* this happens either when the input file of the big table is changed or in
+* closeop. it needs to fetch all the left data from the small tables and try
+* to join them.
+*/
+private void joinfinalleftdata   throws hiveexception
+rowcontainer bigtblrowcontainer   this candidatestorage
+boolean allfetchdone   allfetchdone
+// if all left data in small tables are less than and equal to the left data
+// in big table, let's them catch up
+while  bigtblrowcontainer    null    bigtblrowcontainer size   > 0
+allfetchdone
+joinonegroup
+bigtblrowcontainer   this candidatestorage
+allfetchdone   allfetchdone
+while   allfetchdone
+list<byte> ret   joinonegroup
+if  ret    null    ret size      0
+break
+reportprogress
+nummaprowsread
+allfetchdone   allfetchdone
+boolean dataincache   true
+while  dataincache
+for  byte t   order
+if  this foundnextkeygroup
+this nextkeywritables    null
+promotenextgrouptocandidate t
+joinonegroup
+dataincache   false
+for  byte r   order
+if  this candidatestorage size   > 0
+dataincache   true
+break
+private boolean allfetchdone
+boolean allfetchdone   true
+for  byte tag   order
+if tag     byte  posbigtable
+continue
+allfetchdone   allfetchdone    fetchdone
+return allfetchdone
+private list<byte> joinonegroup   throws hiveexception
+int smallestpos   findsmallestkey
+list<byte> listofneedfetchnext   null
+if smallestpos    null
+listofneedfetchnext   joinobject smallestpos
+if  listofneedfetchnext size   > 0
+// listofneedfetchnext contains all tables that we have joined data in their
+// candidatestorage, and we need to clear candidate storage and promote their
+// nextgroupstorage to candidatestorage and fetch data until we reach a
+// new group.
+for  byte b   listofneedfetchnext
+fetchnextgroup b
+return listofneedfetchnext
+private list<byte> joinobject int smallestpos  throws hiveexception
+list<byte> needfetchlist   new arraylist<byte>
+byte index    byte   smallestpos length   1
+for    index >  0  index
+if  smallestpos > 0    keywritables    null
+putdummyorempty index
+continue
+storage put index  candidatestorage
+needfetchlist add index
+if  smallestpos < 0
+break
+for  index    index >  0  index
+putdummyorempty index
+checkandgenobject
+for  byte pos   needfetchlist
+this candidatestorage clear
+this keywritables   null
+return needfetchlist
+private void fetchnextgroup byte t  throws hiveexception
+if  foundnextkeygroup
+// first promote the next group to be the current group if we reached a
+// new group in the previous fetch
+if  this nextkeywritables    null
+promotenextgrouptocandidate t
+else
+this keywritables   null
+this candidatestorage   null
+this nextgroupstorage   null
+foundnextkeygroup   false
+//for the big table, we only need to promote the next group to the current group.
+if t     byte posbigtable
+return
+//for tables other than the big table, we need to fetch more data until reach a new group or done.
+while   foundnextkeygroup
+if  fetchdone
+break
+fetchonerow t
+if   foundnextkeygroup    fetchdone
+this nextkeywritables   null
+private void promotenextgrouptocandidate byte t  throws hiveexception
+this keywritables   this nextkeywritables
+this nextkeywritables   null
+rowcontainer<arraylist<object>> oldrowcontainer   this candidatestorage
+oldrowcontainer clear
+this candidatestorage   this nextgroupstorage
+this nextgroupstorage   oldrowcontainer
+private int comparekeys  list<object> k1  list<object> k2
+int ret   0
+// join keys have difference sizes?
+ret   k1 size     k2 size
+if  ret    0
+return ret
+for  int i   0  i < k1 size    i
+writablecomparable key_1    writablecomparable  k1 get i
+writablecomparable key_2    writablecomparable  k2 get i
+if  key_1    null    key_2    null
+return nullsafes    null    nullsafes ? 0    1     just return k1 is smaller than k2
+else if  key_1    null
+return  1
+else if  key_2    null
+return 1
+ret   writablecomparator get key_1 getclass    compare key_1  key_2
+if ret    0
+return ret
+return ret
+private void putdummyorempty byte i
+// put a empty list or null
+if  noouterjoin
+storage put i  emptylist
+else
+storage put i  dummyobjvectors
+private int findsmallestkey
+int result   new int
+arraylist<object> smallestone   null
+for  byte i   order
+arraylist<object> key   keywritables
+if  key    null
+continue
+if  smallestone    null
+smallestone   key
+result    1
+continue
+result   comparekeys key  smallestone
+if  result < 0
+smallestone   key
+return smallestone    null ? null   result
+private boolean processkey byte alias  arraylist<object> key
+throws hiveexception
+arraylist<object> keywritable   keywritables
+if  keywritable    null
+//the first group.
+keywritables   key
+return false
+else
+int cmp   comparekeys key  keywritable
+if  cmp    0
+nextkeywritables   key
+return true
+return false
+private void setupfetchcontexts string alias  mergequeue mergequeue  throws hiveexception
+mergequeue clearfetchcontext
+string currentinputfile   getexeccontext   getcurrentinputfile
+bucketmapjoincontext bucketmatchercxt   localwork getbucketmapjoincontext
+class<? extends bucketmatcher> bucketmatchercls   bucketmatchercxt getbucketmatcherclass
+bucketmatcher bucketmatcher   reflectionutils newinstance bucketmatchercls  null
+getexeccontext   setfileid bucketmatchercxt createfileid currentinputfile
+log info     getexeccontext   getfileid
+bucketmatcher setaliasbucketfilenamemapping bucketmatchercxt
+getaliasbucketfilenamemapping
+list<path> aliasfiles   bucketmatcher getaliasbucketfiles currentinputfile
+bucketmatchercxt getmapjoinbigtablealias    alias
+mergequeue setupcontext aliasfiles
+private void fetchonerow byte tag
+string table   tagtoalias get tag
+mergequeue mergequeue   aliastomergequeue get table
+operator<? extends operatordesc> forwardop   localwork getaliastowork
+get table
+try
+inspectableobject row   mergequeue getnextrow
+if  row    null
+fetchdone   true
+return
+forwardop process row o  0
+// check if any operator had a fatal error or early exit during
+// execution
+if  forwardop getdone
+fetchdone   true
+catch  throwable e
+if  e instanceof outofmemoryerror
+// don't create a new object if we are already out of memory
+throw  outofmemoryerror  e
+else
+throw new runtimeexception    e
+transient boolean closecalled   false
+@override
+public void closeop boolean abort  throws hiveexception
+if closecalled
+return
+closecalled   true
+if  inputfilechanged     firstfetchhappened
+//set up the fetch operator for the new input file.
+for  map entry<string  mergequeue> entry   aliastomergequeue entryset
+string alias   entry getkey
+mergequeue mergequeue   entry getvalue
+setupfetchcontexts alias  mergequeue
+firstfetchhappened   true
+for  byte t   order
+if t     byte posbigtable
+fetchnextgroup t
+inputfilechanged   false
+joinfinalleftdata
+//clean up
+for  byte alias   order
+if alias     byte  posbigtable
+fetchdone   false
+foundnextkeygroup   false
+localworkinited   false
+super closeop abort
+for  map entry<string  mergequeue> entry   aliastomergequeue entryset
+string alias   entry getkey
+mergequeue mergequeue   entry getvalue
+operator forwardop   localwork getaliastowork   get alias
+forwardop close abort
+mergequeue clearfetchcontext
+@override
+protected boolean allinitializedparentsareclosed
+return true
+/**
+* implements the getname function for the node interface.
+*
+* @return the name of the operator
+*/
+@override
+public string getname
+return getoperatorname
+static public string getoperatorname
+return
+@override
+public operatortype gettype
+return operatortype mapjoin
+// returns rows from possibly multiple bucket files of small table in ascending order
+// by utilizing primary queue (borrowed from hadoop)
+// elements of queue (integer) are index to fetchoperator[] (segments)
+private class mergequeue extends priorityqueue<integer>
+private final string alias
+private final fetchwork fetchwork
+private final jobconf jobconf
+// for keeping track of the number of elements read. just for debugging
+transient int counter
+transient fetchoperator segments
+transient list<exprnodeevaluator> keyfields
+transient list<objectinspector> keyfieldois
+// index of fetchoperator which is providing smallest one
+transient integer currentminsegment
+transient objectpair<list<object>  inspectableobject> keys
+public mergequeue string alias  fetchwork fetchwork  jobconf jobconf
+this alias   alias
+this fetchwork   fetchwork
+this jobconf   jobconf
+// paths = bucket files of small table for current bucket file of big table
+// initializes a fetchoperator for each file in paths, reuses fetchoperator if possible
+// currently, number of paths is always the same (bucket numbers are all the same over
+// all partitions in a table).
+// but if hive supports assigning bucket number for each partition, this can be vary
+public void setupcontext list<path> paths  throws hiveexception
+int segmentlen   paths size
+fetchoperator segments   segmentsforsize segmentlen
+for  int i   0   i < segmentlen  i
+path path   paths get i
+if  segments    null
+segments   new fetchoperator fetchwork  new jobconf jobconf
+segments setupcontext arrays aslist path
+initialize segmentlen
+for  int i   0  i < segmentlen  i
+if  nexthive i
+put i
+counter   0
+@suppresswarnings
+private fetchoperator segmentsforsize int segmentlen
+if  segments    null    segments length < segmentlen
+fetchoperator newsegments   new fetchoperator
+objectpair<list<object>  inspectableobject> newkeys   new objectpair
+if  segments    null
+system arraycopy segments  0  newsegments  0  segments length
+system arraycopy keys  0  newkeys  0  keys length
+segments   newsegments
+keys   newkeys
+return segments
+public void clearfetchcontext   throws hiveexception
+if  segments    null
+for  fetchoperator op   segments
+if  op    null
+op clearfetchcontext
+protected boolean lessthan object a  object b
+return comparekeys keys getfirst    keys getfirst    < 0
+public final inspectableobject getnextrow   throws ioexception
+if  currentminsegment    null
+adjustpriorityqueue currentminsegment
+integer current   top
+if  current    null
+log info     counter
+return null
+counter
+return keys getsecond
+private void adjustpriorityqueue integer current  throws ioexception
+if  nextio current
+adjusttop        sort
+else
+pop
+// wrapping for exception handling
+private boolean nexthive integer current  throws hiveexception
+try
+return next current
+catch  ioexception e
+throw new hiveexception e
+// wrapping for exception handling
+private boolean nextio integer current  throws ioexception
+try
+return next current
+catch  hiveexception e
+throw new ioexception e
+// return true if current min segment(fetchoperator) has next row
+private boolean next integer current  throws ioexception  hiveexception
+if  keyfields    null
+// joinkeys/joinkeysoi are initialized after making merge queue, so setup lazily at runtime
+byte tag   tagforalias alias
+keyfields   joinkeys get tag
+keyfieldois   joinkeysobjectinspectors get tag
+inspectableobject nextrow   segments getnextrow
+if  nextrow    null
+if  keys    null
+keys   new objectpair<list<object>  inspectableobject>
+// todo this should be changed to be evaluated lazily, especially for single segment case
+keys setfirst joinutil computekeys nextrow o  keyfields  keyfieldois
+keys setsecond nextrow
+return true
+keys   null
+return false

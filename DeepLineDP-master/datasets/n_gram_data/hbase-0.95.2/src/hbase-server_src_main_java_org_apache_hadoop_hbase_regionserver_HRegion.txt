@@ -1,0 +1,4458 @@
+/*
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver
+import java io eofexception
+import java io ioexception
+import java io interruptedioexception
+import java io unsupportedencodingexception
+import java lang reflect constructor
+import java text parseexception
+import java util abstractlist
+import java util arraylist
+import java util arrays
+import java util collection
+import java util collections
+import java util hashmap
+import java util list
+import java util map
+import java util navigablemap
+import java util navigableset
+import java util set
+import java util treemap
+import java util uuid
+import java util concurrent callable
+import java util concurrent completionservice
+import java util concurrent concurrenthashmap
+import java util concurrent concurrentskiplistmap
+import java util concurrent countdownlatch
+import java util concurrent executionexception
+import java util concurrent executorcompletionservice
+import java util concurrent executorservice
+import java util concurrent executors
+import java util concurrent future
+import java util concurrent futuretask
+import java util concurrent threadfactory
+import java util concurrent threadpoolexecutor
+import java util concurrent timeunit
+import java util concurrent timeoutexception
+import java util concurrent atomic atomicboolean
+import java util concurrent atomic atomicinteger
+import java util concurrent atomic atomiclong
+import java util concurrent locks lock
+import java util concurrent locks reentrantreadwritelock
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase cell
+import org apache hadoop hbase compoundconfiguration
+import org apache hadoop hbase droppedsnapshotexception
+import org apache hadoop hbase hbaseconfiguration
+import org apache hadoop hbase hcolumndescriptor
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase notservingregionexception
+import org apache hadoop hbase regiontoobusyexception
+import org apache hadoop hbase tablename
+import org apache hadoop hbase unknownscannerexception
+import org apache hadoop hbase hconstants operationstatuscode
+import org apache hadoop hbase hdfsblocksdistribution
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase keyvalueutil
+import org apache hadoop hbase backup hfilearchiver
+import org apache hadoop hbase client append
+import org apache hadoop hbase client delete
+import org apache hadoop hbase client durability
+import org apache hadoop hbase client get
+import org apache hadoop hbase client increment
+import org apache hadoop hbase client isolationlevel
+import org apache hadoop hbase client mutation
+import org apache hadoop hbase client put
+import org apache hadoop hbase client result
+import org apache hadoop hbase client rowmutations
+import org apache hadoop hbase client row
+import org apache hadoop hbase client scan
+import org apache hadoop hbase errorhandling foreignexceptionsnare
+import org apache hadoop hbase exceptions failedsanitycheckexception
+import org apache hadoop hbase exceptions regioninrecoveryexception
+import org apache hadoop hbase exceptions unknownprotocolexception
+import org apache hadoop hbase filter bytearraycomparable
+import org apache hadoop hbase filter comparefilter compareop
+import org apache hadoop hbase filter filter
+import org apache hadoop hbase filter filterwrapper
+import org apache hadoop hbase filter incompatiblefilterexception
+import org apache hadoop hbase io heapsize
+import org apache hadoop hbase io timerange
+import org apache hadoop hbase io hfile blockcache
+import org apache hadoop hbase io hfile cacheconfig
+import org apache hadoop hbase ipc rpccallcontext
+import org apache hadoop hbase ipc rpcserver
+import org apache hadoop hbase monitoring monitoredtask
+import org apache hadoop hbase monitoring taskmonitor
+import org apache hadoop hbase protobuf generated adminprotos getregioninforesponse compactionstate
+import org apache hadoop hbase protobuf generated clientprotos coprocessorservicecall
+import org apache hadoop hbase protobuf generated hbaseprotos snapshotdescription
+import org apache hadoop hbase protobuf generated walprotos compactiondescriptor
+import org apache hadoop hbase regionserver multiversionconsistencycontrol writeentry
+import org apache hadoop hbase regionserver compactions compactioncontext
+import org apache hadoop hbase regionserver wal hlog
+import org apache hadoop hbase regionserver wal hlogfactory
+import org apache hadoop hbase regionserver wal hlogkey
+import org apache hadoop hbase regionserver wal hlogutil
+import org apache hadoop hbase regionserver wal waledit
+import org apache hadoop hbase snapshot snapshotdescriptionutils
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util cancelableprogressable
+import org apache hadoop hbase util classsize
+import org apache hadoop hbase util compressiontest
+import org apache hadoop hbase util environmentedgemanager
+import org apache hadoop hbase util fsutils
+import org apache hadoop hbase util hashedbytes
+import org apache hadoop hbase util pair
+import org apache hadoop hbase util threads
+import org apache hadoop io multipleioexception
+import org apache hadoop util stringutils
+import org cliffc high_scale_lib counter
+import com google common annotations visiblefortesting
+import com google common base preconditions
+import com google common collect lists
+import com google common collect maps
+import com google common io closeables
+import com google protobuf descriptors
+import com google protobuf message
+import com google protobuf rpccallback
+import com google protobuf rpccontroller
+import com google protobuf service
+/**
+* hregion stores data for a certain region of a table.  it stores all columns
+* for each row. a given table consists of one or more hregions.
+*
+* <p>we maintain multiple hstores for a single hregion.
+*
+* <p>an store is a set of rows with some column data; together,
+* they make up all the data for the rows.
+*
+* <p>each hregion has a 'startkey' and 'endkey'.
+* <p>the first is inclusive, the second is exclusive (except for
+* the final region)  the endkey of region 0 is the same as
+* startkey for region 1 (if it exists).  the startkey for the
+* first region is null. the endkey for the final region is null.
+*
+* <p>locking at the hregion level serves only one purpose: preventing the
+* region from being closed (and consequently split) while other operations
+* are ongoing. each row level operation obtains both a row lock and a region
+* read lock for the duration of the operation. while a scanner is being
+* constructed, getscanner holds a read lock. if the scanner is successfully
+* constructed, it holds a read lock until it is closed. a close takes out a
+* write lock and consequently will block for ongoing operations and will block
+* new operations from starting while the close is in progress.
+*
+* <p>an hregion is defined by its table and its key extent.
+*
+* <p>it consists of at least one store.  the number of stores should be
+* configurable, so that data which is accessed together is stored in the same
+* store.  right now, we approximate that by building a single store for
+* each column family.  (this config info will be communicated via the
+* tabledesc.)
+*
+* <p>the htabledescriptor contains metainfo about the hregion's table.
+* regionname is a unique identifier for this hregion. (startkey, endkey]
+* defines the keyspace for this hregion.
+*/
+@interfaceaudience private
+public class hregion implements heapsize        writable
+public static final log log   logfactory getlog hregion class
+public static final string load_cfs_on_demand_config_key
+/**
+* this is the global default value for durability. all tables/mutations not
+* defining a durability or using use_default will default to this value.
+*/
+private static final durability default_durablity   durability sync_wal
+final atomicboolean closed   new atomicboolean false
+/* closing can take some time; use the closing flag if there is stuff we don't
+* want to do while in closing state; e.g. like offer this region up to the
+* master as a region to close if the carrying regionserver is overloaded.
+* once set, it is never cleared.
+*/
+final atomicboolean closing   new atomicboolean false
+protected long completesequenceid    1l
+/**
+* operation enum is used in {@link hregion#startregionoperation} to provide operation context for
+* startregionoperation to possibly invoke different checks before any region operations. not all
+* operations have to be defined here. it's only needed when a special check is need in
+* startregionoperation
+*/
+protected enum operation
+any  get  put  delete  scan  append  increment  split_region  merge_region  batch_mutate
+replay_batch_mutate  compact_region
+//////////////////////////////////////////////////////////////////////////////
+// members
+//////////////////////////////////////////////////////////////////////////////
+// map from a locked row to the context for that lock including:
+// - countdownlatch for threads waiting on that row
+// - the thread that owns the lock (allow reentrancy)
+// - reference count of (reentrant) locks held by the thread
+// - the row itself
+private final concurrenthashmap<hashedbytes  rowlockcontext> lockedrows
+new concurrenthashmap<hashedbytes  rowlockcontext>
+protected final map<byte  store> stores   new concurrentskiplistmap<byte  store>
+bytes bytes_rawcomparator
+// todo: account for each registered handler in heapsize computation
+private map<string  service> coprocessorservicehandlers   maps newhashmap
+public final atomiclong memstoresize   new atomiclong 0
+// debug possible data loss due to wal off
+final counter nummutationswithoutwal   new counter
+final counter datainmemorywithoutwal   new counter
+// debug why cas operations are taking a while.
+final counter checkandmutatecheckspassed   new counter
+final counter checkandmutatechecksfailed   new counter
+//number of requests
+final counter readrequestscount   new counter
+final counter writerequestscount   new counter
+//how long operations were blocked by a memstore over highwater.
+final counter updatesblockedms   new counter
+private final hlog log
+private final hregionfilesystem fs
+protected final configuration conf
+private final configuration baseconf
+private final keyvalue kvcomparator comparator
+private final int rowlockwaitduration
+static final int default_rowlock_wait_duration   30000
+// the internal wait duration to acquire a lock before read/update
+// from the region. it is not per row. the purpose of this wait time
+// is to avoid waiting a long time while the region is busy, so that
+// we can release the ipc handler soon enough to improve the
+// availability of the region server. it can be adjusted by
+// tuning configuration "hbase.busy.wait.duration".
+final long busywaitduration
+static final long default_busy_wait_duration   hconstants default_hbase_rpc_timeout
+// if updating multiple rows in one call, wait longer,
+// i.e. waiting for busywaitduration * # of rows. however,
+// we can limit the max multiplier.
+final int maxbusywaitmultiplier
+// max busy wait duration. there is no point to wait longer than the rpc
+// purge timeout, when a rpc call will be terminated by the rpc engine.
+final long maxbusywaitduration
+// negative number indicates infinite timeout
+static final long default_row_processor_timeout   60   1000l
+final executorservice rowprocessorexecutor   executors newcachedthreadpool
+private final concurrenthashmap<regionscanner  long> scannerreadpoints
+/**
+* the sequence id that was encountered when this region was opened.
+*/
+private long openseqnum   hconstants no_seqnum
+/**
+* the default setting for whether to enable on-demand cf loading for
+* scan requests to this region. requests can override it.
+*/
+private boolean isloadingcfsondemanddefault   false
+private final atomicinteger majorinprogress   new atomicinteger 0
+private final atomicinteger minorinprogress   new atomicinteger 0
+//
+// context: during replay we want to ensure that we do not lose any data. so, we
+// have to be conservative in how we replay logs. for each store, we calculate
+// the maxseqid up to which the store was flushed. and, skip the edits which
+// are equal to or lower than maxseqid for each store.
+// the following map is populated when opening the region
+map<byte  long> maxseqidinstores   new treemap<byte  long> bytes bytes_comparator
+/**
+* config setting for whether to allow writes when a region is in recovering or not.
+*/
+private boolean disallowwritesinrecovering   false
+// when a region is in recovering state, it can only accept writes not reads
+private volatile boolean isrecovering   false
+/**
+* @return the smallest mvcc readpoint across all the scanners in this
+* region. writes older than this readpoint, are included  in every
+* read operation.
+*/
+public long getsmallestreadpoint
+long minimumreadpoint
+// we need to ensure that while we are calculating the smallestreadpoint
+// no new regionscanners can grab a readpoint that we are unaware of.
+// we achieve this by synchronizing on the scannerreadpoints object.
+synchronized scannerreadpoints
+minimumreadpoint   mvcc memstorereadpoint
+for  long readpoint  this scannerreadpoints values
+if  readpoint < minimumreadpoint
+minimumreadpoint   readpoint
+return minimumreadpoint
+/*
+* data structure of write state flags used coordinating flushes,
+* compactions and closes.
+*/
+static class writestate
+// set while a memstore flush is happening.
+volatile boolean flushing   false
+// set when a flush has been requested.
+volatile boolean flushrequested   false
+// number of compactions running.
+volatile int compacting   0
+// gets set in close. if set, cannot compact or flush again.
+volatile boolean writesenabled   true
+// set if region is read-only
+volatile boolean readonly   false
+/**
+* set flags that make this region read-only.
+*
+* @param onoff flip value for region r/o setting
+*/
+synchronized void setreadonly final boolean onoff
+this writesenabled    onoff
+this readonly   onoff
+boolean isreadonly
+return this readonly
+boolean isflushrequested
+return this flushrequested
+static final long heap_size   classsize align
+classsize object   5   bytes sizeof_boolean
+final writestate writestate   new writestate
+long memstoreflushsize
+final long timestampslop
+final long rowprocessortimeout
+private volatile long lastflushtime
+final regionserverservices rsservices
+private regionserveraccounting rsaccounting
+private list<pair<long  long>> recentflushes   new arraylist<pair<long long>>
+private long flushcheckinterval
+private long blockingmemstoresize
+final long threadwakefrequency
+// used to guard closes
+final reentrantreadwritelock lock
+new reentrantreadwritelock
+// stop updates lock
+private final reentrantreadwritelock updateslock
+new reentrantreadwritelock
+private boolean splitrequest
+private byte explicitsplitpoint   null
+private final multiversionconsistencycontrol mvcc
+new multiversionconsistencycontrol
+// coprocessor host
+private regioncoprocessorhost coprocessorhost
+private htabledescriptor htabledescriptor   null
+private regionsplitpolicy splitpolicy
+private final metricsregion metricsregion
+private final metricsregionwrapperimpl metricsregionwrapper
+private final boolean deferredlogsyncdisabled
+private final durability durability
+/**
+* hregion constructor. this constructor should only be used for testing and
+* extensions.  instances of hregion should be instantiated with the
+* {@link hregion#createhregion} or {@link hregion#openhregion} method.
+*
+* @param tabledir qualified path of directory where region should be located,
+* usually the table directory.
+* @param log the hlog is the outbound log for any updates to the hregion
+* (there's a single hlog for all the hregions on a single hregionserver.)
+* the log file is a logfile from the previous execution that's
+* custom-computed for this hregion. the hregionserver computes and sorts the
+* appropriate log info for this hregion. if there is a previous log file
+* (implying that the hregion has been written-to before), then read it from
+* the supplied path.
+* @param fs is the filesystem.
+* @param confparam is global configuration settings.
+* @param regioninfo - hregioninfo that describes the region
+* is new), then read them from the supplied path.
+* @param htd the table descriptor
+* @param rsservices reference to {@link regionserverservices} or null
+*/
+@deprecated
+public hregion final path tabledir  final hlog log  final filesystem fs
+final configuration confparam  final hregioninfo regioninfo
+final htabledescriptor htd  final regionserverservices rsservices
+this new hregionfilesystem confparam  fs  tabledir  regioninfo
+log  confparam  htd  rsservices
+/**
+* hregion constructor. this constructor should only be used for testing and
+* extensions.  instances of hregion should be instantiated with the
+* {@link hregion#createhregion} or {@link hregion#openhregion} method.
+*
+* @param fs is the filesystem.
+* @param log the hlog is the outbound log for any updates to the hregion
+* (there's a single hlog for all the hregions on a single hregionserver.)
+* the log file is a logfile from the previous execution that's
+* custom-computed for this hregion. the hregionserver computes and sorts the
+* appropriate log info for this hregion. if there is a previous log file
+* (implying that the hregion has been written-to before), then read it from
+* the supplied path.
+* @param confparam is global configuration settings.
+* @param htd the table descriptor
+* @param rsservices reference to {@link regionserverservices} or null
+*/
+public hregion final hregionfilesystem fs  final hlog log  final configuration confparam
+final htabledescriptor htd  final regionserverservices rsservices
+if  htd    null
+throw new illegalargumentexception
+if  confparam instanceof compoundconfiguration
+throw new illegalargumentexception
+this comparator   fs getregioninfo   getcomparator
+this log   log
+this fs   fs
+// 'conf' renamed to 'confparam' b/c we use this.conf in the constructor
+this baseconf   confparam
+this conf   new compoundconfiguration
+add confparam
+addstringmap htd getconfiguration
+addwritablemap htd getvalues
+this flushcheckinterval   conf getint memstore_periodic_flush_interval
+default_cache_flush_interval
+this rowlockwaitduration   conf getint
+default_rowlock_wait_duration
+this isloadingcfsondemanddefault   conf getboolean load_cfs_on_demand_config_key  true
+this htabledescriptor   htd
+this rsservices   rsservices
+this threadwakefrequency   conf getlong hconstants thread_wake_frequency  10   1000
+sethtablespecificconf
+this scannerreadpoints   new concurrenthashmap<regionscanner  long>
+this busywaitduration   conf getlong
+default_busy_wait_duration
+this maxbusywaitmultiplier   conf getint    2
+if  busywaitduration   maxbusywaitmultiplier <  0l
+throw new illegalargumentexception
+busywaitduration
+maxbusywaitmultiplier
+this maxbusywaitduration   conf getlong
+2   hconstants default_hbase_rpc_timeout
+/*
+* timestamp.slop provides a server-side constraint on the timestamp. this
+* assumes that you base your ts around currenttimemillis(). in this case,
+* throw an error to the user if the user-specified ts is newer than now +
+* slop. latest_timestamp == don't use this functionality
+*/
+this timestampslop   conf getlong
+hconstants latest_timestamp
+/**
+* timeout for the process time in processrowswithlocks().
+* use -1 to switch off time bound.
+*/
+this rowprocessortimeout   conf getlong
+default_row_processor_timeout
+// when hbase.regionserver.optionallogflushinterval <= 0 , deferred log sync is disabled.
+this deferredlogsyncdisabled   conf getlong
+1   1000  <  0
+this durability   htd getdurability      durability use_default
+? default_durablity
+htd getdurability
+if  rsservices    null
+this rsaccounting   this rsservices getregionserveraccounting
+// don't initialize coprocessors if not running within a regionserver
+// todo: revisit if coprocessors should load in other cases
+this coprocessorhost   new regioncoprocessorhost this  rsservices  conf
+this metricsregionwrapper   new metricsregionwrapperimpl this
+this metricsregion   new metricsregion this metricsregionwrapper
+else
+this metricsregionwrapper   null
+this metricsregion   null
+if  log isdebugenabled
+// write out region name as string and its encoded name.
+log debug     this
+// by default, we allow writes against a region when it's in recovering
+this disallowwritesinrecovering
+conf getboolean hconstants disallow_writes_in_recovering
+hconstants default_disallow_writes_in_recovering_config
+void sethtablespecificconf
+if  this htabledescriptor    null  return
+long flushsize   this htabledescriptor getmemstoreflushsize
+if  flushsize <  0
+flushsize   conf getlong hconstants hregion_memstore_flush_size
+htabledescriptor default_memstore_flush_size
+this memstoreflushsize   flushsize
+this blockingmemstoresize   this memstoreflushsize
+conf getlong    2
+/**
+* initialize this region.
+* used only by tests and splittransaction to reopen the region.
+* you should use createhregion() or openhregion()
+* @return what the next sequence (edit) id should be.
+* @throws ioexception e
+* @deprecated use hregion.createhregion() or hregion.openhregion()
+*/
+@deprecated
+public long initialize   throws ioexception
+return initialize null
+/**
+* initialize this region.
+*
+* @param reporter tickle every so often if initialize is taking a while.
+* @return what the next sequence (edit) id should be.
+* @throws ioexception e
+*/
+private long initialize final cancelableprogressable reporter  throws ioexception
+monitoredtask status   taskmonitor get   createstatus     this
+long nextseqid    1
+try
+nextseqid   initializeregioninternals reporter  status
+return nextseqid
+finally
+// nextseqid will be -1 if the initialization fails.
+// at least it will be 0 otherwise.
+if  nextseqid     1
+status
+abort     this getregionnameasstring
+private long initializeregioninternals final cancelableprogressable reporter
+final monitoredtask status  throws ioexception  unsupportedencodingexception
+if  coprocessorhost    null
+status setstatus
+coprocessorhost preopen
+// write hri to a file in case we need to recover .meta.
+status setstatus
+fs checkregioninfoonfilesystem
+// remove temporary data left over from old regions
+status setstatus
+fs cleanuptempdir
+// initialize all the hstores
+status setstatus
+long maxseqid   initializeregionstores reporter  status
+status setstatus
+// get rid of any splits or merges that were lost in-progress.  clean out
+// these directories here on open.  we may be opening a region that was
+// being split but we crashed in the middle of it all.
+fs cleanupanysplitdetritus
+fs cleanupmergesdir
+this writestate setreadonly this htabledescriptor isreadonly
+this writestate flushrequested   false
+this writestate compacting   0
+// initialize split policy
+this splitpolicy   regionsplitpolicy create this  conf
+this lastflushtime   environmentedgemanager currenttimemillis
+// use maximum of log sequenceid or that which was found in stores
+// (particularly if no recovered edits, seqid will be -1).
+long nextseqid   maxseqid   1
+log info     this getregioninfo   getshortnametolog
+nextseqid
+// a region can be reopened if failed a split; reset flags
+this closing set false
+this closed set false
+if  coprocessorhost    null
+status setstatus
+coprocessorhost postopen
+status markcomplete
+return nextseqid
+private long initializeregionstores final cancelableprogressable reporter  monitoredtask status
+throws ioexception  unsupportedencodingexception
+// load in all the hstores.
+long maxseqid    1
+// initialized to -1 so that we pick up memstorets from column families
+long maxmemstorets    1
+if   htabledescriptor getfamilies   isempty
+// initialize the thread pool for opening stores in parallel.
+threadpoolexecutor storeopenerthreadpool
+getstoreopenandclosethreadpool     this getregioninfo   getshortnametolog
+completionservice<hstore> completionservice
+new executorcompletionservice<hstore> storeopenerthreadpool
+// initialize each store in parallel
+for  final hcolumndescriptor family   htabledescriptor getfamilies
+status setstatus     family
+completionservice submit new callable<hstore>
+@override
+public hstore call   throws ioexception
+return instantiatehstore family
+try
+for  int i   0  i < htabledescriptor getfamilies   size    i
+future<hstore> future   completionservice take
+hstore store   future get
+this stores put store getcolumnfamilyname   getbytes    store
+// do not include bulk loaded files when determining seqidforreplay
+long storeseqidforreplay   store getmaxsequenceid false
+maxseqidinstores put store getcolumnfamilyname   getbytes
+storeseqidforreplay
+// include bulk loaded files when determining seqidforassignment
+long storeseqidforassignment   store getmaxsequenceid true
+if  maxseqid     1    storeseqidforassignment > maxseqid
+maxseqid   storeseqidforassignment
+long maxstorememstorets   store getmaxmemstorets
+if  maxstorememstorets > maxmemstorets
+maxmemstorets   maxstorememstorets
+catch  interruptedexception e
+throw new ioexception e
+catch  executionexception e
+throw new ioexception e getcause
+finally
+storeopenerthreadpool shutdownnow
+mvcc initialize maxmemstorets   1
+// recover any edits if available.
+maxseqid   math max maxseqid  replayrecoverededitsifany
+this fs getregiondir    maxseqidinstores  reporter  status
+return maxseqid
+/*
+* move any passed hstore files into place (if any).  used to pick up split
+* files and any merges from splits and merges dirs.
+* @param initialfiles
+* @throws ioexception
+*/
+static void moveinitialfilesintoplace final filesystem fs
+final path initialfiles  final path regiondir
+throws ioexception
+if  initialfiles    null    fs exists initialfiles
+if   fs rename initialfiles  regiondir
+log warn     initialfiles       regiondir
+/**
+* @return true if this region has references.
+*/
+public boolean hasreferences
+for  store store   this stores values
+if  store hasreferences    return true
+return false
+/**
+* this function will return the hdfs blocks distribution based on the data
+* captured when hfile is created
+* @return the hdfs blocks distribution for the region.
+*/
+public hdfsblocksdistribution gethdfsblocksdistribution
+hdfsblocksdistribution hdfsblocksdistribution
+new hdfsblocksdistribution
+synchronized  this stores
+for  store store   this stores values
+for  storefile sf   store getstorefiles
+hdfsblocksdistribution storefileblocksdistribution
+sf gethdfsblockdistribution
+hdfsblocksdistribution add storefileblocksdistribution
+return hdfsblocksdistribution
+/**
+* this is a helper function to compute hdfs block distribution on demand
+* @param conf configuration
+* @param tabledescriptor htabledescriptor of the table
+* @param regioninfo encoded name of the region
+* @return the hdfs blocks distribution for the given region.
+* @throws ioexception
+*/
+public static hdfsblocksdistribution computehdfsblocksdistribution final configuration conf
+final htabledescriptor tabledescriptor  final hregioninfo regioninfo  throws ioexception
+hdfsblocksdistribution hdfsblocksdistribution   new hdfsblocksdistribution
+path tablepath   fsutils gettabledir fsutils getrootdir conf   tabledescriptor gettablename
+filesystem fs   tablepath getfilesystem conf
+hregionfilesystem regionfs   new hregionfilesystem conf  fs  tablepath  regioninfo
+for  hcolumndescriptor family  tabledescriptor getfamilies
+collection<storefileinfo> storefiles   regionfs getstorefiles family getnameasstring
+if  storefiles    null  continue
+for  storefileinfo storefileinfo   storefiles
+hdfsblocksdistribution add storefileinfo computehdfsblocksdistribution fs
+return hdfsblocksdistribution
+public atomiclong getmemstoresize
+return memstoresize
+/**
+* increase the size of mem store in this region and the size of global mem
+* store
+* @param memstoresize
+* @return the size of memstore in this region
+*/
+public long addandgetglobalmemstoresize long memstoresize
+if  this rsaccounting    null
+rsaccounting addandgetglobalmemstoresize memstoresize
+return this memstoresize getandadd memstoresize
+/** @return a hregioninfo object for this region */
+public hregioninfo getregioninfo
+return this fs getregioninfo
+/**
+* @return instance of {@link regionserverservices} used by this hregion.
+* can be null.
+*/
+regionserverservices getregionserverservices
+return this rsservices
+/** @return readrequestscount for this region */
+long getreadrequestscount
+return this readrequestscount get
+/** @return writerequestscount for this region */
+long getwriterequestscount
+return this writerequestscount get
+metricsregion getmetrics
+return metricsregion
+/** @return true if region is closed */
+public boolean isclosed
+return this closed get
+/**
+* @return true if closing process has started.
+*/
+public boolean isclosing
+return this closing get
+/**
+* reset recovering state of current region
+* @param newstate
+*/
+public void setrecovering boolean newstate
+this isrecovering   newstate
+/**
+* @return true if current region is in recovering
+*/
+public boolean isrecovering
+return this isrecovering
+/** @return true if region is available (not closed and not closing) */
+public boolean isavailable
+return  isclosed       isclosing
+/** @return true if region is splittable */
+public boolean issplittable
+return isavailable       hasreferences
+/**
+* @return true if region is mergeable
+*/
+public boolean ismergeable
+if   isavailable
+log debug     this getregionnameasstring
+return false
+if  hasreferences
+log debug     this getregionnameasstring
+return false
+return true
+public boolean arewritesenabled
+synchronized this writestate
+return this writestate writesenabled
+public multiversionconsistencycontrol getmvcc
+return mvcc
+public boolean isloadingcfsondemanddefault
+return this isloadingcfsondemanddefault
+/**
+* close down this hregion.  flush the cache, shut down each hstore, don't
+* service any more calls.
+*
+* <p>this method could take some time to execute, so don't call it from a
+* time-sensitive thread.
+*
+* @return vector of all the storage files that the hregion's component
+* hstores make use of.  it's a list of all hstorefile objects. returns empty
+* vector if already closed and null if judged that it should not close.
+*
+* @throws ioexception e
+*/
+public map<byte  list<storefile>> close   throws ioexception
+return close false
+private final object closelock   new object
+/** conf key for the periodic flush interval */
+public static final string memstore_periodic_flush_interval
+/** default interval for the memstore flush */
+public static final int default_cache_flush_interval   3600000
+/**
+* close down this hregion.  flush the cache unless abort parameter is true,
+* shut down each hstore, don't service any more calls.
+*
+* this method could take some time to execute, so don't call it from a
+* time-sensitive thread.
+*
+* @param abort true if server is aborting (only during testing)
+* @return vector of all the storage files that the hregion's component
+* hstores make use of.  it's a list of hstorefile objects.  can be null if
+* we are not to close at this time or we are already closed.
+*
+* @throws ioexception e
+*/
+public map<byte  list<storefile>> close final boolean abort  throws ioexception
+// only allow one thread to close at a time. serialize them so dual
+// threads attempting to close will run up against each other.
+monitoredtask status   taskmonitor get   createstatus
+this
+abort ?
+status setstatus
+try
+synchronized  closelock
+return doclose abort  status
+finally
+status cleanup
+private map<byte  list<storefile>> doclose final boolean abort  monitoredtask status
+throws ioexception
+if  isclosed
+log warn     this
+return null
+if  coprocessorhost    null
+status setstatus
+this coprocessorhost preclose abort
+status setstatus
+boolean wasflushing   false
+synchronized  writestate
+// disable compacting and flushing by background threads for this
+// region.
+writestate writesenabled   false
+wasflushing   writestate flushing
+log debug     this
+waitforflushesandcompactions
+// if we were not just flushing, is it worth doing a preflush...one
+// that will clear out of the bulk of the memstore before we put up
+// the close flag?
+if   abort     wasflushing    worthpreflushing
+status setstatus
+log info     this getregionnameasstring
+internalflushcache status
+this closing set true
+status setstatus
+// block waiting for the lock for closing
+lock writelock   lock
+try
+if  this isclosed
+status abort
+// splittransaction handles the null
+return null
+log debug     this
+// don't flush the cache if we are aborting
+if   abort
+internalflushcache status
+map<byte  list<storefile>> result
+new treemap<byte  list<storefile>> bytes bytes_comparator
+if   stores isempty
+// initialize the thread pool for closing stores in parallel.
+threadpoolexecutor storecloserthreadpool
+getstoreopenandclosethreadpool     this getregionnameasstring
+completionservice<pair<byte  collection<storefile>>> completionservice
+new executorcompletionservice<pair<byte  collection<storefile>>> storecloserthreadpool
+// close each store in parallel
+for  final store store   stores values
+completionservice
+submit new callable<pair<byte  collection<storefile>>>
+@override
+public pair<byte  collection<storefile>> call   throws ioexception
+return new pair<byte  collection<storefile>>
+store getfamily   getname    store close
+try
+for  int i   0  i < stores size    i
+future<pair<byte  collection<storefile>>> future   completionservice take
+pair<byte  collection<storefile>> storefiles   future get
+list<storefile> familyfiles   result get storefiles getfirst
+if  familyfiles    null
+familyfiles   new arraylist<storefile>
+result put storefiles getfirst    familyfiles
+familyfiles addall storefiles getsecond
+catch  interruptedexception e
+throw new ioexception e
+catch  executionexception e
+throw new ioexception e getcause
+finally
+storecloserthreadpool shutdownnow
+this closed set true
+if  coprocessorhost    null
+status setstatus
+this coprocessorhost postclose abort
+if   this metricsregion    null
+this metricsregion close
+if   this metricsregionwrapper    null
+closeables closequietly this metricsregionwrapper
+status markcomplete
+log info     this
+return result
+finally
+lock writelock   unlock
+/**
+* wait for all current flushes and compactions of the region to complete.
+* <p>
+* exposed for testing.
+*/
+public void waitforflushesandcompactions
+synchronized  writestate
+while  writestate compacting > 0    writestate flushing
+log debug     writestate compacting
+writestate flushing ?              this
+try
+writestate wait
+catch  interruptedexception iex
+// essentially ignore and propagate the interrupt back up
+thread currentthread   interrupt
+protected threadpoolexecutor getstoreopenandclosethreadpool
+final string threadnameprefix
+int numstores   math max 1  this htabledescriptor getfamilies   size
+int maxthreads   math min numstores
+conf getint hconstants hstore_open_and_close_threads_max
+hconstants default_hstore_open_and_close_threads_max
+return getopenandclosethreadpool maxthreads  threadnameprefix
+protected threadpoolexecutor getstorefileopenandclosethreadpool
+final string threadnameprefix
+int numstores   math max 1  this htabledescriptor getfamilies   size
+int maxthreads   math max 1
+conf getint hconstants hstore_open_and_close_threads_max
+hconstants default_hstore_open_and_close_threads_max
+numstores
+return getopenandclosethreadpool maxthreads  threadnameprefix
+static threadpoolexecutor getopenandclosethreadpool int maxthreads
+final string threadnameprefix
+return threads getboundedcachedthreadpool maxthreads  30l  timeunit seconds
+new threadfactory
+private int count   1
+@override
+public thread newthread runnable r
+return new thread r  threadnameprefix       count
+/**
+* @return true if its worth doing a flush before we put up the close flag.
+*/
+private boolean worthpreflushing
+return this memstoresize get   >
+this conf getlong    1024   1024   5
+//////////////////////////////////////////////////////////////////////////////
+// hregion accessors
+//////////////////////////////////////////////////////////////////////////////
+/** @return start key for region */
+public byte  getstartkey
+return this getregioninfo   getstartkey
+/** @return end key for region */
+public byte  getendkey
+return this getregioninfo   getendkey
+/** @return region id */
+public long getregionid
+return this getregioninfo   getregionid
+/** @return region name */
+public byte  getregionname
+return this getregioninfo   getregionname
+/** @return region name as string for logging */
+public string getregionnameasstring
+return this getregioninfo   getregionnameasstring
+/** @return htabledescriptor for this region */
+public htabledescriptor gettabledesc
+return this htabledescriptor
+/** @return hlog in use for this region */
+public hlog getlog
+return this log
+/**
+* a split takes the config from the parent region & passes it to the daughter
+* region's constructor. if 'conf' was passed, you would end up using the htd
+* of the parent region in addition to the new daughter htd. pass 'baseconf'
+* to the daughter regions to avoid this tricky dedupe problem.
+* @return configuration object
+*/
+configuration getbaseconf
+return this baseconf
+/** @return {@link filesystem} being used by this region */
+public filesystem getfilesystem
+return fs getfilesystem
+/** @return the {@link hregionfilesystem} used by this region */
+public hregionfilesystem getregionfilesystem
+return this fs
+/** @return the last time the region was flushed */
+public long getlastflushtime
+return this lastflushtime
+//////////////////////////////////////////////////////////////////////////////
+// hregion maintenance.
+//
+// these methods are meant to be called periodically by the hregionserver for
+// upkeep.
+//////////////////////////////////////////////////////////////////////////////
+/** @return returns size of largest hstore. */
+public long getlargesthstoresize
+long size   0
+for  store h   stores values
+long storesize   h getsize
+if  storesize > size
+size   storesize
+return size
+/*
+* do preparation for pending compaction.
+* @throws ioexception
+*/
+protected void doregioncompactionprep   throws ioexception
+void triggermajorcompaction
+for  store h   stores values
+h triggermajorcompaction
+/**
+* this is a helper function that compact all the stores synchronously
+* it is used by utilities and testing
+*
+* @param majorcompaction true to force a major compaction regardless of thresholds
+* @throws ioexception e
+*/
+public void compactstores final boolean majorcompaction
+throws ioexception
+if  majorcompaction
+this triggermajorcompaction
+compactstores
+/**
+* this is a helper function that compact all the stores synchronously
+* it is used by utilities and testing
+*
+* @throws ioexception e
+*/
+public void compactstores   throws ioexception
+for  store s   getstores   values
+compactioncontext compaction   s requestcompaction
+if  compaction    null
+compact compaction  s
+/*
+* called by compaction thread and after region is opened to compact the
+* hstores if necessary.
+*
+* <p>this operation could block for a long time, so don't call it from a
+* time-sensitive thread.
+*
+* note that no locking is necessary at this level because compaction only
+* conflicts with a region split, and that cannot happen because the region
+* server does them sequentially and not in parallel.
+*
+* @param cr compaction details, obtained by requestcompaction()
+* @return whether the compaction completed
+* @throws ioexception e
+*/
+public boolean compact compactioncontext compaction  store store  throws ioexception
+assert compaction    null    compaction hasselection
+assert  compaction getrequest   getfiles   isempty
+if  this closing get      this closed get
+log debug     this
+store cancelrequestedcompaction compaction
+return false
+monitoredtask status   null
+boolean didperformcompaction   false
+// block waiting for the lock for compaction
+lock readlock   lock
+try
+status   taskmonitor get   createstatus     store       this
+if  this closed get
+string msg       this
+log debug msg
+status abort msg
+return false
+boolean wasstateset   false
+try
+synchronized  writestate
+if  writestate writesenabled
+wasstateset   true
+writestate compacting
+else
+string msg       this
+log info msg
+status abort msg
+return false
+log info     store       this
+compaction getrequest   isoffpeak  ?
+doregioncompactionprep
+try
+status setstatus     store
+didperformcompaction   true
+store compact compaction
+catch  interruptedioexception iioe
+string msg
+log info msg  iioe
+status abort msg
+return false
+finally
+if  wasstateset
+synchronized  writestate
+writestate compacting
+if  writestate compacting <  0
+writestate notifyall
+status markcomplete
+return true
+finally
+try
+if   didperformcompaction  store cancelrequestedcompaction compaction
+if  status    null  status cleanup
+finally
+lock readlock   unlock
+/**
+* flush the cache.
+*
+* when this method is called the cache will be flushed unless:
+* <ol>
+*   <li>the cache is empty</li>
+*   <li>the region is closed.</li>
+*   <li>a flush is already in progress</li>
+*   <li>writes are disabled</li>
+* </ol>
+*
+* <p>this method may block for some time, so it should not be called from a
+* time-sensitive thread.
+*
+* @return true if the region needs compacting
+*
+* @throws ioexception general io exceptions
+* @throws droppedsnapshotexception thrown when replay of hlog is required
+* because a snapshot was not properly persisted.
+*/
+public boolean flushcache   throws ioexception
+// fail-fast instead of waiting on the lock
+if  this closing get
+log debug     this
+return false
+monitoredtask status   taskmonitor get   createstatus     this
+status setstatus
+// block waiting for the lock for flushing cache
+lock readlock   lock
+try
+if  this closed get
+log debug     this
+status abort
+return false
+if  coprocessorhost    null
+status setstatus
+coprocessorhost preflush
+if  nummutationswithoutwal get   > 0
+nummutationswithoutwal set 0
+datainmemorywithoutwal set 0
+synchronized  writestate
+if   writestate flushing    writestate writesenabled
+this writestate flushing   true
+else
+if  log isdebugenabled
+log debug     this
+writestate flushing
+writestate writesenabled
+status abort
+writestate flushing ?
+return false
+try
+boolean result   internalflushcache status
+if  coprocessorhost    null
+status setstatus
+coprocessorhost postflush
+status markcomplete
+return result
+finally
+synchronized  writestate
+writestate flushing   false
+this writestate flushrequested   false
+writestate notifyall
+finally
+lock readlock   unlock
+status cleanup
+/**
+* should the memstore be flushed now
+*/
+boolean shouldflush
+if  flushcheckinterval <  0      disabled
+return false
+long now   environmentedgemanager currenttimemillis
+//if we flushed in the recent past, we don't need to do again now
+if   now   getlastflushtime   < flushcheckinterval
+return false
+//since we didn't flush in the recent past, flush now if certain conditions
+//are met. return true on first such memstore hit.
+for  store s   this getstores   values
+if  s timeofoldestedit   < now   flushcheckinterval
+// we have an old enough edit in the memstore, flush
+return true
+return false
+/**
+* flush the memstore.
+*
+* flushing the memstore is a little tricky. we have a lot of updates in the
+* memstore, all of which have also been written to the log. we need to
+* write those updates in the memstore out to disk, while being able to
+* process reads/writes as much as possible during the flush operation. also,
+* the log has to state clearly the point in time at which the memstore was
+* flushed. (that way, during recovery, we know when we can rely on the
+* on-disk flushed structures and when we have to recover the memstore from
+* the log.)
+*
+* <p>so, we have a three-step process:
+*
+* <ul><li>a. flush the memstore to the on-disk stores, noting the current
+* sequence id for the log.<li>
+*
+* <li>b. write a flushcache-complete message to the log, using the sequence
+* id that was current at the time of memstore-flush.</li>
+*
+* <li>c. get rid of the memstore structures that are now redundant, as
+* they've been flushed to the on-disk hstores.</li>
+* </ul>
+* <p>this method is protected, but can be accessed via several public
+* routes.
+*
+* <p> this method may block for some time.
+* @param status
+*
+* @return true if the region needs compacting
+*
+* @throws ioexception general io exceptions
+* @throws droppedsnapshotexception thrown when replay of hlog is required
+* because a snapshot was not properly persisted.
+*/
+protected boolean internalflushcache monitoredtask status
+throws ioexception
+return internalflushcache this log   1  status
+/**
+* @param wal null if we're not to go via hlog/wal.
+* @param myseqid the seqid to use if <code>wal</code> is null writing out
+* flush file.
+* @param status
+* @return true if the region needs compacting
+* @throws ioexception
+* @see #internalflushcache(monitoredtask)
+*/
+protected boolean internalflushcache
+final hlog wal  final long myseqid  monitoredtask status
+throws ioexception
+if  this rsservices    null    this rsservices isaborted
+// don't flush when server aborting, it's unsafe
+throw new ioexception
+final long starttime   environmentedgemanager currenttimemillis
+// clear flush flag.
+// record latest flush time
+this lastflushtime   starttime
+// if nothing to flush, return and avoid logging start/stop flush.
+if  this memstoresize get   <  0
+return false
+if  log isdebugenabled
+log debug     this
+stringutils humanreadableint this memstoresize get
+wal    null ?        myseqid
+// stop updates while we snapshot the memstore of all stores. we only have
+// to do this for a moment.  its quick.  the subsequent sequence id that
+// goes into the hlog after we've flushed all these snapshots also goes
+// into the info file that sits beside the flushed files.
+// we also set the memstore size to zero here before we allow updates
+// again so its value will represent the size of the updates received
+// during the flush
+multiversionconsistencycontrol writeentry w   null
+// we have to take a write lock during snapshot, or else a write could
+// end up in both snapshot and memstore (makes it difficult to do atomic
+// rows then)
+status setstatus
+// block waiting for the lock for internal flush
+this updateslock writelock   lock
+long flushsize   this memstoresize get
+status setstatus
+list<storeflushcontext> storeflushctxs   new arraylist<storeflushcontext> stores size
+long flushseqid    1l
+try
+// record the mvcc for all transactions in progress.
+w   mvcc beginmemstoreinsert
+mvcc advancememstore w
+if  wal    null
+long startseqid   wal startcacheflush this getregioninfo   getencodednameasbytes
+if  startseqid    null
+status setstatus     this getregioninfo   getencodedname
+return false
+flushseqid   startseqid longvalue
+else
+flushseqid   myseqid
+for  store s   stores values
+storeflushctxs add s createflushcontext flushseqid
+// prepare flush (take a snapshot)
+for  storeflushcontext flush   storeflushctxs
+flush prepare
+finally
+this updateslock writelock   unlock
+string s       this
+flushsize
+status setstatus s
+if  log istraceenabled    log trace s
+// sync unflushed wal changes when deferred log sync is enabled
+// see hbase-8208 for details
+if  wal    null     shouldsynclog
+wal sync
+// wait for all in-progress transactions to commit to hlog before
+// we can start the flush. this prevents
+// uncommitted transactions from being written into hfiles.
+// we have to block before we start the flush, otherwise keys that
+// were removed via a rollbackmemstore could be written to hfiles.
+mvcc waitforread w
+s       this
+status setstatus s
+if  log istraceenabled    log trace s
+// any failure from here on out will be catastrophic requiring server
+// restart so hlog content can be replayed and put back into the memstore.
+// otherwise, the snapshot content while backed up in the hlog, it will not
+// be part of the current running servers state.
+boolean compactionrequested   false
+try
+// a.  flush memstore to all the hstores.
+// keep running vector of all store files that includes both old and the
+// just-made new flush store file. the new flushed file is still in the
+// tmp directory.
+for  storeflushcontext flush   storeflushctxs
+flush flushcache status
+// switch snapshot (in memstore) -> new hfile (thus causing
+// all the store scanners to reset/reseek).
+for  storeflushcontext flush   storeflushctxs
+boolean needscompaction   flush commit status
+if  needscompaction
+compactionrequested   true
+storeflushctxs clear
+// set down the memstore size by amount of flush.
+this addandgetglobalmemstoresize  flushsize
+catch  throwable t
+// an exception here means that the snapshot was not persisted.
+// the hlog needs to be replayed so its content is restored to memstore.
+// currently, only a server restart will do this.
+// we used to only catch ioes but its possible that we'd get other
+// exceptions -- e.g. hbase-659 was about an npe -- so now we catch
+// all and sundry.
+if  wal    null
+wal abortcacheflush this getregioninfo   getencodednameasbytes
+droppedsnapshotexception dse   new droppedsnapshotexception
+bytes tostringbinary getregionname
+dse initcause t
+status abort     stringutils stringifyexception t
+throw dse
+// if we get to here, the hstores have been written.
+if  wal    null
+wal completecacheflush this getregioninfo   getencodednameasbytes
+// update the last flushed sequence id for region
+if  this rsservices    null
+completesequenceid   flushseqid
+// c. finally notify anyone waiting on memstore to clear:
+// e.g. checkresources().
+synchronized  this
+notifyall       findbugs nn_naked_notify
+long time   environmentedgemanager currenttimemillis     starttime
+long memstoresize   this memstoresize get
+string msg
+stringutils humanreadableint flushsize        flushsize
+stringutils humanreadableint memstoresize        memstoresize
+this       time       flushseqid
+compactionrequested
+wal    null ?
+log info msg
+status setstatus msg
+this recentflushes add new pair<long long> time 1000  flushsize
+return compactionrequested
+//////////////////////////////////////////////////////////////////////////////
+// get() methods for client use.
+//////////////////////////////////////////////////////////////////////////////
+/**
+* return all the data for the row that matches <i>row</i> exactly,
+* or the one that immediately preceeds it, at or immediately before
+* <i>ts</i>.
+*
+* @param row row key
+* @return map of values
+* @throws ioexception
+*/
+result getclosestrowbefore final byte  row
+throws ioexception
+return getclosestrowbefore row  hconstants catalog_family
+/**
+* return all the data for the row that matches <i>row</i> exactly,
+* or the one that immediately preceeds it, at or immediately before
+* <i>ts</i>.
+*
+* @param row row key
+* @param family column family to find on
+* @return map of values
+* @throws ioexception read exceptions
+*/
+public result getclosestrowbefore final byte  row  final byte  family
+throws ioexception
+if  coprocessorhost    null
+result result   new result
+if  coprocessorhost pregetclosestrowbefore row  family  result
+return result
+// look across all the hstores for this region and determine what the
+// closest key is across all column families, since the data may be sparse
+checkrow row
+startregionoperation operation get
+this readrequestscount increment
+try
+store store   getstore family
+// get the closest key. (hstore.getrowkeyatorbefore can return null)
+keyvalue key   store getrowkeyatorbefore row
+result result   null
+if  key    null
+get get   new get key getrow
+get addfamily family
+result   get get
+if  coprocessorhost    null
+coprocessorhost postgetclosestrowbefore row  family  result
+return result
+finally
+closeregionoperation
+/**
+* return an iterator that scans over the hregion, returning the indicated
+* columns and rows specified by the {@link scan}.
+* <p>
+* this iterator must be closed by the caller.
+*
+* @param scan configured {@link scan}
+* @return regionscanner
+* @throws ioexception read exceptions
+*/
+public regionscanner getscanner scan scan  throws ioexception
+return getscanner scan  null
+void preparescanner scan scan  throws ioexception
+if  scan hasfamilies
+// adding all families to scanner
+for byte family  this htabledescriptor getfamilieskeys
+scan addfamily family
+protected regionscanner getscanner scan scan
+list<keyvaluescanner> additionalscanners  throws ioexception
+startregionoperation operation scan
+try
+// verify families are all valid
+preparescanner scan
+if scan hasfamilies
+for byte  family   scan getfamilymap   keyset
+checkfamily family
+return instantiateregionscanner scan  additionalscanners
+finally
+closeregionoperation
+protected regionscanner instantiateregionscanner scan scan
+list<keyvaluescanner> additionalscanners  throws ioexception
+return new regionscannerimpl scan  additionalscanners  this
+/*
+* @param delete the passed delete is modified by this method. warning!
+*/
+void preparedelete delete delete  throws ioexception
+// check to see if this is a deleterow insert
+if delete getfamilycellmap   isempty
+for byte  family   this htabledescriptor getfamilieskeys
+// don't eat the timestamp
+delete deletefamily family  delete gettimestamp
+else
+for byte  family   delete getfamilycellmap   keyset
+if family    null
+throw new nosuchcolumnfamilyexception
+checkfamily family
+//////////////////////////////////////////////////////////////////////////////
+// set() methods for client use.
+//////////////////////////////////////////////////////////////////////////////
+/**
+* @param delete delete object
+* @throws ioexception read exceptions
+*/
+public void delete delete delete
+throws ioexception
+checkreadonly
+checkresources
+startregionoperation operation delete
+this writerequestscount increment
+try
+delete getrow
+// all edits for the given row (across all column families) must happen atomically.
+dobatchmutate delete
+finally
+closeregionoperation
+/**
+* row needed by below method.
+*/
+private static final byte  for_unit_tests_only   bytes tobytes
+/**
+* this is used only by unit tests. not required to be a public api.
+* @param familymap map of family to edits for the given family.
+* @param clusterid
+* @param durability
+* @throws ioexception
+*/
+void delete navigablemap<byte  list<cell>> familymap  uuid clusterid
+durability durability  throws ioexception
+delete delete   new delete for_unit_tests_only
+delete setfamilymap familymap
+delete setclusterid clusterid
+delete setdurability durability
+dobatchmutate delete
+/**
+* setup correct timestamps in the kvs in delete object.
+* caller should have the row and region locks.
+* @param familymap
+* @param bytenow
+* @throws ioexception
+*/
+void preparedeletetimestamps map<byte  list<cell>> familymap  byte bytenow
+throws ioexception
+for  map entry<byte  list<cell>> e   familymap entryset
+byte family   e getkey
+list<cell> cells   e getvalue
+map<byte  integer> kvcount   new treemap<byte  integer> bytes bytes_comparator
+for  cell cell  cells
+keyvalue kv   keyvalueutil ensurekeyvalue cell
+//  check if time is latest, change to time of most recent addition if so
+//  this is expensive.
+if  kv islatesttimestamp      kv isdeletetype
+byte qual   kv getqualifier
+if  qual    null  qual   hconstants empty_byte_array
+integer count   kvcount get qual
+if  count    null
+kvcount put qual  1
+else
+kvcount put qual  count   1
+count   kvcount get qual
+get get   new get kv getrow
+get setmaxversions count
+get addcolumn family  qual
+list<keyvalue> result   get get  false
+if  result size   < count
+// nothing to delete
+kv updatelateststamp bytenow
+continue
+if  result size   > count
+throw new runtimeexception     result size
+keyvalue getkv   result get count   1
+bytes putbytes kv getbuffer    kv gettimestampoffset
+getkv getbuffer    getkv gettimestampoffset    bytes sizeof_long
+else
+kv updatelateststamp bytenow
+/**
+* @param put
+* @throws ioexception
+*/
+public void put put put
+throws ioexception
+checkreadonly
+// do a rough check that we have resources to accept a write.  the check is
+// 'rough' in that between the resource check and the call to obtain a
+// read lock, resources may run out.  for now, the thought is that this
+// will be extremely rare; we'll deal with it when it happens.
+checkresources
+startregionoperation operation put
+this writerequestscount increment
+try
+// all edits for the given row (across all column families) must happen atomically.
+dobatchmutate put
+finally
+closeregionoperation
+/**
+* struct-like class that tracks the progress of a batch operation,
+* accumulating status codes and tracking the index at which processing
+* is proceeding.
+*/
+private static class batchoperationinprogress<t>
+t operations
+int nextindextoprocess   0
+operationstatus retcodedetails
+waledit waleditsfromcoprocessors
+public batchoperationinprogress t operations
+this operations   operations
+this retcodedetails   new operationstatus
+this waleditsfromcoprocessors   new waledit
+arrays fill this retcodedetails  operationstatus not_run
+public boolean isdone
+return nextindextoprocess    operations length
+/**
+* perform a batch of mutations.
+* it supports only put and delete mutations and will ignore other types passed.
+* @param mutations the list of mutations
+* @return an array of operationstatus which internally contains the
+*         operationstatuscode and the exceptionmessage if any.
+* @throws ioexception
+*/
+public operationstatus batchmutate mutation mutations  throws ioexception
+return batchmutate mutations  false
+/**
+* perform a batch of mutations.
+* it supports only put and delete mutations and will ignore other types passed.
+* @param mutations the list of mutations
+* @return an array of operationstatus which internally contains the
+*         operationstatuscode and the exceptionmessage if any.
+* @throws ioexception
+*/
+operationstatus batchmutate mutation mutations  boolean isreplay
+throws ioexception
+batchoperationinprogress<mutation> batchop
+new batchoperationinprogress<mutation> mutations
+boolean initialized   false
+while   batchop isdone
+if   isreplay
+checkreadonly
+checkresources
+long newsize
+if  isreplay
+startregionoperation operation replay_batch_mutate
+else
+startregionoperation operation batch_mutate
+try
+if   initialized
+if   isreplay
+this writerequestscount increment
+dopremutationhook batchop
+initialized   true
+long addedsize   dominibatchmutation batchop  isreplay
+newsize   this addandgetglobalmemstoresize addedsize
+finally
+closeregionoperation
+if  isflushsize newsize
+requestflush
+return batchop retcodedetails
+private void dopremutationhook batchoperationinprogress<mutation> batchop
+throws ioexception
+/* run coprocessor pre hook outside of locks to avoid deadlock */
+waledit waledit   new waledit
+if  coprocessorhost    null
+for  int i   0   i < batchop operations length  i
+mutation m   batchop operations
+if  m instanceof put
+if  coprocessorhost preput  put  m  waledit  m getdurability
+// pre hook says skip this put
+// mark as success and skip in dominibatchmutation
+batchop retcodedetails   operationstatus success
+else if  m instanceof delete
+if  coprocessorhost predelete  delete  m  waledit  m getdurability
+// pre hook says skip this delete
+// mark as success and skip in dominibatchmutation
+batchop retcodedetails   operationstatus success
+else
+// in case of passing append mutations along with the puts and deletes in batchmutate
+// mark the operation return code as failure so that it will not be considered in
+// the dominibatchmutation
+batchop retcodedetails   new operationstatus operationstatuscode failure
+if   waledit isempty
+batchop waleditsfromcoprocessors   waledit
+waledit   new waledit
+@suppresswarnings
+private long dominibatchmutation batchoperationinprogress<mutation> batchop
+boolean isinreplay  throws ioexception
+// variable to note if all put items are for the same cf -- metrics related
+boolean putscfsetconsistent   true
+//the set of columnfamilies first seen for put.
+set<byte> putscfset   null
+// variable to note if all delete items are for the same cf -- metrics related
+boolean deletescfsetconsistent   true
+//the set of columnfamilies first seen for delete.
+set<byte> deletescfset   null
+waledit waledit   new waledit isinreplay
+multiversionconsistencycontrol writeentry w   null
+long txid   0
+boolean walsyncsuccessful   false
+boolean locked   false
+/** keep track of the locks we hold so we can release them in finally clause */
+list<rowlock> acquiredrowlocks   lists newarraylistwithcapacity batchop operations length
+// reference family maps directly so coprocessors can mutate them if desired
+map<byte  list<cell>> familymaps   new map
+// we try to set up a batch in the range [firstindex,lastindexexclusive)
+int firstindex   batchop nextindextoprocess
+int lastindexexclusive   firstindex
+boolean success   false
+int noofputs   0  noofdeletes   0
+try
+// ------------------------------------
+// step 1. try to acquire as many locks as we can, and ensure
+// we acquire at least one.
+// ----------------------------------
+int numreadytowrite   0
+long now   environmentedgemanager currenttimemillis
+while  lastindexexclusive < batchop operations length
+mutation mutation   batchop operations
+boolean isputmutation   mutation instanceof put
+map<byte  list<cell>> familymap   mutation getfamilycellmap
+// store the family map reference to allow for mutations
+familymaps   familymap
+// skip anything that "ran" already
+if  batchop retcodedetails getoperationstatuscode
+operationstatuscode not_run
+lastindexexclusive
+continue
+try
+if  isputmutation
+// check the families in the put. if bad, skip this one.
+if  isinreplay
+removenonexistentcolumnfamilyforreplay familymap
+else
+checkfamilies familymap keyset
+checktimestamps mutation getfamilycellmap    now
+else
+preparedelete  delete  mutation
+catch  nosuchcolumnfamilyexception nscf
+log warn    nscf
+batchop retcodedetails   new operationstatus
+operationstatuscode bad_family  nscf getmessage
+lastindexexclusive
+continue
+catch  failedsanitycheckexception fsce
+log warn    fsce
+batchop retcodedetails   new operationstatus
+operationstatuscode sanity_check_failure  fsce getmessage
+lastindexexclusive
+continue
+// if we haven't got any rows in our batch, we should block to
+// get the next one.
+boolean shouldblock   numreadytowrite    0
+rowlock rowlock   null
+try
+rowlock   getrowlock mutation getrow    shouldblock
+catch  ioexception ioe
+log warn
+bytes tostringbinary mutation getrow     ioe
+if  rowlock    null
+// we failed to grab another lock
+assert  shouldblock
+break     stop acquiring more rows for this batch
+else
+acquiredrowlocks add rowlock
+lastindexexclusive
+numreadytowrite
+if  isputmutation
+// if column families stay consistent through out all of the
+// individual puts then metrics can be reported as a mutliput across
+// column families in the first put.
+if  putscfset    null
+putscfset   mutation getfamilycellmap   keyset
+else
+putscfsetconsistent   putscfsetconsistent
+mutation getfamilycellmap   keyset   equals putscfset
+else
+if  deletescfset    null
+deletescfset   mutation getfamilycellmap   keyset
+else
+deletescfsetconsistent   deletescfsetconsistent
+mutation getfamilycellmap   keyset   equals deletescfset
+// we should record the timestamp only after we have acquired the rowlock,
+// otherwise, newer puts/deletes are not guaranteed to have a newer timestamp
+now   environmentedgemanager currenttimemillis
+byte bytenow   bytes tobytes now
+// nothing to put/delete -- an exception in the above such as nosuchcolumnfamily?
+if  numreadytowrite <  0  return 0l
+// we've now grabbed as many mutations off the list as we can
+// ------------------------------------
+// step 2. update any latest_timestamp timestamps
+// ----------------------------------
+for  int i   firstindex  i < lastindexexclusive  i
+// skip invalid
+if  batchop retcodedetails getoperationstatuscode
+operationstatuscode not_run  continue
+mutation mutation   batchop operations
+if  mutation instanceof put
+updatekvtimestamps familymaps values    bytenow
+noofputs
+else
+preparedeletetimestamps familymaps  bytenow
+noofdeletes
+lock this updateslock readlock    numreadytowrite
+locked   true
+//
+// ------------------------------------
+// acquire the latest mvcc number
+// ----------------------------------
+w   mvcc beginmemstoreinsert
+// calling the pre cp hook for batch mutation
+if   isinreplay    coprocessorhost    null
+minibatchoperationinprogress<mutation> minibatchop
+new minibatchoperationinprogress<mutation> batchop operations
+batchop retcodedetails  batchop waleditsfromcoprocessors  firstindex  lastindexexclusive
+if  coprocessorhost prebatchmutate minibatchop   return 0l
+// ------------------------------------
+// step 3. write back to memstore
+// write to memstore. it is ok to write to memstore
+// first without updating the hlog because we do not roll
+// forward the memstore mvcc. the mvcc will be moved up when
+// the complete operation is done. these changes are not yet
+// visible to scanners till we update the mvcc. the mvcc is
+// moved only when the sync is complete.
+// ----------------------------------
+long addedsize   0
+for  int i   firstindex  i < lastindexexclusive  i
+if  batchop retcodedetails getoperationstatuscode
+operationstatuscode not_run
+continue
+addedsize    applyfamilymaptomemstore familymaps  w
+// ------------------------------------
+// step 4. build wal edit
+// ----------------------------------
+durability durability   durability use_default
+for  int i   firstindex  i < lastindexexclusive  i
+// skip puts that were determined to be invalid during preprocessing
+if  batchop retcodedetails getoperationstatuscode
+operationstatuscode not_run
+continue
+batchop retcodedetails   operationstatus success
+mutation m   batchop operations
+durability tmpdur   geteffectivedurability m getdurability
+if  tmpdur ordinal   > durability ordinal
+durability   tmpdur
+if  tmpdur    durability skip_wal
+recordmutationwithoutwal m getfamilycellmap
+continue
+// add wal edits by cp
+waledit fromcp   batchop waleditsfromcoprocessors
+if  fromcp    null
+for  keyvalue kv   fromcp getkeyvalues
+waledit add kv
+addfamilymaptowaledit familymaps  waledit
+// -------------------------
+// step 5. append the edit to wal. do not sync wal.
+// -------------------------
+mutation mutation   batchop operations
+if  waledit size   > 0
+txid   this log appendnosync this getregioninfo    this htabledescriptor gettablename
+waledit  mutation getclusterid    now  this htabledescriptor
+// -------------------------------
+// step 6. release row locks, etc.
+// -------------------------------
+if  locked
+this updateslock readlock   unlock
+locked   false
+releaserowlocks acquiredrowlocks
+// -------------------------
+// step 7. sync wal.
+// -------------------------
+if  waledit size   > 0
+syncordefer txid  durability
+walsyncsuccessful   true
+// calling the post cp hook for batch mutation
+if   isinreplay    coprocessorhost    null
+minibatchoperationinprogress<mutation> minibatchop
+new minibatchoperationinprogress<mutation> batchop operations
+batchop retcodedetails  batchop waleditsfromcoprocessors  firstindex  lastindexexclusive
+coprocessorhost postbatchmutate minibatchop
+// ------------------------------------------------------------------
+// step 8. advance mvcc. this will make this put visible to scanners and getters.
+// ------------------------------------------------------------------
+if  w    null
+mvcc completememstoreinsert w
+w   null
+// ------------------------------------
+// step 9. run coprocessor post hooks. this should be done after the wal is
+// synced so that the coprocessor contract is adhered to.
+// ------------------------------------
+if   isinreplay    coprocessorhost    null
+for  int i   firstindex  i < lastindexexclusive  i
+// only for successful puts
+if  batchop retcodedetails getoperationstatuscode
+operationstatuscode success
+continue
+mutation m   batchop operations
+if  m instanceof put
+coprocessorhost postput  put  m  waledit  m getdurability
+else
+coprocessorhost postdelete  delete  m  waledit  m getdurability
+success   true
+return addedsize
+finally
+// if the wal sync was unsuccessful, remove keys from memstore
+if   walsyncsuccessful
+rollbackmemstore batchop  familymaps  firstindex  lastindexexclusive
+if  w    null  mvcc completememstoreinsert w
+if  locked
+this updateslock readlock   unlock
+releaserowlocks acquiredrowlocks
+// see if the column families were consistent through the whole thing.
+// if they were then keep them. if they were not then pass a null.
+// null will be treated as unknown.
+// total time taken might be involving puts and deletes.
+// split the time for puts and deletes based on the total number of puts and deletes.
+if  noofputs > 0
+// there were some puts in the batch.
+if  this metricsregion    null
+this metricsregion updateput
+if  noofdeletes > 0
+// there were some deletes in the batch.
+if  this metricsregion    null
+this metricsregion updatedelete
+if   success
+for  int i   firstindex  i < lastindexexclusive  i
+if  batchop retcodedetails getoperationstatuscode      operationstatuscode not_run
+batchop retcodedetails   operationstatus failure
+batchop nextindextoprocess   lastindexexclusive
+/**
+* returns effective durability from the passed durability and
+* the table descriptor.
+*/
+protected durability geteffectivedurability durability d
+return d    durability use_default ? this durability   d
+//todo, think that gets/puts and deletes should be refactored a bit so that
+//the getting of the lock happens before, so that you would just pass it into
+//the methods. so in the case of checkandmutate you could just do lockrow,
+//get, put, unlockrow or something
+/**
+*
+* @param row
+* @param family
+* @param qualifier
+* @param compareop
+* @param comparator
+* @param w
+* @param writetowal
+* @throws ioexception
+* @return true if the new put was executed, false otherwise
+*/
+public boolean checkandmutate byte  row  byte  family  byte  qualifier
+compareop compareop  bytearraycomparable comparator  mutation w
+boolean writetowal
+throws ioexception
+checkreadonly
+//todo, add check for value length or maybe even better move this to the
+//client if this becomes a global setting
+checkresources
+boolean isput   w instanceof put
+if   isput      w instanceof delete
+throw new org apache hadoop hbase donotretryioexception
+row r    row w
+if   bytes equals row  r getrow
+throw new org apache hadoop hbase donotretryioexception
+startregionoperation
+try
+get get   new get row
+checkfamily family
+get addcolumn family  qualifier
+// lock row - note that dobatchmutate will relock this row if called
+rowlock rowlock   getrowlock get getrow
+// wait for all previous transactions to complete (with lock held)
+mvcc completememstoreinsert mvcc beginmemstoreinsert
+list<keyvalue> result   null
+try
+result   get get  false
+boolean valueisnull   comparator getvalue      null
+comparator getvalue   length    0
+boolean matches   false
+if  result size      0    valueisnull
+matches   true
+else if  result size   > 0    result get 0  getvalue   length    0
+valueisnull
+matches   true
+else if  result size      1     valueisnull
+keyvalue kv   result get 0
+int compareresult   comparator compareto kv getbuffer
+kv getvalueoffset    kv getvaluelength
+switch  compareop
+case less
+matches   compareresult <  0
+break
+case less_or_equal
+matches   compareresult < 0
+break
+case equal
+matches   compareresult    0
+break
+case not_equal
+matches   compareresult    0
+break
+case greater_or_equal
+matches   compareresult > 0
+break
+case greater
+matches   compareresult >  0
+break
+default
+throw new runtimeexception     compareop name
+//if matches put the new put or delete the new delete
+if  matches
+// all edits for the given row (across all column families) must
+// happen atomically.
+dobatchmutate  mutation w
+this checkandmutatecheckspassed increment
+return true
+this checkandmutatechecksfailed increment
+return false
+finally
+rowlock release
+finally
+closeregionoperation
+private void dobatchmutate mutation mutation  throws ioexception
+org apache hadoop hbase donotretryioexception
+operationstatus batchmutate   this batchmutate new mutation   mutation
+if  batchmutate getoperationstatuscode   equals operationstatuscode sanity_check_failure
+throw new failedsanitycheckexception batchmutate getexceptionmsg
+else if  batchmutate getoperationstatuscode   equals operationstatuscode bad_family
+throw new nosuchcolumnfamilyexception batchmutate getexceptionmsg
+/**
+* complete taking the snapshot on the region. writes the region info and adds references to the
+* working snapshot directory.
+*
+* todo for api consistency, consider adding another version with no {@link foreignexceptionsnare}
+* arg.  (in the future other cancellable hregion methods could eventually add a
+* {@link foreignexceptionsnare}, or we could do something fancier).
+*
+* @param desc snasphot description object
+* @param exnsnare foreignexceptionsnare that captures external exeptions in case we need to
+*   bail out.  this is allowed to be null and will just be ignored in that case.
+* @throws ioexception if there is an external or internal error causing the snapshot to fail
+*/
+public void addregiontosnapshot snapshotdescription desc
+foreignexceptionsnare exnsnare  throws ioexception
+// this should be "fast" since we don't rewrite store files but instead
+// back up the store files by creating a reference
+path rootdir   fsutils getrootdir this rsservices getconfiguration
+path snapshotdir   snapshotdescriptionutils getworkingsnapshotdir desc  rootdir
+// 1. dump region meta info into the snapshot directory
+log debug
+hregionfilesystem snapshotregionfs   hregionfilesystem createregiononfilesystem conf
+this fs getfilesystem    snapshotdir  getregioninfo
+// 2. iterate through all the stores in the region
+log debug
+// this ensures that we have an atomic view of the directory as long as we have < ls limit
+// (batch size of the files in a directory) on the namenode. otherwise, we get back the files in
+// batches and may miss files being added/deleted. this could be more robust (iteratively
+// checking to see if we have all the files until we are sure), but the limit is currently 1000
+// files/batch, far more than the number of store files under a single column family.
+for  store store   stores values
+// 2.1. build the snapshot reference directory for the store
+path dststoredir   snapshotregionfs getstoredir store getfamily   getnameasstring
+list<storefile> storefiles   new arraylist<storefile> store getstorefiles
+if  log isdebugenabled
+log debug     storefiles
+// 2.2. iterate through all the store's files and create "references".
+int sz   storefiles size
+for  int i   0  i < sz  i
+if  exnsnare    null
+exnsnare rethrowexception
+path file   storefiles get i  getpath
+// create "reference" to this store file.  it is intentionally an empty file -- all
+// necessary infomration is captured by its fs location and filename.  this allows us to
+// only figure out what needs to be done via a single nn operation (instead of having to
+// open and read the files as well).
+log debug      i 1        sz       file
+path referencefile   new path dststoredir  file getname
+boolean success   fs getfilesystem   createnewfile referencefile
+if   success
+throw new ioexception     referencefile
+/**
+* replaces any kv timestamps set to {@link hconstants#latest_timestamp} with the
+* provided current timestamp.
+*/
+void updatekvtimestamps final iterable<list<cell>> keylists  final byte now
+for  list<cell> cells  keylists
+if  cells    null  continue
+for  cell cell   cells
+keyvalue kv   keyvalueutil ensurekeyvalue cell
+kv updatelateststamp now
+/*
+* check if resources to support an update.
+*
+* here we synchronize on hregion, a broad scoped lock.  its appropriate
+* given we're figuring in here whether this region is able to take on
+* writes.  this is only method with a synchronize (at time of writing),
+* this and the synchronize on 'this' inside in internalflushcache to send
+* the notify.
+*/
+private void checkresources
+throws regiontoobusyexception  interruptedioexception
+// if catalog region, do not impose resource constraints or block updates.
+if  this getregioninfo   ismetaregion    return
+boolean blocked   false
+long starttime   0
+while  this memstoresize get   > this blockingmemstoresize
+requestflush
+if   blocked
+starttime   environmentedgemanager currenttimemillis
+log info     thread currentthread   getname
+bytes tostringbinary getregionname
+stringutils humanreadableint this memstoresize get
+stringutils humanreadableint this blockingmemstoresize
+long now   environmentedgemanager currenttimemillis
+long timetowait   starttime   busywaitduration   now
+if  timetowait <  0l
+final long totaltime   now   starttime
+this updatesblockedms add totaltime
+log info     this
+thread currentthread   getname         totaltime
+throw new regiontoobusyexception
+blocked   true
+synchronized this
+try
+wait math min timetowait  threadwakefrequency
+catch  interruptedexception ie
+final long totaltime   environmentedgemanager currenttimemillis     starttime
+if  totaltime > 0
+this updatesblockedms add totaltime
+log info
+this       thread currentthread   getname
+interruptedioexception iie   new interruptedioexception
+iie initcause ie
+throw iie
+if  blocked
+// add in the blocked time if appropriate
+final long totaltime   environmentedgemanager currenttimemillis     starttime
+if totaltime > 0
+this updatesblockedms add totaltime
+log info     this
+thread currentthread   getname
+/**
+* @throws ioexception throws exception if region is in read-only mode.
+*/
+protected void checkreadonly   throws ioexception
+if  this writestate isreadonly
+throw new ioexception
+/**
+* add updates first to the hlog and then add values to memstore.
+* warning: assumption is caller has lock on passed in row.
+* @param family
+* @param edits cell updates by column
+* @praram now
+* @throws ioexception
+*/
+private void put final byte  row  byte  family  list<cell> edits
+throws ioexception
+navigablemap<byte  list<cell>> familymap
+familymap   new treemap<byte  list<cell>> bytes bytes_comparator
+familymap put family  edits
+put p   new put row
+p setfamilymap familymap
+p setclusterid hconstants default_cluster_id
+dobatchmutate p
+/**
+* atomically apply the given map of family->edits to the memstore.
+* this handles the consistency control on its own, but the caller
+* should already have locked updateslock.readlock(). this also does
+* <b>not</b> check the families for validity.
+*
+* @param familymap map of kvs per family
+* @param localizedwriteentry the writeentry of the mvcc for this transaction.
+*        if null, then this method internally creates a mvcc transaction.
+* @return the additional memory usage of the memstore caused by the
+* new entries.
+*/
+private long applyfamilymaptomemstore map<byte  list<cell>> familymap
+multiversionconsistencycontrol writeentry localizedwriteentry
+long size   0
+boolean freemvcc   false
+try
+if  localizedwriteentry    null
+localizedwriteentry   mvcc beginmemstoreinsert
+freemvcc   true
+for  map entry<byte  list<cell>> e   familymap entryset
+byte family   e getkey
+list<cell> cells   e getvalue
+store store   getstore family
+for  cell cell  cells
+keyvalue kv   keyvalueutil ensurekeyvalue cell
+kv setmvccversion localizedwriteentry getwritenumber
+size    store add kv
+finally
+if  freemvcc
+mvcc completememstoreinsert localizedwriteentry
+return size
+/**
+* remove all the keys listed in the map from the memstore. this method is
+* called when a put/delete has updated memstore but subequently fails to update
+* the wal. this method is then invoked to rollback the memstore.
+*/
+private void rollbackmemstore batchoperationinprogress<mutation> batchop
+map<byte  list<cell>> familymaps
+int start  int end
+int kvsrolledback   0
+for  int i   start  i < end  i
+// skip over request that never succeeded in the first place.
+if  batchop retcodedetails getoperationstatuscode
+operationstatuscode success
+continue
+// rollback all the kvs for this row.
+map<byte  list<cell>> familymap    familymaps
+for  map entry<byte  list<cell>> e   familymap entryset
+byte family   e getkey
+list<cell> cells   e getvalue
+// remove those keys from the memstore that matches our
+// key's (row, cf, cq, timestamp, memstorets). the interesting part is
+// that even the memstorets has to match for keys that will be rolleded-back.
+store store   getstore family
+for  cell cell  cells
+store rollback keyvalueutil ensurekeyvalue cell
+kvsrolledback
+log debug     kvsrolledback
+start       end
+/**
+* check the collection of families for validity.
+* @throws nosuchcolumnfamilyexception if a family does not exist.
+*/
+void checkfamilies collection<byte> families
+throws nosuchcolumnfamilyexception
+for  byte family   families
+checkfamily family
+/**
+* during replay, there could exist column families which are removed between region server
+* failure and replay
+*/
+private void removenonexistentcolumnfamilyforreplay
+final map<byte  list<cell>> familymap
+list<byte> nonexistentlist   null
+for  byte family   familymap keyset
+if   this htabledescriptor hasfamily family
+if  nonexistentlist    null
+nonexistentlist   new arraylist<byte>
+nonexistentlist add family
+if  nonexistentlist    null
+for  byte family   nonexistentlist
+// perhaps schema was changed between crash and replay
+log info     bytes tostring family
+familymap remove family
+void checktimestamps final map<byte  list<cell>> familymap
+long now  throws failedsanitycheckexception
+if  timestampslop    hconstants latest_timestamp
+return
+long maxts   now   timestampslop
+for  list<cell> kvs   familymap values
+for  cell cell   kvs
+// see if the user-side ts is out of range. latest = server-side
+keyvalue kv   keyvalueutil ensurekeyvalue cell
+if   kv islatesttimestamp      kv gettimestamp   > maxts
+throw new failedsanitycheckexception
+cell       timestampslop
+/**
+* append the given map of family->edits to a waledit data structure.
+* this does not write to the hlog itself.
+* @param familymap map of family->edits
+* @param waledit the destination entry to append into
+*/
+private void addfamilymaptowaledit map<byte  list<cell>> familymap
+waledit waledit
+for  list<cell> edits   familymap values
+for  cell cell   edits
+waledit add keyvalueutil ensurekeyvalue cell
+private void requestflush
+if  this rsservices    null
+return
+synchronized  writestate
+if  this writestate isflushrequested
+return
+writestate flushrequested   true
+// make request outside of synchronize block; hbase-818.
+this rsservices getflushrequester   requestflush this
+if  log isdebugenabled
+log debug     this
+/*
+* @param size
+* @return true if size is over the flush threshold
+*/
+private boolean isflushsize final long size
+return size > this memstoreflushsize
+/**
+* read the edits log put under this region by wal log splitting process.  put
+* the recovered edits back up into this region.
+*
+* <p>we can ignore any log message that has a sequence id that's equal to or
+* lower than minseqid.  (because we know such log messages are already
+* reflected in the hfiles.)
+*
+* <p>while this is running we are putting pressure on memory yet we are
+* outside of our usual accounting because we are not yet an onlined region
+* (this stuff is being run as part of region initialization).  this means
+* that if we're up against global memory limits, we'll not be flagged to flush
+* because we are not online. we can't be flushed by usual mechanisms anyways;
+* we're not yet online so our relative sequenceids are not yet aligned with
+* hlog sequenceids -- not till we come up online, post processing of split
+* edits.
+*
+* <p>but to help relieve memory pressure, at least manage our own heap size
+* flushing if are in excess of per-region limits.  flushing, though, we have
+* to be careful and avoid using the regionserver/hlog sequenceid.  its running
+* on a different line to whats going on in here in this region context so if we
+* crashed replaying these edits, but in the midst had a flush that used the
+* regionserver log with a sequenceid in excess of whats going on in here
+* in this region and with its split editlogs, then we could miss edits the
+* next time we go to recover. so, we have to flush inline, using seqids that
+* make sense in a this single region context only -- until we online.
+*
+* @param regiondir
+* @param maxseqidinstores any edit found in split editlogs needs to be in excess of
+* the maxseqid for the store to be applied, else its skipped.
+* @param reporter
+* @return the sequence id of the last edit added to this region out of the
+* recovered edits log or <code>minseqid</code> if nothing added from editlogs.
+* @throws unsupportedencodingexception
+* @throws ioexception
+*/
+protected long replayrecoverededitsifany final path regiondir
+map<byte  long> maxseqidinstores
+final cancelableprogressable reporter  final monitoredtask status
+throws unsupportedencodingexception  ioexception
+long minseqidfortheregion    1
+for  long maxseqidinstore   maxseqidinstores values
+if  maxseqidinstore < minseqidfortheregion    minseqidfortheregion     1
+minseqidfortheregion   maxseqidinstore
+long seqid   minseqidfortheregion
+filesystem fs   this fs getfilesystem
+navigableset<path> files   hlogutil getspliteditfilessorted fs  regiondir
+if  files    null    files isempty    return seqid
+for  path edits  files
+if  edits    null     fs exists edits
+log warn     edits
+continue
+if  iszerolengththendelete fs  edits   continue
+long maxseqid   long max_value
+string filename   edits getname
+maxseqid   math abs long parselong filename
+if  maxseqid <  minseqidfortheregion
+string msg       maxseqid
+minseqidfortheregion
+edits
+log debug msg
+continue
+try
+seqid   replayrecoverededits edits  maxseqidinstores  reporter
+catch  ioexception e
+boolean skiperrors   conf getboolean
+hconstants hregion_edits_replay_skip_errors
+conf getboolean
+hconstants default_hregion_edits_replay_skip_errors
+if  conf get       null
+log warn
+hconstants hregion_edits_replay_skip_errors
+if  skiperrors
+path p   hlogutil moveasidebadeditsfile fs  edits
+log error hconstants hregion_edits_replay_skip_errors
+edits
+p  e
+else
+throw e
+// the edits size added into rsaccounting during this replaying will not
+// be required any more. so just clear it.
+if  this rsaccounting    null
+this rsaccounting clearregionreplayeditssize this getregionname
+if  seqid > minseqidfortheregion
+// then we added some edits to memory. flush and cleanup split edit files.
+internalflushcache null  seqid  status
+// now delete the content of recovered edits.  we're done w/ them.
+for  path file  files
+if   fs delete file  false
+log error     file
+else
+log debug     file
+return seqid
+/*
+* @param edits file of recovered edits.
+* @param maxseqidinstores maximum sequenceid found in each store.  edits in log
+* must be larger than this to be replayed for each store.
+* @param reporter
+* @return the sequence id of the last edit added to this region out of the
+* recovered edits log or <code>minseqid</code> if nothing added from editlogs.
+* @throws ioexception
+*/
+private long replayrecoverededits final path edits
+map<byte  long> maxseqidinstores  final cancelableprogressable reporter
+throws ioexception
+string msg       edits
+log info msg
+monitoredtask status   taskmonitor get   createstatus msg
+filesystem fs   this fs getfilesystem
+status setstatus
+hlog reader reader   null
+try
+reader   hlogfactory createreader fs  edits  conf
+long currenteditseqid    1
+long firstseqidinlog    1
+long skippededits   0
+long editscount   0
+long intervaledits   0
+hlog entry entry
+store store   null
+boolean reported_once   false
+try
+// how many edits seen before we check elapsed time
+int interval   this conf getint
+2000
+// how often to send a progress report (default 1/2 master timeout)
+int period   this conf getint
+this conf getint
+180000    2
+long lastreport   environmentedgemanager currenttimemillis
+while   entry   reader next       null
+hlogkey key   entry getkey
+waledit val   entry getedit
+if  reporter    null
+intervaledits    val size
+if  intervaledits >  interval
+// number of edits interval reached
+intervaledits   0
+long cur   environmentedgemanager currenttimemillis
+if  lastreport   period <  cur
+status setstatus
+skippededits
+editscount
+// timeout reached
+if  reporter progress
+msg
+log warn msg
+status abort msg
+throw new ioexception msg
+reported_once   true
+lastreport   cur
+// start coprocessor replay here. the coprocessor is for each waledit
+// instead of a keyvalue.
+if  coprocessorhost    null
+status setstatus
+if  coprocessorhost prewalrestore this getregioninfo    key  val
+// if bypass this log entry, ignore it ...
+continue
+if  firstseqidinlog     1
+firstseqidinlog   key getlogseqnum
+boolean flush   false
+for  keyvalue kv  val getkeyvalues
+// check this edit is for me. also, guard against writing the special
+// metacolumn info such as hbase::cacheflush entries
+if  kv matchingfamily waledit metafamily
+bytes equals key getencodedregionname
+this getregioninfo   getencodednameasbytes
+//this is a special edit, we should handle it
+compactiondescriptor compaction   waledit getcompaction kv
+if  compaction    null
+//replay the compaction
+completecompactionmarker compaction
+skippededits
+continue
+// figure which store the edit is meant for.
+if  store    null     kv matchingfamily store getfamily   getname
+store   this stores get kv getfamily
+if  store    null
+// this should never happen.  perhaps schema was changed between
+// crash and redeploy?
+log warn     kv
+skippededits
+continue
+// now, figure if we should skip this edit.
+if  key getlogseqnum   <  maxseqidinstores get store getfamily
+getname
+skippededits
+continue
+currenteditseqid   key getlogseqnum
+// once we are over the limit, restoreedit will keep returning true to
+// flush -- but don't flush until we've played all the kvs that make up
+// the waledit.
+flush   restoreedit store  kv
+editscount
+if  flush  internalflushcache null  currenteditseqid  status
+if  coprocessorhost    null
+coprocessorhost postwalrestore this getregioninfo    key  val
+catch  eofexception eof
+path p   hlogutil moveasidebadeditsfile fs  edits
+msg
+edits       p
+log warn msg  eof
+status abort msg
+catch  ioexception ioe
+// if the ioe resulted from bad file format,
+// then this problem is idempotent and retrying won't help
+if  ioe getcause   instanceof parseexception
+path p   hlogutil moveasidebadeditsfile fs  edits
+msg
+edits       p
+log warn msg  ioe
+status setstatus msg
+else
+status abort stringutils stringifyexception ioe
+// other io errors may be transient (bad network connection,
+// checksum exception on one datanode, etc).  throw & retry
+throw ioe
+if  reporter    null     reported_once
+reporter progress
+msg       editscount       skippededits
+firstseqidinlog
+currenteditseqid       edits
+status markcomplete msg
+log debug msg
+return currenteditseqid
+finally
+status cleanup
+if  reader    null
+reader close
+/**
+* call to complete a compaction. its for the case where we find in the wal a compaction
+* that was not finished.  we could find one recovering a wal after a regionserver crash.
+* see hbase-2331.
+* @param fs
+* @param compaction
+*/
+void completecompactionmarker compactiondescriptor compaction
+throws ioexception
+store store   this getstore compaction getfamilyname   tobytearray
+if  store    null
+log warn
+bytes tostring compaction getfamilyname   tobytearray
+return
+store completecompactionmarker compaction
+/**
+* used by tests
+* @param s store to add edit too.
+* @param kv keyvalue to add.
+* @return true if we should flush.
+*/
+protected boolean restoreedit final store s  final keyvalue kv
+long kvsize   s add kv
+if  this rsaccounting    null
+rsaccounting addandgetregionreplayeditssize this getregionname    kvsize
+return isflushsize this addandgetglobalmemstoresize kvsize
+/*
+* @param fs
+* @param p file to check.
+* @return true if file was zero-length (and if so, we'll delete it in here).
+* @throws ioexception
+*/
+private static boolean iszerolengththendelete final filesystem fs  final path p
+throws ioexception
+filestatus stat   fs getfilestatus p
+if  stat getlen   > 0  return false
+log warn     p
+fs delete p  false
+return true
+protected hstore instantiatehstore final hcolumndescriptor family  throws ioexception
+return new hstore this  family  this conf
+/**
+* return hstore instance.
+* use with caution.  exposed for use of fixup utilities.
+* @param column name of column family hosted by this region.
+* @return store that goes with the family on passed <code>column</code>.
+* todo: make this lookup faster.
+*/
+public store getstore final byte column
+return this stores get column
+public map<byte  store> getstores
+return this stores
+/**
+* return list of storefiles for the set of cfs.
+* uses closelock to prevent the race condition where a region closes
+* in between the for loop - closing the stores one by one, some stores
+* will return 0 files.
+* @return list of storefiles.
+*/
+public list<string> getstorefilelist final byte  columns
+throws illegalargumentexception
+list<string> storefilenames   new arraylist<string>
+synchronized closelock
+for byte column   columns
+store store   this stores get column
+if  store    null
+throw new illegalargumentexception
+new string column
+for  storefile storefile  store getstorefiles
+storefilenames add storefile getpath   tostring
+return storefilenames
+//////////////////////////////////////////////////////////////////////////////
+// support code
+//////////////////////////////////////////////////////////////////////////////
+/** make sure this is a valid row for the hregion */
+void checkrow final byte  row  string op  throws ioexception
+if   rowisinrange getregioninfo    row
+throw new wrongregionexception
+op       this
+bytes tostringbinary getstartkey
+bytes tostringbinary getendkey
+bytes tostringbinary row
+/**
+* tries to acquire a lock on the given row.
+* @param waitforlock if true, will block until the lock is available.
+*        otherwise, just tries to obtain the lock and returns
+*        false if unavailable.
+* @return the row lock if acquired,
+*   null if waitforlock was false and the lock was not acquired
+* @throws ioexception if waitforlock was true and the lock could not be acquired after waiting
+*/
+public rowlock getrowlock byte row  boolean waitforlock  throws ioexception
+checkrow row
+startregionoperation
+try
+hashedbytes rowkey   new hashedbytes row
+rowlockcontext rowlockcontext   new rowlockcontext rowkey
+// loop until we acquire the row lock (unless !waitforlock)
+while  true
+rowlockcontext existingcontext   lockedrows putifabsent rowkey  rowlockcontext
+if  existingcontext    null
+// row is not already locked by any thread, use newly created context.
+break
+else if  existingcontext ownedbycurrentthread
+// row is already locked by current thread, reuse existing context instead.
+rowlockcontext   existingcontext
+break
+else
+// row is already locked by some other thread, give up or wait for it
+if   waitforlock
+return null
+try
+if   existingcontext latch await this rowlockwaitduration  timeunit milliseconds
+throw new ioexception     rowkey
+catch  interruptedexception ie
+log warn     rowkey
+interruptedioexception iie   new interruptedioexception
+iie initcause ie
+throw iie
+// allocate new lock for this thread
+return rowlockcontext newlock
+finally
+closeregionoperation
+/**
+* acqures a lock on the given row.
+* the same thread may acquire multiple locks on the same row.
+* @return the acquired row lock
+* @throws ioexception if the lock could not be acquired after waiting
+*/
+public rowlock getrowlock byte row  throws ioexception
+return getrowlock row  true
+/**
+* if the given list of row locks is not null, releases all locks.
+*/
+public void releaserowlocks list<rowlock> rowlocks
+if  rowlocks    null
+for  rowlock rowlock   rowlocks
+rowlock release
+rowlocks clear
+/**
+* determines whether multiple column families are present
+* precondition: familypaths is not null
+*
+* @param familypaths list of pair<byte[] column family, string hfilepath>
+*/
+private static boolean hasmultiplecolumnfamilies
+list<pair<byte  string>> familypaths
+boolean multiplefamilies   false
+byte family   null
+for  pair<byte  string> pair   familypaths
+byte fam   pair getfirst
+if  family    null
+family   fam
+else if   bytes equals family  fam
+multiplefamilies   true
+break
+return multiplefamilies
+public boolean bulkloadhfiles list<pair<byte  string>> familypaths
+boolean assignseqid  throws ioexception
+return bulkloadhfiles familypaths  assignseqid  null
+/**
+* attempts to atomically load a group of hfiles.  this is critical for loading
+* rows with multiple column families atomically.
+*
+* @param familypaths list of pair<byte[] column family, string hfilepath>
+* @param bulkloadlistener internal hooks enabling massaging/preparation of a
+* file about to be bulk loaded
+* @param assignseqid
+* @return true if successful, false if failed recoverably
+* @throws ioexception if failed unrecoverably.
+*/
+public boolean bulkloadhfiles list<pair<byte  string>> familypaths  boolean assignseqid
+bulkloadlistener bulkloadlistener  throws ioexception
+preconditions checknotnull familypaths
+// we need writelock for multi-family bulk load
+startbulkregionoperation hasmultiplecolumnfamilies familypaths
+try
+this writerequestscount increment
+// there possibly was a split that happend between when the split keys
+// were gathered and before the hreiogn's write lock was taken.  we need
+// to validate the hfile region before attempting to bulk load all of them
+list<ioexception> ioes   new arraylist<ioexception>
+list<pair<byte  string>> failures   new arraylist<pair<byte  string>>
+for  pair<byte  string> p   familypaths
+byte familyname   p getfirst
+string path   p getsecond
+store store   getstore familyname
+if  store    null
+ioexception ioe   new org apache hadoop hbase donotretryioexception
+bytes tostringbinary familyname
+ioes add ioe
+else
+try
+store assertbulkloadhfileok new path path
+catch  wrongregionexception wre
+// recoverable (file doesn't fit in region)
+failures add p
+catch  ioexception ioe
+// unrecoverable (hdfs problem)
+ioes add ioe
+// validation failed because of some sort of io problem.
+if  ioes size      0
+ioexception e   multipleioexception createioexception ioes
+log error    e
+throw e
+// validation failed, bail out before doing anything permanent.
+if  failures size      0
+stringbuilder list   new stringbuilder
+for  pair<byte  string> p   failures
+list append    append bytes tostring p getfirst     append
+append p getsecond
+// problem when validating
+log warn
+list
+return false
+for  pair<byte  string> p   familypaths
+byte familyname   p getfirst
+string path   p getsecond
+store store   getstore familyname
+try
+string finalpath   path
+if bulkloadlistener    null
+finalpath   bulkloadlistener preparebulkload familyname  path
+store bulkloadhfile finalpath  assignseqid ? this log obtainseqnum      1
+if bulkloadlistener    null
+bulkloadlistener donebulkload familyname  path
+catch  ioexception ioe
+// a failure here can cause an atomicity violation that we currently
+// cannot recover from since it is likely a failed hdfs operation.
+// todo need a better story for reverting partial failures due to hdfs.
+log error
+bytes tostring p getfirst         p getsecond    ioe
+if bulkloadlistener    null
+try
+bulkloadlistener failedbulkload familyname  path
+catch  exception ex
+log error
+bytes tostring familyname    path  ex
+throw ioe
+return true
+finally
+closebulkregionoperation
+@override
+public boolean equals object o
+if    o instanceof hregion
+return false
+return bytes equals this getregionname      hregion  o  getregionname
+@override
+public int hashcode
+return bytes hashcode this getregionname
+@override
+public string tostring
+return this getregionnameasstring
+/**
+* regionscannerimpl is used to combine scanners from multiple stores (aka column families).
+*/
+class regionscannerimpl implements regionscanner
+// package local for testability
+keyvalueheap storeheap   null
+/** heap of key-values that are not essential for the provided filters and are thus read
+* on demand, if on-demand column family loading is enabled.*/
+keyvalueheap joinedheap   null
+/**
+* if the joined heap data gathering is interrupted due to scan limits, this will
+* contain the row for which we are populating the values.*/
+private keyvalue joinedcontinuationrow   null
+// keyvalue indicating that limit is reached when scanning
+private final keyvalue kv_limit   new keyvalue
+private final byte  stoprow
+private filter filter
+private int batch
+private int isscan
+private boolean filterclosed   false
+private long readpt
+private long maxresultsize
+private hregion region
+@override
+public hregioninfo getregioninfo
+return region getregioninfo
+regionscannerimpl scan scan  list<keyvaluescanner> additionalscanners  hregion region
+throws ioexception
+this region   region
+this maxresultsize   scan getmaxresultsize
+if  scan hasfilter
+this filter   new filterwrapper scan getfilter
+else
+this filter   null
+this batch   scan getbatch
+if  bytes equals scan getstoprow    hconstants empty_end_row      scan isgetscan
+this stoprow   null
+else
+this stoprow   scan getstoprow
+// if we are doing a get, we want to be [startrow,endrow] normally
+// it is [startrow,endrow) and if startrow=endrow we get nothing.
+this isscan   scan isgetscan   ?  1   0
+// synchronize on scannerreadpoints so that nobody calculates
+// getsmallestreadpoint, before scannerreadpoints is updated.
+isolationlevel isolationlevel   scan getisolationlevel
+synchronized scannerreadpoints
+if  isolationlevel    isolationlevel read_uncommitted
+// this scan can read even uncommitted transactions
+this readpt   long max_value
+multiversionconsistencycontrol setthreadreadpoint this readpt
+else
+this readpt   multiversionconsistencycontrol resetthreadreadpoint mvcc
+scannerreadpoints put this  this readpt
+// here we separate all scanners into two lists - scanner that provide data required
+// by the filter to operate (scanners list) and all others (joinedscanners list).
+list<keyvaluescanner> scanners   new arraylist<keyvaluescanner>
+list<keyvaluescanner> joinedscanners   new arraylist<keyvaluescanner>
+if  additionalscanners    null
+scanners addall additionalscanners
+for  map entry<byte  navigableset<byte>> entry
+scan getfamilymap   entryset
+store store   stores get entry getkey
+keyvaluescanner scanner   store getscanner scan  entry getvalue
+if  this filter    null     scan doloadcolumnfamiliesondemand
+this filter isfamilyessential entry getkey
+scanners add scanner
+else
+joinedscanners add scanner
+this storeheap   new keyvalueheap scanners  comparator
+if   joinedscanners isempty
+this joinedheap   new keyvalueheap joinedscanners  comparator
+regionscannerimpl scan scan  hregion region  throws ioexception
+this scan  null  region
+@override
+public long getmaxresultsize
+return maxresultsize
+@override
+public long getmvccreadpoint
+return this readpt
+/**
+* reset both the filter and the old filter.
+*
+* @throws ioexception in case a filter raises an i/o exception.
+*/
+protected void resetfilters   throws ioexception
+if  filter    null
+filter reset
+@override
+public boolean next list<keyvalue> outresults
+throws ioexception
+// apply the batching limit by default
+return next outresults  batch
+@override
+public synchronized boolean next list<keyvalue> outresults  int limit  throws ioexception
+if  this filterclosed
+throw new unknownscannerexception
+startregionoperation operation scan
+readrequestscount increment
+try
+// this could be a new thread from the last time we called next().
+multiversionconsistencycontrol setthreadreadpoint this readpt
+return nextraw outresults  limit
+finally
+closeregionoperation
+@override
+public boolean nextraw list<keyvalue> outresults
+throws ioexception
+return nextraw outresults  batch
+@override
+public boolean nextraw list<keyvalue> outresults  int limit  throws ioexception
+boolean returnresult
+if  outresults isempty
+// usually outresults is empty. this is true when next is called
+// to handle scan or get operation.
+returnresult   nextinternal outresults  limit
+else
+list<keyvalue> tmplist   new arraylist<keyvalue>
+returnresult   nextinternal tmplist  limit
+outresults addall tmplist
+resetfilters
+if  isfilterdone
+return false
+if  region    null    region metricsregion    null
+long totalsize   0
+if  outresults    null
+for keyvalue kv outresults
+totalsize    kv getlength
+region metricsregion updatescannext totalsize
+return returnresult
+private void populatefromjoinedheap list<keyvalue> results  int limit
+throws ioexception
+assert joinedcontinuationrow    null
+keyvalue kv   populateresult results  this joinedheap  limit
+joinedcontinuationrow getbuffer    joinedcontinuationrow getrowoffset
+joinedcontinuationrow getrowlength
+if  kv    kv_limit
+// we are done with this row, reset the continuation.
+joinedcontinuationrow   null
+// as the data is obtained from two independent heaps, we need to
+// ensure that result list is sorted, because result relies on that.
+collections sort results  comparator
+/**
+* fetches records with currentrow into results list, until next row or limit (if not -1).
+* @param results
+* @param heap keyvalueheap to fetch data from.it must be positioned on correct row before call.
+* @param limit max amount of kvs to place in result list, -1 means no limit.
+* @param currentrow byte array with key we are fetching.
+* @param offset offset for currentrow
+* @param length length for currentrow
+* @return kv_limit if limit reached, next keyvalue otherwise.
+*/
+private keyvalue populateresult list<keyvalue> results  keyvalueheap heap  int limit
+byte currentrow  int offset  short length  throws ioexception
+keyvalue nextkv
+do
+heap next results  limit   results size
+if  limit > 0    results size      limit
+return kv_limit
+nextkv   heap peek
+while  nextkv    null    nextkv matchingrow currentrow  offset  length
+return nextkv
+/*
+* @return true if a filter rules the scanner is over, done.
+*/
+@override
+public synchronized boolean isfilterdone   throws ioexception
+return this filter    null    this filter filterallremaining
+private boolean nextinternal list<keyvalue> results  int limit
+throws ioexception
+if   results isempty
+throw new illegalargumentexception
+rpccallcontext rpccall   rpcserver getcurrentcall
+// the loop here is used only when at some point during the next we determine
+// that due to effects of filters or otherwise, we have an empty row in the result.
+// then we loop and try again. otherwise, we must get out on the first iteration via return,
+// "true" if there's more data to read, "false" if there isn't (storeheap is at a stop row,
+// and joinedheap has no more data to read for the last row (if set, joinedcontinuationrow).
+while  true
+if  rpccall    null
+// if a user specifies a too-restrictive or too-slow scanner, the
+// client might time out and disconnect while the server side
+// is still processing the request. we should abort aggressively
+// in that case.
+rpccall throwexceptionifcallerdisconnected getregionnameasstring
+// let's see what we have in the storeheap.
+keyvalue current   this storeheap peek
+byte currentrow   null
+int offset   0
+short length   0
+if  current    null
+currentrow   current getbuffer
+offset   current getrowoffset
+length   current getrowlength
+boolean stoprow   isstoprow currentrow  offset  length
+// check if we were getting data from the joinedheap and hit the limit.
+// if not, then it's main path - getting results from storeheap.
+if  joinedcontinuationrow    null
+// first, check if we are at a stop row. if so, there are no more results.
+if  stoprow
+if  filter    null    filter hasfilterrow
+filter filterrow results
+return false
+// check if rowkey filter wants to exclude this row. if so, loop to next.
+// technically, if we hit limits before on this row, we don't need this call.
+if  filterrowkey currentrow  offset  length
+boolean morerows   nextrow currentrow  offset  length
+if   morerows  return false
+results clear
+continue
+keyvalue nextkv   populateresult results  this storeheap  limit  currentrow  offset
+length
+// ok, we are good, let's try to get some results from the main heap.
+if  nextkv    kv_limit
+if  this filter    null    filter hasfilterrow
+throw new incompatiblefilterexception
+return true     we hit the limit
+stoprow   nextkv    null
+isstoprow nextkv getbuffer    nextkv getrowoffset    nextkv getrowlength
+// save that the row was empty before filters applied to it.
+final boolean isemptyrow   results isempty
+// we have the part of the row necessary for filtering (all of it, usually).
+// first filter with the filterrow(list).
+if  filter    null    filter hasfilterrow
+filter filterrow results
+if  isemptyrow
+boolean morerows   nextrow currentrow  offset  length
+if   morerows  return false
+results clear
+// this row was totally filtered out, if this is not the last row,
+// we should continue on. otherwise, nothing else to do.
+if   stoprow  continue
+return false
+// ok, we are done with storeheap for this row.
+// now we may need to fetch additional, non-essential data into row.
+// these values are not needed for filter to work, so we postpone their
+// fetch to (possibly) reduce amount of data loads from disk.
+if  this joinedheap    null
+keyvalue nextjoinedkv   joinedheap peek
+// if joinedheap is pointing to some other row, try to seek to a correct one.
+boolean mayhavedata
+nextjoinedkv    null    nextjoinedkv matchingrow currentrow  offset  length
+this joinedheap requestseek keyvalue createfirstonrow currentrow  offset  length
+true  true
+joinedheap peek      null
+joinedheap peek   matchingrow currentrow  offset  length
+if  mayhavedata
+joinedcontinuationrow   current
+populatefromjoinedheap results  limit
+else
+// populating from the joined heap was stopped by limits, populate some more.
+populatefromjoinedheap results  limit
+// we may have just called populatefromjoinedmap and hit the limits. if that is
+// the case, we need to call it again on the next next() invocation.
+if  joinedcontinuationrow    null
+return true
+// finally, we are done with both joinedheap and storeheap.
+// double check to prevent empty rows from appearing in result. it could be
+// the case when singlecolumnvalueexcludefilter is used.
+if  results isempty
+boolean morerows   nextrow currentrow  offset  length
+if   morerows  return false
+if   stoprow  continue
+// we are done. return the result.
+return  stoprow
+private boolean filterrowkey byte row  int offset  short length  throws ioexception
+return filter    null
+filter filterrowkey row  offset  length
+protected boolean nextrow byte  currentrow  int offset  short length  throws ioexception
+assert this joinedcontinuationrow    null
+keyvalue next
+while   next   this storeheap peek       null
+next matchingrow currentrow  offset  length
+this storeheap next mocked_list
+resetfilters
+// calling the hook in cp which allows it to do a fast forward
+if  this region getcoprocessorhost      null
+return this region getcoprocessorhost   postscannerfilterrow this  currentrow
+return true
+private boolean isstoprow byte  currentrow  int offset  short length
+return currentrow    null
+stoprow    null
+comparator comparerows stoprow  0  stoprow length
+currentrow  offset  length  <  isscan
+@override
+public synchronized void close
+if  storeheap    null
+storeheap close
+storeheap   null
+if  joinedheap    null
+joinedheap close
+joinedheap   null
+// no need to sychronize here.
+scannerreadpoints remove this
+this filterclosed   true
+keyvalueheap getstoreheapfortesting
+return storeheap
+@override
+public synchronized boolean reseek byte row  throws ioexception
+if  row    null
+throw new illegalargumentexception
+boolean result   false
+startregionoperation
+try
+// this could be a new thread from the last time we called next().
+multiversionconsistencycontrol setthreadreadpoint this readpt
+keyvalue kv   keyvalue createfirstonrow row
+// use request seek to make use of the lazy seek option. see hbase-5520
+result   this storeheap requestseek kv  true  true
+if  this joinedheap    null
+result   this joinedheap requestseek kv  true  true     result
+finally
+closeregionoperation
+return result
+// utility methods
+/**
+* a utility method to create new instances of hregion based on the
+* {@link hconstants#region_impl} configuration property.
+* @param tabledir qualified path of directory where region should be located,
+* usually the table directory.
+* @param log the hlog is the outbound log for any updates to the hregion
+* (there's a single hlog for all the hregions on a single hregionserver.)
+* the log file is a logfile from the previous execution that's
+* custom-computed for this hregion. the hregionserver computes and sorts the
+* appropriate log info for this hregion. if there is a previous log file
+* (implying that the hregion has been written-to before), then read it from
+* the supplied path.
+* @param fs is the filesystem.
+* @param conf is global configuration settings.
+* @param regioninfo - hregioninfo that describes the region
+* is new), then read them from the supplied path.
+* @param htd the table descriptor
+* @param rsservices
+* @return the new instance
+*/
+static hregion newhregion path tabledir  hlog log  filesystem fs
+configuration conf  hregioninfo regioninfo  final htabledescriptor htd
+regionserverservices rsservices
+try
+@suppresswarnings
+class<? extends hregion> regionclass
+class<? extends hregion>  conf getclass hconstants region_impl  hregion class
+constructor<? extends hregion> c
+regionclass getconstructor path class  hlog class  filesystem class
+configuration class  hregioninfo class  htabledescriptor class
+regionserverservices class
+return c newinstance tabledir  log  fs  conf  regioninfo  htd  rsservices
+catch  throwable e
+// todo: what should i throw here?
+throw new illegalstateexception    e
+/**
+* convenience method creating new hregions. used by createtable and by the
+* bootstrap code in the hmaster constructor.
+* note, this method creates an {@link hlog} for the created region. it
+* needs to be closed explicitly.  use {@link hregion#getlog()} to get
+* access.  <b>when done with a region created using this method, you will
+* need to explicitly close the {@link hlog} it created too; it will not be
+* done for you.  not closing the log will leave at least a daemon thread
+* running.</b>  call {@link #closehregion(hregion)} and it will do
+* necessary cleanup for you.
+* @param info info for region to create.
+* @param rootdir root directory for hbase instance
+* @param conf
+* @param htabledescriptor
+* @return new hregion
+*
+* @throws ioexception
+*/
+public static hregion createhregion final hregioninfo info  final path rootdir
+final configuration conf  final htabledescriptor htabledescriptor
+throws ioexception
+return createhregion info  rootdir  conf  htabledescriptor  null
+/**
+* this will do the necessary cleanup a call to
+* {@link #createhregion(hregioninfo, path, configuration, htabledescriptor)}
+* requires.  this method will close the region and then close its
+* associated {@link hlog} file.  you use it if you call the other createhregion,
+* the one that takes an {@link hlog} instance but don't be surprised by the
+* call to the {@link hlog#closeanddelete()} on the {@link hlog} the
+* hregion was carrying.
+* @param r
+* @throws ioexception
+*/
+public static void closehregion final hregion r  throws ioexception
+if  r    null  return
+r close
+if  r getlog      null  return
+r getlog   closeanddelete
+/**
+* convenience method creating new hregions. used by createtable.
+* the {@link hlog} for the created region needs to be closed explicitly.
+* use {@link hregion#getlog()} to get access.
+*
+* @param info info for region to create.
+* @param rootdir root directory for hbase instance
+* @param conf
+* @param htabledescriptor
+* @param hlog shared hlog
+* @param initialize - true to initialize the region
+* @return new hregion
+*
+* @throws ioexception
+*/
+public static hregion createhregion final hregioninfo info  final path rootdir
+final configuration conf
+final htabledescriptor htabledescriptor
+final hlog hlog
+final boolean initialize
+throws ioexception
+return createhregion info  rootdir  conf  htabledescriptor
+hlog  initialize  false
+/**
+* convenience method creating new hregions. used by createtable.
+* the {@link hlog} for the created region needs to be closed
+* explicitly, if it is not null.
+* use {@link hregion#getlog()} to get access.
+*
+* @param info info for region to create.
+* @param rootdir root directory for hbase instance
+* @param conf
+* @param htabledescriptor
+* @param hlog shared hlog
+* @param initialize - true to initialize the region
+* @param ignorehlog - true to skip generate new hlog if it is null, mostly for createtable
+* @return new hregion
+* @throws ioexception
+*/
+public static hregion createhregion final hregioninfo info  final path rootdir
+final configuration conf
+final htabledescriptor htabledescriptor
+final hlog hlog
+final boolean initialize  final boolean ignorehlog
+throws ioexception
+log info     info gettablename   getnameasstring
+htabledescriptor       rootdir
+info gettablename   getnameasstring
+path tabledir   fsutils gettabledir rootdir  info gettablename
+filesystem fs   filesystem get conf
+hregionfilesystem rfs   hregionfilesystem createregiononfilesystem conf  fs  tabledir  info
+hlog effectivehlog   hlog
+if  hlog    null     ignorehlog
+effectivehlog   hlogfactory createhlog fs  rfs getregiondir
+hconstants hregion_logdir_name  conf
+hregion region   hregion newhregion tabledir
+effectivehlog  fs  conf  info  htabledescriptor  null
+if  initialize
+region initialize
+return region
+public static hregion createhregion final hregioninfo info  final path rootdir
+final configuration conf
+final htabledescriptor htabledescriptor
+final hlog hlog
+throws ioexception
+return createhregion info  rootdir  conf  htabledescriptor  hlog  true
+/**
+* open a region.
+* @param info info for region to be opened.
+* @param wal hlog for region to use. this method will call
+* hlog#setsequencenumber(long) passing the result of the call to
+* hregion#getminsequenceid() to ensure the log id is properly kept
+* up.  hregionstore does this every time it opens a new region.
+* @param conf
+* @return new hregion
+*
+* @throws ioexception
+*/
+public static hregion openhregion final hregioninfo info
+final htabledescriptor htd  final hlog wal
+final configuration conf
+throws ioexception
+return openhregion info  htd  wal  conf  null  null
+/**
+* open a region.
+* @param info info for region to be opened
+* @param htd the table descriptor
+* @param wal hlog for region to use. this method will call
+* hlog#setsequencenumber(long) passing the result of the call to
+* hregion#getminsequenceid() to ensure the log id is properly kept
+* up.  hregionstore does this every time it opens a new region.
+* @param conf the configuration object to use.
+* @param rsservices an interface we can request flushes against.
+* @param reporter an interface we can report progress against.
+* @return new hregion
+*
+* @throws ioexception
+*/
+public static hregion openhregion final hregioninfo info
+final htabledescriptor htd  final hlog wal  final configuration conf
+final regionserverservices rsservices
+final cancelableprogressable reporter
+throws ioexception
+return openhregion fsutils getrootdir conf   info  htd  wal  conf  rsservices  reporter
+/**
+* open a region.
+* @param rootdir root directory for hbase instance
+* @param info info for region to be opened.
+* @param htd the table descriptor
+* @param wal hlog for region to use. this method will call
+* hlog#setsequencenumber(long) passing the result of the call to
+* hregion#getminsequenceid() to ensure the log id is properly kept
+* up.  hregionstore does this every time it opens a new region.
+* @param conf the configuration object to use.
+* @return new hregion
+* @throws ioexception
+*/
+public static hregion openhregion path rootdir  final hregioninfo info
+final htabledescriptor htd  final hlog wal  final configuration conf
+throws ioexception
+return openhregion rootdir  info  htd  wal  conf  null  null
+/**
+* open a region.
+* @param rootdir root directory for hbase instance
+* @param info info for region to be opened.
+* @param htd the table descriptor
+* @param wal hlog for region to use. this method will call
+* hlog#setsequencenumber(long) passing the result of the call to
+* hregion#getminsequenceid() to ensure the log id is properly kept
+* up.  hregionstore does this every time it opens a new region.
+* @param conf the configuration object to use.
+* @param rsservices an interface we can request flushes against.
+* @param reporter an interface we can report progress against.
+* @return new hregion
+* @throws ioexception
+*/
+public static hregion openhregion final path rootdir  final hregioninfo info
+final htabledescriptor htd  final hlog wal  final configuration conf
+final regionserverservices rsservices
+final cancelableprogressable reporter
+throws ioexception
+filesystem fs   null
+if  rsservices    null
+fs   rsservices getfilesystem
+if  fs    null
+fs   filesystem get conf
+return openhregion conf  fs  rootdir  info  htd  wal  rsservices  reporter
+/**
+* open a region.
+* @param conf the configuration object to use.
+* @param fs filesystem to use
+* @param rootdir root directory for hbase instance
+* @param info info for region to be opened.
+* @param htd the table descriptor
+* @param wal hlog for region to use. this method will call
+* hlog#setsequencenumber(long) passing the result of the call to
+* hregion#getminsequenceid() to ensure the log id is properly kept
+* up.  hregionstore does this every time it opens a new region.
+* @return new hregion
+* @throws ioexception
+*/
+public static hregion openhregion final configuration conf  final filesystem fs
+final path rootdir  final hregioninfo info  final htabledescriptor htd  final hlog wal
+throws ioexception
+return openhregion conf  fs  rootdir  info  htd  wal  null  null
+/**
+* open a region.
+* @param conf the configuration object to use.
+* @param fs filesystem to use
+* @param rootdir root directory for hbase instance
+* @param info info for region to be opened.
+* @param htd the table descriptor
+* @param wal hlog for region to use. this method will call
+* hlog#setsequencenumber(long) passing the result of the call to
+* hregion#getminsequenceid() to ensure the log id is properly kept
+* up.  hregionstore does this every time it opens a new region.
+* @param rsservices an interface we can request flushes against.
+* @param reporter an interface we can report progress against.
+* @return new hregion
+* @throws ioexception
+*/
+public static hregion openhregion final configuration conf  final filesystem fs
+final path rootdir  final hregioninfo info  final htabledescriptor htd  final hlog wal
+final regionserverservices rsservices  final cancelableprogressable reporter
+throws ioexception
+if  info    null  throw new nullpointerexception
+if  log isdebugenabled
+log debug     info
+path dir   fsutils gettabledir rootdir  info gettablename
+hregion r   hregion newhregion dir  wal  fs  conf  info  htd  rsservices
+return r openhregion reporter
+/**
+* useful when reopening a closed region (normally for unit tests)
+* @param other original object
+* @param reporter an interface we can report progress against.
+* @return new hregion
+* @throws ioexception
+*/
+public static hregion openhregion final hregion other  final cancelableprogressable reporter
+throws ioexception
+hregionfilesystem regionfs   other getregionfilesystem
+hregion r   newhregion regionfs gettabledir    other getlog    regionfs getfilesystem
+other baseconf  other getregioninfo    other gettabledesc    null
+return r openhregion reporter
+/**
+* open hregion.
+* calls initialize and sets sequenceid.
+* @param reporter
+* @return returns <code>this</code>
+* @throws ioexception
+*/
+protected hregion openhregion final cancelableprogressable reporter
+throws ioexception
+checkcompressioncodecs
+this openseqnum   initialize reporter
+if  this log    null
+this log setsequencenumber this openseqnum
+return this
+private void checkcompressioncodecs   throws ioexception
+for  hcolumndescriptor fam  this htabledescriptor getcolumnfamilies
+compressiontest testcompression fam getcompression
+compressiontest testcompression fam getcompactioncompression
+/**
+* create a daughter region from given a temp directory with the region data.
+* @param hri spec. for daughter region to open.
+* @throws ioexception
+*/
+hregion createdaughterregionfromsplits final hregioninfo hri  throws ioexception
+hregion r   hregion newhregion this fs gettabledir    this getlog    fs getfilesystem
+this getbaseconf    hri  this gettabledesc    rsservices
+r readrequestscount set this getreadrequestscount     2
+r writerequestscount set this getwriterequestscount     2
+fs commitdaughterregion hri
+return r
+/**
+* create a merged region given a temp directory with the region data.
+* @param mergedregioninfo
+* @param region_b another merging region
+* @return merged hregion
+* @throws ioexception
+*/
+hregion createmergedregionfrommerges final hregioninfo mergedregioninfo
+final hregion region_b  throws ioexception
+hregion r   hregion newhregion this fs gettabledir    this getlog
+fs getfilesystem    this getbaseconf    mergedregioninfo
+this gettabledesc    this rsservices
+r readrequestscount set this getreadrequestscount
+region_b getreadrequestscount
+r writerequestscount set this getwriterequestscount
+region_b getwriterequestscount
+this fs commitmergedregion mergedregioninfo
+return r
+/**
+* inserts a new region's meta information into the passed
+* <code>meta</code> region. used by the hmaster bootstrap code adding
+* new table to meta table.
+*
+* @param meta meta hregion to be updated
+* @param r hregion to add to <code>meta</code>
+*
+* @throws ioexception
+*/
+// todo remove since only test and merge use this
+public static void addregiontometa final hregion meta  final hregion r  throws ioexception
+meta checkresources
+// the row key is the region name
+byte row   r getregionname
+final long now   environmentedgemanager currenttimemillis
+final list<cell> cells   new arraylist<cell> 2
+cells add new keyvalue row  hconstants catalog_family
+hconstants regioninfo_qualifier  now
+r getregioninfo   tobytearray
+// set into the root table the version of the meta table.
+cells add new keyvalue row  hconstants catalog_family
+hconstants meta_version_qualifier  now
+bytes tobytes hconstants meta_version
+meta put row  hconstants catalog_family  cells
+/**
+* computes the path of the hregion
+*
+* @param tabledir qualified path for table
+* @param name encoded region name
+* @return path of hregion directory
+*/
+@deprecated
+public static path getregiondir final path tabledir  final string name
+return new path tabledir  name
+/**
+* computes the path of the hregion
+*
+* @param rootdir qualified path of hbase root directory
+* @param info hregioninfo for the region
+* @return qualified path of region directory
+*/
+@deprecated
+public static path getregiondir final path rootdir  final hregioninfo info
+return new path
+fsutils gettabledir rootdir  info gettablename
+info getencodedname
+/**
+* determines if the specified row is within the row range specified by the
+* specified hregioninfo
+*
+* @param info hregioninfo that specifies the row range
+* @param row row to be checked
+* @return true if the row is within the range specified by the hregioninfo
+*/
+public static boolean rowisinrange hregioninfo info  final byte  row
+return   info getstartkey   length    0
+bytes compareto info getstartkey    row  <  0
+info getendkey   length    0
+bytes compareto info getendkey    row  > 0
+/**
+* merge two hregions.  the regions must be adjacent and must not overlap.
+*
+* @param srca
+* @param srcb
+* @return new merged hregion
+* @throws ioexception
+*/
+public static hregion mergeadjacent final hregion srca  final hregion srcb
+throws ioexception
+hregion a   srca
+hregion b   srcb
+// make sure that srca comes first; important for key-ordering during
+// write of the merged file.
+if  srca getstartkey      null
+if  srcb getstartkey      null
+throw new ioexception
+// a's start key is null but b's isn't. assume a comes before b
+else if   srcb getstartkey      null
+bytes compareto srca getstartkey    srcb getstartkey    > 0
+a   srcb
+b   srca
+if    bytes compareto a getendkey    b getstartkey       0
+throw new ioexception
+return merge a  b
+/**
+* merge two regions whether they are adjacent or not.
+*
+* @param a region a
+* @param b region b
+* @return new merged region
+* @throws ioexception
+*/
+public static hregion merge final hregion a  final hregion b  throws ioexception
+if   a getregioninfo   gettablename   equals
+b getregioninfo   gettablename
+throw new ioexception
+filesystem fs   a getregionfilesystem   getfilesystem
+// make sure each region's cache is empty
+a flushcache
+b flushcache
+// compact each region so we only have one store file per family
+a compactstores true
+if  log isdebugenabled
+log debug     a
+a getregionfilesystem   logfilesystemstate log
+b compactstores true
+if  log isdebugenabled
+log debug     b
+b getregionfilesystem   logfilesystemstate log
+regionmergetransaction rmt   new regionmergetransaction a  b  true
+if   rmt prepare null
+throw new ioexception     a       b
+hregioninfo mergedregioninfo   rmt getmergedregioninfo
+log info     a       b
+mergedregioninfo getregionnameasstring
+bytes tostringbinary mergedregioninfo getstartkey
+bytes tostringbinary mergedregioninfo getendkey
+hregion dstregion   null
+try
+dstregion   rmt execute null  null
+catch  ioexception ioe
+rmt rollback null  null
+throw new ioexception     a       b
+dstregion compactstores true
+if  log isdebugenabled
+log debug
+dstregion getregionfilesystem   logfilesystemstate log
+if  dstregion getregionfilesystem   hasreferences dstregion gettabledesc
+throw new ioexception     dstregion
+// archiving the 'a' region
+hfilearchiver archiveregion a getbaseconf    fs  a getregioninfo
+// archiving the 'b' region
+hfilearchiver archiveregion b getbaseconf    fs  b getregioninfo
+log info     dstregion
+return dstregion
+/**
+* @return true if needs a major compaction.
+* @throws ioexception
+*/
+boolean ismajorcompaction   throws ioexception
+for  store store   this stores values
+if  store ismajorcompaction
+return true
+return false
+//
+// hbase-880
+//
+/**
+* @param get get object
+* @return result
+* @throws ioexception read exceptions
+*/
+public result get final get get  throws ioexception
+checkrow get getrow
+// verify families are all valid
+if  get hasfamilies
+for  byte  family  get familyset
+checkfamily family
+else      adding all families to scanner
+for  byte family  this htabledescriptor getfamilieskeys
+get addfamily family
+list<keyvalue> results   get get  true
+return new result results
+/*
+* do a get based on the get parameter.
+* @param withcoprocessor invoke coprocessor or not. we don't want to
+* always invoke cp for this private method.
+*/
+private list<keyvalue> get get get  boolean withcoprocessor
+throws ioexception
+list<keyvalue> results   new arraylist<keyvalue>
+// pre-get cp hook
+if  withcoprocessor     coprocessorhost    null
+if  coprocessorhost preget get  results
+return results
+scan scan   new scan get
+regionscanner scanner   null
+try
+scanner   getscanner scan
+scanner next results
+finally
+if  scanner    null
+scanner close
+// post-get cp hook
+if  withcoprocessor     coprocessorhost    null
+coprocessorhost postget get  results
+// do after lock
+if  this metricsregion    null
+long totalsize   0l
+if  results    null
+for  keyvalue kv results
+totalsize    kv getlength
+this metricsregion updateget totalsize
+return results
+public void mutaterow rowmutations rm  throws ioexception
+mutaterowswithlocks rm getmutations    collections singleton rm getrow
+/**
+* perform atomic mutations within the region.
+* @param mutations the list of mutations to perform.
+* <code>mutations</code> can contain operations for multiple rows.
+* caller has to ensure that all rows are contained in this region.
+* @param rowstolock rows to lock
+* if multiple rows are locked care should be taken that
+* <code>rowstolock</code> is sorted in order to avoid deadlocks.
+* @throws ioexception
+*/
+public void mutaterowswithlocks collection<mutation> mutations
+collection<byte> rowstolock  throws ioexception
+multirowmutationprocessor proc
+new multirowmutationprocessor mutations  rowstolock
+processrowswithlocks proc   1
+/**
+* performs atomic multiple reads and writes on a given row.
+*
+* @param processor the object defines the reads and writes to a row.
+*/
+public void processrowswithlocks rowprocessor<? ?> processor
+throws ioexception
+processrowswithlocks processor  rowprocessortimeout
+/**
+* performs atomic multiple reads and writes on a given row.
+*
+* @param processor the object defines the reads and writes to a row.
+* @param timeout the timeout of the processor.process() execution
+*                use a negative number to switch off the time bound
+*/
+public void processrowswithlocks rowprocessor<? ?> processor  long timeout
+throws ioexception
+for  byte row   processor getrowstolock
+checkrow row
+if   processor readonly
+checkreadonly
+checkresources
+startregionoperation
+waledit waledit   new waledit
+// 1. run pre-process hook
+processor preprocess this  waledit
+// short circuit the read only case
+if  processor readonly
+try
+long now   environmentedgemanager currenttimemillis
+doprocessrowwithtimeout
+processor  now  this  null  null  timeout
+processor postprocess this  waledit
+catch  ioexception e
+throw e
+finally
+closeregionoperation
+return
+multiversionconsistencycontrol writeentry writeentry   null
+boolean locked   false
+boolean walsyncsuccessful   false
+list<rowlock> acquiredrowlocks   null
+long addedsize   0
+list<keyvalue> mutations   new arraylist<keyvalue>
+collection<byte> rowstolock   processor getrowstolock
+try
+// 2. acquire the row lock(s)
+acquiredrowlocks   new arraylist<rowlock> rowstolock size
+for  byte row   rowstolock
+// attempt to lock all involved rows, throw if any lock times out
+acquiredrowlocks add getrowlock row
+// 3. region lock
+lock this updateslock readlock    acquiredrowlocks size
+locked   true
+long now   environmentedgemanager currenttimemillis
+try
+// 4. let the processor scan the rows, generate mutations and add
+//    waledits
+doprocessrowwithtimeout
+processor  now  this  mutations  waledit  timeout
+if   mutations isempty
+// 5. get a mvcc write number
+writeentry   mvcc beginmemstoreinsert
+// 6. apply to memstore
+for  keyvalue kv   mutations
+kv setmvccversion writeentry getwritenumber
+byte family   kv getfamily
+checkfamily family
+addedsize    stores get family  add kv
+long txid   0
+// 7. append no sync
+if   waledit isempty
+txid   this log appendnosync this getregioninfo
+this htabledescriptor gettablename    waledit
+processor getclusterid    now  this htabledescriptor
+// 8. release region lock
+if  locked
+this updateslock readlock   unlock
+locked   false
+// 9. release row lock(s)
+releaserowlocks acquiredrowlocks
+// 10. sync edit log
+if  txid    0
+syncordefer txid  geteffectivedurability processor usedurability
+walsyncsuccessful   true
+finally
+if   mutations isempty       walsyncsuccessful
+log warn     mutations size
+processor getrowstolock   iterator   next
+for  keyvalue kv   mutations
+stores get kv getfamily    rollback kv
+// 11. roll mvcc forward
+if  writeentry    null
+mvcc completememstoreinsert writeentry
+writeentry   null
+if  locked
+this updateslock readlock   unlock
+locked   false
+// release locks if some were acquired but another timed out
+releaserowlocks acquiredrowlocks
+// 12. run post-process hook
+processor postprocess this  waledit
+catch  ioexception e
+throw e
+finally
+closeregionoperation
+if   mutations isempty
+isflushsize this addandgetglobalmemstoresize addedsize
+requestflush
+private void doprocessrowwithtimeout final rowprocessor<? ?> processor
+final long now
+final hregion region
+final list<keyvalue> mutations
+final waledit waledit
+final long timeout  throws ioexception
+// short circuit the no time bound case.
+if  timeout < 0
+try
+processor process now  region  mutations  waledit
+catch  ioexception e
+log warn     processor getclass   getname
+bytes tostringbinary
+processor getrowstolock   iterator   next         e
+throw e
+return
+// case with time bound
+futuretask<void> task
+new futuretask<void> new callable<void>
+@override
+public void call   throws ioexception
+try
+processor process now  region  mutations  waledit
+return null
+catch  ioexception e
+log warn     processor getclass   getname
+bytes tostringbinary
+processor getrowstolock   iterator   next         e
+throw e
+rowprocessorexecutor execute task
+try
+task get timeout  timeunit milliseconds
+catch  timeoutexception te
+log error     timeout
+bytes tostringbinary processor getrowstolock   iterator   next
+throw new ioexception te
+catch  exception e
+throw new ioexception e
+// todo: there's a lot of boiler plate code identical
+// to increment... see how to better unify that.
+/**
+* perform one or more append operations on a row.
+*
+* @param append
+* @return new keyvalues after increment
+* @throws ioexception
+*/
+public result append append append
+throws ioexception
+byte row   append getrow
+checkrow row
+boolean flush   false
+durability durability   geteffectivedurability append getdurability
+boolean writetowal   durability    durability skip_wal
+waledit waledits   null
+list<cell> allkvs   new arraylist<cell> append size
+map<store  list<cell>> tempmemstore   new hashmap<store  list<cell>>
+long size   0
+long txid   0
+checkreadonly
+// lock row
+startregionoperation operation append
+this writerequestscount increment
+writeentry w   null
+rowlock rowlock   null
+try
+rowlock   getrowlock row
+try
+lock this updateslock readlock
+// wait for all prior mvcc transactions to finish - while we hold the row lock
+// (so that we are guaranteed to see the latest state)
+mvcc completememstoreinsert mvcc beginmemstoreinsert
+// now start my own transaction
+w   mvcc beginmemstoreinsert
+try
+long now   environmentedgemanager currenttimemillis
+// process each family
+for  map entry<byte  list<cell>> family   append getfamilycellmap   entryset
+store store   stores get family getkey
+list<cell> kvs   new arraylist<cell> family getvalue   size
+collections sort family getvalue    store getcomparator
+// get previous values for all columns in this family
+get get   new get row
+for  cell cell   family getvalue
+keyvalue kv   keyvalueutil ensurekeyvalue cell
+get addcolumn family getkey    kv getqualifier
+list<keyvalue> results   get get  false
+// iterate the input columns and update existing values if they were
+// found, otherwise add new column initialized to the append value
+// avoid as much copying as possible. every byte is copied at most
+// once.
+// would be nice if keyvalue had scatter/gather logic
+int idx   0
+for  cell cell   family getvalue
+keyvalue kv   keyvalueutil ensurekeyvalue cell
+keyvalue newkv
+if  idx < results size
+results get idx  matchingqualifier kv getbuffer
+kv getqualifieroffset    kv getqualifierlength
+keyvalue oldkv   results get idx
+// allocate an empty kv once
+newkv   new keyvalue row length  kv getfamilylength
+kv getqualifierlength    now  keyvalue type put
+oldkv getvaluelength     kv getvaluelength
+// copy in the value
+system arraycopy oldkv getbuffer    oldkv getvalueoffset
+newkv getbuffer    newkv getvalueoffset
+oldkv getvaluelength
+system arraycopy kv getbuffer    kv getvalueoffset
+newkv getbuffer
+newkv getvalueoffset     oldkv getvaluelength
+kv getvaluelength
+idx
+else
+// allocate an empty kv once
+newkv   new keyvalue row length  kv getfamilylength
+kv getqualifierlength    now  keyvalue type put
+kv getvaluelength
+// copy in the value
+system arraycopy kv getbuffer    kv getvalueoffset
+newkv getbuffer    newkv getvalueoffset
+kv getvaluelength
+// copy in row, family, and qualifier
+system arraycopy kv getbuffer    kv getrowoffset
+newkv getbuffer    newkv getrowoffset    kv getrowlength
+system arraycopy kv getbuffer    kv getfamilyoffset
+newkv getbuffer    newkv getfamilyoffset
+kv getfamilylength
+system arraycopy kv getbuffer    kv getqualifieroffset
+newkv getbuffer    newkv getqualifieroffset
+kv getqualifierlength
+newkv setmvccversion w getwritenumber
+kvs add newkv
+// append update to wal
+if  writetowal
+if  waledits    null
+waledits   new waledit
+waledits add newkv
+//store the kvs to the temporary memstore before writing hlog
+tempmemstore put store  kvs
+// actually write to wal now
+if  writetowal
+// using default cluster id, as this can only happen in the orginating
+// cluster. a slave cluster receives the final value (not the delta)
+// as a put.
+txid   this log appendnosync this getregioninfo    this htabledescriptor gettablename
+waledits  hconstants default_cluster_id  environmentedgemanager currenttimemillis
+this htabledescriptor
+else
+recordmutationwithoutwal append getfamilycellmap
+//actually write to memstore now
+for  map entry<store  list<cell>> entry   tempmemstore entryset
+store store   entry getkey
+if  store getfamily   getmaxversions      1
+// upsert if versions for this cf == 1
+size    store upsert entry getvalue    getsmallestreadpoint
+else
+// otherwise keep older versions around
+for  cell cell  entry getvalue
+keyvalue kv   keyvalueutil ensurekeyvalue cell
+size    store add kv
+allkvs addall entry getvalue
+size   this addandgetglobalmemstoresize size
+flush   isflushsize size
+finally
+this updateslock readlock   unlock
+finally
+rowlock release
+if  writetowal
+// sync the transaction log outside the rowlock
+syncordefer txid  durability
+finally
+if  w    null
+mvcc completememstoreinsert w
+closeregionoperation
+if  this metricsregion    null
+this metricsregion updateappend
+if  flush
+// request a cache flush. do it outside update lock.
+requestflush
+return append isreturnresults   ? new result allkvs    null
+/**
+* perform one or more increment operations on a row.
+* @param increment
+* @return new keyvalues after increment
+* @throws ioexception
+*/
+public result increment increment increment
+throws ioexception
+byte  row   increment getrow
+checkrow row
+timerange tr   increment gettimerange
+boolean flush   false
+durability durability   geteffectivedurability increment getdurability
+boolean writetowal   durability    durability skip_wal
+waledit waledits   null
+list<cell> allkvs   new arraylist<cell> increment size
+map<store  list<cell>> tempmemstore   new hashmap<store  list<cell>>
+long size   0
+long txid   0
+checkreadonly
+// lock row
+startregionoperation operation increment
+this writerequestscount increment
+writeentry w   null
+try
+rowlock rowlock   getrowlock row
+try
+lock this updateslock readlock
+// wait for all prior mvcc transactions to finish - while we hold the row lock
+// (so that we are guaranteed to see the latest state)
+mvcc completememstoreinsert mvcc beginmemstoreinsert
+// now start my own transaction
+w   mvcc beginmemstoreinsert
+try
+long now   environmentedgemanager currenttimemillis
+// process each family
+for  map entry<byte   list<cell>> family
+increment getfamilycellmap   entryset
+store store   stores get family getkey
+list<cell> kvs   new arraylist<cell> family getvalue   size
+// get previous values for all columns in this family
+get get   new get row
+for  cell cell  family getvalue
+keyvalue kv   keyvalueutil ensurekeyvalue cell
+get addcolumn family getkey    kv getqualifier
+get settimerange tr getmin    tr getmax
+list<keyvalue> results   get get  false
+// iterate the input columns and update existing values if they were
+// found, otherwise add new column initialized to the increment amount
+int idx   0
+for  cell cell  family getvalue
+keyvalue kv   keyvalueutil ensurekeyvalue cell
+long amount   bytes tolong kv getvalue
+byte  qualifier   kv getqualifier
+if  idx < results size      results get idx  matchingqualifier qualifier
+kv   results get idx
+if kv getvaluelength      bytes sizeof_long
+amount    bytes tolong kv getbuffer    kv getvalueoffset    bytes sizeof_long
+else
+// throw donotretryioexception instead of illegalargumentexception
+throw new org apache hadoop hbase donotretryioexception
+idx
+// append new incremented keyvalue to list
+keyvalue newkv
+new keyvalue row  family getkey    qualifier  now  bytes tobytes amount
+newkv setmvccversion w getwritenumber
+kvs add newkv
+// prepare wal updates
+if  writetowal
+if  waledits    null
+waledits   new waledit
+waledits add newkv
+//store the kvs to the temporary memstore before writing hlog
+tempmemstore put store  kvs
+// actually write to wal now
+if  writetowal
+// using default cluster id, as this can only happen in the orginating
+// cluster. a slave cluster receives the final value (not the delta)
+// as a put.
+txid   this log appendnosync this getregioninfo    this htabledescriptor gettablename
+waledits  hconstants default_cluster_id  environmentedgemanager currenttimemillis
+this htabledescriptor
+else
+recordmutationwithoutwal increment getfamilycellmap
+//actually write to memstore now
+for  map entry<store  list<cell>> entry   tempmemstore entryset
+store store   entry getkey
+if  store getfamily   getmaxversions      1
+// upsert if versions for this cf == 1
+size    store upsert entry getvalue    getsmallestreadpoint
+else
+// otherwise keep older versions around
+for  cell cell   entry getvalue
+keyvalue kv   keyvalueutil ensurekeyvalue cell
+size    store add kv
+allkvs addall entry getvalue
+size   this addandgetglobalmemstoresize size
+flush   isflushsize size
+finally
+this updateslock readlock   unlock
+finally
+rowlock release
+if  writetowal
+// sync the transaction log outside the rowlock
+syncordefer txid  durability
+finally
+if  w    null
+mvcc completememstoreinsert w
+closeregionoperation
+if  this metricsregion    null
+this metricsregion updateincrement
+if  flush
+// request a cache flush.  do it outside update lock.
+requestflush
+return new result allkvs
+//
+// new hbase-880 helpers
+//
+private void checkfamily final byte  family
+throws nosuchcolumnfamilyexception
+if   this htabledescriptor hasfamily family
+throw new nosuchcolumnfamilyexception
+bytes tostring family        this
+this htabledescriptor
+public static final long fixed_overhead   classsize align
+classsize object
+classsize array
+38   classsize reference   2   bytes sizeof_int
+11   bytes sizeof_long
+4   bytes sizeof_boolean
+// woefully out of date - currently missing:
+// 1 x hashmap - coprocessorservicehandlers
+// 6 org.cliffc.high_scale_lib.counter - nummutationswithoutwal, datainmemorywithoutwal,
+//   checkandmutatecheckspassed, checkandmutatechecksfailed, readrequestscount,
+//   writerequestscount, updatesblockedms
+// 1 x hregion$writestate - writestate
+// 1 x regioncoprocessorhost - coprocessorhost
+// 1 x regionsplitpolicy - splitpolicy
+// 1 x metricsregion - metricsregion
+// 1 x metricsregionwrapperimpl - metricsregionwrapper
+public static final long deep_overhead   fixed_overhead
+classsize object      closelock
+2   classsize atomic_boolean       closed  closing
+3   classsize atomic_long       memstoresize  numputswithoutwal  datainmemorywithoutwal
+2   classsize concurrent_hashmap        lockedrows  scannerreadpoints
+writestate heap_size      writestate
+classsize concurrent_skiplistmap   classsize concurrent_skiplistmap_entry      stores
+2   classsize reentrant_lock       lock  updateslock
+classsize arraylist      recentflushes
+multiversionconsistencycontrol fixed_size    mvcc
+classsize treemap    maxseqidinstores
+2   classsize atomic_integer    majorinprogress  minorinprogress
+@override
+public long heapsize
+long heapsize   deep_overhead
+for  store store   this stores values
+heapsize    store heapsize
+// this does not take into account row locks, recent flushes, mvcc entries, and more
+return heapsize
+/*
+* this method calls system.exit.
+* @param message message to print out.  may be null.
+*/
+private static void printusageandexit final string message
+if  message    null    message length   > 0  system out println message
+system out println
+system out println
+system out println
+system out println
+system exit 1
+/**
+* registers a new protocol buffer {@link service} subclass as a coprocessor endpoint to
+* be available for handling
+* {@link hregion#execservice(com.google.protobuf.rpccontroller,
+*    org.apache.hadoop.hbase.protobuf.generated.clientprotos.coprocessorservicecall)}} calls.
+*
+* <p>
+* only a single instance may be registered per region for a given {@link service} subclass (the
+* instances are keyed on {@link com.google.protobuf.descriptors.servicedescriptor#getfullname()}.
+* after the first registration, subsequent calls with the same service name will fail with
+* a return value of {@code false}.
+* </p>
+* @param instance the {@code service} subclass instance to expose as a coprocessor endpoint
+* @return {@code true} if the registration was successful, {@code false}
+* otherwise
+*/
+public boolean registerservice service instance
+/*
+* no stacking of instances is allowed for a single service name
+*/
+descriptors servicedescriptor servicedesc   instance getdescriptorfortype
+if  coprocessorservicehandlers containskey servicedesc getfullname
+log error   servicedesc getfullname
+instance
+return false
+coprocessorservicehandlers put servicedesc getfullname    instance
+if  log isdebugenabled
+log debug
+bytes tostringbinary getregionname      servicedesc getfullname
+return true
+/**
+* executes a single protocol buffer coprocessor endpoint {@link service} method using
+* the registered protocol handlers.  {@link service} implementations must be registered via the
+* {@link hregion#registerservice(com.google.protobuf.service)}
+* method before they are available.
+*
+* @param controller an {@code rpccontoller} implementation to pass to the invoked service
+* @param call a {@code coprocessorservicecall} instance identifying the service, method,
+*     and parameters for the method invocation
+* @return a protocol buffer {@code message} instance containing the method's result
+* @throws ioexception if no registered service handler is found or an error
+*     occurs during the invocation
+* @see org.apache.hadoop.hbase.regionserver.hregion#registerservice(com.google.protobuf.service)
+*/
+public message execservice rpccontroller controller  coprocessorservicecall call
+throws ioexception
+string servicename   call getservicename
+string methodname   call getmethodname
+if   coprocessorservicehandlers containskey servicename
+throw new unknownprotocolexception null
+servicename
+bytes tostringbinary getregionname
+service service   coprocessorservicehandlers get servicename
+descriptors servicedescriptor servicedesc   service getdescriptorfortype
+descriptors methoddescriptor methoddesc   servicedesc findmethodbyname methodname
+if  methoddesc    null
+throw new unknownprotocolexception service getclass
+methodname   servicename
+bytes tostringbinary getregionname
+message request   service getrequestprototype methoddesc  newbuilderfortype
+mergefrom call getrequest    build
+final message builder responsebuilder
+service getresponseprototype methoddesc  newbuilderfortype
+service callmethod methoddesc  controller  request  new rpccallback<message>
+@override
+public void run message message
+if  message    null
+responsebuilder mergefrom message
+return responsebuilder build
+/*
+* process table.
+* do major compaction or list content.
+* @param fs
+* @param p
+* @param log
+* @param c
+* @param majorcompact
+* @throws ioexception
+*/
+private static void processtable final filesystem fs  final path p
+final hlog log  final configuration c
+final boolean majorcompact
+throws ioexception
+hregion region   null
+// currently expects tables have one region only.
+if  fsutils gettablename p  equals tablename meta_table_name
+region   hregion newhregion p  log  fs  c
+hregioninfo first_meta_regioninfo  htabledescriptor meta_tabledesc  null
+else
+throw new ioexception     p tostring
+try
+region initialize
+if  majorcompact
+region compactstores true
+else
+// default behavior
+scan scan   new scan
+// scan.addfamily(hconstants.catalog_family);
+regionscanner scanner   region getscanner scan
+try
+list<keyvalue> kvs   new arraylist<keyvalue>
+boolean done   false
+do
+kvs clear
+done   scanner next kvs
+if  kvs size   > 0  log info kvs
+while  done
+finally
+scanner close
+finally
+region close
+boolean shouldforcesplit
+return this splitrequest
+byte getexplicitsplitpoint
+return this explicitsplitpoint
+void forcesplit byte sp
+// note : this hregion will go away after the forced split is successfull
+//        therefore, no reason to clear this value
+this splitrequest   true
+if  sp    null
+this explicitsplitpoint   sp
+void clearsplit_tests_only
+this splitrequest   false
+/**
+* give the region a chance to prepare before it is split.
+*/
+protected void preparetosplit
+// nothing
+/**
+* return the splitpoint. null indicates the region isn't splittable
+* if the splitpoint isn't explicitly specified, it will go over the stores
+* to find the best splitpoint. currently the criteria of best splitpoint
+* is based on the size of the store.
+*/
+public byte checksplit
+// can't split meta
+if  this getregioninfo   ismetatable
+tablename namespace_table_name equals this getregioninfo   gettablename
+if  shouldforcesplit
+log warn
+return null
+// can't split region which is in recovering state
+if  this isrecovering
+log info     this getregioninfo   getencodedname
+return null
+if   splitpolicy shouldsplit
+return null
+byte ret   splitpolicy getsplitpoint
+if  ret    null
+try
+checkrow ret
+catch  ioexception e
+log error    e
+return null
+return ret
+/**
+* @return the priority that this region should have in the compaction queue
+*/
+public int getcompactpriority
+int count   integer max_value
+for  store store   stores values
+count   math min count  store getcompactpriority
+return count
+/**
+* checks every store to see if one has too many
+* store files
+* @return true if any store has too many store files
+*/
+public boolean needscompaction
+for  store store   stores values
+if store needscompaction
+return true
+return false
+/** @return the coprocessor host */
+public regioncoprocessorhost getcoprocessorhost
+return coprocessorhost
+/** @param coprocessorhost the new coprocessor host */
+public void setcoprocessorhost final regioncoprocessorhost coprocessorhost
+this coprocessorhost   coprocessorhost
+/**
+* this method needs to be called before any public call that reads or
+* modifies data. it has to be called just before a try.
+* #closeregionoperation needs to be called in the try's finally block
+* acquires a read lock and checks if the region is closing or closed.
+* @throws notservingregionexception when the region is closing or closed
+* @throws regiontoobusyexception if failed to get the lock in time
+* @throws interruptedioexception if interrupted while waiting for a lock
+*/
+public void startregionoperation
+throws notservingregionexception  regiontoobusyexception  interruptedioexception
+startregionoperation operation any
+/**
+* @param op the operation is about to be taken on the region
+* @throws notservingregionexception
+* @throws regiontoobusyexception
+* @throws interruptedioexception
+*/
+protected void startregionoperation operation op  throws notservingregionexception
+regiontoobusyexception  interruptedioexception
+switch  op
+case increment
+case append
+case get
+case scan
+case split_region
+case merge_region
+case put
+case delete
+case batch_mutate
+case compact_region
+// when a region is in recovering state, no read, split or merge is allowed
+if  this isrecovering       this disallowwritesinrecovering
+op    operation put    op    operation delete    op    operation batch_mutate
+throw new regioninrecoveryexception this getregionnameasstring
+break
+default
+break
+if  op    operation merge_region    op    operation split_region
+op    operation compact_region
+// split, merge or compact region doesn't need to check the closing/closed state or lock the
+// region
+return
+if  this closing get
+throw new notservingregionexception getregionnameasstring
+lock lock readlock
+if  this closed get
+lock readlock   unlock
+throw new notservingregionexception getregionnameasstring
+/**
+* closes the lock. this needs to be called in the finally block corresponding
+* to the try block of #startregionoperation
+*/
+public void closeregionoperation
+lock readlock   unlock
+/**
+* this method needs to be called before any public call that reads or
+* modifies stores in bulk. it has to be called just before a try.
+* #closebulkregionoperation needs to be called in the try's finally block
+* acquires a writelock and checks if the region is closing or closed.
+* @throws notservingregionexception when the region is closing or closed
+* @throws regiontoobusyexception if failed to get the lock in time
+* @throws interruptedioexception if interrupted while waiting for a lock
+*/
+private void startbulkregionoperation boolean writelockneeded
+throws notservingregionexception  regiontoobusyexception  interruptedioexception
+if  this closing get
+throw new notservingregionexception getregionnameasstring
+if  writelockneeded  lock lock writelock
+else lock lock readlock
+if  this closed get
+if  writelockneeded  lock writelock   unlock
+else lock readlock   unlock
+throw new notservingregionexception getregionnameasstring
+/**
+* closes the lock. this needs to be called in the finally block corresponding
+* to the try block of #startregionoperation
+*/
+private void closebulkregionoperation
+if  lock writelock   isheldbycurrentthread    lock writelock   unlock
+else lock readlock   unlock
+/**
+* update counters for numer of puts without wal and the size of possible data loss.
+* these information are exposed by the region server metrics.
+*/
+private void recordmutationwithoutwal final map<byte   list<cell>> familymap
+nummutationswithoutwal increment
+if  nummutationswithoutwal get   <  1
+log info     this
+long mutationsize   0
+for  list<cell> cells  familymap values
+for  cell cell   cells
+keyvalue kv   keyvalueutil ensurekeyvalue cell
+mutationsize    kv getkeylength     kv getvaluelength
+datainmemorywithoutwal add mutationsize
+private void lock final lock lock
+throws regiontoobusyexception  interruptedioexception
+lock lock  1
+/**
+* try to acquire a lock.  throw regiontoobusyexception
+* if failed to get the lock in time. throw interruptedioexception
+* if interrupted while waiting for the lock.
+*/
+private void lock final lock lock  final int multiplier
+throws regiontoobusyexception  interruptedioexception
+try
+final long waittime   math min maxbusywaitduration
+busywaitduration   math min multiplier  maxbusywaitmultiplier
+if   lock trylock waittime  timeunit milliseconds
+throw new regiontoobusyexception
+waittime
+catch  interruptedexception ie
+log info
+interruptedioexception iie   new interruptedioexception
+iie initcause ie
+throw iie
+/**
+* calls sync with the given transaction id if the region's table is not
+* deferring it.
+* @param txid should sync up to which transaction
+* @throws ioexception if anything goes wrong with dfs
+*/
+private void syncordefer long txid  durability durability  throws ioexception
+if  this getregioninfo   ismetaregion
+this log sync txid
+else
+switch durability
+case use_default
+// do what table defaults to
+if  shouldsynclog
+this log sync txid
+break
+case skip_wal
+// nothing do to
+break
+case async_wal
+// defer the sync, unless we globally can't
+if  this deferredlogsyncdisabled
+this log sync txid
+break
+case sync_wal
+case fsync_wal
+// sync the wal edit (sync and fsync treated the same for now)
+this log sync txid
+break
+/**
+* check whether we should sync the log from the table's durability settings
+*/
+private boolean shouldsynclog
+return this deferredlogsyncdisabled
+durability ordinal   >  durability async_wal ordinal
+/**
+* a mocked list implementaion - discards all updates.
+*/
+private static final list<keyvalue> mocked_list   new abstractlist<keyvalue>
+@override
+public void add int index  keyvalue element
+// do nothing
+@override
+public boolean addall int index  collection<? extends keyvalue> c
+return false     this list is never changed as a result of an update
+@override
+public keyvalue get int index
+throw new unsupportedoperationexception
+@override
+public int size
+return 0
+/**
+* facility for dumping and compacting catalog tables.
+* only does catalog tables since these are only tables we for sure know
+* schema on.  for usage run:
+* <pre>
+*   ./bin/hbase org.apache.hadoop.hbase.regionserver.hregion
+* </pre>
+* @param args
+* @throws ioexception
+*/
+public static void main string args  throws ioexception
+if  args length < 1
+printusageandexit null
+boolean majorcompact   false
+if  args length > 1
+if   args tolowercase   startswith
+printusageandexit     args
+majorcompact   true
+final path tabledir   new path args
+final configuration c   hbaseconfiguration create
+final filesystem fs   filesystem get c
+final path logdir   new path c get
+final string logname       fsutils gettablename tabledir    system currenttimemillis
+final hlog log   hlogfactory createhlog fs  logdir  logname  c
+try
+processtable fs  tabledir  log  c  majorcompact
+finally
+log close
+// todo: is this still right?
+blockcache bc   new cacheconfig c  getblockcache
+if  bc    null  bc shutdown
+/**
+* gets the latest sequence number that was read from storage when this region was opened.
+*/
+public long getopenseqnum
+return this openseqnum
+/**
+* gets max sequence ids of stores that was read from storage when this region was opened. wal
+* edits with smaller or equal sequence number will be skipped from replay.
+*/
+public map<byte  long> getmaxstoreseqidforlogreplay
+return this maxseqidinstores
+/**
+* @return if a given region is in compaction now.
+*/
+public compactionstate getcompactionstate
+boolean hasmajor   majorinprogress get   > 0  hasminor   minorinprogress get   > 0
+return  hasmajor ?  hasminor ? compactionstate major_and_minor   compactionstate major
+hasminor ? compactionstate minor   compactionstate none
+public void reportcompactionrequeststart boolean ismajor
+ismajor ? majorinprogress   minorinprogress  incrementandget
+public void reportcompactionrequestend boolean ismajor
+int newvalue    ismajor ? majorinprogress   minorinprogress  decrementandget
+assert newvalue >  0
+/**
+* listener class to enable callers of
+* bulkloadhfile() to perform any necessary
+* pre/post processing of a given bulkload call
+*/
+public interface bulkloadlistener
+/**
+* called before an hfile is actually loaded
+* @param family family being loaded to
+* @param srcpath path of hfile
+* @return final path to be used for actual loading
+* @throws ioexception
+*/
+string preparebulkload byte family  string srcpath  throws ioexception
+/**
+* called after a successful hfile load
+* @param family family being loaded to
+* @param srcpath path of hfile
+* @throws ioexception
+*/
+void donebulkload byte family  string srcpath  throws ioexception
+/**
+* called after a failed hfile load
+* @param family family being loaded to
+* @param srcpath path of hfile
+* @throws ioexception
+*/
+void failedbulkload byte family  string srcpath  throws ioexception
+@visiblefortesting class rowlockcontext
+private final hashedbytes row
+private final countdownlatch latch   new countdownlatch 1
+private final thread thread
+private int lockcount   0
+rowlockcontext hashedbytes row
+this row   row
+this thread   thread currentthread
+boolean ownedbycurrentthread
+return thread    thread currentthread
+rowlock newlock
+lockcount
+return new rowlock this
+void releaselock
+if   ownedbycurrentthread
+throw new illegalargumentexception     thread
+thread currentthread
+lockcount
+if  lockcount    0
+// no remaining locks by the thread, unlock and allow other threads to access
+rowlockcontext existingcontext   lockedrows remove row
+if  existingcontext    this
+throw new runtimeexception
+row
+latch countdown
+/**
+* row lock held by a given thread.
+* one thread may acquire multiple locks on the same row simultaneously.
+* the locks must be released by calling release() from the same thread.
+*/
+public class rowlock
+@visiblefortesting final rowlockcontext context
+private boolean released   false
+@visiblefortesting rowlock rowlockcontext context
+this context   context
+/**
+* release the given lock.  if there are no remaining locks held by the current thread
+* then unlock the row and allow other threads to acquire the lock.
+* @throws illegalargumentexception if called by a different thread than the lock owning thread
+*/
+public void release
+if   released
+context releaselock
+released   true

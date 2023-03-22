@@ -1,0 +1,360 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache camel component mina2
+import java net inetsocketaddress
+import java net socketaddress
+import java nio charset charset
+import java util list
+import java util concurrent countdownlatch
+import java util concurrent executorservice
+import java util concurrent timeunit
+import org apache camel camelexchangeexception
+import org apache camel exchange
+import org apache camel exchangetimedoutexception
+import org apache camel servicepoolaware
+import org apache camel converter ioconverter
+import org apache camel impl defaultproducer
+import org apache camel util camellogger
+import org apache camel util exchangehelper
+import org apache mina core filterchain defaultiofilterchainbuilder
+import org apache mina core filterchain iofilter
+import org apache mina core future closefuture
+import org apache mina core future connectfuture
+import org apache mina core service ioconnector
+import org apache mina core service iohandleradapter
+import org apache mina core service ioservice
+import org apache mina core session iosession
+import org apache mina core session iosessionconfig
+import org apache mina filter codec protocolcodecfactory
+import org apache mina filter codec protocolcodecfilter
+import org apache mina filter codec serialization objectserializationcodecfactory
+import org apache mina filter codec textline linedelimiter
+import org apache mina filter executor executorfilter
+import org apache mina filter executor unorderedthreadpoolexecutor
+import org apache mina filter logging loggingfilter
+import org apache mina filter ssl sslfilter
+import org apache mina transport socket nio niodatagramconnector
+import org apache mina transport socket nio niosocketconnector
+import org apache mina transport vmpipe vmpipeaddress
+import org apache mina transport vmpipe vmpipeconnector
+import org slf4j logger
+import org slf4j loggerfactory
+/**
+* a {@link org.apache.camel.producer} implementation for mina
+*
+* @version
+*/
+public class mina2producer extends defaultproducer implements servicepoolaware
+private static final transient logger log   loggerfactory getlogger mina2producer class
+private iosession session
+private countdownlatch latch
+private boolean lazysessioncreation
+private long timeout
+private socketaddress address
+private ioconnector connector
+private boolean sync
+private camellogger noreplylogger
+private mina2configuration configuration
+private iosessionconfig connectorconfig
+private executorservice workerpool
+public mina2producer mina2endpoint endpoint  throws exception
+super endpoint
+this configuration   endpoint getconfiguration
+this lazysessioncreation   configuration islazysessioncreation
+this timeout   configuration gettimeout
+this sync   configuration issync
+this noreplylogger   new camellogger log  configuration getnoreplyloglevel
+string protocol   configuration getprotocol
+if  protocol equals
+setupsocketprotocol protocol
+else if  configuration isdatagramprotocol
+setupdatagramprotocol protocol
+else if  protocol equals
+setupvmprotocol protocol
+@override
+public mina2endpoint getendpoint
+return  mina2endpoint  super getendpoint
+@override
+public boolean issingleton
+// the producer should not be singleton otherwise cannot use concurrent producers and safely
+// use request/reply with correct correlation
+return false
+@suppresswarnings
+public void process exchange exchange  throws exception
+if  session    null     lazysessioncreation
+throw new illegalstateexception
+if  session    null     session isconnected
+openconnection
+// set the exchange encoding property
+if  getendpoint   getconfiguration   getcharsetname      null
+exchange setproperty exchange charset_name  ioconverter normalizecharset getendpoint   getconfiguration   getcharsetname
+object body   mina2payloadhelper getin getendpoint    exchange
+if  body    null
+noreplylogger log     exchange
+return     exit early since nothing to write
+// if textline enabled then covert to a string which must be used for textline
+if  getendpoint   getconfiguration   istextline
+body   getendpoint   getcamelcontext   gettypeconverter   mandatoryconvertto string class  exchange  body
+// if sync is true then we should also wait for a response (synchronous mode)
+if  sync
+// only initialize latch if we should get a response
+latch   new countdownlatch 1
+// reset handler if we expect a response
+responsehandler handler    responsehandler  session gethandler
+handler reset
+// log what we are writing
+if  log isdebugenabled
+object out   body
+if  body instanceof byte
+// byte arrays is not readable so convert to string
+out   exchange getcontext   gettypeconverter   convertto string class  body
+log debug    out
+// write the body
+mina2helper writebody session  body  exchange
+if  sync
+// wait for response, consider timeout
+log debug    timeout
+boolean done   latch await timeout  timeunit milliseconds
+if   done
+throw new exchangetimedoutexception exchange  timeout
+// did we get a response
+responsehandler handler    responsehandler  session gethandler
+if  handler getcause      null
+throw new camelexchangeexception    exchange  handler getcause
+else if   handler ismessagereceived
+// no message received
+throw new exchangetimedoutexception exchange  timeout
+else
+// set the result on either in or out on the original exchange depending on its pattern
+if  exchangehelper isoutcapable exchange
+mina2payloadhelper setout exchange  handler getmessage
+else
+mina2payloadhelper setin exchange  handler getmessage
+// should session be closed after complete?
+boolean close
+if  exchangehelper isoutcapable exchange
+close   exchange getout   getheader mina2constants mina_close_session_when_complete  boolean class
+else
+close   exchange getin   getheader mina2constants mina_close_session_when_complete  boolean class
+// should we disconnect, the header can override the configuration
+boolean disconnect   getendpoint   getconfiguration   isdisconnect
+if  close    null
+disconnect   close
+if  disconnect
+log debug    address
+session close true
+public defaultiofilterchainbuilder getfilterchain
+return connector getfilterchain
+@override
+protected void dostart   throws exception
+super dostart
+if   lazysessioncreation
+openconnection
+@override
+protected void dostop   throws exception
+if  log isdebugenabled
+log debug    connector  address
+closeconnection
+super dostop
+@override
+protected void doshutdown   throws exception
+if  workerpool    null
+workerpool shutdown
+super doshutdown
+private void closeconnection
+if  session    null
+closefuture closefuture   session close true
+closefuture awaituninterruptibly
+connector dispose true
+private void openconnection
+if  log isdebugenabled
+log debug    new object address  connector  timeout
+// connect and wait until the connection is established
+if  connectorconfig    null
+connector getsessionconfig   setall connectorconfig
+connector sethandler new responsehandler
+connectfuture future   connector connect address
+future awaituninterruptibly
+session   future getsession
+// implementation methods
+//-------------------------------------------------------------------------
+protected void setupvmprotocol string uri
+boolean minalogger   configuration isminalogger
+list<iofilter> filters   configuration getfilters
+address   new vmpipeaddress configuration getport
+connector   new vmpipeconnector
+// connector config
+if  minalogger
+connector getfilterchain   addlast    new loggingfilter
+appendiofilterstochain filters  connector getfilterchain
+if  configuration getsslcontextparameters      null
+log warn
+configurecodecfactory    connector
+protected void setupsocketprotocol string uri  throws exception
+boolean minalogger   configuration isminalogger
+long timeout   configuration gettimeout
+list<iofilter> filters   configuration getfilters
+address   new inetsocketaddress configuration gethost    configuration getport
+final int processorcount   runtime getruntime   availableprocessors     1
+connector   new niosocketconnector processorcount
+// connector config
+connectorconfig   connector getsessionconfig
+// using the unordered thread pool is fine as we dont need ordered invocation in our response handler
+workerpool   new unorderedthreadpoolexecutor configuration getmaximumpoolsize
+connector getfilterchain   addlast    new executorfilter workerpool
+if  minalogger
+connector getfilterchain   addlast    new loggingfilter
+appendiofilterstochain filters  connector getfilterchain
+if  configuration getsslcontextparameters      null
+connector getfilterchain   addfirst    new sslfilter configuration getsslcontextparameters   createsslcontext    configuration isautostarttls
+configurecodecfactory    connector
+// set connect timeout to mina in seconds
+connector setconnecttimeoutmillis timeout
+protected void configurecodecfactory string type  ioservice service
+if  configuration getcodec      null
+addcodecfactory service  configuration getcodec
+else if  configuration isallowdefaultcodec
+configuredefaultcodecfactory type  service
+protected void configuredefaultcodecfactory string type  ioservice service
+if  configuration istextline
+charset charset   getencodingparameter type  configuration
+linedelimiter delimiter   getlinedelimiterparameter configuration gettextlinedelimiter
+mina2textlinecodecfactory codecfactory   new mina2textlinecodecfactory charset  delimiter
+if  configuration getencodermaxlinelength   > 0
+codecfactory setencodermaxlinelength configuration getencodermaxlinelength
+if  configuration getdecodermaxlinelength   > 0
+codecfactory setdecodermaxlinelength configuration getdecodermaxlinelength
+addcodecfactory service  codecfactory
+log debug
+new object type  codecfactory  charset  configuration gettextlinedelimiter    delimiter
+log debug
+codecfactory getencodermaxlinelength    codecfactory getdecodermaxlinelength
+else
+objectserializationcodecfactory codecfactory   new objectserializationcodecfactory
+addcodecfactory service  codecfactory
+log debug    type  codecfactory
+protected void setupdatagramprotocol string uri
+boolean minalogger   configuration isminalogger
+boolean transferexchange   configuration istransferexchange
+list<iofilter> filters   configuration getfilters
+if  transferexchange
+throw new illegalargumentexception
+address   new inetsocketaddress configuration gethost    configuration getport
+final int processorcount   runtime getruntime   availableprocessors     1
+connector   new niodatagramconnector processorcount
+// using the unordered thread pool is fine as we dont need ordered invocation in our response handler
+workerpool   new unorderedthreadpoolexecutor configuration getmaximumpoolsize
+connectorconfig   connector getsessionconfig
+connector getfilterchain   addlast    new executorfilter workerpool
+if  minalogger
+connector getfilterchain   addlast    new loggingfilter
+appendiofilterstochain filters  connector getfilterchain
+if  configuration getsslcontextparameters      null
+log warn     configuration getprotocol
+configuredatagramcodecfactory    connector  configuration
+// set connect timeout to mina in seconds
+connector setconnecttimeoutmillis timeout
+/**
+* for datagrams the entire message is available as a single iobuffer so lets just pass those around by default
+* and try converting whatever they payload is into iobuffer unless some custom converter is specified
+*/
+protected void configuredatagramcodecfactory final string type  final ioservice service  final mina2configuration configuration
+protocolcodecfactory codecfactory   configuration getcodec
+if  codecfactory    null
+final charset charset   getencodingparameter type  configuration
+codecfactory   new mina2udpprotocolcodecfactory this getendpoint   getcamelcontext    charset
+if  log isdebugenabled
+log debug    new object type  codecfactory  charset
+addcodecfactory service  codecfactory
+private void addcodecfactory ioservice service  protocolcodecfactory codecfactory
+log debug    codecfactory getclass   getname
+service getfilterchain   addlast    new protocolcodecfilter codecfactory
+private static linedelimiter getlinedelimiterparameter mina2textlinedelimiter delimiter
+if  delimiter    null
+return linedelimiter default
+switch  delimiter
+case default
+return linedelimiter default
+case auto
+return linedelimiter auto
+case unix
+return linedelimiter unix
+case windows
+return linedelimiter windows
+case mac
+return linedelimiter mac
+default
+throw new illegalargumentexception     delimiter
+private charset getencodingparameter string type  mina2configuration configuration
+string encoding   configuration getencoding
+if  encoding    null
+encoding   charset defaultcharset   name
+// set in on configuration so its updated
+configuration setencoding encoding
+log debug    type  encoding
+if   charset issupported encoding
+throw new illegalargumentexception     encoding
+return charset forname encoding
+private void appendiofilterstochain list<iofilter> filters  defaultiofilterchainbuilder filterchain
+if  filters    null    filters size   > 0
+for  iofilter iofilter   filters
+filterchain addlast iofilter getclass   getcanonicalname    iofilter
+/**
+* handles response from session writes
+*/
+private final class responsehandler extends iohandleradapter
+private object message
+private throwable cause
+private boolean messagereceived
+public void reset
+this message   null
+this cause   null
+this messagereceived   false
+@override
+public void messagereceived iosession iosession  object message  throws exception
+log debug    message
+this message   message
+messagereceived   true
+cause   null
+countdown
+protected void countdown
+countdownlatch downlatch   latch
+if  downlatch    null
+downlatch countdown
+@override
+public void sessionclosed iosession session  throws exception
+if  sync     messagereceived
+// sync=true (inout mode) so we expected a message as reply but did not get one before the session is closed
+log debug    address
+// session was closed but no message received. this could be because the remote server had an internal error
+// and could not return a response. we should count down to stop waiting for a response
+countdown
+@override
+public void exceptioncaught iosession iosession  throwable cause
+log error     address
+connector  cause
+this message   null
+this messagereceived   false
+this cause   cause
+if  iosession    null
+iosession close true
+public throwable getcause
+return this cause
+public object getmessage
+return this message
+public boolean ismessagereceived
+return messagereceived

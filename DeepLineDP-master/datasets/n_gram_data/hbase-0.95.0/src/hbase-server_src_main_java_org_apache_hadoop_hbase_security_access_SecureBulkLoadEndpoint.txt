@@ -1,0 +1,281 @@
+/*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase security access
+import com google protobuf rpccallback
+import com google protobuf rpccontroller
+import com google protobuf service
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop fs permission fspermission
+import org apache hadoop hbase coprocessor
+import org apache hadoop hbase coprocessorenvironment
+import org apache hadoop hbase exceptions donotretryioexception
+import org apache hadoop hbase coprocessor coprocessorservice
+import org apache hadoop hbase coprocessor regioncoprocessorenvironment
+import org apache hadoop hbase ipc requestcontext
+import org apache hadoop hbase protobuf responseconverter
+import org apache hadoop hbase protobuf generated clientprotos
+import org apache hadoop hbase protobuf generated securebulkloadprotos securebulkloadservice
+import org apache hadoop hbase protobuf generated securebulkloadprotos preparebulkloadrequest
+import org apache hadoop hbase protobuf generated securebulkloadprotos preparebulkloadresponse
+import org apache hadoop hbase protobuf generated securebulkloadprotos cleanupbulkloadrequest
+import org apache hadoop hbase protobuf generated securebulkloadprotos cleanupbulkloadresponse
+import org apache hadoop hbase protobuf generated securebulkloadprotos securebulkloadhfilesrequest
+import org apache hadoop hbase protobuf generated securebulkloadprotos securebulkloadhfilesresponse
+import org apache hadoop hbase regionserver hregion
+import org apache hadoop hbase security securebulkloadutil
+import org apache hadoop hbase security user
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util methods
+import org apache hadoop hbase util pair
+import org apache hadoop io text
+import org apache hadoop security usergroupinformation
+import org apache hadoop security token token
+import java io ioexception
+import java math biginteger
+import java security privilegedaction
+import java security securerandom
+import java util arraylist
+import java util list
+/**
+* coprocessor service for bulk loads in secure mode.
+* this coprocessor has to be installed as part of enabling
+* security in hbase.
+*
+* this service addresses two issues:
+*
+* 1. moving files in a secure filesystem wherein the hbase client
+* and hbase server are different filesystem users.
+* 2. does moving in a secure manner. assuming that the filesystem
+* is posix compliant.
+*
+* the algorithm is as follows:
+*
+* 1. create an hbase owned staging directory which is
+* world traversable (711): /hbase/staging
+* 2. a user writes out data to his secure output directory: /user/foo/data
+* 3. a call is made to hbase to create a secret staging directory
+* which globally rwx (777): /user/staging/averylongandrandomdirectoryname
+* 4. the user makes the data world readable and writable, then moves it
+* into the random staging directory, then calls bulkloadhfiles()
+*
+* like delegation tokens the strength of the security lies in the length
+* and randomness of the secret directory.
+*
+*/
+@interfaceaudience private
+public class securebulkloadendpoint extends securebulkloadservice
+implements coprocessorservice  coprocessor
+public static final long version   0l
+//320/5 = 64 characters
+private static final int random_width   320
+private static final int random_radix   32
+private static log log   logfactory getlog securebulkloadendpoint class
+private final static fspermission perm_all_access   fspermission valueof
+private final static fspermission perm_hidden   fspermission valueof
+private securerandom random
+private filesystem fs
+private configuration conf
+//two levels so it doesn't get deleted accidentally
+//no sticky bit in hadoop 1.0
+private path basestagingdir
+private regioncoprocessorenvironment env
+@override
+public void start coprocessorenvironment env
+this env    regioncoprocessorenvironment env
+random   new securerandom
+conf   env getconfiguration
+basestagingdir   securebulkloadutil getbasestagingdir conf
+try
+fs   filesystem get conf
+fs mkdirs basestagingdir  perm_hidden
+fs setpermission basestagingdir  perm_hidden
+//no sticky bit in hadoop-1.0, making directory nonempty so it never gets erased
+fs mkdirs new path basestagingdir     perm_hidden
+filestatus status   fs getfilestatus basestagingdir
+if status    null
+throw new illegalstateexception
+if  status getpermission   equals perm_hidden
+throw new illegalstateexception
+catch  ioexception e
+throw new illegalstateexception   e
+@override
+public void stop coprocessorenvironment env  throws ioexception
+@override
+public void preparebulkload rpccontroller controller
+preparebulkloadrequest request
+rpccallback<preparebulkloadresponse> done
+try
+getaccesscontroller   prepreparebulkload env
+string bulktoken   createstagingdir basestagingdir
+getactiveuser    request gettablename   tobytearray    tostring
+done run preparebulkloadresponse newbuilder   setbulktoken bulktoken  build
+catch  ioexception e
+responseconverter setcontrollerexception controller  e
+done run null
+@override
+public void cleanupbulkload rpccontroller controller
+cleanupbulkloadrequest request
+rpccallback<cleanupbulkloadresponse> done
+try
+getaccesscontroller   precleanupbulkload env
+fs delete createstagingdir basestagingdir
+getactiveuser
+env getregion   gettabledesc   getname
+new path request getbulktoken    getname
+true
+done run cleanupbulkloadresponse newbuilder   build
+catch  ioexception e
+responseconverter setcontrollerexception controller  e
+done run null
+@override
+public void securebulkloadhfiles rpccontroller controller
+securebulkloadhfilesrequest request
+rpccallback<securebulkloadhfilesresponse> done
+final list<pair<byte  string>> familypaths   new arraylist<pair<byte  string>>
+for clientprotos bulkloadhfilerequest familypath el   request getfamilypathlist
+familypaths add new pair el getfamily   tobytearray   el getpath
+final token usertoken
+new token request getfstoken   getidentifier   tobytearray
+request getfstoken   getpassword   tobytearray
+new text request getfstoken   getkind
+new text request getfstoken   getservice
+final string bulktoken   request getbulktoken
+user user   getactiveuser
+final usergroupinformation ugi   user getugi
+if usertoken    null
+ugi addtoken usertoken
+else if user issecurityenabled
+//we allow this to pass through in "simple" security mode
+//for mini cluster testing
+responseconverter setcontrollerexception controller
+new donotretryioexception
+return
+hregion region   env getregion
+boolean bypass   false
+if  region getcoprocessorhost      null
+try
+bypass   region getcoprocessorhost   prebulkloadhfile familypaths
+catch  ioexception e
+responseconverter setcontrollerexception controller  e
+done run null
+return
+boolean loaded   false
+if   bypass
+loaded   ugi doas new privilegedaction<boolean>
+@override
+public boolean run
+filesystem fs   null
+try
+configuration conf   env getconfiguration
+fs   filesystem get conf
+for pair<byte  string> el  familypaths
+path p   new path el getsecond
+log trace     p
+fs setpermission p  perm_all_access
+path stagefamily   new path bulktoken  bytes tostring el getfirst
+if  fs exists stagefamily
+fs mkdirs stagefamily
+fs setpermission stagefamily  perm_all_access
+//we call bulkloadhfiles as requesting user
+//to enable access prior to staging
+return env getregion   bulkloadhfiles familypaths  true
+new securebulkloadlistener fs  bulktoken
+catch  exception e
+log error    e
+return false
+if  region getcoprocessorhost      null
+try
+loaded   region getcoprocessorhost   postbulkloadhfile familypaths  loaded
+catch  ioexception e
+responseconverter setcontrollerexception controller  e
+done run null
+return
+done run securebulkloadhfilesresponse newbuilder   setloaded loaded  build
+private accesscontroller getaccesscontroller
+return  accesscontroller  this env getregion
+getcoprocessorhost   findcoprocessor accesscontroller class getname
+private path createstagingdir path basedir  user user  byte tablename  throws ioexception
+string randomdir   user getshortname     bytes tostring tablename
+new biginteger random_width  random  tostring random_radix
+return createstagingdir basedir  user  tablename  randomdir
+private path createstagingdir path basedir
+user user
+byte tablename
+string randomdir  throws ioexception
+path p   new path basedir  randomdir
+fs mkdirs p  perm_all_access
+fs setpermission p  perm_all_access
+return p
+private user getactiveuser
+user user   requestcontext getrequestuser
+if   requestcontext isinrequestcontext
+return null
+//this is for testing
+if   equalsignorecase conf get user hbase_security_conf_key
+return user createuserfortesting conf  user getshortname    new string
+return user
+@override
+public service getservice
+return this
+private static class securebulkloadlistener implements hregion bulkloadlistener
+private filesystem fs
+private string stagingdir
+public securebulkloadlistener filesystem fs  string stagingdir
+this fs   fs
+this stagingdir   stagingdir
+@override
+public string preparebulkload final byte family  final string srcpath  throws ioexception
+path p   new path srcpath
+path stagep   new path stagingdir  new path bytes tostring family   p getname
+if  isfile p
+throw new ioexception     p
+log debug     p       stagep
+if  fs rename p  stagep
+throw new ioexception     p       stagep
+return stagep tostring
+@override
+public void donebulkload byte family  string srcpath  throws ioexception
+log debug     srcpath
+@override
+public void failedbulkload final byte family  final string srcpath  throws ioexception
+path p   new path srcpath
+path stagep   new path stagingdir
+new path bytes tostring family   p getname
+log debug     stagep       p
+if  fs rename stagep  p
+throw new ioexception     stagep       p
+/**
+* check if the path is referencing a file.
+* this is mainly needed to avoid symlinks.
+* @param p
+* @return true if the p is a file
+* @throws ioexception
+*/
+private boolean isfile path p  throws ioexception
+filestatus status   fs getfilestatus p
+boolean isfile    status isdir
+try
+isfile   isfile      boolean methods call filestatus class  status     null  null
+catch  exception e
+return isfile

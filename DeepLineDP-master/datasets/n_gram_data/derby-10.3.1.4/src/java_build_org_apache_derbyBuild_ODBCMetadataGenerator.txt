@@ -1,0 +1,965 @@
+/*
+derby - class org.apache.derby.catalog.odbcprocedurecolsvti
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derbybuild
+import java io ioexception
+import java io inputstream
+import java io inputstreamreader
+import java io linenumberreader
+import java io filewriter
+import java util properties
+import java util hashmap
+import java util arraylist
+import org apache derby iapi services sanity sanitymanager
+/* ****
+* this class is used at compile time only.  it is responsible for generating
+* odbc metadata queries based on existing jdbc queries.  in a word,
+* this class reads from the org/apache/derby/impl/jdbc/metadata.properties
+* file (which is where the jdbc queries are stored), and for each query,
+* performs the changes/additions required to make it comply with odbc
+* standards.  the generated odbc queries are written to an output file
+* that is then used, at build time, to create a full set of both jdbc and
+* odbc queries, all of which are then loaded into the database system
+* tables at creation time.
+*
+* for more on the odbc specification of the metadata methods in question,
+* see:
+*
+* "http://msdn.microsoft.com/library/default.asp?url=/library/en-us/odbc/
+*  htm/odbcsqlprocedures.asp"
+*
+* for more on how the generated queries are used at execution time, see
+* embeddatabasemetadata.java and systemprocedures.java in the codeline.
+*
+*/
+public class odbcmetadatagenerator
+// types of changes that are possible.  there are four
+// types that we handle here:
+//
+//	1. column rename:
+//		rename a column to have an odbc-specified name.
+//		for ex. change "scale" to "decimal_digits"
+//	2. where clause:
+//		change the where clause of the query. for ex.
+//		used to change getcrossreference "t.tablename=?"
+//		to "t.tablename like ?" since jdbc and odbc specs
+//		differ on whether table name must be set or not
+//	3. type and/or value change:
+//		cast a column to an obdc-specified type.  at time
+//		of writing, this was just for casting ints to
+//		smallints; or modify an existing jdbc value
+//		to match the odbc specification.
+//	4. additional column(s):
+//		add a new, odbc-specified column to an existing
+//		result set.
+private final byte col_rename_change   0x01
+private final byte type_value_change   0x02
+private final byte add_column_change   0x04
+private final byte where_clause_change   0x08
+// notice written before each generated odbc statement.
+private final string odbc_query_notice
+metadata properties
+// prefix to append to all odbc queries.  note: if you change
+// this value, you'll have to modify embeddatabasemetadata.java
+// to reflect the change.
+private final string odbc_query_prefix
+// name to use when making jdbc queries into subqueries
+// (loaded from odbcfragments).  note: if you change this value,
+// you'll have to modify "odbcgen_fragments.properties" to
+// reflect the change.
+private final string subquery_name
+// mock value used to accomplish insertion of new columns.
+private final string new_col_placeholder
+// used for trimming 'whitespace'.
+private final short following   1
+private final short preceding    1
+// list of what types of changes are required for a given
+// metadata procedure.
+private hashmap changemap
+// sql fragments and keywords that are used in composing
+// odbc metadata queries.  these are loaded from a file
+// once and then used throughout the generation process
+// to build the odbc queries piece-by-piece.
+private properties odbcfragments
+// output file; all processed statements are written to this
+// file.  at build time, this file will clobber the copy of
+// "metadata.properties" that is in the build/classes
+// directory.  note: this will not clobber the metadata
+// properties file that is in the source/codeline.
+private filewriter odbcmetafile
+/* ****
+* constructor.
+* initializes sql fragments used for generation, and
+* then opens the output file,
+*/
+public odbcmetadatagenerator   throws ioexception
+// sql fragments.
+odbcfragments   new properties
+odbcfragments load this getclass   getresourceasstream
+// prep output file.
+odbcmetafile   new filewriter
+/* ****
+* main:
+* open the metadata.properties file (the copy that is in the
+* build directory, not the one in the source directory),
+* figure out what changes are needed for the various metadata
+* queries, and then generate the odbc-compliant versions
+* where needed.
+* @param args ignored.
+* @return odbc-compliant metadata statements have been
+*  	generated and written out to "odbc_metadata.properties"
+*		in the running directory.
+*/
+public static void main string  args  throws ioexception
+odbcmetadatagenerator odbcgen   new odbcmetadatagenerator
+odbcgen initchanges
+odbcgen generateodbcqueries odbcgen getclass   getresourceasstream
+/* ****
+* initchanges
+* create a listing of the types of changes that need to be
+* made for each metadata query to be odbc-compliant.
+* if a metadata query has no entry in this map, then
+* it is left unchanged and no odbc-version will be created.
+* having this mapping allows us to skip over string
+* parsing (which can be slow) when it's not required.
+* for details on the changes, see the appropriate methods
+* below.
+* @return map holding the list of changes to be made for
+* 	each metadata query has been initialized.
+*/
+private void initchanges
+changemap   new hashmap
+changemap put
+new byte col_rename_change
+changemap put
+new byte  byte  col_rename_change
+type_value_change
+add_column_change
+changemap put
+new byte type_value_change
+changemap put
+new byte type_value_change
+changemap put
+new byte type_value_change
+changemap put
+new byte type_value_change
+changemap put
+new byte type_value_change
+changemap put
+new byte type_value_change
+changemap put
+new byte  byte  col_rename_change
+type_value_change
+add_column_change
+changemap put
+new byte type_value_change
+changemap put
+new byte where_clause_change
+return
+/* ****
+* generateodbcqueries:
+* reads the existing (jdbc) metadata queries from
+* metadata.properties and, for each one, makes a call
+* to generate an odbc-compliant version.
+* @param is inputstream for reading metadata.properties.
+*/
+public void generateodbcqueries inputstream is
+throws ioexception
+// jdbc query that we read from metadata.properties.
+stringbuffer query   new stringbuffer
+// note: we use iso-8859-1 because property files are
+// defined to be that encoding.
+linenumberreader reader
+new linenumberreader new inputstreamreader is
+string line   null
+for  line   reader readline    line    null
+line   reader readline
+if  line length      0
+// blank line; ignore
+continue
+else if  line charat 0
+// comment; write it to file.
+odbcmetafile write line
+odbcmetafile write
+continue
+// write the line, then add an end-of-line to maintain
+// readability.
+query append line
+query append
+// check to see if this is the last line of the query.
+boolean done   true
+for  int lastnonws   line length     1
+lastnonws >  0  lastnonws
+char ch   line charat lastnonws
+if   character iswhitespace ch
+// this is the last non-whitespace character; if it's
+// a backslash, then we continue building the query
+// by reading the next line.
+if  ch
+// then continue building the query.
+done   false
+break
+if   done
+// read next line and append it to current query.
+continue
+// take the query and see if we need to generate an odbc-
+// compliant version.
+generateodbcquery query
+// prep for another query.
+query delete 0  query length
+// make sure we didn't end up with an incomplete query somewhere.
+if  query length   > 0
+throw new ioexception
+// close out.
+odbcmetafile flush
+odbcmetafile close
+/* ****
+* generateodbcquery
+* takes a specific jdbc query, writes it to the output file,
+* and then creates an odbc-compliant version of that
+* query (if needed) and writes that to the output file,
+* as well.
+* @param querytext sql text from a jdbc metadata query
+*	that was read from metadata.properties.
+*/
+private void generateodbcquery stringbuffer querytext
+throws ioexception
+// create a string for purposes of using "indexof"
+// calls, which aren't allowed on a stringbuffer
+// for jdbc 2.0.
+string queryasstring   querytext tostring   trim
+if  queryasstring startswith odbc_query_prefix
+// this query was automatically generated (presumably
+// by this class), so ignore it now.
+return
+// write the original (jdbc) query.
+odbcmetafile write queryasstring  0  queryasstring length
+odbcmetafile write
+// parse out the name of this particular query.
+int pos   queryasstring indexof
+if  pos     1
+throw new ioexception
+string queryname   querytext substring 0  pos
+// parse out the order by clause since they are not allowed
+// in subqueries; we'll re-attach it later.
+string orderby
+int orderbypos   queryasstring lastindexof
+if  orderbypos     1
+orderby   queryasstring substring orderbypos  queryasstring length
+// isolate query text (remove order by clause and then query name,
+// in that order).
+if  orderbypos     1
+querytext delete orderbypos  querytext length
+querytext delete 0  pos 1
+// three types of modifications that we may need to do.
+// -- #1: column renaming.
+stringbuffer outerquerytext   new stringbuffer
+boolean haveodbcchanges   renamecolsforodbc queryname  querytext
+// -- #2: change where clause.
+if  changewhereclause queryname  querytext   haveodbcchanges   true
+// get a list of the column definitions in the subquery, for
+// use by subsequent operations.
+arraylist coldefs   new arraylist
+pos   getselectcoldefinitions querytext  coldefs
+// in some cases, we need to add "helper" columns to the
+// subquery so that we can use them in calculations for
+// the outer query.
+addhelpercolstosubquery queryname  querytext  pos
+// -- #3.a: prep to add new odbc columns.  note: we need
+// to do this before we generate the outer select statement.
+marknewcolposition queryname  coldefs
+// if we're going to use a subquery, generate the outer
+// select statement.  this is where we enforce column
+// types (via cast) if needed.
+generateselectclause queryname  coldefs  outerquerytext
+// -- #4: alter column values, where needed.
+changevaluesforodbc queryname  outerquerytext
+// -- #3.b: add new odbc columns.
+addnewcolumnsforodbc queryname  outerquerytext
+haveodbcchanges    haveodbcchanges     outerquerytext length   > 0
+if   haveodbcchanges
+// we didn't change anything, so nothing left to do.
+return
+// write out the new, odbc version of the query.
+odbcmetafile write odbc_query_notice
+odbcmetafile write odbc_query_prefix
+odbcmetafile write queryname
+odbcmetafile write
+if  outerquerytext length      0
+// all we did was change column names, so just write out the
+// original query with the new column names.
+odbcmetafile write querytext tostring
+if  orderby length      0
+// re-attach order by clause.
+odbcmetafile write orderby
+odbcmetafile write
+return
+// else, we need to make the original query a subquery so that we
+// can change types/values and/or add columns.
+queryasstring   querytext tostring   trim
+odbcmetafile write outerquerytext tostring
+odbcmetafile write queryasstring
+if  querytext charat queryasstring length   1
+odbcmetafile write
+else
+odbcmetafile write
+odbcmetafile write subquery_name
+if  orderby length      0
+odbcmetafile write
+else
+// re-attach order by clause.
+odbcmetafile write
+odbcmetafile write orderby
+odbcmetafile write
+return
+/* ****
+* renamecolsforodbc
+* renames any columns in the received query so that they are
+* odbc-compliant.
+* @param queryname name of the query being processed.
+* @param querytext text of the query being processed.
+* @return all columns requiring renaming have been renamed in
+*	place in the received stringbuffer.  true is returned if
+*	at least one column was renamed; false otherwise.
+*/
+private boolean renamecolsforodbc string queryname  stringbuffer querytext
+// if we know the received query doesn't have any columns to
+// be renamed, then there's nothing to do here.
+if   stmtneedschange queryname  col_rename_change
+return false
+// which columns are renamed, and what the new names are,
+// depends on which query we're processing.
+if  queryname equals
+renamecolforodbc querytext
+renamecolforodbc querytext
+renamecolforodbc querytext
+return true
+else if  queryname equals
+renamecolforodbc querytext
+renamecolforodbc querytext
+renamecolforodbc querytext
+renamecolforodbc querytext
+return true
+else if  queryname equals
+renamecolforodbc querytext
+renamecolforodbc querytext
+return true
+// no renaming was necessary.
+return false
+/* ****
+* renamecolforodbc
+* searches for the old column name in the received string
+* buffer and replaces it with the new column name.  note
+* that we only replace the old column name where it is
+* preceded by "as", because this is the instance that
+* determines the column name in the final result set.
+* @param querytext the query text in which we're doing the
+*	rename operation.
+* @param oldval the old column name.
+* @param newval the new column name.
+* @return occurence of <"as " + oldval> in the query text
+*	has been changed in place to newval.
+*/
+private void renamecolforodbc stringbuffer querytext
+string oldval  string newval
+string querystring   querytext tostring
+int pos   querystring indexof oldval
+while  pos     1
+// next line will set pos2 to be the index of the
+// first (reading left-to-right) ignorable char
+// preceding the old column name.  that means
+// that the letters immediately preceding this
+// position should be "as".  if not, don't
+// replace this instance.
+int pos2   trimignorable preceding  querystring  pos
+if    pos2   2  > 0      querystring charat pos2 2
+querystring charat pos2 1
+then this is the one we want to replace
+break
+else
+// look for next occurrence.
+pos   querystring indexof oldval  pos 1
+if  pos     1
+// couldn't find the one to replace; leave unchanged.
+return
+// do the renaming.
+querytext replace pos  pos   oldval length    newval
+/* ****
+* generateselectclause
+* generates an outer select clause that is then wrapped around a
+* jdbc query to change the types and/or values of the jdbc
+* result set.  the jdbc query thus becomes a subquery.
+*
+* ex. if we have a jdbc query "select a, b from t1" and odbc
+* requires that "a" be a smallint, this method will generate
+* a select clause "select cast (t2.a as smallint), t2.b from"
+* that is then used to wrap the jdbc query, as follows:
+*
+*		select cast (t2.a as smallint), t2.b from
+*			(select a, b from t1) t2
+*
+* @param queryname name of the query being processed.
+* @param selectcoldefs array list of the select columns that
+* 	exist for the jdbc version of the query.  for the above
+*  example, this would be an array list with two string
+*  elements, "a" and "b".
+* @param newquerytext stringbuffer to which the generated
+*  outer select will be appended.
+* @return an outer select clause has been generated and
+*  appended to the received buffer.  the "from" keyword
+*  has been appended, but the subquery itself is not
+*  added here.
+*/
+private void generateselectclause string queryname
+arraylist selectcoldefs  stringbuffer newquerytext
+if   stmtneedschange queryname  type_value_change
+stmtneedschange queryname  add_column_change
+then we don't need to generate a select  because we
+// don't need to use a subquery (we're only renaming).
+return
+// begin the select clause.
+newquerytext append
+// for each of the select columns in jdbc, either
+// just grab the column name and use it directly in
+// the generated clause, or else cast the column
+// to the required type, if appropriate.
+string colname
+string castinfo
+for  int i   0  i < selectcoldefs size    i
+if  i > 0
+newquerytext append
+colname   extractcolname  string selectcoldefs get i
+castinfo   getcastinfoforcol queryname  colname
+if  castinfo    null
+newquerytext append
+newquerytext append subquery_name
+newquerytext append
+newquerytext append colname
+if  castinfo    null
+newquerytext append
+newquerytext append castinfo
+newquerytext append
+if   colname equals new_col_placeholder
+// don't append the "as" clause if this is just our
+// place-holder for adding new columns.
+newquerytext append
+newquerytext append colname
+if  newquerytext charat newquerytext length     1
+newquerytext append
+// end the select clause.
+newquerytext append
+return
+/* ****
+* changevaluesforodbc
+* searches for a jdbc column name in the received string
+* buffer and replaces the first occurrence with an odbc-
+* compliant value.  this method determines what specific
+* columns need updated values for a given query, and then
+* makes the appropriate call for each column.
+* @param queryname name of the query being processed.
+* @param newquerytext the query text in which we're doing the
+*	change-value operation.
+* @return all relevant columns have been updated in place
+*	to return the required odbc-compliant values.
+*/
+private void changevaluesforodbc string queryname
+stringbuffer newquerytext
+if   stmtneedschange queryname  type_value_change
+return
+// which column values are changed, and what the new
+// values are, depends on which query we're processing.
+if  queryname equals
+changecolvaluetoodbc queryname     newquerytext
+changecolvaluetoodbc queryname     newquerytext
+changecolvaluetoodbc queryname     newquerytext
+changecolvaluetoodbc queryname     newquerytext
+changecolvaluetoodbc queryname     newquerytext
+changecolvaluetoodbc queryname     newquerytext
+else if  queryname startswith
+changecolvaluetoodbc queryname     newquerytext
+changecolvaluetoodbc queryname     newquerytext
+else if  queryname equals
+changecolvaluetoodbc queryname     newquerytext
+changecolvaluetoodbc queryname     newquerytext
+changecolvaluetoodbc queryname     newquerytext
+changecolvaluetoodbc queryname     newquerytext
+changecolvaluetoodbc queryname     newquerytext
+else if  queryname equals
+changecolvaluetoodbc queryname     newquerytext
+changecolvaluetoodbc queryname     newquerytext
+/* ****
+* changecolvaluetoodbc
+* searches for the received column name in the received string
+* buffer and replaces it with an odbc-compliant value.
+* @param queryname name of the query being processed.
+* @param colname name of the specific column to update.
+* @param newquerytext the query text in which we're doing
+*	the change-value operation.
+* @return the received column has been updated in place
+*	to return the required odbc-compliant value.
+*/
+private void changecolvaluetoodbc string queryname  string colname
+stringbuffer newquerytext
+colname   subquery_name       colname
+int pos   newquerytext tostring   indexof colname
+if  pos     1
+// column we're supposed to change isn't in the query.
+return
+if  colname endswith
+newquerytext replace pos  pos   colname length
+getfragment
+else if  colname endswith
+newquerytext replace pos  pos   colname length
+getfragment
+else if  colname endswith
+newquerytext replace pos  pos   colname length
+getfragment
+else if  colname endswith
+newquerytext replace pos  pos   colname length
+getfragment
+else if  colname endswith
+newquerytext replace pos  pos   colname length
+getfragment
+else if  colname endswith
+newquerytext replace pos  pos   colname length
+getfragment
+else if  colname endswith
+newquerytext replace pos  pos   colname length
+getfragment
+else if  colname endswith
+newquerytext replace pos  pos   colname length
+getfragment
+else if  colname endswith new_col_placeholder
+// this is a special case indication that we need to add new columns.
+if  queryname equals
+newquerytext replace pos  pos   colname length
+getfragment
+else if  queryname equals
+newquerytext replace pos  pos   colname length
+getfragment
+/* ****
+* getselectcoldefinitions
+* parses the select clause of a jdbc metadata sql query
+* and returns a list of the columns being selected.  for
+* example, if the received statement was "select a,
+* b as c, d * 2 from t1", this method will return an
+* arraylist with three string elements: 1) "a", 2) "b
+* as c", and 3) "d * 2".
+* @param query the query from which we are extracting
+*	the select columns.
+* @param coldeflist arraylist in which we want to
+* 	store the column definitions that we find.
+* @return received arraylist has one string value for
+*	each of the columns found in the received query.
+*	also, an integer is returned indicating the index
+*	in the received query of the start of the from
+*	clause, for later use by the calling method.
+*/
+private int getselectcoldefinitions stringbuffer querytext
+arraylist coldeflist
+// create a string for purposes of using "indexof"
+// calls, which aren't allowed on a stringbuffer
+// for jdbc 2.0.
+string query   querytext tostring   trim
+char  querychars   query tochararray
+// move beyond the "select" keyword, if there is one.
+int start   query indexof
+if  start     1
+// "+6" in the next line is length of "select".
+start    6
+else
+// just start at the first character.
+start   0
+// have to read character-by-character in order to
+// figure out where each column description ends.
+int fromclauseindex    1
+int parendepth   0
+for  int i   start  i < querychars length  i
+if  querychars
+parendepth
+else if  querychars
+parendepth
+else if   querychars           parendepth    0
+// this is a naive way of determining the end of a
+// column definition (it'll work so long as there are no
+// string constants in the query that have commas in them,
+// which was true at the time of writing.
+coldeflist add new string querychars  start   i   start   trim
+// skip over non-important whitespace to find start
+// of next column definition.  next line will set i to
+// just before the next non-whitespace character.
+i   trimignorable following  querychars  i
+start   i   1
+else if    i 3  < querychars length
+parendepth    0
+querychars
+querychars
+querychars
+querychars
+this is the end of final column definition  store it
+// and then exit the loop, after trimming off non-important
+// whitespace.  next line will set i to just after the
+// last (reading left-to-right) non-whitespace character
+// before the from.
+i   trimignorable preceding  querychars  i
+fromclauseindex   i
+coldeflist add new string querychars  start   i   start   trim
+break
+return fromclauseindex
+/* ****
+* addhelpercolstosubquery
+* for some of the metadata queries, the odbc version
+* needs to access values that are only available in
+* the jdbc subquery.  in such cases, we want to add
+* those values as additional "helper" columns to
+* the subquery result set, so that they can be
+* referenced from the new odbc outer query (without
+* requiring a join).  for example, assume we have 2
+* tables t1(int i, int j) and t2 (int a), and a
+* subquery "select t1.i, t1.j + t2.a from t1, t2)".
+* then we have an outer query that, instead of
+* returning "t1.j + t2.a", needs to return the
+* value of "2 * t2.a":
+*
+* select vt.i, 2 * t2.a from
+*	(select t1.i, t1.j + t2.a from t1, t2) vt
+*
+* the above statement won't work, because the outer
+* query can't see the value "t2.a".  so in such a
+* a case, this method will add "t2.a" to the list
+* of columns returned by the subquery, so that the
+* outer query can then access it:
+*
+* select vt.i, 2 * vt.a from
+* 	(select t1.i, t1.j + t2.a, t2.a from t1, t2) vt
+*
+* which specific columns are added to the subquery
+* depends on the query in question.
+*
+* @param queryname name of the query in question.
+* @param subquerytext text of the subquery in question.
+* @param insertpos index into the received buffer
+*	marking the position where the helper columns
+* 	should be inserted.
+*/
+private void addhelpercolstosubquery string queryname
+stringbuffer subquerytext  int insertpos
+if  queryname equals
+subquerytext insert insertpos
+getfragment
+else if  queryname startswith
+subquerytext insert insertpos
+getfragment
+/* ****
+* extractcolname
+* takes a single column definition from a select clause
+* and returns only the unqualified name of the column.
+* assumption here is that any column definition we see
+* here will either 1) end with an "as <column_name>"
+* clause, or 2) consist of only a column name, such
+* as "a" or "a.b".  at the time of writing, these
+* assumptions were true for all relevant metadata
+* queries.
+*
+* ex. if coldef is "a", this method will return "a".
+* if coldef is "a.b", this method will return "b".
+* if coldef is "<bunch of sql> as c", this method
+* will return "c".
+*
+* @param coldef column definition from which we're
+*	trying to extract the name.
+* @return name of the column that is referenced in
+*	the received column definition.
+*/
+private string extractcolname string coldef
+// find out where the column name starts.
+int pos   coldef lastindexof
+if  pos     1
+// we assume that the col def is _just_ a column name,
+// so start at the beginning.
+pos   0
+else
+// move beyond the "as".
+pos    2
+// skip any non-important whitespace or backslashes.
+char c   coldef charat pos
+while   c          character iswhitespace c
+c   coldef charat   pos
+// check to see if it's a qualified name.
+int pos2   coldef indexof    pos
+if  pos2     1
+// it's not a qualified name, so just return it.
+return coldef substring pos  coldef length
+// else, strip off the schema and just return the col name.
+return coldef substring pos2 1  coldef length
+/* ****
+* getcastinfoforcol
+* returns the target type for a result set column that
+* needs to be cast into an odbc type.  this is usually
+* for casting integers to "smallint".
+* @param queryname name of query being processed.
+* @param colname name of the specific column for which
+* 	we are trying to find the target type.
+* @return the target type if one exists, or else null
+*  if the received column in the received query has
+* 	no known target type.
+*/
+private string getcastinfoforcol string queryname
+string colname
+if  queryname equals
+if  colname equals
+colname equals
+colname equals
+colname equals
+colname equals
+colname equals
+colname equals
+return
+else if  queryname equals
+if  colname equals
+colname equals
+colname equals
+colname equals
+colname equals
+colname equals
+return
+else if  queryname equals
+if  colname equals
+return
+else if  queryname equals
+if  colname equals
+return
+else if  queryname startswith
+if  colname equals
+return
+else if  queryname equals
+if  colname equals
+colname equals
+return
+// no target type for the received column
+// in the received query (leave it unchanged).
+return null
+/* ****
+* marknewcolposition
+* in effect, "marks" the position at which additional
+* columns are to be added for odbc compliance.  this
+* is accomplished by adding a dummy column name to
+* the list of select columns.  later, in the method
+* that actually adds the columns, we'll do a find-
+* replace on this dummy value.
+* @param queryname name of the query.
+* @param selectcoldefs array list of the select
+* 	columns that exist in the odbc version of
+*	the query thus far.
+* @return a dummy column name has been added to
+*	the received list of columns at the position
+*	at which new odbc columns should be added.
+*  if a query doesn't require additional
+* 	columns to be odbc compliant, this method
+*	leaves the received column list unchanged.
+*/
+private void marknewcolposition string queryname
+arraylist selectcoldefs
+if   stmtneedschange queryname  add_column_change
+return
+if  queryname equals
+// add the new columns in front of the derby-specific ones.
+// the "-2" in the next line is because there are 2 derby-
+// specific columns in the jdbc version of getprocedurecols
+// (parameter_id and method_id).
+selectcoldefs add selectcoldefs size     2  new_col_placeholder
+else if  queryname equals
+// just add the new column to the end.
+selectcoldefs add new_col_placeholder
+/* ****
+* addnewcolumnsforodbc
+* adds new columns to the odbc version of a metadata
+* query (the odbc version is at this point being
+* built up in newquerytext).  before this method
+* was called, a dummy placeholder should have been
+* placed in the newquerytext buffer (by a call to
+* "marknewcolposition").  this method simply replaces
+* that dummy placeholder with the sql text for the
+* new columns.
+* @param queryname name of query being processed.
+* @newquerytext the buffer in which we want to
+* 	add the new column.
+* @return the dummy placeholder in the received
+*  buffer has been replaced with any odbc columns
+*  that need to be added to the query in question
+*  for odbc compliance.
+*/
+private void addnewcolumnsforodbc string queryname
+stringbuffer newquerytext
+if   stmtneedschange queryname  add_column_change
+return
+changecolvaluetoodbc queryname  new_col_placeholder  newquerytext
+// it's possible that the new column fragments we added
+// have placeholders in them for _other_ fragments.  we
+// need to do the substitution here.
+if  queryname equals
+fragsubstitution    newquerytext
+fragsubstitution    newquerytext
+return
+/* ****
+* fragsubstitution
+* replaces a single occurrence of the received
+* fragment key with the text corresponding to
+* that key.
+* @param fragkey the fragment key for which we are
+*	going to do the substitution.
+* @querytext the buffer in which we are going to do
+* 	the substitution.
+* @return fragkey has been substituted (in place)
+*	with the fragment corresponding to it in the
+*	received buffer.  if the fragment key could not
+* 	be found, the buffer remains unchanged.
+*/
+private void fragsubstitution string fragkey
+stringbuffer querytext
+int pos   querytext tostring   indexof fragkey
+if  pos     1
+// note: the " + 1" and " - 1" in the next line
+// are needed because the fragment key is
+// enclosed within curly braces ("{}").
+querytext replace pos   1  pos   fragkey length     1
+getfragment fragkey
+/**
+* changewhereclause
+* substitutes patterns in the where clause
+* @param queryname the name of the jdbc query; found in
+* metadata.properties
+* @param querytext the buffer in which we are going to do
+* the substitution.
+* @return the substitution is performed in place. if no changes
+* are needed on this query, the querytext buffer remains
+* unchanged.
+*/
+private boolean changewhereclause string queryname
+stringbuffer querytext
+if   stmtneedschange queryname  where_clause_change
+return false
+if  queryname equals
+substitutepatternwhere
+querytext
+return true
+return false
+/**
+* replaces a single occurrence of the received old pattern with
+* the text in the new pattern
+* @param oldpattern the text we want to remove
+* @param newpattern the text we want to replace the oldpattern
+* with
+* @param querytext the buffer in which we are going to do the
+* substitution.
+* @return the old pattern is substituted with the new pattern (in
+* place). if the old pattern could not be found, the querytext
+* buffer remains unchanged.
+*/
+private void substitutepatternwhere string oldpattern  string newpattern
+stringbuffer querytext
+string querytextstring   querytext tostring
+int querylength   querytextstring length
+int wherepos   querytextstring indexof
+//only look for the pattern after the where keyword. there may
+//actually be more than one where clause, in which case we do
+//not know if this is the right one. since the pattern
+//substitution is only performed at compile time (on specified
+//queries), more rigorous checks are not performed her.
+//rather, verify that
+//classes/org/apache/derby/impl/jdbc/metadata.properties is
+//updated correctly when you add new where-clause
+//substitutions.
+int possubstring   querytextstring substring wherepos  querylength
+indexof oldpattern
+if  possubstring     1
+//possubstring is the position in the query *after* the
+//word where. have to add
+querytext replace wherepos   possubstring
+wherepos   possubstring   oldpattern length
+newpattern
+/* ****
+* trimignorable
+* removes all 'ignorable' chars that immediately precede or
+* follow (depending on the direction) the character at
+* the received index.  "ignorable" here means whitespace
+* or a single backslash ("\"), which is used in the
+* metadata.properties file to indicate line continuation.
+* @param direction +1 if we want to trim following, -1
+*	if we want to trim preceding.
+* @param chars the character array being processed.
+* @param index the point before/after which to start
+* 	trimming.
+* @return the index into the received char array of the
+*	"last" ignorable character w.r.t the received index
+*	and direction.  in other words, if we're trimming
+*	the chars following, the returned index will be of
+* 	the last (reading left-to-right) ignorable char; if
+*	we're trimming the chars preceding, the returned index
+*	will be of the first (reading left-to-right) ignorable
+*	character.
+*/
+private int trimignorable short direction  char  chars  int index
+index    direction
+while   index >  0      index < chars length
+chars
+character iswhitespace chars
+index    direction
+// index is now on the final non-ignorable character
+// in the given direction.  move it back one so that
+// it's on the "last" ignorable character (with
+// respect to direction).
+index    direction
+return index
+/* ****
+* trimignorable
+* same as trimignorable above, except with string argument
+* instead of char[].
+*/
+private int trimignorable short direction  string str  int index
+index    direction
+while   index >  0      index < str length
+str charat index
+character iswhitespace str charat index
+index    direction
+// index is now on the final non-ignorable character
+// in the given direction.  move it back one so that
+// it's on the "first" ignorable character (with
+// respect to direction).
+index    direction
+return index
+/* ****
+* stmtneedschange
+* returns whether or not a specific metadata statement
+* requires the received type of change.  this is determined
+* based on the info stored in the "changemaps" mapping.
+* @param queryname name of the query in question.
+* @param changetype the type of change in question.
+*/
+private boolean stmtneedschange string queryname  byte changetype
+byte changebyte    byte changemap get queryname
+if  changebyte    null
+// no entry means change is not needed.
+return false
+return   changebyte bytevalue     changetype     changetype
+/* ****
+* getfragment
+* looks up an sql fragment and returns the value as a string.
+* @param string fragid id of the fragment to look up.
+* @return the string fragment corresponding to the received
+* 	fragment id.
+*/
+private string getfragment string fragid
+return  string  odbcfragments get fragid

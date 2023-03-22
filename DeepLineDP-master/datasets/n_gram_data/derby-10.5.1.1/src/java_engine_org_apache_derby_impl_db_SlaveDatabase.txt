@@ -1,0 +1,331 @@
+/*
+derby - class org.apache.derby.impl.db.slavedatabase
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl db
+import org apache derby iapi error publicapi
+import org apache derby iapi reference attribute
+import org apache derby iapi reference sqlstate
+import org apache derby iapi error standardexception
+import org apache derby iapi jdbc authenticationservice
+import org apache derby iapi services context contextmanager
+import org apache derby iapi services context contextservice
+import org apache derby iapi services monitor monitor
+import org apache derby iapi store replication slave slavefactory
+import org apache derby iapi sql conn languageconnectioncontext
+import java sql driver
+import java sql drivermanager
+import java sql sqlexception
+import java util properties
+/**
+* slavedatabase is an instance of database, and is booted instead of
+* basicdatabase if this database will have the replication slave
+* role. slavedatabase differs from basicdatabase in the following
+* ways:
+*
+* 1: when starting a non-replicated database (i.e., basicdatabase),
+*    only one thread is used to start all modules of the database.
+*    when booted in slave mode, the thread that boots the store
+*    module will be blocked during log recovery. to remedy this,
+*    slavedatabase runs the boot method of basicdatabase in a
+*    separate thread. this ensures that the connection attempt that
+*    started slave replication mode will not hang.
+*
+* 2: while the database is in replication slave mode, the
+*    authentication services are not available because these require
+*    that the store module has been booted first. calling
+*    getauthenticationservice when in slave mode will raise an
+*    exception.
+*
+* 3: while the database is in replication slave mode, connections are
+*    not accepted since the database cannot process transaction
+*    requests. calling setupconnection when in slave mode will raise
+*    an exception.
+*
+* 4: if the failover command has been executed for this database, it
+*    is no longer in replication slave mode. when this has
+*    happened, slavedatabase works exactly as basicdatabase.
+*/
+public class slavedatabase extends basicdatabase
+/** true until slavedatabasebootthread has successfully booted the
+* database. does not happen until the failover command has been
+* executed for this database */
+private volatile boolean inreplicationslavemode
+private volatile boolean shutdowninitiated
+/** true until this database has been successfully booted. any
+* exception that occurs while inboot is true will be handed to
+* the client thread booting this database. */
+private volatile boolean inboot
+/** set by the database boot thread if it fails before slave mode
+* has been started properly (i.e., if inboot is true). this
+* exception will then be reported to the client connection. */
+private volatile standardexception bootexception
+private string dbname     the name of the replicated database
+private volatile slavefactory slavefac
+/////////////////////////////
+// modulecontrol interface //
+/////////////////////////////
+/**
+* determines whether this database implementation should be used
+* to boot the database.
+* @param startparams the properties used to decide if
+* slavedatabase is the correct implementation of database for the
+* database to be booted.
+* @return true if the database is updatable (not read-only) and
+* replication slave mode is specified in startparams
+*/
+public boolean cansupport properties startparams
+boolean supported
+monitor isdesiredcreatetype startparams  getenginetype
+if  supported
+string replimode
+startparams getproperty slavefactory replication_mode
+if  replimode    null
+replimode equals slavefactory slave_mode
+supported   false
+return supported
+public void boot boolean create  properties startparams
+throws standardexception
+inreplicationslavemode   true
+inboot   true
+shutdowninitiated   false
+dbname   startparams getproperty slavefactory slave_db
+// slavedatabasebootthread is an internal class
+slavedatabasebootthread dbbootthread
+new slavedatabasebootthread create  startparams
+thread sdbthread
+new thread dbbootthread      dbname
+sdbthread setdaemon true
+sdbthread start
+// check that the database was booted successfully, or throw
+// the exception that caused the boot to fail.
+verifysuccessfulboot
+inboot   false
+// this module has now been booted (hence active=true) even
+// though submodules like store and authentication may not
+// have completed their boot yet. we deal with that by raising
+// an error on attempts to use these
+active true
+/**
+* called by monitor when this module is stopped, i.e. when the
+* database is shut down. when the database is shut down using the
+* stopslave command, the stopreplicationslave method has already
+* been called when this method is called. in this case, the
+* replication functionality has already been stopped. if the
+* database is shutdown as part of a system shutdown, however, we
+* need to cleanup slave replication as part of database shutdown.
+*/
+public void stop
+if  inreplicationslavemode    slavefac    null
+try
+slavefac stopslave true
+catch  standardexception ex
+finally
+slavefac   null
+super stop
+/////////////////////
+// class interface //
+/////////////////////
+public slavedatabase
+////////////////////////
+// database interface //
+////////////////////////
+public boolean isinslavemode
+return inreplicationslavemode
+public languageconnectioncontext setupconnection contextmanager cm
+string user
+string drdaid
+string dbname
+throws standardexception
+if  inreplicationslavemode
+// do not allow connections to a database that is
+// currently in replication slave move
+throw standardexception newexception
+sqlstate cannot_connect_to_db_in_slave_mode  dbname
+return super setupconnection cm  user  drdaid  dbname
+public authenticationservice getauthenticationservice
+throws standardexception
+if  inreplicationslavemode
+// cannot get authentication service for a database that
+// is currently in replication slave move
+throw standardexception newexception
+sqlstate cannot_connect_to_db_in_slave_mode  dbname
+return super getauthenticationservice
+/**
+* verify that a connection to stop the slave has been made from
+* here. if verified, the database context is given to the method
+* caller. this will ensure this database is shutdown when an
+* exception with database severity is thrown. if not verified, an
+* exception is thrown.
+*
+* @exception standardexception thrown if a stop slave connection
+* attempt was not made from this class
+*/
+public void verifyshutdownslave   throws standardexception
+if   shutdowninitiated
+throw standardexception
+newexception sqlstate replication_stopslave_not_initiated
+pushdbcontext contextservice getfactory
+getcurrentcontextmanager
+/**
+* stop replication slave mode if replication slave mode is active and
+* the network connection with the master is down
+*
+* @exception sqlexception thrown on error, if not in replication
+* slave mode or if the network connection with the master is not down
+*/
+public  void stopreplicationslave   throws sqlexception
+if  shutdowninitiated
+// the boot thread has failed or stopreplicationslave has
+// already been called. there is nothing more to do to
+// stop slave replication mode.
+return
+if   inreplicationslavemode
+standardexception se   standardexception
+newexception sqlstate replication_not_in_slave_mode
+throw publicapi wrapstandardexception se
+// stop slave without using force, meaning that this method
+// call will fail with an exception if the network connection
+// with the master is up
+try
+slavefac stopslave false
+catch  standardexception se
+throw publicapi wrapstandardexception se
+slavefac   null
+public void failover string dbname  throws standardexception
+if  inreplicationslavemode
+slavefac failover
+// slavefactory#failover will make the
+// slavedatabasebootthread complete booting of the store
+// modules, and inreplicationslavemode will then be set to
+// false (see slavedatabasebootthread#run).
+// wait until store is completely booted before returning from
+// this method
+while  inreplicationslavemode
+try
+thread sleep 500
+catch  interruptedexception ie
+// do nothing
+else
+// if failover is performed on a master that has been a slave
+// earlier
+super failover dbname
+/////////////////
+// inner class //
+/////////////////
+/**
+* thread that boots the slave database. will be blocked in
+* logfactory.recover until database is no longer in slave
+* replication mode.
+*/
+private class slavedatabasebootthread implements runnable
+private boolean create
+private properties params
+public slavedatabasebootthread boolean create  properties startparams
+this create   create
+params   startparams
+public void run
+// the thread needs a contextmanager since two threads
+// cannot share a context
+contextmanager bootthreadcm   null
+try
+bootthreadcm   contextservice getfactory   newcontextmanager
+contextservice getfactory
+setcurrentcontextmanager bootthreadcm
+bootbasicdatabase create  params      will be blocked
+// if we get here, failover has been called and the
+// database can now be connected to
+inreplicationslavemode   false
+if  bootthreadcm    null
+contextservice getfactory
+resetcurrentcontextmanager bootthreadcm
+bootthreadcm   null
+catch  standardexception se
+// we get here when slavecontroller#stopslave has been
+// called, or if a fatal exception has been thrown.
+handleshutdown se
+////////////////////
+// private methods//
+////////////////////
+/**
+* verify that the slave functionality has been properly started.
+* this method will block until a successful slave startup has
+* been confirmed, or it will throw the exception that caused it
+* to fail.
+*/
+private void verifysuccessfulboot   throws standardexception
+while    isslavefactoryset      slavefac isstarted
+if  bootexception    null
+throw bootexception
+else
+try
+thread sleep 500
+catch  interruptedexception ie
+// do nothing
+/**
+* if slavefac (the reference to the slavefactory) has not already
+* been set, this method will try to set it by calling
+* monitor.findservicemodule. if slavfac was already set, the
+* method does not do anything.
+*
+* @return true if slavefac is set after calling this method,
+* false otherwise
+*/
+private boolean isslavefactoryset
+if  slavefac    null
+return true
+try
+slavefac    slavefactory monitor
+findservicemodule this  slavefactory module
+return true
+catch  standardexception se
+// we get a standardexception if slavefactory has not been
+// booted yet. safe to retry later.
+return false
+/**
+* used to shutdown this database.
+*
+* if an error occurs as part of the database boot process, we
+* hand the exception that caused boot to fail to the client
+* thread. the client thread will in turn shut down this database.
+*
+* if an error occurs at a later stage than during boot, we shut
+* down the database by setting up a connection with the shutdown
+* attribute. the internal connection is required because database
+* shutdown requires embedconnection to do cleanup.
+*
+* @param shutdowncause the reason why the database needs to be
+* shutdown
+*/
+private void handleshutdown standardexception shutdowncause
+if  inboot
+bootexception   shutdowncause
+return
+try
+shutdowninitiated   true
+string drivername
+class forname drivername  newinstance
+driver embeddriver
+drivermanager getdriver attribute protocol
+string constr     dbname
+attribute replication_internal_shutdown_slave
+embeddriver connect constr   properties  null
+catch  exception e
+// todo: report error to derby.log if exception is not
+// sqlstate.shutdown_database
+private void bootbasicdatabase boolean create  properties params
+throws standardexception
+// this call will be blocked while slave replication mode is
+// active
+super boot create  params

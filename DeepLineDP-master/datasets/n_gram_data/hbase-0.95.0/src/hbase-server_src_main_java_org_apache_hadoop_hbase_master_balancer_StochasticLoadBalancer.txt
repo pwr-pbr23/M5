@@ -1,0 +1,558 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase master balancer
+import org apache commons lang mutable mutableint
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache commons math stat descriptive descriptivestatistics
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop hbase clusterstatus
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase serverload
+import org apache hadoop hbase regionload
+import org apache hadoop hbase servername
+import org apache hadoop hbase master masterservices
+import org apache hadoop hbase master regionplan
+import org apache hadoop hbase util bytes
+import java util arraylist
+import java util hashmap
+import java util linkedlist
+import java util list
+import java util map
+import java util map entry
+import java util random
+/**
+* <p>this is a best effort load balancer. given a cost function f(c) => x it will
+* randomly try and mutate the cluster to cprime. if f(cprime) < f(c) then the
+* new cluster state becomes the plan. it includes costs functions to compute the cost of:</p>
+* <ul>
+* <li>region load</li>
+* <li>table load</li>
+* <li>data locality</li>
+* <li>memstore sizes</li>
+* <li>storefile sizes</li>
+* </ul>
+*
+*
+* <p>every cost function returns a number between 0 and 1 inclusive; where 0 is the lowest cost
+* best solution, and 1 is the highest possible cost and the worst solution.  the computed costs are
+* scaled by their respective multipliers:</p>
+*
+* <ul>
+*   <li>hbase.master.balancer.stochastic.regionloadcost</li>
+*   <li>hbase.master.balancer.stochastic.movecost</li>
+*   <li>hbase.master.balancer.stochastic.tableloadcost</li>
+*   <li>hbase.master.balancer.stochastic.localitycost</li>
+*   <li>hbase.master.balancer.stochastic.memstoresizecost</li>
+*   <li>hbase.master.balancer.stochastic.storefilesizecost</li>
+* </ul>
+*
+* <p>in addition to the above configurations, the balancer can be tuned by the following
+* configuration values:</p>
+* <ul>
+*   <li>hbase.master.balancer.stochastic.maxmoveregions which
+*   controls what the max number of regions that can be moved in a single invocation of this
+*   balancer.</li>
+*   <li>hbase.master.balancer.stochastic.stepsperregion is the coefficient by which the number of
+*   regions is multiplied to try and get the number of times the balancer will
+*   mutate all servers.</li>
+*   <li>hbase.master.balancer.stochastic.maxsteps which controls the maximum number of times that
+*   the balancer will try and mutate all the servers. the balancer will use the minimum of this
+*   value and the above computation.</li>
+* </ul>
+*
+* <p>this balancer is best used with hbase.master.loadbalance.bytable set to false
+* so that the balancer gets the full picture of all loads on the cluster.</p>
+*/
+@interfaceaudience private
+public class stochasticloadbalancer extends baseloadbalancer
+private static final string storefile_size_cost_key
+private static final string memstore_size_cost_key
+private static final string write_request_cost_key
+private static final string read_request_cost_key
+private static final string locality_cost_key
+private static final string table_load_cost_key
+private static final string move_cost_key
+private static final string region_load_cost_key
+private static final string steps_per_region_key
+private static final string max_steps_key
+private static final string max_moves_key
+private static final string keep_region_loads
+private static final random random   new random system currenttimemillis
+private static final log log   logfactory getlog stochasticloadbalancer class
+private final regionlocationfinder regionfinder   new regionlocationfinder
+private clusterstatus clusterstatus   null
+private map<string  list<regionload>> loads   new hashmap<string  list<regionload>>
+// values are defaults
+private int maxsteps   15000
+private int stepsperregion   110
+private int maxmoves   600
+private int numregionloadstoremember   15
+private float loadmultiplier   55
+private float movecostmultiplier   5
+private float tablemultiplier   5
+private float localitymultiplier   5
+private float readrequestmultiplier   0
+private float writerequestmultiplier   0
+private float memstoresizemultiplier   5
+private float storefilesizemultiplier   5
+@override
+public void setconf configuration conf
+super setconf conf
+regionfinder setconf conf
+maxsteps   conf getint max_steps_key  maxsteps
+maxmoves   conf getint max_moves_key  maxmoves
+stepsperregion   conf getint steps_per_region_key  stepsperregion
+numregionloadstoremember   conf getint keep_region_loads  numregionloadstoremember
+// load multiplier should be the greatest as it is the most general way to balance data.
+loadmultiplier   conf getfloat region_load_cost_key  loadmultiplier
+// move cost multiplier should be the same cost or higer than the rest of the costs to ensure
+// that two costs must get better to justify a move cost.
+movecostmultiplier   conf getfloat move_cost_key  movecostmultiplier
+// these are the added costs so that the stochastic load balancer can get a little bit smarter
+// about where to move regions.
+tablemultiplier   conf getfloat table_load_cost_key  tablemultiplier
+localitymultiplier   conf getfloat locality_cost_key  localitymultiplier
+memstoresizemultiplier   conf getfloat memstore_size_cost_key  memstoresizemultiplier
+storefilesizemultiplier   conf getfloat storefile_size_cost_key  storefilesizemultiplier
+readrequestmultiplier   conf getfloat read_request_cost_key  readrequestmultiplier
+writerequestmultiplier   conf getfloat write_request_cost_key  writerequestmultiplier
+@override
+public void setclusterstatus clusterstatus st
+super setclusterstatus st
+regionfinder setclusterstatus st
+this clusterstatus   st
+updateregionload
+@override
+public void setmasterservices masterservices masterservices
+super setmasterservices masterservices
+this services   masterservices
+this regionfinder setservices masterservices
+/**
+* given the cluster state this will try and approach an optimal balance. this
+* should always approach the optimal state given enough steps.
+*/
+@override
+public list<regionplan> balancecluster map<servername  list<hregioninfo>> clusterstate
+// no need to balance a one node cluster.
+if  clusterstate size   <  1
+log debug
+return null
+long starttime   system currenttimemillis
+// keep track of servers to iterate through them.
+list<servername> servers   new arraylist<servername> clusterstate keyset
+map<hregioninfo  servername> initialregionmapping   createregionmapping clusterstate
+double currentcost  newcost  initcost
+currentcost   newcost   initcost   computecost initialregionmapping  clusterstate
+int computedmaxsteps
+math min this maxsteps   initialregionmapping size     this stepsperregion
+// perform a stochastic walk to see if we can get a good fit.
+for  int step   0  step < computedmaxsteps  step
+// try and perform a mutation
+for  servername leftserver   servers
+// what server are we going to be swapping regions with ?
+servername rightserver   pickotherserver leftserver  servers
+if  rightserver    null
+continue
+// get the regions.
+list<hregioninfo> leftregionlist   clusterstate get leftserver
+list<hregioninfo> rightregionlist   clusterstate get rightserver
+// pick what regions to swap around.
+// if we get a null for one then this isn't a swap just a move
+hregioninfo lregion   pickrandomregion leftregionlist  0
+hregioninfo rregion   pickrandomregion rightregionlist  0 5
+// we randomly picked to do nothing.
+if  lregion    null    rregion    null
+continue
+if  rregion    null
+leftregionlist add rregion
+if  lregion    null
+rightregionlist add lregion
+newcost   computecost initialregionmapping  clusterstate
+// should this be kept?
+if  newcost < currentcost
+currentcost   newcost
+else
+// put things back the way they were before.
+if  rregion    null
+leftregionlist remove rregion
+rightregionlist add rregion
+if  lregion    null
+rightregionlist remove lregion
+leftregionlist add lregion
+long endtime   system currenttimemillis
+if  initcost > currentcost
+list<regionplan> plans   createregionplans initialregionmapping  clusterstate
+log debug
+endtime   starttime        computedmaxsteps
+plans size
+initcost
+currentcost
+return plans
+log debug     computedmaxsteps
+endtime   starttime
+initcost
+return null
+/**
+* create all of the regionplan's needed to move from the initial cluster state to the desired
+* state.
+*
+* @param initialregionmapping initial mapping of region to server
+* @param clusterstate the desired mapping of servername to regions
+* @return list of regionplan's that represent the moves needed to get to desired final state.
+*/
+private list<regionplan> createregionplans map<hregioninfo  servername> initialregionmapping
+map<servername  list<hregioninfo>> clusterstate
+list<regionplan> plans   new linkedlist<regionplan>
+for  entry<servername  list<hregioninfo>> entry   clusterstate entryset
+servername newserver   entry getkey
+for  hregioninfo region   entry getvalue
+servername initialserver   initialregionmapping get region
+if   newserver equals initialserver
+log trace     region getencodedname
+initialserver gethostname         newserver gethostname
+regionplan rp   new regionplan region  initialserver  newserver
+plans add rp
+return plans
+/**
+* create a map that will represent the initial location of regions on a
+* {@link servername}
+*
+* @param clusterstate starting state of the cluster and regions.
+* @return a map of {@link hregioninfo} to the {@link servername} that is
+*         currently hosting that region
+*/
+private map<hregioninfo  servername> createregionmapping
+map<servername  list<hregioninfo>> clusterstate
+map<hregioninfo  servername> mapping   new hashmap<hregioninfo  servername>
+for  entry<servername  list<hregioninfo>> entry   clusterstate entryset
+for  hregioninfo region   entry getvalue
+mapping put region  entry getkey
+return mapping
+/** store the current region loads. */
+private synchronized void updateregionload
+//we create a new hashmap so that regions that are no longer there are removed.
+//however we temporarily need the old loads so we can use them to keep the rolling average.
+map<string  list<regionload>> oldloads   loads
+loads   new hashmap<string  list<regionload>>
+for  servername sn   clusterstatus getservers
+serverload sl   clusterstatus getload sn
+if  sl    null  continue
+for  entry<byte  regionload> entry   sl getregionsload   entryset
+list<regionload> rloads   oldloads get bytes tostring entry getkey
+if  rloads    null
+//we're only going to keep 15.  so if there are that many already take the last 14
+if  rloads size   >  numregionloadstoremember
+int numtoremove   1     rloads size     numregionloadstoremember
+rloads   rloads sublist numtoremove  rloads size
+else
+//there was nothing there
+rloads   new arraylist<regionload>
+rloads add entry getvalue
+loads put bytes tostring entry getkey     rloads
+/**
+* from a list of regions pick a random one. null can be returned which
+* {@link stochasticloadbalancer#balancecluster(map)} recognize as signal to try a region move
+* rather than swap.
+*
+* @param regions        list of regions.
+* @param chanceofnoswap chance that this will decide to try a move rather
+*                       than a swap.
+* @return a random {@link hregioninfo} or null if an asymmetrical move is
+*         suggested.
+*/
+private hregioninfo pickrandomregion list<hregioninfo> regions  double chanceofnoswap
+//check to see if this is just a move.
+if  regions isempty      random nextfloat   < chanceofnoswap
+//signal a move only.
+return null
+int count   0
+hregioninfo r   null
+//we will try and find a region up to 10 times.  if we always
+while  count < 10    r    null
+count
+r   regions get random nextint regions size
+// if this is a special region we always try not to move it.
+// so clear out r.  try again
+if  r ismetaregion
+r   null
+if  r    null
+regions remove r
+return r
+/**
+* given a server we will want to switch regions with another server. this
+* function picks a random server from the list.
+*
+* @param server     current server. this server will never be the return value.
+* @param allservers list of all server from which to pick
+* @return random server. null if no other servers were found.
+*/
+private servername pickotherserver servername server  list<servername> allservers
+servername s   null
+int count   0
+while  count < 100     s    null    s equals server
+count
+s   allservers get random nextint allservers size
+// if nothing but the current server was found return null.
+return  s    null    s equals server   ? null   s
+/**
+* this is the main cost function.  it will compute a cost associated with a proposed cluster
+* state.  all different costs will be combined with their multipliers to produce a double cost.
+*
+* @param initialregionmapping map of where the regions started.
+* @param clusterstate map of servername to list of regions.
+* @return a double of a cost associated with the proposed
+*/
+protected double computecost map<hregioninfo  servername> initialregionmapping
+map<servername  list<hregioninfo>> clusterstate
+double movecost   movecostmultiplier   computemovecost initialregionmapping  clusterstate
+double regioncountskewcost   loadmultiplier   computeskewloadcost clusterstate
+double tableskewcost   tablemultiplier   computetableskewloadcost clusterstate
+double localitycost
+localitymultiplier   computedatalocalitycost initialregionmapping  clusterstate
+double memstoresizecost
+memstoresizemultiplier
+computeregionloadcost clusterstate  regionloadcosttype memstore_size
+double storefilesizecost
+storefilesizemultiplier
+computeregionloadcost clusterstate  regionloadcosttype storefile_size
+double readrequestcost
+readrequestmultiplier
+computeregionloadcost clusterstate  regionloadcosttype read_request
+double writerequestcost
+writerequestmultiplier
+computeregionloadcost clusterstate  regionloadcosttype write_request
+double total
+movecost   regioncountskewcost   tableskewcost   localitycost   memstoresizecost
+storefilesizecost   readrequestcost   writerequestcost
+log trace     total
+movecost       regioncountskewcost
+tableskewcost       localitycost
+memstoresizecost       storefilesizecost
+return total
+/**
+* given the starting state of the regions and a potential ending state
+* compute cost based upon the number of regions that have moved.
+*
+* @param initialregionmapping the starting location of regions.
+* @param clusterstate         the potential new cluster state.
+* @return the cost. between 0 and 1.
+*/
+double computemovecost map<hregioninfo  servername> initialregionmapping
+map<servername  list<hregioninfo>> clusterstate
+float movecost   0
+for  entry<servername  list<hregioninfo>> entry   clusterstate entryset
+for  hregioninfo region   entry getvalue
+if  initialregionmapping get region     entry getkey
+movecost    1
+//don't let this single balance move more than the max moves.
+//this allows better scaling to accurately represent the actual cost of a move.
+if  movecost > maxmoves
+return 10000      return a number much greater than any of the other cost functions
+return scale 0  math min maxmoves  initialregionmapping size     movecost
+/**
+* compute the cost of a potential cluster state from skew in number of
+* regions on a cluster
+*
+* @param clusterstate the proposed cluster state
+* @return the cost of region load imbalance.
+*/
+double computeskewloadcost map<servername  list<hregioninfo>> clusterstate
+descriptivestatistics stats   new descriptivestatistics
+for  list<hregioninfo> regions   clusterstate values
+int size   regions size
+stats addvalue size
+return costfromstats stats
+/**
+* compute the cost of a potential cluster configuration based upon how evenly
+* distributed tables are.
+*
+* @param clusterstate proposed cluster state.
+* @return cost of imbalance in table.
+*/
+double computetableskewloadcost map<servername  list<hregioninfo>> clusterstate
+map<string  mutableint> tableregionstotal   new hashmap<string  mutableint>
+map<string  mutableint> tableregionsoncurrentserver   new hashmap<string  mutableint>
+map<string  integer> tablecostseensofar   new hashmap<string  integer>
+// go through everything per server
+for  entry<servername  list<hregioninfo>> entry   clusterstate entryset
+tableregionsoncurrentserver clear
+// for all of the regions count how many are from each table
+for  hregioninfo region   entry getvalue
+string tablename   region gettablenameasstring
+// see if this table already has a count on this server
+mutableint regionsonservercount   tableregionsoncurrentserver get tablename
+// if this is the first time we've seen this table on this server
+// create a new mutable int.
+if  regionsonservercount    null
+regionsonservercount   new mutableint 0
+tableregionsoncurrentserver put tablename  regionsonservercount
+// increment the count of how many regions from this table are host on
+// this server
+regionsonservercount increment
+// now count the number of regions in this table.
+mutableint totalcount   tableregionstotal get tablename
+// if this is the first region from this table create a new counter for
+// this table.
+if  totalcount    null
+totalcount   new mutableint 0
+tableregionstotal put tablename  totalcount
+totalcount increment
+// now go through all of the tables we have seen and keep the max number
+// of regions of this table a single region server is hosting.
+for  entry<string  mutableint> currentserverentry  tableregionsoncurrentserver entryset
+string tablename   currentserverentry getkey
+integer thiscount   currentserverentry getvalue   tointeger
+integer maxcountsofar   tablecostseensofar get tablename
+if  maxcountsofar    null    thiscount compareto maxcountsofar  > 0
+tablecostseensofar put tablename  thiscount
+double max   0
+double min   0
+double value   0
+// compute the min, value, and max.
+for  entry<string  mutableint> currententry   tableregionstotal entryset
+max    tableregionstotal get currententry getkey    doublevalue
+min    tableregionstotal get currententry getkey    doublevalue     clusterstate size
+value    tablecostseensofar get currententry getkey    doublevalue
+return scale min  max  value
+/**
+* compute a cost of a potential cluster configuration based upon where
+* {@link org.apache.hadoop.hbase.regionserver.storefile}s are located.
+*
+* @param initialregionmapping - not used
+* @param clusterstate the state of the cluster
+* @return a cost between 0 and 1. 0 means all regions are on the sever with
+*         the most local store files.
+*/
+double computedatalocalitycost map<hregioninfo  servername> initialregionmapping
+map<servername  list<hregioninfo>> clusterstate
+double max   0
+double cost   0
+// if there's no master so there's no way anything else works.
+if  this services    null  return cost
+for  entry<servername  list<hregioninfo>> entry   clusterstate entryset
+servername sn   entry getkey
+for  hregioninfo region   entry getvalue
+max    1
+list<servername> dataonservers   regionfinder gettopblocklocations region
+// if we can't find where the data is gettopblock returns null.
+// so count that as being the best possible.
+if  dataonservers    null
+continue
+int index   dataonservers indexof sn
+if  index < 0
+cost    1
+else
+cost     double  index    double  dataonservers size
+return scale 0  max  cost
+/** the cost's that can be derived from regionload */
+private enum regionloadcosttype
+read_request  write_request  memstore_size  storefile_size
+/**
+* compute the cost of the current cluster state due to some regionloadcost type
+*
+* @param clusterstate the cluster
+* @param costtype     what type of cost to consider
+* @return the scaled cost.
+*/
+private double computeregionloadcost map<servername  list<hregioninfo>> clusterstate
+regionloadcosttype costtype
+if  this clusterstatus    null    this loads    null    this loads size      0  return 0
+descriptivestatistics stats   new descriptivestatistics
+// for every server look at the cost of each region
+for  list<hregioninfo> regions   clusterstate values
+long cost   0    cost this server has from regionload
+// for each region
+for  hregioninfo region   regions
+// try and get the region using the regionnameasstring
+list<regionload> rl   loads get region getregionnameasstring
+// that could have failed if the regionload is using the other regionname
+if  rl    null
+// try getting the region load using encoded name.
+rl   loads get region getencodedname
+// now if we found a region load get the type of cost that was requested.
+if  rl    null
+cost    getregionloadcost rl  costtype
+// add the total cost to the stats.
+stats addvalue cost
+// no return the scaled cost from data held in the stats object.
+return costfromstats stats
+/**
+* get the un-scaled cost from a regionload
+*
+* @param regionloadlist   the region load list
+* @param type the type of cost to extract
+* @return the double representing the cost
+*/
+private double getregionloadcost list<regionload> regionloadlist  regionloadcosttype type
+double cost   0
+int size   regionloadlist size
+for int i  0  i< size  i
+regionload rl   regionloadlist get i
+double toadd   0
+switch  type
+case read_request
+toadd    rl getreadrequestscount
+break
+case write_request
+toadd    rl getwriterequestscount
+break
+case memstore_size
+toadd    rl getmemstoresizemb
+break
+case storefile_size
+toadd    rl getstorefilesizemb
+break
+default
+assert false
+return 0
+if  cost    0
+cost   toadd
+else
+cost     5   cost      5   toadd
+return cost
+/**
+* function to compute a scaled cost using {@link descriptivestatistics}. it
+* assumes that this is a zero sum set of costs.  it assumes that the worst case
+* possible is all of the elements in one region server and the rest having 0.
+*
+* @param stats the costs
+* @return a scaled set of costs.
+*/
+double costfromstats descriptivestatistics stats
+double totalcost   0
+double mean   stats getmean
+//compute max as if all region servers had 0 and one had the sum of all costs.  this must be
+// a zero sum cost for this to make sense.
+double max     stats getn     1    stats getmean       stats getsum     stats getmean
+for  double n   stats getvalues
+totalcost    math abs mean   n
+return scale 0  max  totalcost
+/**
+* scale the value between 0 and 1.
+*
+* @param min   min value
+* @param max   the max value
+* @param value the value to be scaled.
+* @return the scaled value.
+*/
+private double scale double min  double max  double value
+if  max    0    value    0
+return 0
+return math max 0d  math min 1d   value   min    max

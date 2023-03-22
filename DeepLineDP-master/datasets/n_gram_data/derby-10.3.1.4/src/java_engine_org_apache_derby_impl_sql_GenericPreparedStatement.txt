@@ -1,0 +1,818 @@
+/*
+derby - class org.apache.derby.impl.sql.genericpreparedstatement
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl sql
+import	org apache derby catalog dependable
+import	org apache derby catalog dependablefinder
+import org apache derby iapi services context contextservice
+import org apache derby iapi services context contextmanager
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services stream headerprintwriter
+import org apache derby iapi services cache cacheable
+import org apache derby catalog uuid
+import org apache derby iapi services uuid uuidfactory
+import org apache derby iapi util bytearray
+import org apache derby iapi sql dictionary datadictionary
+import org apache derby iapi sql dictionary schemadescriptor
+import org apache derby iapi sql dictionary spsdescriptor
+import org apache derby iapi sql parametervalueset
+import org apache derby iapi sql preparedstatement
+import org apache derby iapi sql statement
+import org apache derby iapi types datatypedescriptor
+import org apache derby iapi sql resultcolumndescriptor
+import org apache derby iapi sql resultdescription
+import org apache derby iapi sql resultset
+import org apache derby iapi sql activation
+import org apache derby iapi sql execute constantaction
+import org apache derby iapi sql execute execcursortablereference
+import org apache derby iapi sql execute execpreparedstatement
+import org apache derby iapi sql depend dependencymanager
+import org apache derby iapi sql depend provider
+import org apache derby iapi sql conn languageconnectioncontext
+import org apache derby iapi sql conn statementcontext
+import org apache derby impl sql compile cursornode
+import org apache derby impl sql compile statementnode
+import org apache derby iapi error standardexception
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services loader generatedclass
+import java sql timestamp
+import java sql sqlwarning
+import java util list
+/**
+* basic implementation of prepared statement.
+* relies on implementation of resultdescription and statement that
+* are also in this package.
+* <p>
+* these are both dependents (of the schema objects and prepared statements
+* they depend on) and providers.  prepared statements that are providers
+* are cursors that end up being used in positioned delete and update
+* statements (at present).
+* <p>
+* this is impl with the regular prepared statements; they will never
+* have the cursor info fields set.
+* <p>
+* stored prepared statements extend this implementation
+*
+*/
+public class genericpreparedstatement
+implements execpreparedstatement
+///////////////////////////////////////////////
+//
+// warning: when adding members to this class, be
+// sure to do the right thing in getclone(): if
+// it is preparedstatement specific like finished,
+// then it shouldn't be copied, but stuff like parameters
+// must be copied.
+//
+////////////////////////////////////////////////
+////////////////////////////////////////////////
+// state that is copied by getclone()
+////////////////////////////////////////////////
+public statement statement
+protected generatedclass activationclass     satisfies activation
+protected resultdescription resultdesc
+protected datatypedescriptor paramtypedescriptors
+private string			spsname
+private sqlwarning		warnings
+//if the query node for this statement references session schema tables, mark it so in the boolean below
+//this information will be used by execute statement if it is executing a statement that was created with nocompile. because
+//of nocompile, we could not catch session schema table reference by the statement at create statement time. need to catch
+//such statements at execute statement time when the query is getting compiled.
+//this information will also be used to decide if the statement should be cached or not. any statement referencing session
+//schema tables will not be cached.
+private boolean		referencessessionschema
+// fields used for cursors
+protected execcursortablereference	targettable
+protected resultcolumndescriptor	targetcolumns
+protected string 					updatecolumns
+protected int 						updatemode
+protected constantaction	executionconstants
+protected object	savedobjects
+protected list requiredpermissionslist
+// fields for dependency tracking
+protected string uuidstring
+protected uuid   uuidvalue
+private boolean needssavepoint
+private string execstmtname
+private string execschemaname
+protected boolean isatomic
+protected string sourcetxt
+private int inusecount
+// true if the statement is being compiled.
+boolean compilingstatement
+////////////////////////////////////////////////
+// state that is not copied by getclone()
+////////////////////////////////////////////////
+// fields for run time stats
+protected long parsetime
+protected long bindtime
+protected long optimizetime
+protected long generatetime
+protected long compiletime
+protected timestamp begincompiletimestamp
+protected timestamp endcompiletimestamp
+//private boolean finished;
+protected boolean isvalid
+protected boolean spsaction
+// state for caching.
+/**
+if non-null then this object is the cacheable
+that holds us in the cache.
+*/
+private cacheable cacheholder
+//
+// constructors
+//
+genericpreparedstatement
+/* get the uuid for this prepared statement */
+uuidfactory uuidfactory
+monitor getmonitor   getuuidfactory
+uuidvalue   uuidfactory createuuid
+uuidstring   uuidvalue tostring
+spsaction   false
+/**
+*/
+public genericpreparedstatement statement st
+this
+statement   st
+//
+// preparedstatement interface
+//
+public synchronized boolean	uptodate
+throws standardexception
+return  isvalid     activationclass    null      compilingstatement
+public void reprepare languageconnectioncontext lcc
+throws standardexception
+if   uptodate
+preparedstatement ps   statement prepare lcc
+if  sanitymanager debug
+sanitymanager assert ps    this
+/**
+* get a new activation instance.
+*
+* @exception standardexception thrown if finished.
+*/
+public activation getactivation languageconnectioncontext lcc
+boolean scrollable
+throws standardexception
+activation ac
+synchronized  this
+generatedclass gc   getactivationclass
+if  gc    null
+reprepare lcc
+gc   getactivationclass
+ac   new genericactivationholder lcc  gc  this  scrollable
+inusecount
+// derby-2689. close unused activations-- this method should be called
+// when i'm not holding a lock on a prepared statement to avoid
+// deadlock.
+lcc closeunusedactivations
+return ac
+public resultset execute languageconnectioncontext lcc
+boolean rollbackparentcontext
+long timeoutmillis
+throws standardexception
+activation a   getactivation lcc  false
+a setsingleexecution
+return execute a  rollbackparentcontext  timeoutmillis
+/**
+*	the guts of execution.
+*
+*	@param	activation					the activation to run.
+* @param rollbackparentcontext true if 1) the statement context is
+*  not a top-level context, and 2) in the event of a statement-level
+*	 exception, the parent context needs to be rolled back, too.
+* @param timeoutmillis timeout value in milliseconds.
+*	@return	the result set to be pawed through
+*
+*	@exception	standardexception thrown on error
+*/
+public resultset execute activation activation
+boolean rollbackparentcontext
+long timeoutmillis
+throws
+standardexception
+boolean				needtoclearsavepoint   false
+if  activation    null    activation getpreparedstatement      this
+throw standardexception newexception sqlstate lang_wrong_activation
+recompileoutofdateplan
+while  true
+// verify the activation is for me--somehow.  note: this is
+// different from the above check for whether the activation is
+// associated with the right preparedstatement - it's conceivable
+// that someone could construct an activation of the wrong type
+// that points to the right preparedstatement.
+//
+//sanitymanager.assert(activation instanceof activationclass, "executing wrong activation");
+/* this is where we set and clear savepoints around each individual
+* statement which needs one.  we don't set savepoints for cursors because
+* they're not needed and they wouldn't work in a read only database.
+* we can't set savepoints for commit/rollback because they'll get
+* blown away before we try to clear them.
+*/
+languageconnectioncontext lcctouse   activation getlanguageconnectioncontext
+if  lcctouse getlogstatementtext
+headerprintwriter istream   monitor getstream
+string xactid   lcctouse gettransactionexecute   getactivestatetxidstring
+string pvsstring
+parametervalueset pvs   activation getparametervalueset
+if  pvs    null    pvs getparametercount   > 0
+pvsstring       pvs getparametercount
+pvs tostring
+istream printlnwithheader languageconnectioncontext xidstr
+xactid
+languageconnectioncontext lccstr
+lcctouse getinstancenumber
+languageconnectioncontext dbnamestr
+lcctouse getdbname
+languageconnectioncontext drdastr
+lcctouse getdrdaid
+getsource
+pvsstring
+parametervalueset pvs   activation getparametervalueset
+/* put it in try block to unlock the ps in any case
+*/
+if   spsaction
+// only re-prepare if this isn't an sps for a trigger-action;
+// if it _is_ an sps for a trigger action, then we can't just
+// do a regular prepare because the statement might contain
+// internal sql that isn't allowed in other statements (such as a
+// static method call to get the trigger context for retrieval
+// of "new row" or "old row" values).  so in that case we
+// skip the call to 'reprepare' and if the statement is out
+// of date, we'll get a needs_compile exception when we try
+// to execute.  that exception will be caught by the executesps()
+// method of the generictriggerexecutor class, and at that time
+// the sps action will be recompiled correctly.
+reprepare lcctouse
+statementcontext statementcontext   lcctouse pushstatementcontext
+isatomic  updatemode  cursornode read_only  getsource    pvs  rollbackparentcontext  timeoutmillis
+if  needssavepoint
+/* mark this position in the log so that a statement
+* rollback will undo any changes.
+*/
+statementcontext setsavepoint
+needtoclearsavepoint   true
+if  executionconstants    null
+lcctouse validatestmtexecution executionconstants
+resultset resultset   null
+try
+resultset   activation execute
+resultset open
+catch  standardexception se
+/* cann't handle recompiling sps action recompile here */
+if   se getmessageid   equals sqlstate lang_statement_needs_recompile
+spsaction
+throw se
+statementcontext cleanuponerror se
+continue recompileoutofdateplan
+if  needtoclearsavepoint
+/* we're done with our updates */
+statementcontext clearsavepoint
+lcctouse popstatementcontext statementcontext  null
+if  activation issingleexecution      resultset isclosed
+// if the result set is 'done', i.e. not openable,
+// then we can also release the activation.
+// note that a result set with output parameters
+// or rows to return is explicitly finished
+// by the user.
+activation close
+return resultset
+public resultdescription	getresultdescription
+return resultdesc
+public datatypedescriptor	getparametertypes
+return paramtypedescriptors
+public string getsource
+return  sourcetxt    null  ?
+sourcetxt
+statement    null  ?
+statement getsource
+public void setsource string text
+sourcetxt   text
+public final void setspsname string name
+spsname   name
+public string getspsname
+return spsname
+/**
+* get the total compile time for the associated query in milliseconds.
+* compile time can be divided into parse, bind, optimize and generate times.
+*
+* @return long		the total compile time for the associated query in milliseconds.
+*/
+public long getcompiletimeinmillis
+return compiletime
+/**
+* get the parse time for the associated query in milliseconds.
+*
+* @return long		the parse time for the associated query in milliseconds.
+*/
+public long getparsetimeinmillis
+return parsetime
+/**
+* get the bind time for the associated query in milliseconds.
+*
+* @return long		the bind time for the associated query in milliseconds.
+*/
+public long getbindtimeinmillis
+return bindtime
+/**
+* get the optimize time for the associated query in milliseconds.
+*
+* @return long		the optimize time for the associated query in milliseconds.
+*/
+public long getoptimizetimeinmillis
+return optimizetime
+/**
+* get the generate time for the associated query in milliseconds.
+*
+* @return long		the generate time for the associated query in milliseconds.
+*/
+public long getgeneratetimeinmillis
+return generatetime
+/**
+* get the timestamp for the beginning of compilation
+*
+* @return timestamp	the timestamp for the beginning of compilation.
+*/
+public timestamp getbegincompiletimestamp
+return begincompiletimestamp
+/**
+* get the timestamp for the end of compilation
+*
+* @return timestamp	the timestamp for the end of compilation.
+*/
+public timestamp getendcompiletimestamp
+return endcompiletimestamp
+void setcompiletimewarnings sqlwarning warnings
+this warnings   warnings
+public final sqlwarning getcompiletimewarnings
+return warnings
+/**
+* set the compile time for this prepared statement.
+*
+* @param compiletime	the compile time
+*/
+protected void setcompiletimemillis long parsetime  long bindtime
+long optimizetime
+long generatetime
+long compiletime
+timestamp begincompiletimestamp
+timestamp endcompiletimestamp
+this parsetime   parsetime
+this bindtime   bindtime
+this optimizetime   optimizetime
+this generatetime   generatetime
+this compiletime   compiletime
+this begincompiletimestamp   begincompiletimestamp
+this endcompiletimestamp   endcompiletimestamp
+/**
+finish marks a statement as totally unusable.
+*/
+public void finish languageconnectioncontext lcc
+synchronized  this
+inusecount
+if  cacheholder    null
+return
+if  inusecount    0
+//if (sanitymanager.debug) {
+//	if (inusecount < 0)
+//		sanitymanager.throwassert("inusecount is negative " + inusecount + " for " + this);
+//}
+return
+// invalidate any prepared statements that
+// depended on this statement (including this one)
+// preparetoinvalidate(this, dependencymanager.prepared_statement_invalid);
+try
+/* note: since we are non-persistent, we "know" that no exception
+* will be thrown under us.
+*/
+makeinvalid dependencymanager prepared_statement_release  lcc
+catch  standardexception se
+if  sanitymanager debug
+sanitymanager throwassert    se
+/**
+*	set the execution constants. this routine is called as we prepare the
+*	statement.
+*
+*	@param constantaction the big structure enclosing the execution constants.
+*/
+final void	setconstantaction  constantaction constantaction
+executionconstants   constantaction
+/**
+*	get the execution constants. this routine is called at execution time.
+*
+*	@return	constantaction	the big structure enclosing the execution constants.
+*/
+public	final constantaction	getconstantaction
+return	executionconstants
+/**
+*	set the saved objects. called when compilation completes.
+*
+*	@param	objects	the objects to save from compilation
+*/
+final void	setsavedobjects  object objects
+savedobjects   objects
+/**
+*	get the specified saved object.
+*
+*	@param	objectnum	the object to get.
+*	@return	the requested saved object.
+*/
+public final object	getsavedobject int objectnum
+if  sanitymanager debug
+if    objectnum> 0    objectnum<savedobjects length
+sanitymanager throwassert
+objectnum
+savedobjects length
+return	savedobjects
+/**
+*	get the saved objects.
+*
+*	@return all the saved objects
+*/
+public	final object	getsavedobjects
+return	savedobjects
+//
+// dependent interface
+//
+/**
+check that all of the dependent's dependencies are valid.
+@return true if the dependent is currently valid
+*/
+public boolean isvalid
+return isvalid
+/**
+* set this prepared statement to be valid, currently used by
+* generictriggerexecutor.
+*/
+public void setvalid
+isvalid   true
+/**
+* indicate this prepared statement is an sps action, currently used
+* by generictriggerexecutor.
+*/
+public void setspsaction
+spsaction   true
+/**
+prepare to mark the dependent as invalid (due to at least one of
+its dependencies being invalid).
+@param	action	the action causing the invalidation
+@param	p		the provider
+@exception standardexception thrown if unable to make it invalid
+*/
+public void preparetoinvalidate provider p  int action
+languageconnectioncontext lcc
+throws standardexception
+/*
+this statement can have other open result sets
+if another one is closing without any problems.
+it is not a problem to create an index when there is an open
+result set, since it doesn't invalidate the access path that was
+chosen for the result set.
+*/
+switch  action
+case dependencymanager changed_cursor
+case dependencymanager create_index
+return
+/* verify that there are no activations with open result sets
+* on this prepared statement.
+*/
+lcc verifynoopenresultsets this  p  action
+/**
+mark the dependent as invalid (due to at least one of
+its dependencies being invalid).
+@param	action	the action causing the invalidation
+@exception standardexception standard derby error policy.
+*/
+public void makeinvalid int action  languageconnectioncontext lcc
+throws standardexception
+boolean alreadyinvalid
+synchronized  this
+if  compilingstatement
+return
+alreadyinvalid    isvalid
+// make ourseleves invalid
+isvalid   false
+// block compiles while we are invalidating
+compilingstatement   true
+try
+dependencymanager dm   lcc getdatadictionary   getdependencymanager
+/* clear out the old dependencies on this statement as we
+* will build the new set during the reprepare in makevalid().
+*/
+dm cleardependencies lcc  this
+/*
+** if we are invalidating an execute statement because of a stale
+** plan, we also need to invalidate the stored prepared statement.
+*/
+if  execstmtname    null
+switch  action
+case dependencymanager internal_recompile_request
+case dependencymanager changed_cursor
+/*
+** get the datadictionary, so we can get the descriptor for
+** the spp to invalidate it.
+*/
+datadictionary dd   lcc getdatadictionary
+schemadescriptor sd   dd getschemadescriptor execschemaname  lcc gettransactioncompile    true
+spsdescriptor spsd   dd getspsdescriptor execstmtname  sd
+spsd makeinvalid action  lcc
+break
+finally
+synchronized  this
+compilingstatement   false
+notifyall
+/**
+* is this dependent persistent?  a stored dependency will be required
+* if both the dependent and provider are persistent.
+*
+* @return boolean		whether or not this dependent is persistent.
+*/
+public boolean ispersistent
+/* non-stored prepared statements are not persistent */
+return false
+//
+// dependable interface
+//
+/**
+@return the stored form of this dependable
+@see dependable#getdependablefinder
+*/
+public dependablefinder getdependablefinder
+return null
+/**
+* return the name of this dependable.  (useful for errors.)
+*
+* @return string	the name of this dependable..
+*/
+public string getobjectname
+return uuidstring
+/**
+* get the dependable's uuid string.
+*
+* @return string	the dependable's uuid string.
+*/
+public uuid getobjectid
+return uuidvalue
+/**
+* get the dependable's class type.
+*
+* @return string		classname that this dependable belongs to.
+*/
+public string getclasstype
+return dependable prepared_statement
+/**
+* return true if the query node for this statement references session schema
+* tables/views.
+* this method gets called at the very beginning of the compile phase of any statement.
+* if the statement which needs to be compiled is already found in cache, then there is
+* no need to compile it again except the case when the statement is referencing session
+* schema objects. there is a small window where such a statement might get cached
+* temporarily (a statement referencing session schema object will be removed from the
+* cache after the bind phase is over because that is when we know for sure that the
+* statement is referencing session schema objects.)
+*
+* @return	true if references session schema tables, else false
+*/
+public boolean referencessessionschema
+return referencessessionschema
+/**
+* return true if the querytreenode references session schema tables/views.
+* the return value is also saved in the local field because it will be
+* used by referencessessionschema() method.
+* this method gets called when the statement is not found in cache and
+* hence it is getting compiled.
+* at the beginning of compilation for any statement, first we check if
+* the statement's plan already exist in the cache. if not, then we add
+* the statement to the cache and continue with the parsing and binding.
+* at the end of the binding, this method gets called to see if the
+* querytreenode references a session schema object. if it does, then
+* we want to remove it from the cache, since any statements referencing
+* session schema objects should never get cached.
+*
+* @return	true if references session schema tables/views, else false
+*/
+public boolean referencessessionschema statementnode qt
+throws standardexception
+//if the query references a session schema table (temporary or permanent), then
+// mark so in this statement
+referencessessionschema   qt referencessessionschema
+return referencessessionschema
+//
+// class interface
+//
+/**
+makes the prepared statement valid, assigning
+values for its query tree, generated class,
+and associated information.
+@param qt the query tree for this statement
+@exception standardexception thrown on failure.
+*/
+void completecompile statementnode qt
+throws standardexception
+//if (finished)
+//	throw standardexception.newexception(sqlstate.lang_statement_closed, "completecompile()");
+paramtypedescriptors   qt getparametertypes
+// erase cursor info in case statement text changed
+if  targettable  null
+targettable   null
+updatemode   0
+updatecolumns   null
+targetcolumns   null
+// get the result description (null for non-cursor statements)
+// would we want to reuse an old resultdesc?
+// or do we need to always replace in case this was select *?
+resultdesc   qt makeresultdescription
+// would look at resultdesc.getstatementtype() but it
+// doesn't call out cursors as such, so we check
+// the root node type instead.
+if  resultdesc    null
+/*
+for cursors, we carry around some extra information.
+*/
+cursorinfo cursorinfo    cursorinfo qt getcursorinfo
+if  cursorinfo    null
+targettable   cursorinfo targettable
+targetcolumns   cursorinfo targetcolumns
+updatecolumns   cursorinfo updatecolumns
+updatemode   cursorinfo updatemode
+isvalid   true
+return
+public generatedclass getactivationclass
+throws standardexception
+return activationclass
+void setactivationclass generatedclass ac
+activationclass   ac
+//
+// execpreparedstatement
+//
+/**
+* the update mode of the cursor
+*
+* @return	the update mode of the cursor
+*/
+public int	getupdatemode
+return updatemode
+/**
+* the target table of the cursor
+*
+* @return	target table of the cursor
+*/
+public execcursortablereference gettargettable
+if  sanitymanager debug
+sanitymanager assert targettable  null
+return targettable
+/**
+* the target columns of the cursor as a result column list
+*
+* @return	target columns of the cursor as a result column list
+*/
+public resultcolumndescriptor	gettargetcolumns
+return targetcolumns
+/**
+* the update columns of the cursor as a update column list
+*
+* @return	update columns of the cursor as a array of strings
+*/
+public string	getupdatecolumns
+return updatecolumns
+/**
+* return the cursor info in a single chunk.  used
+* by strorablepreparedstatement
+*/
+public object getcursorinfo
+return new cursorinfo
+updatemode
+targettable
+targetcolumns
+updatecolumns
+void setcursorinfo cursorinfo cursorinfo
+if  cursorinfo    null
+updatemode   cursorinfo updatemode
+targettable   cursorinfo targettable
+targetcolumns   cursorinfo targetcolumns
+updatecolumns   cursorinfo updatecolumns
+//
+// class implementation
+//
+/**
+* get the byte code saver for this statement.
+* overridden for storablepreparedstatement.  we
+* don't want to save anything
+*
+* @return a byte code saver (null for us)
+*/
+bytearray getbytecodesaver
+return null
+/**
+* does this statement need a savepoint?
+*
+* @return true if this statement needs a savepoint.
+*/
+public boolean needssavepoint
+return needssavepoint
+/**
+* set the stmts 'needssavepoint' state.  used
+* by an sps to convey whether the underlying stmt
+* needs a savepoint or not.
+*
+* @param needssavepoint true if this statement needs a savepoint.
+*/
+void setneedssavepoint boolean needssavepoint
+this needssavepoint   needssavepoint
+/**
+* set the stmts 'isatomic' state.
+*
+* @param isatomic true if this statement must be atomic
+* (i.e. it is not ok to do a commit/rollback in the middle)
+*/
+void setisatomic boolean isatomic
+this isatomic   isatomic
+/**
+* returns whether or not this statement requires should
+* behave atomically -- i.e. whether a user is permitted
+* to do a commit/rollback during the execution of this
+* statement.
+*
+* @return boolean	whether or not this statement is atomic
+*/
+public boolean isatomic
+return isatomic
+/**
+* set the name of the statement and schema for an "execute statement"
+* command.
+*/
+void setexecutestatementnameandschema string execstmtname
+string execschemaname
+this execstmtname   execstmtname
+this execschemaname   execschemaname
+/**
+* get a new prepared statement that is a shallow copy
+* of the current one.
+*
+* @return a new prepared statement
+*
+* @exception standardexception on error
+*/
+public execpreparedstatement getclone   throws standardexception
+genericpreparedstatement clone   new genericpreparedstatement statement
+clone activationclass   getactivationclass
+clone resultdesc   resultdesc
+clone paramtypedescriptors   paramtypedescriptors
+clone executionconstants   executionconstants
+clone uuidstring   uuidstring
+clone uuidvalue   uuidvalue
+clone savedobjects   savedobjects
+clone execstmtname   execstmtname
+clone execschemaname   execschemaname
+clone isatomic   isatomic
+clone sourcetxt   sourcetxt
+clone targettable   targettable
+clone targetcolumns   targetcolumns
+clone updatecolumns   updatecolumns
+clone updatemode   updatemode
+clone needssavepoint   needssavepoint
+return clone
+// cache holder stuff.
+public void setcacheholder cacheable cacheholder
+this cacheholder   cacheholder
+if  cacheholder    null
+// need to invalidate the statement
+if   isvalid     inusecount    0
+return
+contextmanager cm   contextservice getfactory   getcurrentcontextmanager
+languageconnectioncontext lcc
+languageconnectioncontext
+cm getcontext languageconnectioncontext context_id
+// invalidate any prepared statements that
+// depended on this statement (including this one)
+// preparetoinvalidate(this, dependencymanager.prepared_statement_invalid);
+try
+/* note: since we are non-persistent, we "know" that no exception
+* will be thrown under us.
+*/
+makeinvalid dependencymanager prepared_statement_release  lcc
+catch  standardexception se
+if  sanitymanager debug
+sanitymanager throwassert    se
+public string tostring
+return getobjectname
+public boolean isstorable
+return false
+public void setrequiredpermissionslist  list requiredpermissionslist
+this requiredpermissionslist   requiredpermissionslist
+public list getrequiredpermissionslist
+return requiredpermissionslist

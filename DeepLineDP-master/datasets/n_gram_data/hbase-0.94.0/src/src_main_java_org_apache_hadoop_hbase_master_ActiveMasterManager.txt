@@ -1,0 +1,200 @@
+/**
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase master
+import java util concurrent atomic atomicboolean
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase server
+import org apache hadoop hbase servername
+import org apache hadoop hbase monitoring monitoredtask
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase zookeeper zkutil
+import org apache hadoop hbase zookeeper zookeeperlistener
+import org apache hadoop hbase zookeeper zookeeperwatcher
+import org apache zookeeper keeperexception
+import org apache hadoop hbase zookeeper clusterstatustracker
+/**
+* handles everything on master-side related to master election.
+*
+* <p>listens and responds to zookeeper notifications on the master znode,
+* both <code>nodecreated</code> and <code>nodedeleted</code>.
+*
+* <p>contains blocking methods which will hold up backup masters, waiting
+* for the active master to fail.
+*
+* <p>this class is instantiated in the hmaster constructor and the method
+* #blockuntilbecomingactivemaster() is called to wait until becoming
+* the active master of the cluster.
+*/
+class activemastermanager extends zookeeperlistener
+private static final log log   logfactory getlog activemastermanager class
+final atomicboolean clusterhasactivemaster   new atomicboolean false
+private final servername sn
+private final server master
+/**
+* @param watcher
+* @param sn servername
+* @param master in an instance of a master.
+*/
+activemastermanager zookeeperwatcher watcher  servername sn  server master
+super watcher
+this sn   sn
+this master   master
+@override
+public void nodecreated string path
+if path equals watcher masteraddressznode      master isstopped
+handlemasternodechange
+@override
+public void nodedeleted string path
+if path equals watcher masteraddressznode      master isstopped
+handlemasternodechange
+/**
+* handle a change in the master node.  doesn't matter whether this was called
+* from a nodecreated or nodedeleted event because there are no guarantees
+* that the current state of the master node matches the event at the time of
+* our next zk request.
+*
+* <p>uses the watchandcheckexists method which watches the master address node
+* regardless of whether it exists or not.  if it does exist (there is an
+* active master), it returns true.  otherwise it returns false.
+*
+* <p>a watcher is set which guarantees that this method will get called again if
+* there is another change in the master node.
+*/
+private void handlemasternodechange
+// watch the node and check if it exists.
+try
+synchronized clusterhasactivemaster
+if zkutil watchandcheckexists watcher  watcher masteraddressznode
+// a master node exists, there is an active master
+log debug
+clusterhasactivemaster set true
+else
+// node is no longer there, cluster does not have an active master
+log debug
+clusterhasactivemaster set false
+// notify any thread waiting to become the active master
+clusterhasactivemaster notifyall
+catch  keeperexception ke
+master abort    ke
+/**
+* block until becoming the active master.
+*
+* method blocks until there is not another active master and our attempt
+* to become the new active master is successful.
+*
+* this also makes sure that we are watching the master znode so will be
+* notified if another master dies.
+* @param startupstatus
+* @return true if no issue becoming active master else false if another
+* master was running or if some other problem (zookeeper, stop flag has been
+* set on this master)
+*/
+boolean blockuntilbecomingactivemaster monitoredtask startupstatus
+clusterstatustracker clusterstatustracker
+startupstatus setstatus
+boolean cleansetofactivemaster   true
+// try to become the active master, watch if there is another master.
+// write out our servername as versioned bytes.
+try
+string backupznode   zkutil joinznode
+this watcher backupmasteraddressesznode  this sn tostring
+if  zkutil createephemeralnodeandwatch this watcher
+this watcher masteraddressznode  this sn getversionedbytes
+// if we were a backup master before, delete our znode from the backup
+// master directory since we are the active now
+log info     backupznode
+zkutil deletenodefailsilent this watcher  backupznode
+// we are the master, return
+startupstatus setstatus
+this clusterhasactivemaster set true
+log info     this sn
+return cleansetofactivemaster
+cleansetofactivemaster   false
+// there is another active master running elsewhere or this is a restart
+// and the master ephemeral node has not expired yet.
+this clusterhasactivemaster set true
+/*
+* add a znode for ourselves in the backup master directory since we are
+* not the active master.
+*
+* if we become the active master later, activemastermanager will delete
+* this node explicitly.  if we crash before then, zookeeper will delete
+* this node for us since it is ephemeral.
+*/
+log info     backupznode
+zkutil createephemeralnodeandwatch this watcher  backupznode
+this sn getversionedbytes
+string msg
+byte  bytes
+zkutil getdataandwatch this watcher  this watcher masteraddressznode
+if  bytes    null
+msg
+else
+servername currentmaster   servername parseversionedservername bytes
+if  servername issamehostnameandport currentmaster  this sn
+msg
+currentmaster
+// hurry along the expiration of the znode.
+zkutil deletenode this watcher  this watcher masteraddressznode
+else
+msg       currentmaster
+log info msg
+startupstatus setstatus msg
+catch  keeperexception ke
+master abort    ke
+return false
+synchronized  this clusterhasactivemaster
+while  this clusterhasactivemaster get       this master isstopped
+try
+this clusterhasactivemaster wait
+catch  interruptedexception e
+// we expect to be interrupted when a master dies, will fall out if so
+log debug    e
+if   clusterstatustracker isclusterup
+this master stop
+if  this master isstopped
+return cleansetofactivemaster
+// try to become active master again now that there is no active master
+blockuntilbecomingactivemaster startupstatus clusterstatustracker
+return cleansetofactivemaster
+/**
+* @return true if cluster has an active master.
+*/
+public boolean isactivemaster
+try
+if  zkutil checkexists watcher  watcher masteraddressznode  >  0
+return true
+catch  keeperexception ke
+log info
+ke
+return false
+public void stop
+try
+// if our address is in zk, delete it on our way out
+byte  bytes
+zkutil getdataandwatch watcher  watcher masteraddressznode
+// todo: redo this to make it atomic (only added for tests)
+servername master   servername parseversionedservername bytes
+if  master    null     master equals this sn
+zkutil deletenode watcher  watcher masteraddressznode
+catch  keeperexception e
+log error this watcher prefix     e

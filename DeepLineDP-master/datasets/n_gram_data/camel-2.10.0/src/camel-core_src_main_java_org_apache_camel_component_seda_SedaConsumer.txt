@@ -1,0 +1,246 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache camel component seda
+import java util list
+import java util concurrent blockingqueue
+import java util concurrent countdownlatch
+import java util concurrent executorservice
+import java util concurrent timeunit
+import java util concurrent atomic atomicinteger
+import org apache camel asynccallback
+import org apache camel asyncprocessor
+import org apache camel consumer
+import org apache camel endpoint
+import org apache camel exchange
+import org apache camel processor
+import org apache camel shutdownrunningtask
+import org apache camel suspendableservice
+import org apache camel impl loggingexceptionhandler
+import org apache camel processor multicastprocessor
+import org apache camel spi exceptionhandler
+import org apache camel spi shutdownaware
+import org apache camel spi synchronization
+import org apache camel support servicesupport
+import org apache camel util asyncprocessorconverterhelper
+import org apache camel util asyncprocessorhelper
+import org apache camel util exchangehelper
+import org apache camel util objecthelper
+import org apache camel util unitofworkhelper
+import org slf4j logger
+import org slf4j loggerfactory
+/**
+* a consumer for the seda component.
+* <p/>
+* in this implementation there is a little <i>slack period</i> when you suspend/stop the consumer, by which
+* the consumer may pickup a newly arrived messages and process it. that period is up till 1 second.
+*
+* @version
+*/
+public class sedaconsumer extends servicesupport implements consumer  runnable  shutdownaware  suspendableservice
+private static final transient logger log   loggerfactory getlogger sedaconsumer class
+private final atomicinteger taskcount   new atomicinteger
+private volatile countdownlatch latch
+private volatile boolean shutdownpending
+private sedaendpoint endpoint
+private asyncprocessor processor
+private executorservice executor
+private exceptionhandler exceptionhandler
+private final int polltimeout
+public sedaconsumer sedaendpoint endpoint  processor processor
+this endpoint   endpoint
+this processor   asyncprocessorconverterhelper convert processor
+this polltimeout   endpoint getpolltimeout
+@override
+public string tostring
+return     endpoint
+public endpoint getendpoint
+return endpoint
+public exceptionhandler getexceptionhandler
+if  exceptionhandler    null
+exceptionhandler   new loggingexceptionhandler getclass
+return exceptionhandler
+public void setexceptionhandler exceptionhandler exceptionhandler
+this exceptionhandler   exceptionhandler
+public processor getprocessor
+return processor
+public boolean defershutdown shutdownrunningtask shutdownrunningtask
+// deny stopping on shutdown as we want seda consumers to run in case some other queues
+// depend on this consumer to run, so it can complete its exchanges
+return true
+public int getpendingexchangessize
+// number of pending messages on the queue
+return endpoint getqueue   size
+@override
+public void prepareshutdown boolean forced
+// signal we want to shutdown
+shutdownpending   true
+if  latch    null
+log debug    latch getcount
+// wait for all threads to end
+try
+latch await
+catch  interruptedexception e
+// ignore
+@override
+public boolean isrunallowed
+if  issuspending      issuspended
+// allow to run even if we are suspended as we want to
+// keep the thread task running
+return true
+return super isrunallowed
+public void run
+taskcount incrementandget
+try
+dorun
+finally
+taskcount decrementandget
+protected void dorun
+blockingqueue<exchange> queue   endpoint getqueue
+// loop while we are allowed, or if we are stopping loop until the queue is empty
+while  queue    null     isrunallowed
+// do not poll during camelcontext is starting, as we should only poll when camelcontext is fully started
+if  getendpoint   getcamelcontext   getstatus   isstarting
+log trace
+try
+// sleep at most 1 sec
+thread sleep math min polltimeout  1000
+catch  interruptedexception e
+log debug    isstopping      isstopped
+continue
+// do not poll if we are suspended
+if  issuspending      issuspended
+log trace
+try
+// sleep at most 1 sec
+thread sleep math min polltimeout  1000
+catch  interruptedexception e
+log debug    isstopping      isstopped
+continue
+exchange exchange   null
+try
+// use the end user configured poll timeout
+exchange   queue poll polltimeout  timeunit milliseconds
+if  exchange    null
+try
+// send a new copied exchange with new camel context
+exchange newexchange   prepareexchange exchange
+// process the exchange
+sendtoconsumers newexchange
+// copy the message back
+if  newexchange hasout
+exchange setout newexchange getout   copy
+else
+exchange setin newexchange getin
+// log exception if an exception occurred and was not handled
+if  newexchange getexception      null
+exchange setexception newexchange getexception
+getexceptionhandler   handleexception    exchange  exchange getexception
+catch  exception e
+getexceptionhandler   handleexception    exchange  e
+else if  shutdownpending    queue isempty
+log trace
+// we want to shutdown so break out if there queue is empty
+break
+catch  interruptedexception e
+log debug    isstopping      isstopped
+continue
+catch  throwable e
+if  exchange    null
+getexceptionhandler   handleexception    exchange  e
+else
+getexceptionhandler   handleexception e
+latch countdown
+log debug    latch getcount
+/**
+* strategy to prepare exchange for being processed by this consumer
+*
+* @param exchange the exchange
+* @return the exchange to process by this consumer.
+*/
+protected exchange prepareexchange exchange exchange
+// send a new copied exchange with new camel context
+exchange newexchange   exchangehelper copyexchangeandsetcamelcontext exchange  endpoint getcamelcontext
+// set the from endpoint
+newexchange setfromendpoint endpoint
+return newexchange
+/**
+* send the given {@link exchange} to the consumer(s).
+* <p/>
+* if multiple consumers then they will each receive a copy of the exchange.
+* a multicast processor will send the exchange in parallel to the multiple consumers.
+* <p/>
+* if there is only a single consumer then its dispatched directly to it using same thread.
+*
+* @param exchange the exchange
+* @throws exception can be thrown if processing of the exchange failed
+*/
+protected void sendtoconsumers final exchange exchange  throws exception
+int size   endpoint getconsumers   size
+// if there are multiple consumers then multicast to them
+if  size > 1
+// validate multiple consumers has been enabled
+if   endpoint ismultipleconsumerssupported
+throw new illegalstateexception     endpoint
+if  log isdebugenabled
+log debug    endpoint getconsumers   size    exchange
+// handover completions, as we need to done this when the multicast is done
+final list<synchronization> completions   exchange handovercompletions
+// use a multicast processor to process it
+multicastprocessor mp   endpoint getconsumermulticastprocessor
+objecthelper notnull mp     this
+// and use the asynchronous routing engine to support it
+asyncprocessorhelper process mp  exchange  new asynccallback
+public void done boolean donesync
+// done the uow on the completions
+unitofworkhelper donesynchronizations exchange  completions  log
+else
+// use the regular processor and use the asynchronous routing engine to support it
+asyncprocessorhelper process processor  exchange  new asynccallback
+public void done boolean donesync
+// noop
+protected void dostart   throws exception
+latch   new countdownlatch endpoint getconcurrentconsumers
+shutdownpending   false
+setuptasks
+endpoint onstarted this
+@override
+protected void dosuspend   throws exception
+endpoint onstopped this
+@override
+protected void doresume   throws exception
+dostart
+protected void dostop   throws exception
+endpoint onstopped this
+@override
+protected void doshutdown   throws exception
+// only shutdown thread pool when we shutdown
+if  executor    null
+endpoint getcamelcontext   getexecutorservicemanager   shutdownnow executor
+executor   null
+/**
+* setup the thread pool and ensures tasks gets executed (if needed)
+*/
+private void setuptasks
+int poolsize   endpoint getconcurrentconsumers
+// create thread pool if needed
+if  executor    null
+executor   endpoint getcamelcontext   getexecutorservicemanager   newfixedthreadpool this  endpoint getendpointuri    poolsize
+// submit needed number of tasks
+int tasks   poolsize   taskcount get
+log debug    tasks  polltimeout
+for  int i   0  i < tasks  i
+executor execute this

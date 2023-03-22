@@ -1,0 +1,205 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase master balancer
+import java util arraylist
+import java util list
+import java util map
+import java util random
+import java util set
+import java util treemap
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop hbase clusterstatus
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase servername
+import org apache hadoop hbase master assignmentmanager
+import org apache hadoop hbase master loadbalancer
+import org apache hadoop hbase master masterservices
+import com google common base joiner
+import com google common collect arraylistmultimap
+import com google common collect sets
+/**
+* the base class for load balancers. it provides the the functions used to by
+* {@link assignmentmanager} to assign regions in the edge cases. it doesn't
+* provide an implementation of the actual balancing algorithm.
+*
+*/
+public abstract class baseloadbalancer implements loadbalancer
+// slop for regions
+private float slop
+private configuration config
+private static final random random   new random system currenttimemillis
+private static final log log   logfactory getlog baseloadbalancer class
+protected masterservices services
+@override
+public void setconf configuration conf
+this slop   conf getfloat     float  0 2
+if  slop < 0  slop   0
+else if  slop > 1  slop   1
+this config   conf
+@override
+public configuration getconf
+return this config
+public void setclusterstatus clusterstatus st
+// not used except for the stocasticbalancer
+public void setmasterservices masterservices masterservices
+this services   masterservices
+protected boolean needsbalance clusterloadstate cs
+// check if we even need to do any load balancing
+float average   cs getloadaverage       for logging
+// hbase-3681 check sloppiness first
+int floor    int  math floor average    1   slop
+int ceiling    int  math ceil average    1   slop
+return cs getminload   > ceiling    cs getmaxload   < floor
+/**
+* generates a bulk assignment plan to be used on cluster startup using a
+* simple round-robin assignment.
+* <p>
+* takes a list of all the regions and all the servers in the cluster and
+* returns a map of each server to the regions that it should be assigned.
+* <p>
+* currently implemented as a round-robin assignment. same invariant as load
+* balancing, all servers holding floor(avg) or ceiling(avg).
+*
+* todo: use block locations from hdfs to place regions with their blocks
+*
+* @param regions all regions
+* @param servers all servers
+* @return map of server to the regions it should take, or null if no
+*         assignment is possible (ie. no regions or no servers)
+*/
+public map<servername  list<hregioninfo>> roundrobinassignment list<hregioninfo> regions
+list<servername> servers
+if  regions isempty      servers isempty
+return null
+map<servername  list<hregioninfo>> assignments   new treemap<servername  list<hregioninfo>>
+int numregions   regions size
+int numservers   servers size
+int max    int  math ceil  float  numregions   numservers
+int serveridx   0
+if  numservers > 1
+serveridx   random nextint numservers
+int regionidx   0
+for  int j   0  j < numservers  j
+servername server   servers get  j   serveridx  % numservers
+list<hregioninfo> serverregions   new arraylist<hregioninfo> max
+for  int i   regionidx  i < numregions  i    numservers
+serverregions add regions get i % numregions
+assignments put server  serverregions
+regionidx
+return assignments
+/**
+* generates an immediate assignment plan to be used by a new master for
+* regions in transition that do not have an already known destination.
+*
+* takes a list of regions that need immediate assignment and a list of all
+* available servers. returns a map of regions to the server they should be
+* assigned to.
+*
+* this method will return quickly and does not do any intelligent balancing.
+* the goal is to make a fast decision not the best decision possible.
+*
+* currently this is random.
+*
+* @param regions
+* @param servers
+* @return map of regions to the server it should be assigned to
+*/
+public map<hregioninfo  servername> immediateassignment list<hregioninfo> regions
+list<servername> servers
+map<hregioninfo  servername> assignments   new treemap<hregioninfo  servername>
+for  hregioninfo region   regions
+assignments put region  randomassignment region  servers
+return assignments
+/**
+* used to assign a single region to a random server.
+*/
+public servername randomassignment hregioninfo regioninfo  list<servername> servers
+if  servers    null    servers isempty
+log warn
+return null
+return servers get random nextint servers size
+/**
+* generates a bulk assignment startup plan, attempting to reuse the existing
+* assignment information from meta, but adjusting for the specified list of
+* available/online servers available for assignment.
+* <p>
+* takes a map of all regions to their existing assignment from meta. also
+* takes a list of online servers for regions to be assigned to. attempts to
+* retain all assignment, so in some instances initial assignment will not be
+* completely balanced.
+* <p>
+* any leftover regions without an existing server to be assigned to will be
+* assigned randomly to available servers.
+*
+* @param regions regions and existing assignment from meta
+* @param servers available servers
+* @return map of servers and regions to be assigned to them
+*/
+public map<servername  list<hregioninfo>> retainassignment map<hregioninfo  servername> regions
+list<servername> servers
+// group all of the old assignments by their hostname.
+// we can't group directly by servername since the servers all have
+// new start-codes.
+// group the servers by their hostname. it's possible we have multiple
+// servers on the same host on different ports.
+arraylistmultimap<string  servername> serversbyhostname   arraylistmultimap create
+for  servername server   servers
+serversbyhostname put server gethostname    server
+// now come up with new assignments
+map<servername  list<hregioninfo>> assignments   new treemap<servername  list<hregioninfo>>
+for  servername server   servers
+assignments put server  new arraylist<hregioninfo>
+// collection of the hostnames that used to have regions
+// assigned, but for which we no longer have any rs running
+// after the cluster restart.
+set<string> oldhostsnolongerpresent   sets newtreeset
+int numrandomassignments   0
+int numretainedassigments   0
+for  map entry<hregioninfo  servername> entry   regions entryset
+hregioninfo region   entry getkey
+servername oldservername   entry getvalue
+list<servername> localservers   new arraylist<servername>
+if  oldservername    null
+localservers   serversbyhostname get oldservername gethostname
+if  localservers isempty
+// no servers on the new cluster match up with this hostname,
+// assign randomly.
+servername randomserver   servers get random nextint servers size
+assignments get randomserver  add region
+numrandomassignments
+if  oldservername    null  oldhostsnolongerpresent add oldservername gethostname
+else if  localservers size      1
+// the usual case - one new server on same host
+assignments get localservers get 0   add region
+numretainedassigments
+else
+// multiple new servers in the cluster on this same host
+int size   localservers size
+servername target   localservers get random nextint size
+assignments get target  add region
+numretainedassigments
+string randomassignmsg
+if  numrandomassignments > 0
+randomassignmsg
+numrandomassignments
+joiner on    join oldhostsnolongerpresent
+log info     regions size         numretainedassigments
+randomassignmsg
+return assignments

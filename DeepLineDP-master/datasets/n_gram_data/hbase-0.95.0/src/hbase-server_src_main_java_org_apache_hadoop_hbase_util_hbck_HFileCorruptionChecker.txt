@@ -1,0 +1,294 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase util hbck
+import java io filenotfoundexception
+import java io ioexception
+import java util arraylist
+import java util collection
+import java util hashset
+import java util list
+import java util set
+import java util concurrent callable
+import java util concurrent concurrentskiplistset
+import java util concurrent executionexception
+import java util concurrent executorservice
+import java util concurrent future
+import java util concurrent atomic atomicinteger
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase io hfile cacheconfig
+import org apache hadoop hbase exceptions corrupthfileexception
+import org apache hadoop hbase io hfile hfile
+import org apache hadoop hbase util fsutils
+import org apache hadoop hbase util fsutils familydirfilter
+import org apache hadoop hbase util fsutils hfilefilter
+import org apache hadoop hbase util fsutils regiondirfilter
+import org apache hadoop hbase util hbasefsck errorreporter
+/**
+* this class marches through all of the region's hfiles and verifies that
+* they are all valid files. one just needs to instantiate the class, use
+* checktables(list<path>) and then retrieve the corrupted hfiles (and
+* quarantined files if in quarantining mode)
+*
+* the implementation currently parallelizes at the regiondir level.
+*/
+@interfaceaudience private
+public class hfilecorruptionchecker
+private static final log log   logfactory getlog hfilecorruptionchecker class
+final configuration conf
+final filesystem fs
+final cacheconfig cacheconf
+final executorservice executor
+final set<path> corrupted   new concurrentskiplistset<path>
+final set<path> failures   new concurrentskiplistset<path>
+final set<path> quarantined   new concurrentskiplistset<path>
+final set<path> missing   new concurrentskiplistset<path>
+final boolean inquarantinemode
+final atomicinteger hfileschecked   new atomicinteger
+public hfilecorruptionchecker configuration conf  executorservice executor
+boolean quarantine  throws ioexception
+this conf   conf
+this fs   filesystem get conf
+this cacheconf   new cacheconfig conf
+this executor   executor
+this inquarantinemode   quarantine
+/**
+* checks a path to see if it is a valid hfile.
+*
+* @param p
+*          full path to an hfile
+* @throws ioexception
+*           this is a connectivity related exception
+*/
+protected void checkhfile path p  throws ioexception
+hfile reader r   null
+try
+r   hfile createreader fs  p  cacheconf
+catch  corrupthfileexception che
+log warn     p  che
+corrupted add p
+if  inquarantinemode
+path dest   createquarantinepath p
+log warn     p       dest
+boolean success   fs mkdirs dest getparent
+success   success ? fs rename p  dest   false
+if   success
+failures add p
+else
+quarantined add dest
+return
+catch  filenotfoundexception fnfe
+log warn     p
+missing add p
+finally
+hfileschecked addandget 1
+if  r    null
+r close true
+/**
+* given a path, generates a new path to where we move a corrupted hfile (bad
+* trailer, no trailer).
+*
+* @param hfile
+*          path to a corrupt hfile (assumes that it is hbase_dir/ table
+*          /region/cf/file)
+* @return path to where corrupted files are stored. this should be
+*         hbase_dir/.corrupt/table/region/cf/file.
+*/
+path createquarantinepath path hfile  throws ioexception
+// extract the normal dirs structure
+path cfdir   hfile getparent
+path regiondir   cfdir getparent
+path tabledir   regiondir getparent
+// build up the corrupted dirs strcture
+path corruptbasedir   new path fsutils getrootdir conf   conf get
+hconstants corrupt_dir_name
+path corrupttabledir   new path corruptbasedir  tabledir getname
+path corruptregiondir   new path corrupttabledir  regiondir getname
+path corruptfamilydir   new path corruptregiondir  cfdir getname
+path corrupthfile   new path corruptfamilydir  hfile getname
+return corrupthfile
+/**
+* check all files in a column family dir.
+*
+* @param cfdir
+*          column family directory
+* @throws ioexception
+*/
+protected void checkcolfamdir path cfdir  throws ioexception
+filestatus hfs   null
+try
+hfs   fs liststatus cfdir  new hfilefilter fs       use same filter as scanner
+catch  filenotfoundexception fnfe
+// hadoop 0.23+ liststatus semantics throws an exception if the path does not exist.
+log warn     cfdir
+missing add cfdir
+return
+// hadoop 1.0 liststatus does not throw an exception if the path does not exist.
+if  hfs length    0     fs exists cfdir
+log warn     cfdir
+missing add cfdir
+return
+for  filestatus hffs   hfs
+path hf   hffs getpath
+checkhfile hf
+/**
+* check all column families in a region dir.
+*
+* @param regiondir
+*          region directory
+* @throws ioexception
+*/
+protected void checkregiondir path regiondir  throws ioexception
+filestatus cfs   null
+try
+cfs   fs liststatus regiondir  new familydirfilter fs
+catch  filenotfoundexception fnfe
+// hadoop 0.23+ liststatus semantics throws an exception if the path does not exist.
+log warn     regiondir
+missing add regiondir
+return
+// hadoop 1.0 liststatus does not throw an exception if the path does not exist.
+if  cfs length    0     fs exists regiondir
+log warn     regiondir
+missing add regiondir
+return
+for  filestatus cffs   cfs
+path cfdir   cffs getpath
+checkcolfamdir cfdir
+/**
+* check all the regiondirs in the specified tabledir
+*
+* @param tabledir
+*          path to a table
+* @throws ioexception
+*/
+void checktabledir path tabledir  throws ioexception
+filestatus rds   fs liststatus tabledir  new regiondirfilter fs
+if  rds length    0     fs exists tabledir
+// interestingly liststatus does not throw an exception if the path does not exist.
+log warn     tabledir
+missing add tabledir
+return
+// parallelize check at the region dir level
+list<regiondirchecker> rdcs   new arraylist<regiondirchecker>
+list<future<void>> rdfutures
+for  filestatus rdfs   rds
+path rddir   rdfs getpath
+regiondirchecker work   new regiondirchecker rddir
+rdcs add work
+// submit and wait for completion
+try
+rdfutures   executor invokeall rdcs
+catch  interruptedexception ie
+thread currentthread   interrupt
+log warn    ie
+return
+for  int i   0  i < rdfutures size    i
+future<void> f   rdfutures get i
+try
+f get
+catch  executionexception e
+log warn
+rdcs get i  regiondir  e getcause
+// rethrow ioexceptions
+if  e getcause   instanceof ioexception
+throw  ioexception  e getcause
+// rethrow runtimeexceptions
+if  e getcause   instanceof runtimeexception
+throw  runtimeexception  e getcause
+// this should never happen
+log error    e
+return     bailing out
+catch  interruptedexception ie
+thread currentthread   interrupt
+log warn    ie
+// bailing out
+return
+/**
+* an individual work item for parallelized regiondir processing. this is
+* intentionally an inner class so it can use the shared error sets and fs.
+*/
+private class regiondirchecker implements callable<void>
+final path regiondir
+regiondirchecker path regiondir
+this regiondir   regiondir
+@override
+public void call   throws ioexception
+checkregiondir regiondir
+return null
+/**
+* check the specified table dirs for bad hfiles.
+*/
+public void checktables collection<path> tables  throws ioexception
+for  path t   tables
+checktabledir t
+/**
+* @return the set of check failure file paths after checktables is called.
+*/
+public collection<path> getfailures
+return new hashset<path> failures
+/**
+* @return the set of corrupted file paths after checktables is called.
+*/
+public collection<path> getcorrupted
+return new hashset<path> corrupted
+/**
+* @return number of hfiles checked in the last hfilecorruptionchecker run
+*/
+public int gethfileschecked
+return hfileschecked get
+/**
+* @return the set of successfully quarantined paths after checktables is called.
+*/
+public collection<path> getquarantined
+return new hashset<path> quarantined
+/**
+* @return the set of paths that were missing.  likely due to deletion/moves from
+*  compaction or flushes.
+*/
+public collection<path> getmissing
+return new hashset<path> missing
+/**
+* print a human readable summary of hfile quarantining operations.
+* @param out
+*/
+public void report errorreporter out
+out print     hfileschecked get
+out print     corrupted size
+if  inquarantinemode
+out print     quarantined size
+for  path sq   quarantined
+out print     sq
+out print     failures size
+for  path fq   failures
+out print     fq
+out print     missing size
+for  path mq   missing
+out print     mq
+string initialstate    corrupted size      0  ?
+string fixedstate    corrupted size      quarantined size    ?
+if  inquarantinemode
+out print     initialstate       fixedstate
+else
+out print     initialstate

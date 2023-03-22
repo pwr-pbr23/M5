@@ -1,0 +1,908 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq transport failover
+import java io bufferedreader
+import java io filereader
+import java io ioexception
+import java io inputstreamreader
+import java io interruptedioexception
+import java net inetaddress
+import java net malformedurlexception
+import java net uri
+import java net url
+import java util arraylist
+import java util collections
+import java util hashset
+import java util iterator
+import java util linkedhashmap
+import java util list
+import java util map
+import java util stringtokenizer
+import java util concurrent copyonwritearraylist
+import java util concurrent atomic atomicreference
+import org apache activemq broker sslcontext
+import org apache activemq command command
+import org apache activemq command connectioncontrol
+import org apache activemq command connectionid
+import org apache activemq command messagedispatch
+import org apache activemq command messagepull
+import org apache activemq command removeinfo
+import org apache activemq command response
+import org apache activemq state connectionstatetracker
+import org apache activemq state tracked
+import org apache activemq thread task
+import org apache activemq thread taskrunner
+import org apache activemq thread taskrunnerfactory
+import org apache activemq transport compositetransport
+import org apache activemq transport defaulttransportlistener
+import org apache activemq transport futureresponse
+import org apache activemq transport responsecallback
+import org apache activemq transport transport
+import org apache activemq transport transportfactory
+import org apache activemq transport transportlistener
+import org apache activemq util ioexceptionsupport
+import org apache activemq util servicesupport
+import org slf4j logger
+import org slf4j loggerfactory
+/**
+* a transport that is made reliable by being able to fail over to another
+* transport when a transport failure is detected.
+*/
+public class failovertransport implements compositetransport
+private static final logger log   loggerfactory getlogger failovertransport class
+private static final int default_initial_reconnect_delay   10
+private static final int infinite    1
+private transportlistener transportlistener
+private boolean disposed
+private boolean connected
+private final copyonwritearraylist<uri> uris   new copyonwritearraylist<uri>
+private final copyonwritearraylist<uri> updated   new copyonwritearraylist<uri>
+private final object reconnectmutex   new object
+private final object backupmutex   new object
+private final object sleepmutex   new object
+private final object listenermutex   new object
+private final connectionstatetracker statetracker   new connectionstatetracker
+private final map<integer  command> requestmap   new linkedhashmap<integer  command>
+private uri connectedtransporturi
+private uri failedconnecttransporturi
+private final atomicreference<transport> connectedtransport   new atomicreference<transport>
+private final taskrunnerfactory reconnecttaskfactory
+private final taskrunner reconnecttask
+private boolean started
+private boolean initialized
+private long initialreconnectdelay   default_initial_reconnect_delay
+private long maxreconnectdelay   1000   30
+private double backoffmultiplier   2d
+private long timeout   infinite
+private boolean useexponentialbackoff   true
+private boolean randomize   true
+private int maxreconnectattempts   infinite
+private int startupmaxreconnectattempts   infinite
+private int connectfailures
+private long reconnectdelay   default_initial_reconnect_delay
+private exception connectionfailure
+private boolean firstconnection   true
+// optionally always have a backup created
+private boolean backup   false
+private final list<backuptransport> backups   new copyonwritearraylist<backuptransport>
+private int backuppoolsize   1
+private boolean trackmessages   false
+private boolean tracktransactionproducers   true
+private int maxcachesize   128   1024
+private final transportlistener disposedlistener   new defaulttransportlistener
+private final transportlistener mytransportlistener   createtransportlistener
+private boolean updateurissupported   true
+private boolean reconnectsupported   true
+// remember for reconnect thread
+private sslcontext brokersslcontext
+private string updateurisurl   null
+private boolean rebalanceupdateuris   true
+private boolean dorebalance   false
+private boolean connectedtopriority   false
+private boolean prioritybackup   false
+private arraylist<uri> prioritylist   new arraylist<uri>
+private boolean prioritybackupavailable   false
+public failovertransport   throws interruptedioexception
+brokersslcontext   sslcontext getcurrentsslcontext
+statetracker settracktransactions true
+// setup a task that is used to reconnect the a connection async.
+reconnecttaskfactory   new taskrunnerfactory
+reconnecttaskfactory init
+reconnecttask   reconnecttaskfactory createtaskrunner new task
+public boolean iterate
+boolean result   false
+if   started
+return result
+boolean buildbackup   true
+synchronized  backupmutex
+if   connectedtransport get      null    dorebalance    prioritybackupavailable      disposed
+result   doreconnect
+buildbackup   false
+connectedtopriority   ispriority connectedtransporturi
+if  buildbackup
+buildbackups
+if  prioritybackup     connectedtopriority
+try
+dodelay
+if  reconnecttask    null
+return true
+reconnecttask wakeup
+catch  interruptedexception e
+log debug    e
+else
+// build backups on the next iteration
+buildbackup   true
+try
+if  reconnecttask    null
+return true
+reconnecttask wakeup
+catch  interruptedexception e
+log debug    e
+return result
+system identityhashcode this
+transportlistener createtransportlistener
+return new transportlistener
+public void oncommand object o
+command command    command  o
+if  command    null
+return
+if  command isresponse
+object object   null
+synchronized  requestmap
+object   requestmap remove integer valueof   response  command  getcorrelationid
+if  object    null    object getclass      tracked class
+tracked  object  onresponses command
+if   initialized
+initialized   true
+if  command isconnectioncontrol
+handleconnectioncontrol  connectioncontrol  command
+if  transportlistener    null
+transportlistener oncommand command
+public void onexception ioexception error
+try
+handletransportfailure error
+catch  interruptedexception e
+thread currentthread   interrupt
+transportlistener onexception new interruptedioexception
+public void transportinterupted
+if  transportlistener    null
+transportlistener transportinterupted
+public void transportresumed
+if  transportlistener    null
+transportlistener transportresumed
+public final void disposetransport transport transport
+transport settransportlistener disposedlistener
+servicesupport dispose transport
+public final void handletransportfailure ioexception e  throws interruptedexception
+if  log istraceenabled
+log trace this       e
+transport transport   connectedtransport getandset null
+if  transport    null
+// sync with possible in progress reconnect
+synchronized  reconnectmutex
+transport   connectedtransport getandset null
+if  transport    null
+disposetransport transport
+boolean reconnectok   false
+synchronized  reconnectmutex
+if  canreconnect
+reconnectok   true
+log warn     transport getremoteaddress         e
+reconnectok ?
+initialized   false
+failedconnecttransporturi   connectedtransporturi
+connectedtransporturi   null
+connected   false
+// notify before any reconnect attempt so ack state can be whacked
+if  transportlistener    null
+transportlistener transportinterupted
+if  reconnectok
+updated remove failedconnecttransporturi
+reconnecttask wakeup
+else if   isdisposed
+propagatefailuretoexceptionlistener e
+private boolean canreconnect
+return started    0    calculatereconnectattemptlimit
+public final void handleconnectioncontrol connectioncontrol control
+string reconnectstr   control getreconnectto
+if  reconnectstr    null
+reconnectstr   reconnectstr trim
+if  reconnectstr length   > 0
+try
+uri uri   new uri reconnectstr
+if  isreconnectsupported
+reconnect uri
+log info     uri
+catch  exception e
+log error     reconnectstr  e
+processnewtransports control isrebalanceconnection    control getconnectedbrokers
+private final void processnewtransports boolean rebalance  string newtransports
+if  newtransports    null
+newtransports   newtransports trim
+if  newtransports length   > 0    isupdateurissupported
+list<uri> list   new arraylist<uri>
+stringtokenizer tokenizer   new stringtokenizer newtransports
+while  tokenizer hasmoretokens
+string str   tokenizer nexttoken
+try
+uri uri   new uri str
+list add uri
+catch  exception e
+log error     str  e
+if  list isempty      false
+try
+updateuris rebalance  list toarray new uri
+catch  ioexception e
+log error     newtransports  e
+public void start   throws exception
+synchronized  reconnectmutex
+if  log isdebugenabled
+log debug     this
+if  started
+return
+started   true
+statetracker setmaxcachesize getmaxcachesize
+statetracker settrackmessages istrackmessages
+statetracker settracktransactionproducers istracktransactionproducers
+if  connectedtransport get      null
+statetracker restore connectedtransport get
+else
+reconnect false
+public void stop   throws exception
+transport transporttostop   null
+list<transport> backupstostop   new arraylist<transport> backups size
+try
+synchronized  reconnectmutex
+if  log isdebugenabled
+log debug     this
+if   started
+return
+started   false
+disposed   true
+connected   false
+if  connectedtransport get      null
+transporttostop   connectedtransport getandset null
+reconnectmutex notifyall
+synchronized  sleepmutex
+sleepmutex notifyall
+finally
+reconnecttask shutdown
+reconnecttaskfactory shutdownnow
+synchronized backupmutex
+for  backuptransport backup   backups
+backup setdisposed true
+transport transport   backup gettransport
+if  transport    null
+transport settransportlistener disposedlistener
+backupstostop add transport
+backups clear
+for  transport transport   backupstostop
+try
+if  log istraceenabled
+log trace     transport
+disposetransport transport
+catch  exception e
+if  transporttostop    null
+transporttostop stop
+public long getinitialreconnectdelay
+return initialreconnectdelay
+public void setinitialreconnectdelay long initialreconnectdelay
+this initialreconnectdelay   initialreconnectdelay
+public long getmaxreconnectdelay
+return maxreconnectdelay
+public void setmaxreconnectdelay long maxreconnectdelay
+this maxreconnectdelay   maxreconnectdelay
+public long getreconnectdelay
+return reconnectdelay
+public void setreconnectdelay long reconnectdelay
+this reconnectdelay   reconnectdelay
+public double getreconnectdelayexponent
+return backoffmultiplier
+public void setreconnectdelayexponent double reconnectdelayexponent
+this backoffmultiplier   reconnectdelayexponent
+public transport getconnectedtransport
+return connectedtransport get
+public uri getconnectedtransporturi
+return connectedtransporturi
+public int getmaxreconnectattempts
+return maxreconnectattempts
+public void setmaxreconnectattempts int maxreconnectattempts
+this maxreconnectattempts   maxreconnectattempts
+public int getstartupmaxreconnectattempts
+return this startupmaxreconnectattempts
+public void setstartupmaxreconnectattempts int startupmaxreconnectattempts
+this startupmaxreconnectattempts   startupmaxreconnectattempts
+public long gettimeout
+return timeout
+public void settimeout long timeout
+this timeout   timeout
+/**
+* @return returns the randomize.
+*/
+public boolean israndomize
+return randomize
+/**
+* @param randomize the randomize to set.
+*/
+public void setrandomize boolean randomize
+this randomize   randomize
+public boolean isbackup
+return backup
+public void setbackup boolean backup
+this backup   backup
+public int getbackuppoolsize
+return backuppoolsize
+public void setbackuppoolsize int backuppoolsize
+this backuppoolsize   backuppoolsize
+public int getcurrentbackups
+return this backups size
+public boolean istrackmessages
+return trackmessages
+public void settrackmessages boolean trackmessages
+this trackmessages   trackmessages
+public boolean istracktransactionproducers
+return this tracktransactionproducers
+public void settracktransactionproducers boolean tracktransactionproducers
+this tracktransactionproducers   tracktransactionproducers
+public int getmaxcachesize
+return maxcachesize
+public void setmaxcachesize int maxcachesize
+this maxcachesize   maxcachesize
+public boolean isprioritybackup
+return prioritybackup
+public void setprioritybackup boolean prioritybackup
+this prioritybackup   prioritybackup
+public void setpriorityuris string priorityuris
+stringtokenizer tokenizer   new stringtokenizer priorityuris
+while  tokenizer hasmoretokens
+string str   tokenizer nexttoken
+try
+uri uri   new uri str
+prioritylist add uri
+catch  exception e
+log error     str  e
+public void oneway object o  throws ioexception
+command command    command  o
+exception error   null
+try
+synchronized  reconnectmutex
+if  command    null    connectedtransport get      null
+if  command isshutdowninfo
+// skipping send of shutdowninfo command when not connected.
+return
+else if  command instanceof removeinfo    command ismessageack
+// simulate response to removeinfo command or messageack (as it will be stale)
+statetracker track command
+if  command isresponserequired
+response response   new response
+response setcorrelationid command getcommandid
+mytransportlistener oncommand response
+return
+else if  command instanceof messagepull
+// simulate response to messagepull if timed as we can't honor that now.
+messagepull pullrequest    messagepull  command
+if  pullrequest gettimeout      0
+messagedispatch dispatch   new messagedispatch
+dispatch setconsumerid pullrequest getconsumerid
+dispatch setdestination pullrequest getdestination
+mytransportlistener oncommand dispatch
+return
+// keep trying until the message is sent.
+for  int i   0   disposed  i
+try
+// wait for transport to be connected.
+transport transport   connectedtransport get
+long start   system currenttimemillis
+boolean timedout   false
+while  transport    null     disposed    connectionfailure    null
+thread currentthread   isinterrupted
+if  log istraceenabled
+log trace     command
+long end   system currenttimemillis
+if  timeout > 0     end   start > timeout
+timedout   true
+if  log isinfoenabled
+log info      end   start
+break
+try
+reconnectmutex wait 100
+catch  interruptedexception e
+thread currentthread   interrupt
+if  log isdebugenabled
+log debug     e  e
+transport   connectedtransport get
+if  transport    null
+// previous loop may have exited due to use being
+// disposed.
+if  disposed
+error   new ioexception
+else if  connectionfailure    null
+error   connectionfailure
+else if  timedout    true
+error   new ioexception     timeout
+else
+error   new ioexception
+break
+// if it was a request and it was not being tracked by
+// the state tracker,
+// then hold it in the requestmap so that we can replay
+// it later.
+tracked tracked   statetracker track command
+synchronized  requestmap
+if  tracked    null    tracked iswaitingforresponse
+requestmap put integer valueof command getcommandid     tracked
+else if  tracked    null    command isresponserequired
+requestmap put integer valueof command getcommandid     command
+// send the message.
+try
+transport oneway command
+statetracker trackback command
+catch  ioexception e
+// if the command was not tracked.. we will retry in
+// this method
+if  tracked    null
+// since we will retry in this method.. take it
+// out of the request
+// map so that it is not sent 2 times on
+// recovery
+if  command isresponserequired
+requestmap remove integer valueof command getcommandid
+// rethrow the exception so it will handled by
+// the outer catch
+throw e
+else
+// handle the error but allow the method to return since the
+// tracked commands are replayed on reconnect.
+if  log isdebugenabled
+log debug     i       command
+handletransportfailure e
+return
+catch  ioexception e
+if  log isdebugenabled
+log debug     i       command
+handletransportfailure e
+catch  interruptedexception e
+// some one may be trying to stop our thread.
+thread currentthread   interrupt
+throw new interruptedioexception
+if   disposed
+if  error    null
+if  error instanceof ioexception
+throw  ioexception  error
+throw ioexceptionsupport create error
+public futureresponse asyncrequest object command  responsecallback responsecallback  throws ioexception
+throw new assertionerror
+public object request object command  throws ioexception
+throw new assertionerror
+public object request object command  int timeout  throws ioexception
+throw new assertionerror
+public void add boolean rebalance  uri u
+boolean newuri   false
+for  uri uri   u
+if   contains uri
+uris add uri
+newuri   true
+if  newuri
+reconnect rebalance
+public void remove boolean rebalance  uri u
+for  uri uri   u
+uris remove uri
+// rebalance is automatic if any connected to removed/stopped broker
+public void add boolean rebalance  string u
+try
+uri newuri   new uri u
+if  contains newuri     false
+uris add newuri
+reconnect rebalance
+catch  exception e
+log error     u
+public void reconnect boolean rebalance
+synchronized  reconnectmutex
+if  started
+if  rebalance
+dorebalance   true
+log debug
+try
+reconnecttask wakeup
+catch  interruptedexception e
+thread currentthread   interrupt
+else
+log debug
+private list<uri> getconnectlist
+if   updated isempty
+if  failedconnecttransporturi    null
+boolean removed   updated remove failedconnecttransporturi
+if  removed
+updated add failedconnecttransporturi
+return updated
+arraylist<uri> l   new arraylist<uri> uris
+boolean removed   false
+if  failedconnecttransporturi    null
+removed   l remove failedconnecttransporturi
+if  randomize
+// randomly, reorder the list by random swapping
+for  int i   0  i < l size    i
+int p    int   math random     100 % l size
+uri t   l get p
+l set p  l get i
+l set i  t
+if  removed
+l add failedconnecttransporturi
+if  log isdebugenabled
+log debug     l       uris
+return l
+public transportlistener gettransportlistener
+return transportlistener
+public void settransportlistener transportlistener commandlistener
+synchronized  listenermutex
+this transportlistener   commandlistener
+listenermutex notifyall
+public <t> t narrow class<t> target
+if  target isassignablefrom getclass
+return target cast this
+transport transport   connectedtransport get
+if  transport    null
+return transport narrow target
+return null
+protected void restoretransport transport t  throws exception  ioexception
+t start
+// send information to the broker - informing it we are an ft client
+connectioncontrol cc   new connectioncontrol
+cc setfaulttolerant true
+t oneway cc
+statetracker restore t
+map<integer  command> tmpmap   null
+synchronized  requestmap
+tmpmap   new linkedhashmap<integer  command> requestmap
+for  command command   tmpmap values
+if  log istraceenabled
+log trace     command
+t oneway command
+public boolean isuseexponentialbackoff
+return useexponentialbackoff
+public void setuseexponentialbackoff boolean useexponentialbackoff
+this useexponentialbackoff   useexponentialbackoff
+@override
+public string tostring
+return connectedtransporturi    null ?     connectedtransporturi tostring
+public string getremoteaddress
+transport transport   connectedtransport get
+if  transport    null
+return transport getremoteaddress
+return null
+public boolean isfaulttolerant
+return true
+private void doupdateurisfromdisk
+// if updateurisurl is specified, read the file and add any new
+// transport uri's to this failovertransport.
+// note: could track file timestamp to avoid unnecessary reading.
+string fileurl   getupdateurisurl
+if  fileurl    null
+bufferedreader in   null
+string newuris   null
+stringbuffer buffer   new stringbuffer
+try
+in   new bufferedreader geturlstream fileurl
+while  true
+string line   in readline
+if  line    null
+break
+buffer append line
+newuris   buffer tostring
+catch  ioexception ioe
+log error     fileurl  ioe
+finally
+if  in    null
+try
+in close
+catch  ioexception ioe
+// ignore
+processnewtransports isrebalanceupdateuris    newuris
+final boolean doreconnect
+exception failure   null
+synchronized  reconnectmutex
+// first ensure we are up to date.
+doupdateurisfromdisk
+if  disposed    connectionfailure    null
+reconnectmutex notifyall
+if   connectedtransport get      null     dorebalance     prioritybackupavailable     disposed    connectionfailure    null
+return false
+else
+list<uri> connectlist   getconnectlist
+if  connectlist isempty
+failure   new ioexception
+else
+if  dorebalance
+if  connectlist get 0  equals connectedtransporturi
+// already connected to first in the list, no need to rebalance
+dorebalance   false
+return false
+else
+if  log isdebugenabled
+log debug     connectedtransporturi       connectlist
+try
+transport transport   this connectedtransport getandset null
+if  transport    null
+disposetransport transport
+catch  exception e
+if  log isdebugenabled
+log debug    e
+dorebalance   false
+resetreconnectdelay
+transport transport   null
+uri uri   null
+// if we have a backup already waiting lets try it.
+synchronized  backupmutex
+if   prioritybackup    backup      backups isempty
+arraylist<backuptransport> l   new arraylist<backuptransport> backups
+if  randomize
+collections shuffle l
+backuptransport bt   l remove 0
+backups remove bt
+transport   bt gettransport
+uri   bt geturi
+if  prioritybackup    prioritybackupavailable
+transport old   this connectedtransport getandset null
+if  transport    null
+disposetransport old
+prioritybackupavailable   false
+// sleep for the reconnectdelay if there's no backup and we aren't trying
+// for the first time, or we were disposed for some reason.
+if  transport    null     firstconnection     reconnectdelay > 0      disposed
+synchronized  sleepmutex
+if  log isdebugenabled
+log debug     reconnectdelay
+try
+sleepmutex wait reconnectdelay
+catch  interruptedexception e
+thread currentthread   interrupt
+iterator<uri> iter   connectlist iterator
+while   transport    null    iter hasnext        connectedtransport get      null     disposed
+try
+sslcontext setcurrentsslcontext brokersslcontext
+// we could be starting with a backup and if so we wait to grab a
+// uri from the pool until next time around.
+if  transport    null
+uri   iter next
+transport   transportfactory compositeconnect uri
+if  log isdebugenabled
+log debug     connectfailures       uri
+transport settransportlistener mytransportlistener
+transport start
+if  started      firstconnection
+restoretransport transport
+if  log isdebugenabled
+log debug
+reconnectdelay   initialreconnectdelay
+connectedtransporturi   uri
+connectedtransport set transport
+reconnectmutex notifyall
+connectfailures   0
+// make sure on initial startup, that the transportlistener
+// has been initialized for this instance.
+synchronized  listenermutex
+if  transportlistener    null
+try
+// if it isn't set after 2secs - it probably never will be
+listenermutex wait 2000
+catch  interruptedexception ex
+if  transportlistener    null
+transportlistener transportresumed
+else
+if  log isdebugenabled
+log debug
+if  firstconnection
+firstconnection   false
+log info     uri
+else
+log info     uri
+connected   true
+return false
+catch  exception e
+failure   e
+if  log isdebugenabled
+log debug     uri       e
+if  transport    null
+try
+transport stop
+transport   null
+catch  exception ee
+if  log isdebugenabled
+log debug     transport
+ee
+finally
+sslcontext setcurrentsslcontext null
+int reconnectlimit   calculatereconnectattemptlimit
+connectfailures
+if  reconnectlimit    infinite    connectfailures >  reconnectlimit
+log error     uris       connectfailures
+connectionfailure   failure
+// make sure on initial startup, that the transportlistener has been
+// initialized for this instance.
+synchronized  listenermutex
+if  transportlistener    null
+try
+listenermutex wait 2000
+catch  interruptedexception ex
+propagatefailuretoexceptionlistener connectionfailure
+return false
+if   disposed
+dodelay
+return  disposed
+private void dodelay
+if  reconnectdelay > 0
+synchronized  sleepmutex
+if  log isdebugenabled
+log debug     reconnectdelay
+try
+sleepmutex wait reconnectdelay
+catch  interruptedexception e
+thread currentthread   interrupt
+if  useexponentialbackoff
+// exponential increment of reconnect delay.
+reconnectdelay    backoffmultiplier
+if  reconnectdelay > maxreconnectdelay
+reconnectdelay   maxreconnectdelay
+private void resetreconnectdelay
+if   useexponentialbackoff    reconnectdelay    default_initial_reconnect_delay
+reconnectdelay   initialreconnectdelay
+/*
+* called with reconnectmutex held
+*/
+private void propagatefailuretoexceptionlistener exception exception
+if  transportlistener    null
+if  exception instanceof ioexception
+transportlistener onexception  ioexception exception
+else
+transportlistener onexception ioexceptionsupport create exception
+reconnectmutex notifyall
+private int calculatereconnectattemptlimit
+int maxreconnectvalue   this maxreconnectattempts
+if  firstconnection    this startupmaxreconnectattempts    infinite
+maxreconnectvalue   this startupmaxreconnectattempts
+return maxreconnectvalue
+final boolean buildbackups
+synchronized  backupmutex
+if   disposed     backup    prioritybackup     backups size   < backuppoolsize
+arraylist<uri> backuplist   new arraylist<uri> prioritylist
+list<uri> connectlist   getconnectlist
+for  uri uri  connectlist
+if   backuplist contains uri
+backuplist add uri
+// removed disposed backups
+list<backuptransport> disposedlist   new arraylist<backuptransport>
+for  backuptransport bt   backups
+if  bt isdisposed
+disposedlist add bt
+backups removeall disposedlist
+disposedlist clear
+for  iterator<uri> iter   backuplist iterator     disposed    iter hasnext      backups size   < backuppoolsize
+uri uri   iter next
+if  connectedtransporturi    null     connectedtransporturi equals uri
+try
+sslcontext setcurrentsslcontext brokersslcontext
+backuptransport bt   new backuptransport this
+bt seturi uri
+if   backups contains bt
+transport t   transportfactory compositeconnect uri
+t settransportlistener bt
+t start
+bt settransport t
+backups add bt
+if  prioritybackup    ispriority uri
+prioritybackupavailable   true
+catch  exception e
+log debug    e
+finally
+sslcontext setcurrentsslcontext null
+return false
+protected boolean ispriority uri uri
+if   prioritylist isempty
+return prioritylist contains uri
+return uris indexof uri     0
+public boolean isdisposed
+return disposed
+public boolean isconnected
+return connected
+public void reconnect uri uri  throws ioexception
+add true  new uri uri
+public boolean isreconnectsupported
+return this reconnectsupported
+public void setreconnectsupported boolean value
+this reconnectsupported   value
+public boolean isupdateurissupported
+return this updateurissupported
+public void setupdateurissupported boolean value
+this updateurissupported   value
+public void updateuris boolean rebalance  uri updateduris  throws ioexception
+if  isupdateurissupported
+hashset<uri> copy   new hashset<uri> this updated
+updated clear
+if  updateduris    null    updateduris length > 0
+for  uri uri   updateduris
+if  uri    null     updated contains uri
+updated add uri
+if    copy isempty      updated isempty        copy equals new hashset<uri> updated
+buildbackups
+synchronized  reconnectmutex
+reconnect rebalance
+/**
+* @return the updateurisurl
+*/
+public string getupdateurisurl
+return this updateurisurl
+/**
+* @param updateurisurl the updateurisurl to set
+*/
+public void setupdateurisurl string updateurisurl
+this updateurisurl   updateurisurl
+/**
+* @return the rebalanceupdateuris
+*/
+public boolean isrebalanceupdateuris
+return this rebalanceupdateuris
+/**
+* @param rebalanceupdateuris the rebalanceupdateuris to set
+*/
+public void setrebalanceupdateuris boolean rebalanceupdateuris
+this rebalanceupdateuris   rebalanceupdateuris
+public int getreceivecounter
+transport transport   connectedtransport get
+if  transport    null
+return 0
+return transport getreceivecounter
+public int getconnectfailures
+return connectfailures
+public void connectioninterruptprocessingcomplete connectionid connectionid
+synchronized  reconnectmutex
+statetracker connectioninterruptprocessingcomplete this  connectionid
+public connectionstatetracker getstatetracker
+return statetracker
+private boolean contains uri newuri
+boolean result   false
+for  uri uri   uris
+if  newuri getport      uri getport
+inetaddress newaddr   null
+inetaddress addr   null
+try
+newaddr   inetaddress getbyname newuri gethost
+addr   inetaddress getbyname uri gethost
+catch ioexception e
+if  newaddr    null
+log error     newuri       e
+else
+log error     uri       e
+if  newuri gethost   equalsignorecase uri gethost
+result   true
+break
+else
+continue
+if  addr equals newaddr
+result   true
+break
+return result
+private inputstreamreader geturlstream string path  throws ioexception
+inputstreamreader result   null
+url url   null
+try
+url   new url path
+result   new inputstreamreader url openstream
+catch  malformedurlexception e
+// ignore - it could be a path to a a local file
+if  result    null
+result   new filereader path
+return result

@@ -1,0 +1,274 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq kaha impl async
+import java io ioexception
+import java io interruptedioexception
+import java io randomaccessfile
+import java util map
+import java util concurrent concurrenthashmap
+import java util concurrent countdownlatch
+import org apache activemq util bytesequence
+import org apache activemq util databytearrayoutputstream
+import org apache activemq util linkednode
+/**
+* an optimized writer to do batch appends to a data file. this object is thread
+* safe and gains throughput as you increase the number of concurrent writes it
+* does.
+*
+* @version $revision: 1.1.1.1 $
+*/
+class datafileappender
+protected static final byte reserved_space   new byte
+protected static final string shutdown_command
+protected final asyncdatamanager datamanager
+protected final map<writekey  writecommand> inflightwrites
+protected final object enqueuemutex   new object
+protected writebatch nextwritebatch
+protected boolean shutdown
+protected ioexception firstasyncexception
+protected final countdownlatch shutdowndone   new countdownlatch 1
+protected int maxwritebatchsize   1024   1024   4
+private boolean running
+private thread thread
+public static class writekey
+private final int file
+private final long offset
+private final int hash
+public writekey location item
+file   item getdatafileid
+offset   item getoffset
+// todo: see if we can build a better hash
+hash    int  file ^ offset
+public int hashcode
+return hash
+public boolean equals object obj
+if  obj instanceof writekey
+writekey di    writekey obj
+return di file    file    di offset    offset
+return false
+public class writebatch
+public final datafile datafile
+public final writecommand first
+public final countdownlatch latch   new countdownlatch 1
+public int size
+public writebatch datafile datafile  writecommand write  throws ioexception
+this datafile   datafile
+this first   write
+size    write location getsize
+public boolean canappend datafile datafile  writecommand write
+if  datafile    this datafile
+return false
+if  size   write location getsize   >  maxwritebatchsize
+return false
+return true
+public void append writecommand write  throws ioexception
+this first gettailnode   linkafter write
+size    write location getsize
+public static class writecommand extends linkednode
+public final location location
+public final bytesequence data
+final boolean sync
+public writecommand location location  bytesequence data  boolean sync
+this location   location
+this data   data
+this sync   sync
+/**
+* construct a store writer
+*
+* @param fileid
+*/
+public datafileappender asyncdatamanager datamanager
+this datamanager   datamanager
+this inflightwrites   this datamanager getinflightwrites
+/**
+* @param type
+* @param marshaller
+* @param payload
+* @param type
+* @param sync
+* @return
+* @throws ioexception
+* @throws
+* @throws
+*/
+public location storeitem bytesequence data  byte type  boolean sync  throws ioexception
+// write the packet our internal buffer.
+int size   data getlength     asyncdatamanager item_head_foot_space
+final location location   new location
+location setsize size
+location settype type
+writebatch batch
+writecommand write   new writecommand location  data  sync
+// locate datafile and enqueue into the executor in sychronized block so
+// that
+// writes get equeued onto the executor in order that they were assigned
+// by
+// the data manager (which is basically just appending)
+synchronized  this
+// find the position where this item will land at.
+datafile datafile   datamanager allocatelocation location
+batch   enqueue datafile  write
+location setlatch batch latch
+if  sync
+try
+batch latch await
+catch  interruptedexception e
+throw new interruptedioexception
+else
+inflightwrites put new writekey location   write
+return location
+private writebatch enqueue datafile datafile  writecommand write  throws ioexception
+synchronized  enqueuemutex
+writebatch rc   null
+if  shutdown
+throw new ioexception
+if  firstasyncexception    null
+throw firstasyncexception
+if   running
+running   true
+thread   new thread
+public void run
+processqueue
+thread setpriority thread max_priority
+thread setdaemon true
+thread setname
+thread start
+if  nextwritebatch    null
+nextwritebatch   new writebatch datafile  write
+rc   nextwritebatch
+enqueuemutex notify
+else
+// append to current batch if possible..
+if  nextwritebatch canappend datafile  write
+nextwritebatch append write
+rc   nextwritebatch
+else
+// otherwise wait for the queuedcommand to be null
+try
+while  nextwritebatch    null
+enqueuemutex wait
+catch  interruptedexception e
+throw new interruptedioexception
+if  shutdown
+throw new ioexception
+// start a new batch.
+nextwritebatch   new writebatch datafile  write
+rc   nextwritebatch
+enqueuemutex notify
+return rc
+public void close   throws ioexception
+synchronized  enqueuemutex
+if   shutdown
+shutdown   true
+if  running
+enqueuemutex notifyall
+else
+shutdowndone countdown
+try
+shutdowndone await
+catch  interruptedexception e
+throw new interruptedioexception
+/**
+* the async processing loop that writes to the data files and does the
+* force calls.
+*
+* since the file sync() call is the slowest of all the operations, this
+* algorithm tries to 'batch' or group together several file sync() requests
+* into a single file sync() call. the batching is accomplished attaching
+* the same countdownlatch instance to every force request in a group.
+*
+*/
+protected void processqueue
+datafile datafile   null
+randomaccessfile file   null
+try
+databytearrayoutputstream buff   new databytearrayoutputstream maxwritebatchsize
+while  true
+object o   null
+// block till we get a command.
+synchronized  enqueuemutex
+while  true
+if  shutdown
+o   shutdown_command
+break
+if  nextwritebatch    null
+o   nextwritebatch
+nextwritebatch   null
+break
+enqueuemutex wait
+enqueuemutex notify
+if  o    shutdown_command
+break
+writebatch wb    writebatch o
+if  datafile    wb datafile
+if  file    null
+datafile closerandomaccessfile file
+datafile   wb datafile
+file   datafile openrandomaccessfile true
+writecommand write   wb first
+// write all the data.
+// only need to seek to first location.. all others
+// are in sequence.
+file seek write location getoffset
+//
+// is it just 1 big write?
+if  wb size    write location getsize
+// just write it directly..
+file writeint write location getsize
+file writebyte write location gettype
+file write reserved_space
+file write asyncdatamanager item_head_sor
+file write write data getdata    write data getoffset    write data getlength
+file write asyncdatamanager item_head_eor
+else
+// combine the smaller writes into 1 big buffer
+while  write    null
+buff writeint write location getsize
+buff writebyte write location gettype
+buff write reserved_space
+buff write asyncdatamanager item_head_sor
+buff write write data getdata    write data getoffset    write data getlength
+buff write asyncdatamanager item_head_eor
+write    writecommand write getnext
+// now do the 1 big write.
+bytesequence sequence   buff tobytesequence
+file write sequence getdata    sequence getoffset    sequence getlength
+buff reset
+file getfd   sync
+writecommand lastwrite    writecommand wb first gettailnode
+datamanager setlastappendlocation lastwrite location
+// signal any waiting threads that the write is on disk.
+wb latch countdown
+// now that the data is on disk, remove the writes from the in
+// flight
+// cache.
+write   wb first
+while  write    null
+if   write sync
+inflightwrites remove new writekey write location
+write    writecommand write getnext
+buff close
+catch  ioexception e
+synchronized  enqueuemutex
+firstasyncexception   e
+catch  interruptedexception e
+finally
+try
+if  file    null
+datafile closerandomaccessfile file
+catch  throwable ignore
+shutdowndone countdown

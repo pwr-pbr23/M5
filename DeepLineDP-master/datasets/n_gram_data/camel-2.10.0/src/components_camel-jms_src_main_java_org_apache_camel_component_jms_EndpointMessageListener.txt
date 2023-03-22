@@ -1,0 +1,298 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache camel component jms
+import javax jms destination
+import javax jms jmsexception
+import javax jms message
+import javax jms messagelistener
+import javax jms session
+import org apache camel asynccallback
+import org apache camel asyncprocessor
+import org apache camel exchange
+import org apache camel exchangepattern
+import org apache camel processor
+import org apache camel rollbackexchangeexception
+import org apache camel runtimecamelexception
+import org apache camel util asyncprocessorconverterhelper
+import org apache camel util asyncprocessorhelper
+import org apache camel util objecthelper
+import org slf4j logger
+import org slf4j loggerfactory
+import org springframework jms core jmsoperations
+import org springframework jms core messagecreator
+import static org apache camel util objecthelper wrapruntimecamelexception
+/**
+* a jms {@link messagelistener} which can be used to delegate processing to a
+* camel endpoint.
+*
+* note that instance of this object has to be thread safe (reentrant)
+*
+* @version
+*/
+public class endpointmessagelistener implements messagelistener
+private static final transient logger log   loggerfactory getlogger endpointmessagelistener class
+private final jmsendpoint endpoint
+private final asyncprocessor processor
+private jmsbinding binding
+private boolean eagerloadingofproperties
+private object replytodestination
+private jmsoperations template
+private boolean disablereplyto
+private boolean async
+public endpointmessagelistener jmsendpoint endpoint  processor processor
+this endpoint   endpoint
+this processor   asyncprocessorconverterhelper convert processor
+public void onmessage final message message
+log trace
+log debug    endpoint  message
+boolean sendreply
+runtimecamelexception rce
+try
+object replydestination   getreplytodestination message
+// we can only send back a reply if there was a reply destination configured
+// and disablereplyto hasn't been explicit enabled
+sendreply   replydestination    null     disablereplyto
+final exchange exchange   createexchange message  replydestination
+if  eagerloadingofproperties
+exchange getin   getheaders
+string correlationid   message getjmscorrelationid
+if  correlationid    null
+log debug    correlationid
+// process the exchange either asynchronously or synchronous
+log trace
+asynccallback callback   new endpointmessagelistenerasynccallback message  exchange  endpoint  sendreply  replydestination
+// async is by default false, which mean we by default will process the exchange synchronously
+// to keep backwards compatible, as well ensure this consumer will pickup messages in order
+// (eg to not consume the next message before the previous has been fully processed)
+// but if end user explicit configure consumerasync=true, then we can process the message
+// asynchronously (unless endpoint has been configured synchronous, or we use transaction)
+boolean forcesync   endpoint issynchronous      endpoint istransacted
+if  forcesync     isasync
+// must process synchronous if transacted or configured to do so
+if  log istraceenabled
+log trace    exchange getexchangeid
+try
+processor process exchange
+catch  exception e
+exchange setexception e
+finally
+callback done true
+else
+// process asynchronous using the async routing engine
+if  log istraceenabled
+log trace    exchange getexchangeid
+boolean sync   asyncprocessorhelper process processor  exchange  callback
+if   sync
+// will be done async so return now
+return
+// if we failed processed the exchange from the async callback task, then grab the exception
+rce   exchange getexception runtimecamelexception class
+catch  exception e
+rce   wrapruntimecamelexception e
+// an exception occurred so rethrow to trigger rollback on jms listener
+// the jms listener will use the error handler to handle the uncaught exception
+if  rce    null
+log trace    rce getmessage
+// spring message listener container will handle uncaught exceptions
+// being thrown from this onmessage, and will us the errorhandler configured
+// on the jmsendpoint to handle the exception
+throw rce
+log trace
+/**
+* callback task that is performed when the exchange has been processed
+*/
+private final class endpointmessagelistenerasynccallback implements asynccallback
+private final message message
+private final exchange exchange
+private final jmsendpoint endpoint
+private final boolean sendreply
+private final object replydestination
+private endpointmessagelistenerasynccallback message message  exchange exchange  jmsendpoint endpoint
+boolean sendreply  object replydestination
+this message   message
+this exchange   exchange
+this endpoint   endpoint
+this sendreply   sendreply
+this replydestination   replydestination
+@override
+public void done boolean donesync
+log trace
+// now we evaluate the processing of the exchange and determine if it was a success or failure
+// we also grab information from the exchange to be used for sending back a reply (if we are to do so)
+// so the following logic seems a bit complicated at first glance
+// if we send back a reply it can either be the message body or transferring a caused exception
+org apache camel message body   null
+exception cause   null
+runtimecamelexception rce   null
+if  exchange isfailed      exchange isrollbackonly
+if  exchange isrollbackonly
+// rollback only so wrap an exception so we can rethrow the exception to cause rollback
+rce   wrapruntimecamelexception new rollbackexchangeexception exchange
+else if  exchange getexception      null
+// an exception occurred while processing
+if  endpoint istransferexception
+// send the exception as reply, so null body and set the exception as the cause
+body   null
+cause   exchange getexception
+else
+// only throw exception if endpoint is not configured to transfer exceptions back to caller
+// do not send a reply but wrap and rethrow the exception
+rce   wrapruntimecamelexception exchange getexception
+else if  exchange hasout      exchange getout   isfault
+// a fault occurred while processing
+body   exchange getout
+cause   null
+else
+// process ok so get the reply body if we are inout and has a body
+if  sendreply    exchange getpattern   isoutcapable      exchange hasout
+body   exchange getout
+cause   null
+// send back reply if there was no error and we are supposed to send back a reply
+if  rce    null    sendreply     body    null    cause    null
+log trace
+if  replydestination instanceof destination
+sendreply  destination replydestination  message  exchange  body  cause
+else
+sendreply  string replydestination  message  exchange  body  cause
+log trace
+// if an exception occurred
+if  rce    null
+if  donesync
+// we were done sync, so put exception on exchange, so we can grab it in the onmessage
+// method and rethrow it
+exchange setexception rce
+else
+// we were done async, so use the endpoint error handler
+if  endpoint geterrorhandler      null
+endpoint geterrorhandler   handleerror rce
+public exchange createexchange message message  object replydestination
+exchange exchange   endpoint createexchange
+jmsbinding binding   getbinding
+exchange setproperty exchange binding  binding
+exchange setin new jmsmessage message  binding
+// lets set to an inout if we have some kind of reply-to destination
+if  replydestination    null     disablereplyto
+// only change pattern if not already out capable
+if   exchange getpattern   isoutcapable
+exchange setpattern exchangepattern inout
+return exchange
+// properties
+// -------------------------------------------------------------------------
+public jmsbinding getbinding
+if  binding    null
+binding   new jmsbinding endpoint
+return binding
+/**
+* sets the binding used to convert from a camel message to and from a jms
+* message
+*
+* @param binding the binding to use
+*/
+public void setbinding jmsbinding binding
+this binding   binding
+public boolean iseagerloadingofproperties
+return eagerloadingofproperties
+public void seteagerloadingofproperties boolean eagerloadingofproperties
+this eagerloadingofproperties   eagerloadingofproperties
+public synchronized jmsoperations gettemplate
+if  template    null
+template   endpoint createinonlytemplate
+return template
+public void settemplate jmsoperations template
+this template   template
+public boolean isdisablereplyto
+return disablereplyto
+/**
+* allows the reply-to behaviour to be disabled
+*/
+public void setdisablereplyto boolean disablereplyto
+this disablereplyto   disablereplyto
+public object getreplytodestination
+return replytodestination
+/**
+* provides an explicit reply to destination which overrides
+* any incoming value of {@link message#getjmsreplyto()}
+*
+* @param replytodestination the destination that should be used to send replies to
+* as either a string or {@link javax.jms.destination} type.
+*/
+public void setreplytodestination object replytodestination
+this replytodestination   replytodestination
+public boolean isasync
+return async
+/**
+* sets whether asynchronous routing is enabled.
+* <p/>
+* by default this is <tt>false</tt>. if configured as <tt>true</tt> then
+* this listener will process the {@link org.apache.camel.exchange} asynchronous.
+*/
+public void setasync boolean async
+this async   async
+// implementation methods
+//-------------------------------------------------------------------------
+/**
+* strategy to determine which correlation id to use among <tt>jmsmessageid</tt> and <tt>jmscorrelationid</tt>.
+*
+* @param message the jms message
+* @return the correlation id to use
+* @throws jmsexception can be thrown
+*/
+protected string determinecorrelationid final message message  throws jmsexception
+final string messageid   message getjmsmessageid
+final string correlationid   message getjmscorrelationid
+if  endpoint getconfiguration   isusemessageidascorrelationid
+return messageid
+else if  objecthelper isempty correlationid
+// correlation id is empty so fallback to message id
+return messageid
+else
+return correlationid
+protected void sendreply destination replydestination  final message message  final exchange exchange
+final org apache camel message out  final exception cause
+if  replydestination    null
+log debug    out
+return
+gettemplate   send replydestination  new messagecreator
+public message createmessage session session  throws jmsexception
+message reply   endpoint getbinding   makejmsmessage exchange  out  session  cause
+final string correlationid   determinecorrelationid message
+reply setjmscorrelationid correlationid
+if  log isdebugenabled
+log debug    new object endpoint  correlationid  reply
+return reply
+protected void sendreply string replydestination  final message message  final exchange exchange
+final org apache camel message out  final exception cause
+if  replydestination    null
+log debug    out
+return
+gettemplate   send replydestination  new messagecreator
+public message createmessage session session  throws jmsexception
+message reply   endpoint getbinding   makejmsmessage exchange  out  session  cause
+final string correlationid   determinecorrelationid message
+reply setjmscorrelationid correlationid
+if  log isdebugenabled
+log debug    new object endpoint  correlationid  reply
+return reply
+protected object getreplytodestination message message  throws jmsexception
+// lets send a response back if we can
+object destination   getreplytodestination
+if  destination    null
+destination   jmsmessagehelper getjmsreplyto message
+return destination
+@override
+public string tostring
+return     endpoint

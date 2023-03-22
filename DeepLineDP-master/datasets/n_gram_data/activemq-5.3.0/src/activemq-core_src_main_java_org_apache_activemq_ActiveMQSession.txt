@@ -1,0 +1,1630 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq
+import org apache activemq blob blobtransferpolicy
+import org apache activemq blob blobuploader
+import org apache activemq command
+import org apache activemq management jmssessionstatsimpl
+import org apache activemq management statscapable
+import org apache activemq management statsimpl
+import org apache activemq thread scheduler
+import org apache activemq transaction synchronization
+import org apache activemq usage memoryusage
+import org apache activemq util callback
+import org apache activemq util longsequencegenerator
+import org apache commons logging log
+import org apache commons logging logfactory
+import javax jms
+import javax jms illegalstateexception
+import javax jms message
+import java io file
+import java io inputstream
+import java io serializable
+import java net url
+import java util collections
+import java util iterator
+import java util list
+import java util concurrent copyonwritearraylist
+import java util concurrent atomic atomicboolean
+import org apache activemq blob blobdownloader
+/**
+* <p>
+* a <code>session</code> object is a single-threaded context for producing
+* and consuming messages. although it may allocate provider resources outside
+* the java virtual machine (jvm), it is considered a lightweight jms object.
+* <p>
+* a session serves several purposes:
+* <ul>
+* <li>it is a factory for its message producers and consumers.
+* <li>it supplies provider-optimized message factories.
+* <li>it is a factory for <code>temporarytopics</code> and
+* <code>temporaryqueues</code>.
+* <li>it provides a way to create <code>queue</code> or <code>topic</code>
+* objects for those clients that need to dynamically manipulate
+* provider-specific destination names.
+* <li>it supports a single series of transactions that combine work spanning
+* its producers and consumers into atomic units.
+* <li>it defines a serial order for the messages it consumes and the messages
+* it produces.
+* <li>it retains messages it consumes until they have been acknowledged.
+* <li>it serializes execution of message listeners registered with its message
+* consumers.
+* <li>it is a factory for <code>queuebrowsers</code>.
+* </ul>
+* <p>
+* a session can create and service multiple message producers and consumers.
+* <p>
+* one typical use is to have a thread block on a synchronous
+* <code>messageconsumer</code> until a message arrives. the thread may then
+* use one or more of the <code>session</code>'s<code>messageproducer</code>s.
+* <p>
+* if a client desires to have one thread produce messages while others consume
+* them, the client should use a separate session for its producing thread.
+* <p>
+* once a connection has been started, any session with one or more registered
+* message listeners is dedicated to the thread of control that delivers
+* messages to it. it is erroneous for client code to use this session or any of
+* its constituent objects from another thread of control. the only exception to
+* this rule is the use of the session or connection <code>close</code>
+* method.
+* <p>
+* it should be easy for most clients to partition their work naturally into
+* sessions. this model allows clients to start simply and incrementally add
+* message processing complexity as their need for concurrency grows.
+* <p>
+* the <code>close</code> method is the only session method that can be called
+* while some other session method is being executed in another thread.
+* <p>
+* a session may be specified as transacted. each transacted session supports a
+* single series of transactions. each transaction groups a set of message sends
+* and a set of message receives into an atomic unit of work. in effect,
+* transactions organize a session's input message stream and output message
+* stream into series of atomic units. when a transaction commits, its atomic
+* unit of input is acknowledged and its associated atomic unit of output is
+* sent. if a transaction rollback is done, the transaction's sent messages are
+* destroyed and the session's input is automatically recovered.
+* <p>
+* the content of a transaction's input and output units is simply those
+* messages that have been produced and consumed within the session's current
+* transaction.
+* <p>
+* a transaction is completed using either its session's <code>commit</code>
+* method or its session's <code>rollback </code> method. the completion of a
+* session's current transaction automatically begins the next. the result is
+* that a transacted session always has a current transaction within which its
+* work is done.
+* <p>
+* the java transaction service (jts) or some other transaction monitor may be
+* used to combine a session's transaction with transactions on other resources
+* (databases, other jms sessions, etc.). since java distributed transactions
+* are controlled via the java transaction api (jta), use of the session's
+* <code>commit</code> and <code>rollback</code> methods in this context is
+* prohibited.
+* <p>
+* the jms api does not require support for jta; however, it does define how a
+* provider supplies this support.
+* <p>
+* although it is also possible for a jms client to handle distributed
+* transactions directly, it is unlikely that many jms clients will do this.
+* support for jta in the jms api is targeted at systems vendors who will be
+* integrating the jms api into their application server products.
+*
+* @version $revision: 1.34 $
+* @see javax.jms.session
+* @see javax.jms.queuesession
+* @see javax.jms.topicsession
+* @see javax.jms.xasession
+*/
+public class activemqsession implements session  queuesession  topicsession  statscapable  activemqdispatcher
+/**
+* only acknowledge an individual message - using message.acknowledge()
+* as opposed to client_acknowledge which
+* acknowledges all messages consumed by a session at when acknowledge()
+* is called
+*/
+public static final int individual_acknowledge   4
+public static final int max_ack_constant   individual_acknowledge
+public static interface deliverylistener
+void beforedelivery activemqsession session  message msg
+void afterdelivery activemqsession session  message msg
+private static final log log   logfactory getlog activemqsession class
+protected static final scheduler scheduler   scheduler getinstance
+protected int acknowledgementmode
+protected final activemqconnection connection
+protected final sessioninfo info
+protected final longsequencegenerator consumeridgenerator   new longsequencegenerator
+protected final longsequencegenerator produceridgenerator   new longsequencegenerator
+protected final longsequencegenerator deliveryidgenerator   new longsequencegenerator
+protected final activemqsessionexecutor executor   new activemqsessionexecutor this
+protected final atomicboolean started   new atomicboolean false
+protected final copyonwritearraylist<activemqmessageconsumer> consumers   new copyonwritearraylist<activemqmessageconsumer>
+protected final copyonwritearraylist<activemqmessageproducer> producers   new copyonwritearraylist<activemqmessageproducer>
+protected boolean closed
+private volatile boolean synchronizationregistered
+protected boolean asyncdispatch
+protected boolean sessionasyncdispatch
+protected final boolean debug
+protected object sendmutex   new object
+private messagelistener messagelistener
+private jmssessionstatsimpl stats
+private transactioncontext transactioncontext
+private deliverylistener deliverylistener
+private messagetransformer transformer
+private blobtransferpolicy blobtransferpolicy
+private long lastdeliveredsequenceid
+/**
+* construct the session
+*
+* @param connection
+* @param sessionid
+* @param acknowledgemode n.b if transacted - the acknowledgemode ==
+*                session.session_transacted
+* @param asyncdispatch
+* @param sessionasyncdispatch
+* @throws jmsexception on internal error
+*/
+protected activemqsession activemqconnection connection  sessionid sessionid  int acknowledgemode  boolean asyncdispatch  boolean sessionasyncdispatch  throws jmsexception
+this debug   log isdebugenabled
+this connection   connection
+this acknowledgementmode   acknowledgemode
+this asyncdispatch   asyncdispatch
+this sessionasyncdispatch   sessionasyncdispatch
+this info   new sessioninfo connection getconnectioninfo    sessionid getvalue
+settransactioncontext new transactioncontext connection
+connection addsession this
+stats   new jmssessionstatsimpl producers  consumers
+this connection asyncsendpacket info
+settransformer connection gettransformer
+setblobtransferpolicy connection getblobtransferpolicy
+if  connection isstarted
+start
+protected activemqsession activemqconnection connection  sessionid sessionid  int acknowledgemode  boolean asyncdispatch  throws jmsexception
+this connection  sessionid  acknowledgemode  asyncdispatch  true
+/**
+* sets the transaction context of the session.
+*
+* @param transactioncontext - provides the means to control a jms
+*                transaction.
+*/
+public void settransactioncontext transactioncontext transactioncontext
+this transactioncontext   transactioncontext
+/**
+* returns the transaction context of the session.
+*
+* @return transactioncontext - session's transaction context.
+*/
+public transactioncontext gettransactioncontext
+return transactioncontext
+/*
+* (non-javadoc)
+*
+* @see org.apache.activemq.management.statscapable#getstats()
+*/
+public statsimpl getstats
+return stats
+/**
+* returns the session's statistics.
+*
+* @return stats - session's statistics.
+*/
+public jmssessionstatsimpl getsessionstats
+return stats
+/**
+* creates a <code>bytesmessage</code> object. a <code>bytesmessage</code>
+* object is used to send a message containing a stream of uninterpreted
+* bytes.
+*
+* @return the an activemqbytesmessage
+* @throws jmsexception if the jms provider fails to create this message due
+*                 to some internal error.
+*/
+public bytesmessage createbytesmessage   throws jmsexception
+activemqbytesmessage message   new activemqbytesmessage
+configuremessage message
+return message
+/**
+* creates a <code>mapmessage</code> object. a <code>mapmessage</code>
+* object is used to send a self-defining set of name-value pairs, where
+* names are <code>string</code> objects and values are primitive values
+* in the java programming language.
+*
+* @return an activemqmapmessage
+* @throws jmsexception if the jms provider fails to create this message due
+*                 to some internal error.
+*/
+public mapmessage createmapmessage   throws jmsexception
+activemqmapmessage message   new activemqmapmessage
+configuremessage message
+return message
+/**
+* creates a <code>message</code> object. the <code>message</code>
+* interface is the root interface of all jms messages. a
+* <code>message</code> object holds all the standard message header
+* information. it can be sent when a message containing only header
+* information is sufficient.
+*
+* @return an activemqmessage
+* @throws jmsexception if the jms provider fails to create this message due
+*                 to some internal error.
+*/
+public message createmessage   throws jmsexception
+activemqmessage message   new activemqmessage
+configuremessage message
+return message
+/**
+* creates an <code>objectmessage</code> object. an
+* <code>objectmessage</code> object is used to send a message that
+* contains a serializable java object.
+*
+* @return an activemqobjectmessage
+* @throws jmsexception if the jms provider fails to create this message due
+*                 to some internal error.
+*/
+public objectmessage createobjectmessage   throws jmsexception
+activemqobjectmessage message   new activemqobjectmessage
+configuremessage message
+return message
+/**
+* creates an initialized <code>objectmessage</code> object. an
+* <code>objectmessage</code> object is used to send a message that
+* contains a serializable java object.
+*
+* @param object the object to use to initialize this message
+* @return an activemqobjectmessage
+* @throws jmsexception if the jms provider fails to create this message due
+*                 to some internal error.
+*/
+public objectmessage createobjectmessage serializable object  throws jmsexception
+activemqobjectmessage message   new activemqobjectmessage
+configuremessage message
+message setobject object
+return message
+/**
+* creates a <code>streammessage</code> object. a
+* <code>streammessage</code> object is used to send a self-defining
+* stream of primitive values in the java programming language.
+*
+* @return an activemqstreammessage
+* @throws jmsexception if the jms provider fails to create this message due
+*                 to some internal error.
+*/
+public streammessage createstreammessage   throws jmsexception
+activemqstreammessage message   new activemqstreammessage
+configuremessage message
+return message
+/**
+* creates a <code>textmessage</code> object. a <code>textmessage</code>
+* object is used to send a message containing a <code>string</code>
+* object.
+*
+* @return an activemqtextmessage
+* @throws jmsexception if the jms provider fails to create this message due
+*                 to some internal error.
+*/
+public textmessage createtextmessage   throws jmsexception
+activemqtextmessage message   new activemqtextmessage
+configuremessage message
+return message
+/**
+* creates an initialized <code>textmessage</code> object. a
+* <code>textmessage</code> object is used to send a message containing a
+* <code>string</code>.
+*
+* @param text the string used to initialize this message
+* @return an activemqtextmessage
+* @throws jmsexception if the jms provider fails to create this message due
+*                 to some internal error.
+*/
+public textmessage createtextmessage string text  throws jmsexception
+activemqtextmessage message   new activemqtextmessage
+message settext text
+configuremessage message
+return message
+/**
+* creates an initialized <code>blobmessage</code> object. a
+* <code>blobmessage</code> object is used to send a message containing a
+* <code>url</code> which points to some network addressible blob.
+*
+* @param url the network addressable url used to pass directly to the
+*                consumer
+* @return a blobmessage
+* @throws jmsexception if the jms provider fails to create this message due
+*                 to some internal error.
+*/
+public blobmessage createblobmessage url url  throws jmsexception
+return createblobmessage url  false
+/**
+* creates an initialized <code>blobmessage</code> object. a
+* <code>blobmessage</code> object is used to send a message containing a
+* <code>url</code> which points to some network addressible blob.
+*
+* @param url the network addressable url used to pass directly to the
+*                consumer
+* @param deletedbybroker indicates whether or not the resource is deleted
+*                by the broker when the message is acknowledged
+* @return a blobmessage
+* @throws jmsexception if the jms provider fails to create this message due
+*                 to some internal error.
+*/
+public blobmessage createblobmessage url url  boolean deletedbybroker  throws jmsexception
+activemqblobmessage message   new activemqblobmessage
+configuremessage message
+message seturl url
+message setdeletedbybroker deletedbybroker
+message setblobdownloader new blobdownloader getblobtransferpolicy
+return message
+/**
+* creates an initialized <code>blobmessage</code> object. a
+* <code>blobmessage</code> object is used to send a message containing
+* the <code>file</code> content. before the message is sent the file
+* conent will be uploaded to the broker or some other remote repository
+* depending on the {@link #getblobtransferpolicy()}.
+*
+* @param file the file to be uploaded to some remote repo (or the broker)
+*                depending on the strategy
+* @return a blobmessage
+* @throws jmsexception if the jms provider fails to create this message due
+*                 to some internal error.
+*/
+public blobmessage createblobmessage file file  throws jmsexception
+activemqblobmessage message   new activemqblobmessage
+configuremessage message
+message setblobuploader new blobuploader getblobtransferpolicy    file
+message setblobdownloader new blobdownloader  getblobtransferpolicy
+message setdeletedbybroker true
+message setname file getname
+return message
+/**
+* creates an initialized <code>blobmessage</code> object. a
+* <code>blobmessage</code> object is used to send a message containing
+* the <code>file</code> content. before the message is sent the file
+* conent will be uploaded to the broker or some other remote repository
+* depending on the {@link #getblobtransferpolicy()}.
+*
+* @param in the stream to be uploaded to some remote repo (or the broker)
+*                depending on the strategy
+* @return a blobmessage
+* @throws jmsexception if the jms provider fails to create this message due
+*                 to some internal error.
+*/
+public blobmessage createblobmessage inputstream in  throws jmsexception
+activemqblobmessage message   new activemqblobmessage
+configuremessage message
+message setblobuploader new blobuploader getblobtransferpolicy    in
+message setblobdownloader new blobdownloader getblobtransferpolicy
+message setdeletedbybroker true
+return message
+/**
+* indicates whether the session is in transacted mode.
+*
+* @return true if the session is in transacted mode
+* @throws jmsexception if there is some internal error.
+*/
+public boolean gettransacted   throws jmsexception
+checkclosed
+return  acknowledgementmode    session session_transacted      transactioncontext isinxatransaction
+/**
+* returns the acknowledgement mode of the session. the acknowledgement mode
+* is set at the time that the session is created. if the session is
+* transacted, the acknowledgement mode is ignored.
+*
+* @return if the session is not transacted, returns the current
+*         acknowledgement mode for the session. if the session is
+*         transacted, returns session_transacted.
+* @throws jmsexception
+* @see javax.jms.connection#createsession(boolean,int)
+* @since 1.1 exception jmsexception if there is some internal error.
+*/
+public int getacknowledgemode   throws jmsexception
+checkclosed
+return this acknowledgementmode
+/**
+* commits all messages done in this transaction and releases any locks
+* currently held.
+*
+* @throws jmsexception if the jms provider fails to commit the transaction
+*                 due to some internal error.
+* @throws transactionrolledbackexception if the transaction is rolled back
+*                 due to some internal error during commit.
+* @throws javax.jms.illegalstateexception if the method is not called by a
+*                 transacted session.
+*/
+public void commit   throws jmsexception
+checkclosed
+if   gettransacted
+throw new javax jms illegalstateexception
+if  log isdebugenabled
+log debug getsessionid         transactioncontext gettransactionid
+transactioncontext commit
+/**
+* rolls back any messages done in this transaction and releases any locks
+* currently held.
+*
+* @throws jmsexception if the jms provider fails to roll back the
+*                 transaction due to some internal error.
+* @throws javax.jms.illegalstateexception if the method is not called by a
+*                 transacted session.
+*/
+public void rollback   throws jmsexception
+checkclosed
+if   gettransacted
+throw new javax jms illegalstateexception
+if  log isdebugenabled
+log debug getsessionid
+transactioncontext rollback
+/**
+* closes the session.
+* <p>
+* since a provider may allocate some resources on behalf of a session
+* outside the jvm, clients should close the resources when they are not
+* needed. relying on garbage collection to eventually reclaim these
+* resources may not be timely enough.
+* <p>
+* there is no need to close the producers and consumers of a closed
+* session.
+* <p>
+* this call will block until a <code>receive</code> call or message
+* listener in progress has completed. a blocked message consumer
+* <code>receive</code> call returns <code>null</code> when this session
+* is closed.
+* <p>
+* closing a transacted session must roll back the transaction in progress.
+* <p>
+* this method is the only <code>session</code> method that can be called
+* concurrently.
+* <p>
+* invoking any other <code>session</code> method on a closed session must
+* throw a <code> jmsexception.illegalstateexception</code>. closing a
+* closed session must <i>not </i> throw an exception.
+*
+* @throws jmsexception if the jms provider fails to close the session due
+*                 to some internal error.
+*/
+public void close   throws jmsexception
+if   closed
+if  gettransactioncontext   isinxatransaction
+if   synchronizationregistered
+synchronizationregistered   true
+gettransactioncontext   addsynchronization new synchronization
+public void aftercommit   throws exception
+doclose
+synchronizationregistered   false
+public void afterrollback   throws exception
+doclose
+synchronizationregistered   false
+else
+doclose
+private void doclose   throws jmsexception
+dispose
+removeinfo removecommand   info createremovecommand
+removecommand setlastdeliveredsequenceid lastdeliveredsequenceid
+connection asyncsendpacket removecommand
+void clearmessagesinprogress
+executor clearmessagesinprogress
+for  iterator<activemqmessageconsumer> iter   consumers iterator    iter hasnext
+activemqmessageconsumer consumer   iter next
+consumer clearmessagesinprogress
+void deliveracks
+for  iterator<activemqmessageconsumer> iter   consumers iterator    iter hasnext
+activemqmessageconsumer consumer   iter next
+consumer deliveracks
+public synchronized void dispose   throws jmsexception
+if   closed
+try
+executor stop
+for  iterator<activemqmessageconsumer> iter   consumers iterator    iter hasnext
+activemqmessageconsumer consumer   iter next
+consumer setfailureerror connection getfirstfailureerror
+consumer dispose
+lastdeliveredsequenceid   math max lastdeliveredsequenceid  consumer getlastdeliveredsequenceid
+consumers clear
+for  iterator<activemqmessageproducer> iter   producers iterator    iter hasnext
+activemqmessageproducer producer   iter next
+producer dispose
+producers clear
+try
+if  gettransactioncontext   isinlocaltransaction
+rollback
+catch  jmsexception e
+finally
+connection removesession this
+this transactioncontext   null
+closed   true
+/**
+* checks that the session is not closed then configures the message
+*/
+protected void configuremessage activemqmessage message  throws illegalstateexception
+checkclosed
+message setconnection connection
+/**
+* check if the session is closed. it is used for ensuring that the session
+* is open before performing various operations.
+*
+* @throws illegalstateexception if the session is closed
+*/
+protected void checkclosed   throws illegalstateexception
+if  closed
+throw new illegalstateexception
+/**
+* stops message delivery in this session, and restarts message delivery
+* with the oldest unacknowledged message.
+* <p>
+* all consumers deliver messages in a serial order. acknowledging a
+* received message automatically acknowledges all messages that have been
+* delivered to the client.
+* <p>
+* restarting a session causes it to take the following actions:
+* <ul>
+* <li>stop message delivery
+* <li>mark all messages that might have been delivered but not
+* acknowledged as "redelivered"
+* <li>restart the delivery sequence including all unacknowledged messages
+* that had been previously delivered. redelivered messages do not have to
+* be delivered in exactly their original delivery order.
+* </ul>
+*
+* @throws jmsexception if the jms provider fails to stop and restart
+*                 message delivery due to some internal error.
+* @throws illegalstateexception if the method is called by a transacted
+*                 session.
+*/
+public void recover   throws jmsexception
+checkclosed
+if  gettransacted
+throw new illegalstateexception
+for  iterator<activemqmessageconsumer> iter   consumers iterator    iter hasnext
+activemqmessageconsumer c   iter next
+c rollback
+/**
+* returns the session's distinguished message listener (optional).
+*
+* @return the message listener associated with this session
+* @throws jmsexception if the jms provider fails to get the message
+*                 listener due to an internal error.
+* @see javax.jms.session#setmessagelistener(javax.jms.messagelistener)
+* @see javax.jms.serversessionpool
+* @see javax.jms.serversession
+*/
+public messagelistener getmessagelistener   throws jmsexception
+checkclosed
+return this messagelistener
+/**
+* sets the session's distinguished message listener (optional).
+* <p>
+* when the distinguished message listener is set, no other form of message
+* receipt in the session can be used; however, all forms of sending
+* messages are still supported.
+* <p>
+* this is an expert facility not used by regular jms clients.
+*
+* @param listener the message listener to associate with this session
+* @throws jmsexception if the jms provider fails to set the message
+*                 listener due to an internal error.
+* @see javax.jms.session#getmessagelistener()
+* @see javax.jms.serversessionpool
+* @see javax.jms.serversession
+*/
+public void setmessagelistener messagelistener listener  throws jmsexception
+checkclosed
+this messagelistener   listener
+if  listener    null
+executor setdispatchedbysessionpool true
+/**
+* optional operation, intended to be used only by application servers, not
+* by ordinary jms clients.
+*
+* @see javax.jms.serversession
+*/
+public void run
+messagedispatch messagedispatch
+while   messagedispatch   executor dequeuenowait       null
+final messagedispatch md   messagedispatch
+activemqmessage message    activemqmessage md getmessage
+if  message isexpired      connection isduplicate activemqsession this  message
+// todo: ack it without delivery to client
+continue
+if  isclientacknowledge    isindividualacknowledge
+message setacknowledgecallback new callback
+public void execute   throws exception
+if  deliverylistener    null
+deliverylistener beforedelivery this  message
+md setdeliverysequenceid getnextdeliveryid
+try
+messagelistener onmessage message
+catch  runtimeexception e
+log error    e
+// a problem while invoking the messagelistener does not
+// in general indicate a problem with the connection to the broker, i.e.
+// it will usually be sufficient to let the afterdelivery() method either
+// commit or roll back in order to deal with the exception.
+// however, we notify any registered client internal exception listener
+// of the problem.
+connection onclientinternalexception e
+try
+messageack ack   new messageack md  messageack standard_ack_type  1
+ack setfirstmessageid md getmessage   getmessageid
+dostarttransaction
+ack settransactionid gettransactioncontext   gettransactionid
+if  ack gettransactionid      null
+gettransactioncontext   addsynchronization new synchronization
+public void afterrollback   throws exception
+md getmessage   onmessagerolledback
+// ensure we don't filter this as a duplicate
+connection rollbackduplicate activemqsession this  md getmessage
+redeliverypolicy redeliverypolicy   connection getredeliverypolicy
+int redeliverycounter   md getmessage   getredeliverycounter
+if  redeliverypolicy getmaximumredeliveries      redeliverypolicy no_maximum_redeliveries
+redeliverycounter > redeliverypolicy getmaximumredeliveries
+// we need to nack the messages so that they get
+// sent to the
+// dlq.
+// acknowledge the last message.
+messageack ack   new messageack md  messageack posion_ack_type  1
+ack setfirstmessageid md getmessage   getmessageid
+asyncsendpacket ack
+else
+messageack ack   new messageack md  messageack redelivered_ack_type  1
+ack setfirstmessageid md getmessage   getmessageid
+asyncsendpacket ack
+// figure out how long we should wait to resend
+// this message.
+long redeliverydelay   0
+for  int i   0  i < redeliverycounter  i
+redeliverydelay   redeliverypolicy getredeliverydelay redeliverydelay
+scheduler executeafterdelay new runnable
+public void run
+activemqdispatcher md getconsumer    dispatch md
+redeliverydelay
+asyncsendpacket ack
+catch  throwable e
+connection onclientinternalexception e
+if  deliverylistener    null
+deliverylistener afterdelivery this  message
+/**
+* creates a <code>messageproducer</code> to send messages to the
+* specified destination.
+* <p>
+* a client uses a <code>messageproducer</code> object to send messages to
+* a destination. since <code>queue </code> and <code>topic</code> both
+* inherit from <code>destination</code>, they can be used in the
+* destination parameter to create a <code>messageproducer</code> object.
+*
+* @param destination the <code>destination</code> to send to, or null if
+*                this is a producer which does not have a specified
+*                destination.
+* @return the messageproducer
+* @throws jmsexception if the session fails to create a messageproducer due
+*                 to some internal error.
+* @throws invaliddestinationexception if an invalid destination is
+*                 specified.
+* @since 1.1
+*/
+public messageproducer createproducer destination destination  throws jmsexception
+checkclosed
+if  destination instanceof customdestination
+customdestination customdestination    customdestination destination
+return customdestination createproducer this
+int timesendout   connection getsendtimeout
+return new activemqmessageproducer this  getnextproducerid    activemqmessagetransformation transformdestination destination  timesendout
+/**
+* creates a <code>messageconsumer</code> for the specified destination.
+* since <code>queue</code> and <code> topic</code> both inherit from
+* <code>destination</code>, they can be used in the destination
+* parameter to create a <code>messageconsumer</code>.
+*
+* @param destination the <code>destination</code> to access.
+* @return the messageconsumer
+* @throws jmsexception if the session fails to create a consumer due to
+*                 some internal error.
+* @throws invaliddestinationexception if an invalid destination is
+*                 specified.
+* @since 1.1
+*/
+public messageconsumer createconsumer destination destination  throws jmsexception
+return createconsumer destination   string  null
+/**
+* creates a <code>messageconsumer</code> for the specified destination,
+* using a message selector. since <code> queue</code> and
+* <code>topic</code> both inherit from <code>destination</code>, they
+* can be used in the destination parameter to create a
+* <code>messageconsumer</code>.
+* <p>
+* a client uses a <code>messageconsumer</code> object to receive messages
+* that have been sent to a destination.
+*
+* @param destination the <code>destination</code> to access
+* @param messageselector only messages with properties matching the message
+*                selector expression are delivered. a value of null or an
+*                empty string indicates that there is no message selector
+*                for the message consumer.
+* @return the messageconsumer
+* @throws jmsexception if the session fails to create a messageconsumer due
+*                 to some internal error.
+* @throws invaliddestinationexception if an invalid destination is
+*                 specified.
+* @throws invalidselectorexception if the message selector is invalid.
+* @since 1.1
+*/
+public messageconsumer createconsumer destination destination  string messageselector  throws jmsexception
+return createconsumer destination  messageselector  false
+/**
+* creates a <code>messageconsumer</code> for the specified destination.
+* since <code>queue</code> and <code> topic</code> both inherit from
+* <code>destination</code>, they can be used in the destination
+* parameter to create a <code>messageconsumer</code>.
+*
+* @param destination the <code>destination</code> to access.
+* @param messagelistener the listener to use for async consumption of messages
+* @return the messageconsumer
+* @throws jmsexception if the session fails to create a consumer due to
+*                 some internal error.
+* @throws invaliddestinationexception if an invalid destination is
+*                 specified.
+* @since 1.1
+*/
+public messageconsumer createconsumer destination destination  messagelistener messagelistener  throws jmsexception
+return createconsumer destination  null  messagelistener
+/**
+* creates a <code>messageconsumer</code> for the specified destination,
+* using a message selector. since <code> queue</code> and
+* <code>topic</code> both inherit from <code>destination</code>, they
+* can be used in the destination parameter to create a
+* <code>messageconsumer</code>.
+* <p>
+* a client uses a <code>messageconsumer</code> object to receive messages
+* that have been sent to a destination.
+*
+* @param destination the <code>destination</code> to access
+* @param messageselector only messages with properties matching the message
+*                selector expression are delivered. a value of null or an
+*                empty string indicates that there is no message selector
+*                for the message consumer.
+* @param messagelistener the listener to use for async consumption of messages
+* @return the messageconsumer
+* @throws jmsexception if the session fails to create a messageconsumer due
+*                 to some internal error.
+* @throws invaliddestinationexception if an invalid destination is
+*                 specified.
+* @throws invalidselectorexception if the message selector is invalid.
+* @since 1.1
+*/
+public messageconsumer createconsumer destination destination  string messageselector  messagelistener messagelistener  throws jmsexception
+return createconsumer destination  messageselector  false  messagelistener
+/**
+* creates <code>messageconsumer</code> for the specified destination,
+* using a message selector. this method can specify whether messages
+* published by its own connection should be delivered to it, if the
+* destination is a topic.
+* <p>
+* since <code>queue</code> and <code>topic</code> both inherit from
+* <code>destination</code>, they can be used in the destination
+* parameter to create a <code>messageconsumer</code>.
+* <p>
+* a client uses a <code>messageconsumer</code> object to receive messages
+* that have been published to a destination.
+* <p>
+* in some cases, a connection may both publish and subscribe to a topic.
+* the consumer <code>nolocal</code> attribute allows a consumer to
+* inhibit the delivery of messages published by its own connection. the
+* default value for this attribute is false. the <code>nolocal</code>
+* value must be supported by destinations that are topics.
+*
+* @param destination the <code>destination</code> to access
+* @param messageselector only messages with properties matching the message
+*                selector expression are delivered. a value of null or an
+*                empty string indicates that there is no message selector
+*                for the message consumer.
+* @param nolocal - if true, and the destination is a topic, inhibits the
+*                delivery of messages published by its own connection. the
+*                behavior for <code>nolocal</code> is not specified if
+*                the destination is a queue.
+* @return the messageconsumer
+* @throws jmsexception if the session fails to create a messageconsumer due
+*                 to some internal error.
+* @throws invaliddestinationexception if an invalid destination is
+*                 specified.
+* @throws invalidselectorexception if the message selector is invalid.
+* @since 1.1
+*/
+public messageconsumer createconsumer destination destination  string messageselector  boolean nolocal  throws jmsexception
+return createconsumer destination  messageselector  nolocal  null
+/**
+* creates <code>messageconsumer</code> for the specified destination,
+* using a message selector. this method can specify whether messages
+* published by its own connection should be delivered to it, if the
+* destination is a topic.
+* <p>
+* since <code>queue</code> and <code>topic</code> both inherit from
+* <code>destination</code>, they can be used in the destination
+* parameter to create a <code>messageconsumer</code>.
+* <p>
+* a client uses a <code>messageconsumer</code> object to receive messages
+* that have been published to a destination.
+* <p>
+* in some cases, a connection may both publish and subscribe to a topic.
+* the consumer <code>nolocal</code> attribute allows a consumer to
+* inhibit the delivery of messages published by its own connection. the
+* default value for this attribute is false. the <code>nolocal</code>
+* value must be supported by destinations that are topics.
+*
+* @param destination the <code>destination</code> to access
+* @param messageselector only messages with properties matching the message
+*                selector expression are delivered. a value of null or an
+*                empty string indicates that there is no message selector
+*                for the message consumer.
+* @param nolocal - if true, and the destination is a topic, inhibits the
+*                delivery of messages published by its own connection. the
+*                behavior for <code>nolocal</code> is not specified if
+*                the destination is a queue.
+* @param messagelistener the listener to use for async consumption of messages
+* @return the messageconsumer
+* @throws jmsexception if the session fails to create a messageconsumer due
+*                 to some internal error.
+* @throws invaliddestinationexception if an invalid destination is
+*                 specified.
+* @throws invalidselectorexception if the message selector is invalid.
+* @since 1.1
+*/
+public messageconsumer createconsumer destination destination  string messageselector  boolean nolocal  messagelistener messagelistener  throws jmsexception
+checkclosed
+if  destination instanceof customdestination
+customdestination customdestination    customdestination destination
+return customdestination createconsumer this  messageselector  nolocal
+activemqprefetchpolicy prefetchpolicy   connection getprefetchpolicy
+int prefetch   0
+if  destination instanceof topic
+prefetch   prefetchpolicy gettopicprefetch
+else
+prefetch   prefetchpolicy getqueueprefetch
+activemqdestination activemqdestination   activemqmessagetransformation transformdestination destination
+return new activemqmessageconsumer this  getnextconsumerid    activemqdestination  null  messageselector
+prefetch  prefetchpolicy getmaximumpendingmessagelimit    nolocal  false  isasyncdispatch    messagelistener
+/**
+* creates a queue identity given a <code>queue</code> name.
+* <p>
+* this facility is provided for the rare cases where clients need to
+* dynamically manipulate queue identity. it allows the creation of a queue
+* identity with a provider-specific name. clients that depend on this
+* ability are not portable.
+* <p>
+* note that this method is not for creating the physical queue. the
+* physical creation of queues is an administrative task and is not to be
+* initiated by the jms api. the one exception is the creation of temporary
+* queues, which is accomplished with the <code>createtemporaryqueue</code>
+* method.
+*
+* @param queuename the name of this <code>queue</code>
+* @return a <code>queue</code> with the given name
+* @throws jmsexception if the session fails to create a queue due to some
+*                 internal error.
+* @since 1.1
+*/
+public queue createqueue string queuename  throws jmsexception
+checkclosed
+if  queuename startswith activemqdestination temp_destination_name_prefix
+return new activemqtempqueue queuename
+return new activemqqueue queuename
+/**
+* creates a topic identity given a <code>topic</code> name.
+* <p>
+* this facility is provided for the rare cases where clients need to
+* dynamically manipulate topic identity. this allows the creation of a
+* topic identity with a provider-specific name. clients that depend on this
+* ability are not portable.
+* <p>
+* note that this method is not for creating the physical topic. the
+* physical creation of topics is an administrative task and is not to be
+* initiated by the jms api. the one exception is the creation of temporary
+* topics, which is accomplished with the <code>createtemporarytopic</code>
+* method.
+*
+* @param topicname the name of this <code>topic</code>
+* @return a <code>topic</code> with the given name
+* @throws jmsexception if the session fails to create a topic due to some
+*                 internal error.
+* @since 1.1
+*/
+public topic createtopic string topicname  throws jmsexception
+checkclosed
+if  topicname startswith activemqdestination temp_destination_name_prefix
+return new activemqtemptopic topicname
+return new activemqtopic topicname
+/**
+* creates a <code>queuebrowser</code> object to peek at the messages on
+* the specified queue.
+*
+* @param queue the <code>queue</code> to access
+* @exception invaliddestinationexception if an invalid destination is
+*                    specified
+* @since 1.1
+*/
+/**
+* creates a durable subscriber to the specified topic.
+* <p>
+* if a client needs to receive all the messages published on a topic,
+* including the ones published while the subscriber is inactive, it uses a
+* durable <code>topicsubscriber</code>. the jms provider retains a
+* record of this durable subscription and insures that all messages from
+* the topic's publishers are retained until they are acknowledged by this
+* durable subscriber or they have expired.
+* <p>
+* sessions with durable subscribers must always provide the same client
+* identifier. in addition, each client must specify a name that uniquely
+* identifies (within client identifier) each durable subscription it
+* creates. only one session at a time can have a
+* <code>topicsubscriber</code> for a particular durable subscription.
+* <p>
+* a client can change an existing durable subscription by creating a
+* durable <code>topicsubscriber</code> with the same name and a new topic
+* and/or message selector. changing a durable subscriber is equivalent to
+* unsubscribing (deleting) the old one and creating a new one.
+* <p>
+* in some cases, a connection may both publish and subscribe to a topic.
+* the subscriber <code>nolocal</code> attribute allows a subscriber to
+* inhibit the delivery of messages published by its own connection. the
+* default value for this attribute is false.
+*
+* @param topic the non-temporary <code>topic</code> to subscribe to
+* @param name the name used to identify this subscription
+* @return the topicsubscriber
+* @throws jmsexception if the session fails to create a subscriber due to
+*                 some internal error.
+* @throws invaliddestinationexception if an invalid topic is specified.
+* @since 1.1
+*/
+public topicsubscriber createdurablesubscriber topic topic  string name  throws jmsexception
+checkclosed
+return createdurablesubscriber topic  name  null  false
+/**
+* creates a durable subscriber to the specified topic, using a message
+* selector and specifying whether messages published by its own connection
+* should be delivered to it.
+* <p>
+* if a client needs to receive all the messages published on a topic,
+* including the ones published while the subscriber is inactive, it uses a
+* durable <code>topicsubscriber</code>. the jms provider retains a
+* record of this durable subscription and insures that all messages from
+* the topic's publishers are retained until they are acknowledged by this
+* durable subscriber or they have expired.
+* <p>
+* sessions with durable subscribers must always provide the same client
+* identifier. in addition, each client must specify a name which uniquely
+* identifies (within client identifier) each durable subscription it
+* creates. only one session at a time can have a
+* <code>topicsubscriber</code> for a particular durable subscription. an
+* inactive durable subscriber is one that exists but does not currently
+* have a message consumer associated with it.
+* <p>
+* a client can change an existing durable subscription by creating a
+* durable <code>topicsubscriber</code> with the same name and a new topic
+* and/or message selector. changing a durable subscriber is equivalent to
+* unsubscribing (deleting) the old one and creating a new one.
+*
+* @param topic the non-temporary <code>topic</code> to subscribe to
+* @param name the name used to identify this subscription
+* @param messageselector only messages with properties matching the message
+*                selector expression are delivered. a value of null or an
+*                empty string indicates that there is no message selector
+*                for the message consumer.
+* @param nolocal if set, inhibits the delivery of messages published by its
+*                own connection
+* @return the queue browser
+* @throws jmsexception if the session fails to create a subscriber due to
+*                 some internal error.
+* @throws invaliddestinationexception if an invalid topic is specified.
+* @throws invalidselectorexception if the message selector is invalid.
+* @since 1.1
+*/
+public topicsubscriber createdurablesubscriber topic topic  string name  string messageselector  boolean nolocal  throws jmsexception
+checkclosed
+if  topic instanceof customdestination
+customdestination customdestination    customdestination topic
+return customdestination createdurablesubscriber this  name  messageselector  nolocal
+connection checkclientidwasmanuallyspecified
+activemqprefetchpolicy prefetchpolicy   this connection getprefetchpolicy
+int prefetch   isautoacknowledge      connection isoptimizedmessagedispatch   ? prefetchpolicy getoptimizedurabletopicprefetch     prefetchpolicy getdurabletopicprefetch
+int maxprendinglimit   prefetchpolicy getmaximumpendingmessagelimit
+return new activemqtopicsubscriber this  getnextconsumerid    activemqmessagetransformation transformdestination topic   name  messageselector  prefetch  maxprendinglimit
+nolocal  false  asyncdispatch
+/**
+* creates a <code>queuebrowser</code> object to peek at the messages on
+* the specified queue.
+*
+* @param queue the <code>queue</code> to access
+* @return the queue browser
+* @throws jmsexception if the session fails to create a browser due to some
+*                 internal error.
+* @throws invaliddestinationexception if an invalid destination is
+*                 specified
+* @since 1.1
+*/
+public queuebrowser createbrowser queue queue  throws jmsexception
+checkclosed
+return createbrowser queue  null
+/**
+* creates a <code>queuebrowser</code> object to peek at the messages on
+* the specified queue using a message selector.
+*
+* @param queue the <code>queue</code> to access
+* @param messageselector only messages with properties matching the message
+*                selector expression are delivered. a value of null or an
+*                empty string indicates that there is no message selector
+*                for the message consumer.
+* @return the queue browser
+* @throws jmsexception if the session fails to create a browser due to some
+*                 internal error.
+* @throws invaliddestinationexception if an invalid destination is
+*                 specified
+* @throws invalidselectorexception if the message selector is invalid.
+* @since 1.1
+*/
+public queuebrowser createbrowser queue queue  string messageselector  throws jmsexception
+checkclosed
+return new activemqqueuebrowser this  getnextconsumerid    activemqmessagetransformation transformdestination queue   messageselector  asyncdispatch
+/**
+* creates a <code>temporaryqueue</code> object. its lifetime will be that
+* of the <code>connection</code> unless it is deleted earlier.
+*
+* @return a temporary queue identity
+* @throws jmsexception if the session fails to create a temporary queue due
+*                 to some internal error.
+* @since 1.1
+*/
+public temporaryqueue createtemporaryqueue   throws jmsexception
+checkclosed
+return  temporaryqueue connection createtempdestination false
+/**
+* creates a <code>temporarytopic</code> object. its lifetime will be that
+* of the <code>connection</code> unless it is deleted earlier.
+*
+* @return a temporary topic identity
+* @throws jmsexception if the session fails to create a temporary topic due
+*                 to some internal error.
+* @since 1.1
+*/
+public temporarytopic createtemporarytopic   throws jmsexception
+checkclosed
+return  temporarytopic connection createtempdestination true
+/**
+* creates a <code>queuereceiver</code> object to receive messages from
+* the specified queue.
+*
+* @param queue the <code>queue</code> to access
+* @return
+* @throws jmsexception if the session fails to create a receiver due to
+*                 some internal error.
+* @throws jmsexception
+* @throws invaliddestinationexception if an invalid queue is specified.
+*/
+public queuereceiver createreceiver queue queue  throws jmsexception
+checkclosed
+return createreceiver queue  null
+/**
+* creates a <code>queuereceiver</code> object to receive messages from
+* the specified queue using a message selector.
+*
+* @param queue the <code>queue</code> to access
+* @param messageselector only messages with properties matching the message
+*                selector expression are delivered. a value of null or an
+*                empty string indicates that there is no message selector
+*                for the message consumer.
+* @return queuereceiver
+* @throws jmsexception if the session fails to create a receiver due to
+*                 some internal error.
+* @throws invaliddestinationexception if an invalid queue is specified.
+* @throws invalidselectorexception if the message selector is invalid.
+*/
+public queuereceiver createreceiver queue queue  string messageselector  throws jmsexception
+checkclosed
+if  queue instanceof customdestination
+customdestination customdestination    customdestination queue
+return customdestination createreceiver this  messageselector
+activemqprefetchpolicy prefetchpolicy   this connection getprefetchpolicy
+return new activemqqueuereceiver this  getnextconsumerid    activemqmessagetransformation transformdestination queue   messageselector  prefetchpolicy getqueueprefetch
+prefetchpolicy getmaximumpendingmessagelimit    asyncdispatch
+/**
+* creates a <code>queuesender</code> object to send messages to the
+* specified queue.
+*
+* @param queue the <code>queue</code> to access, or null if this is an
+*                unidentified producer
+* @return queuesender
+* @throws jmsexception if the session fails to create a sender due to some
+*                 internal error.
+* @throws invaliddestinationexception if an invalid queue is specified.
+*/
+public queuesender createsender queue queue  throws jmsexception
+checkclosed
+if  queue instanceof customdestination
+customdestination customdestination    customdestination queue
+return customdestination createsender this
+int timesendout   connection getsendtimeout
+return new activemqqueuesender this  activemqmessagetransformation transformdestination queue  timesendout
+/**
+* creates a nondurable subscriber to the specified topic. <p/>
+* <p>
+* a client uses a <code>topicsubscriber</code> object to receive messages
+* that have been published to a topic. <p/>
+* <p>
+* regular <code>topicsubscriber</code> objects are not durable. they
+* receive only messages that are published while they are active. <p/>
+* <p>
+* in some cases, a connection may both publish and subscribe to a topic.
+* the subscriber <code>nolocal</code> attribute allows a subscriber to
+* inhibit the delivery of messages published by its own connection. the
+* default value for this attribute is false.
+*
+* @param topic the <code>topic</code> to subscribe to
+* @return topicsubscriber
+* @throws jmsexception if the session fails to create a subscriber due to
+*                 some internal error.
+* @throws invaliddestinationexception if an invalid topic is specified.
+*/
+public topicsubscriber createsubscriber topic topic  throws jmsexception
+checkclosed
+return createsubscriber topic  null  false
+/**
+* creates a nondurable subscriber to the specified topic, using a message
+* selector or specifying whether messages published by its own connection
+* should be delivered to it. <p/>
+* <p>
+* a client uses a <code>topicsubscriber</code> object to receive messages
+* that have been published to a topic. <p/>
+* <p>
+* regular <code>topicsubscriber</code> objects are not durable. they
+* receive only messages that are published while they are active. <p/>
+* <p>
+* messages filtered out by a subscriber's message selector will never be
+* delivered to the subscriber. from the subscriber's perspective, they do
+* not exist. <p/>
+* <p>
+* in some cases, a connection may both publish and subscribe to a topic.
+* the subscriber <code>nolocal</code> attribute allows a subscriber to
+* inhibit the delivery of messages published by its own connection. the
+* default value for this attribute is false.
+*
+* @param topic the <code>topic</code> to subscribe to
+* @param messageselector only messages with properties matching the message
+*                selector expression are delivered. a value of null or an
+*                empty string indicates that there is no message selector
+*                for the message consumer.
+* @param nolocal if set, inhibits the delivery of messages published by its
+*                own connection
+* @return topicsubscriber
+* @throws jmsexception if the session fails to create a subscriber due to
+*                 some internal error.
+* @throws invaliddestinationexception if an invalid topic is specified.
+* @throws invalidselectorexception if the message selector is invalid.
+*/
+public topicsubscriber createsubscriber topic topic  string messageselector  boolean nolocal  throws jmsexception
+checkclosed
+if  topic instanceof customdestination
+customdestination customdestination    customdestination topic
+return customdestination createsubscriber this  messageselector  nolocal
+activemqprefetchpolicy prefetchpolicy   this connection getprefetchpolicy
+return new activemqtopicsubscriber this  getnextconsumerid    activemqmessagetransformation transformdestination topic   null  messageselector  prefetchpolicy
+gettopicprefetch    prefetchpolicy getmaximumpendingmessagelimit    nolocal  false  asyncdispatch
+/**
+* creates a publisher for the specified topic. <p/>
+* <p>
+* a client uses a <code>topicpublisher</code> object to publish messages
+* on a topic. each time a client creates a <code>topicpublisher</code> on
+* a topic, it defines a new sequence of messages that have no ordering
+* relationship with the messages it has previously sent.
+*
+* @param topic the <code>topic</code> to publish to, or null if this is
+*                an unidentified producer
+* @return topicpublisher
+* @throws jmsexception if the session fails to create a publisher due to
+*                 some internal error.
+* @throws invaliddestinationexception if an invalid topic is specified.
+*/
+public topicpublisher createpublisher topic topic  throws jmsexception
+checkclosed
+if  topic instanceof customdestination
+customdestination customdestination    customdestination topic
+return customdestination createpublisher this
+int timesendout   connection getsendtimeout
+return new activemqtopicpublisher this  activemqmessagetransformation transformdestination topic  timesendout
+/**
+* unsubscribes a durable subscription that has been created by a client.
+* <p>
+* this method deletes the state being maintained on behalf of the
+* subscriber by its provider.
+* <p>
+* it is erroneous for a client to delete a durable subscription while there
+* is an active <code>messageconsumer </code> or
+* <code>topicsubscriber</code> for the subscription, or while a consumed
+* message is part of a pending transaction or has not been acknowledged in
+* the session.
+*
+* @param name the name used to identify this subscription
+* @throws jmsexception if the session fails to unsubscribe to the durable
+*                 subscription due to some internal error.
+* @throws invaliddestinationexception if an invalid subscription name is
+*                 specified.
+* @since 1.1
+*/
+public void unsubscribe string name  throws jmsexception
+checkclosed
+connection unsubscribe name
+public void dispatch messagedispatch messagedispatch
+try
+executor execute messagedispatch
+catch  interruptedexception e
+thread currentthread   interrupt
+connection onclientinternalexception e
+/**
+* acknowledges all consumed messages of the session of this consumed
+* message.
+* <p>
+* all consumed jms messages support the <code>acknowledge</code> method
+* for use when a client has specified that its jms session's consumed
+* messages are to be explicitly acknowledged. by invoking
+* <code>acknowledge</code> on a consumed message, a client acknowledges
+* all messages consumed by the session that the message was delivered to.
+* <p>
+* calls to <code>acknowledge</code> are ignored for both transacted
+* sessions and sessions specified to use implicit acknowledgement modes.
+* <p>
+* a client may individually acknowledge each message as it is consumed, or
+* it may choose to acknowledge messages as an application-defined group
+* (which is done by calling acknowledge on the last received message of the
+* group, thereby acknowledging all messages consumed by the session.)
+* <p>
+* messages that have been received but not acknowledged may be redelivered.
+*
+* @throws jmsexception if the jms provider fails to acknowledge the
+*                 messages due to some internal error.
+* @throws javax.jms.illegalstateexception if this method is called on a
+*                 closed session.
+* @see javax.jms.session#client_acknowledge
+*/
+public void acknowledge   throws jmsexception
+for  iterator<activemqmessageconsumer> iter   consumers iterator    iter hasnext
+activemqmessageconsumer c   iter next
+c acknowledge
+/**
+* add a message consumer.
+*
+* @param consumer - message consumer.
+* @throws jmsexception
+*/
+protected void addconsumer activemqmessageconsumer consumer  throws jmsexception
+this consumers add consumer
+if  consumer isdurablesubscriber
+stats oncreatedurablesubscriber
+this connection adddispatcher consumer getconsumerid    this
+/**
+* remove the message consumer.
+*
+* @param consumer - consumer to be removed.
+* @throws jmsexception
+*/
+protected void removeconsumer activemqmessageconsumer consumer
+this connection removedispatcher consumer getconsumerid
+if  consumer isdurablesubscriber
+stats onremovedurablesubscriber
+this consumers remove consumer
+this connection removedispatcher consumer
+/**
+* adds a message producer.
+*
+* @param producer - message producer to be added.
+* @throws jmsexception
+*/
+protected void addproducer activemqmessageproducer producer  throws jmsexception
+this producers add producer
+this connection addproducer producer getproducerinfo   getproducerid    producer
+/**
+* removes a message producer.
+*
+* @param producer - message producer to be removed.
+* @throws jmsexception
+*/
+protected void removeproducer activemqmessageproducer producer
+this connection removeproducer producer getproducerinfo   getproducerid
+this producers remove producer
+/**
+* start this session.
+*
+* @throws jmsexception
+*/
+protected void start   throws jmsexception
+started set true
+for  iterator<activemqmessageconsumer> iter   consumers iterator    iter hasnext
+activemqmessageconsumer c   iter next
+c start
+executor start
+/**
+* stops this session.
+*
+* @throws jmsexception
+*/
+protected void stop   throws jmsexception
+for  iterator<activemqmessageconsumer> iter   consumers iterator    iter hasnext
+activemqmessageconsumer c   iter next
+c stop
+started set false
+executor stop
+/**
+* returns the session id.
+*
+* @return value - session id.
+*/
+protected sessionid getsessionid
+return info getsessionid
+/**
+* @return
+*/
+protected consumerid getnextconsumerid
+return new consumerid info getsessionid    consumeridgenerator getnextsequenceid
+/**
+* @return
+*/
+protected producerid getnextproducerid
+return new producerid info getsessionid    produceridgenerator getnextsequenceid
+/**
+* sends the message for dispatch by the broker.
+*
+* @param producer - message producer.
+* @param destination - message destination.
+* @param message - message to be sent.
+* @param deliverymode - jms messsage delivery mode.
+* @param priority - message priority.
+* @param timetolive - message expiration.
+* @param producerwindow
+* @throws jmsexception
+*/
+protected void send activemqmessageproducer producer  activemqdestination destination  message message  int deliverymode  int priority  long timetolive
+memoryusage producerwindow  int sendtimeout  throws jmsexception
+checkclosed
+if  destination istemporary      connection isdeleted destination
+throw new invaliddestinationexception     destination
+synchronized  sendmutex
+// tell the broker we are about to start a new transaction
+dostarttransaction
+transactionid txid   transactioncontext gettransactionid
+long sequencenumber   producer getmessagesequence
+//set the "jms" header fields on the orriginal message, see 1.1 spec section 3.4.11
+message setjmsdestination destination
+message setjmsdeliverymode deliverymode
+long expiration   0l
+if   producer getdisablemessagetimestamp
+long timestamp   system currenttimemillis
+message setjmstimestamp timestamp
+if  timetolive > 0
+expiration   timetolive   timestamp
+message setjmsexpiration expiration
+message setjmspriority priority
+message setjmsredelivered false
+// transform to our own message format here
+activemqmessage msg   activemqmessagetransformation transformmessage message  connection
+// set the message id.
+if  msg    message
+msg setmessageid new messageid producer getproducerinfo   getproducerid    sequencenumber
+else
+msg setmessageid new messageid producer getproducerinfo   getproducerid    sequencenumber
+message setjmsmessageid msg getmessageid   tostring
+//clear the brokerpath in case we are re-sending this message
+msg setbrokerpath null
+msg settransactionid txid
+if  connection iscopymessageonsend
+msg    activemqmessage msg copy
+msg setconnection connection
+msg onsend
+msg setproducerid msg getmessageid   getproducerid
+if  log istraceenabled
+log trace getsessionid         msg
+if  sendtimeout <  0     msg isresponserequired       connection isalwayssyncsend        msg ispersistent      connection isuseasyncsend      txid    null
+this connection asyncsendpacket msg
+if  producerwindow    null
+// since we defer lots of the marshaling till we hit the
+// wire, this might not
+// provide and accurate size. we may change over to doing
+// more aggressive marshaling,
+// to get more accurate sizes.. this is more important once
+// users start using producer window
+// flow control.
+int size   msg getsize
+producerwindow increaseusage size
+else
+if  sendtimeout > 0
+this connection syncsendpacket msg sendtimeout
+else
+this connection syncsendpacket msg
+/**
+* send transactioninfo to indicate transaction has started
+*
+* @throws jmsexception if some internal error occurs
+*/
+protected void dostarttransaction   throws jmsexception
+if  gettransacted       transactioncontext isinxatransaction
+transactioncontext begin
+/**
+* checks whether the session has unconsumed messages.
+*
+* @return true - if there are unconsumed messages.
+*/
+public boolean hasuncomsumedmessages
+return executor hasuncomsumedmessages
+/**
+* checks whether the session uses transactions.
+*
+* @return true - if the session uses transactions.
+*/
+public boolean istransacted
+return this acknowledgementmode    session session_transacted
+/**
+* checks whether the session used client acknowledgment.
+*
+* @return true - if the session uses client acknowledgment.
+*/
+protected boolean isclientacknowledge
+return this acknowledgementmode    session client_acknowledge
+/**
+* checks whether the session used auto acknowledgment.
+*
+* @return true - if the session uses client acknowledgment.
+*/
+public boolean isautoacknowledge
+return acknowledgementmode    session auto_acknowledge
+/**
+* checks whether the session used dup ok acknowledgment.
+*
+* @return true - if the session uses client acknowledgment.
+*/
+public boolean isdupsokacknowledge
+return acknowledgementmode    session dups_ok_acknowledge
+public boolean isindividualacknowledge
+return acknowledgementmode    activemqsession individual_acknowledge
+/**
+* returns the message delivery listener.
+*
+* @return deliverylistener - message delivery listener.
+*/
+public deliverylistener getdeliverylistener
+return deliverylistener
+/**
+* sets the message delivery listener.
+*
+* @param deliverylistener - message delivery listener.
+*/
+public void setdeliverylistener deliverylistener deliverylistener
+this deliverylistener   deliverylistener
+/**
+* returns the sessioninfo bean.
+*
+* @return info - sessioninfo bean.
+* @throws jmsexception
+*/
+protected sessioninfo getsessioninfo   throws jmsexception
+sessioninfo info   new sessioninfo connection getconnectioninfo    getsessionid   getvalue
+return info
+/**
+* send the asynchronus command.
+*
+* @param command - command to be executed.
+* @throws jmsexception
+*/
+public void asyncsendpacket command command  throws jmsexception
+connection asyncsendpacket command
+/**
+* send the synchronus command.
+*
+* @param command - command to be executed.
+* @return response
+* @throws jmsexception
+*/
+public response syncsendpacket command command  throws jmsexception
+return connection syncsendpacket command
+public long getnextdeliveryid
+return deliveryidgenerator getnextsequenceid
+public void redispatch activemqdispatcher dispatcher  messagedispatchchannel unconsumedmessages  throws jmsexception
+list<messagedispatch> c   unconsumedmessages removeall
+for  messagedispatch md   c
+this connection rollbackduplicate dispatcher  md getmessage
+collections reverse c
+for  iterator<messagedispatch> iter   c iterator    iter hasnext
+messagedispatch md   iter next
+executor executefirst md
+public boolean isrunning
+return started get
+public boolean isasyncdispatch
+return asyncdispatch
+public void setasyncdispatch boolean asyncdispatch
+this asyncdispatch   asyncdispatch
+/**
+* @return returns the sessionasyncdispatch.
+*/
+public boolean issessionasyncdispatch
+return sessionasyncdispatch
+/**
+* @param sessionasyncdispatch the sessionasyncdispatch to set.
+*/
+public void setsessionasyncdispatch boolean sessionasyncdispatch
+this sessionasyncdispatch   sessionasyncdispatch
+public messagetransformer gettransformer
+return transformer
+public activemqconnection getconnection
+return connection
+/**
+* sets the transformer used to transform messages before they are sent on
+* to the jms bus or when they are received from the bus but before they are
+* delivered to the jms client
+*/
+public void settransformer messagetransformer transformer
+this transformer   transformer
+public blobtransferpolicy getblobtransferpolicy
+return blobtransferpolicy
+/**
+* sets the policy used to describe how out-of-band blobs (binary large
+* objects) are transferred from producers to brokers to consumers
+*/
+public void setblobtransferpolicy blobtransferpolicy blobtransferpolicy
+this blobtransferpolicy   blobtransferpolicy
+public list getunconsumedmessages
+return executor getunconsumedmessages
+public string tostring
+return     info getsessionid         started get
+public void checkmessagelistener   throws jmsexception
+if  messagelistener    null
+throw new illegalstateexception
+for  iterator<activemqmessageconsumer> i   consumers iterator    i hasnext
+activemqmessageconsumer consumer   i next
+if  consumer getmessagelistener      null
+throw new illegalstateexception
+protected void setoptimizeacknowledge boolean value
+for  iterator<activemqmessageconsumer> iter   consumers iterator    iter hasnext
+activemqmessageconsumer c   iter next
+c setoptimizeacknowledge value
+protected void setprefetchsize consumerid id  int prefetch
+for  iterator<activemqmessageconsumer> iter   consumers iterator    iter hasnext
+activemqmessageconsumer c   iter next
+if  c getconsumerid   equals id
+c setprefetchsize prefetch
+break
+protected void close consumerid id
+for  iterator<activemqmessageconsumer> iter   consumers iterator    iter hasnext
+activemqmessageconsumer c   iter next
+if  c getconsumerid   equals id
+try
+c close
+catch  jmsexception e
+log warn    e
+log warn
+break
+public boolean isinuse activemqtempdestination destination
+for  iterator<activemqmessageconsumer> iter   consumers iterator    iter hasnext
+activemqmessageconsumer c   iter next
+if  c isinuse destination
+return true
+return false
+/**
+* highest sequence id of the last message delivered by this session.
+* passed to the broker in the close command, maintained by dispose()
+* @return lastdeliveredsequenceid
+*/
+public long getlastdeliveredsequenceid
+return lastdeliveredsequenceid
+protected void sendack messageack ack  throws jmsexception
+sendack ack false
+protected void sendack messageack ack  boolean lazy  throws jmsexception
+if  lazy    connection issendacksasync      gettransacted
+asyncsendpacket ack
+else
+syncsendpacket ack

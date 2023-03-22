@@ -1,0 +1,327 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql optimizer ppr
+import java util arraylist
+import java util iterator
+import java util linkedhashmap
+import java util linkedhashset
+import java util list
+import java util map
+import java util set
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop hive common objectpair
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive metastore warehouse
+import org apache hadoop hive metastore api fieldschema
+import org apache hadoop hive metastore api metaexception
+import org apache hadoop hive ql errormsg
+import org apache hadoop hive ql exec exprnodeevaluator
+import org apache hadoop hive ql exec functionregistry
+import org apache hadoop hive ql exec tablescanoperator
+import org apache hadoop hive ql exec utilities
+import org apache hadoop hive ql log perflogger
+import org apache hadoop hive ql metadata hive
+import org apache hadoop hive ql metadata hiveexception
+import org apache hadoop hive ql metadata partition
+import org apache hadoop hive ql metadata table
+import org apache hadoop hive ql optimizer prunerutils
+import org apache hadoop hive ql optimizer transform
+import org apache hadoop hive ql parse parsecontext
+import org apache hadoop hive ql parse prunedpartitionlist
+import org apache hadoop hive ql parse semanticexception
+import org apache hadoop hive ql plan exprnodecolumndesc
+import org apache hadoop hive ql plan exprnodeconstantdesc
+import org apache hadoop hive ql plan exprnodedesc
+import org apache hadoop hive ql plan exprnodegenericfuncdesc
+import org apache hadoop hive ql udf generic genericudf
+import org apache hadoop hive ql udf generic genericudfopand
+import org apache hadoop hive ql udf generic genericudfopor
+import org apache hadoop hive serde2 objectinspector primitiveobjectinspector
+/**
+* the transformation step that does partition pruning.
+*
+*/
+public class partitionpruner implements transform
+// the log
+private static final log log   logfactory
+getlog
+/*
+* (non-javadoc)
+*
+* @see
+* org.apache.hadoop.hive.ql.optimizer.transform#transform(org.apache.hadoop
+* .hive.ql.parse.parsecontext)
+*/
+@override
+public parsecontext transform parsecontext pctx  throws semanticexception
+// create a the context for walking operators
+opwalkerctx opwalkerctx   new opwalkerctx pctx getoptopartpruner
+/* move logic to prunerutils.walkoperatortree() so that it can be reused. */
+prunerutils walkoperatortree pctx  opwalkerctx  opprocfactory getfilterproc
+opprocfactory getdefaultproc
+return pctx
+/**
+* find out whether the condition only contains partitioned columns. note that
+* if the table is not partitioned, the function always returns true.
+* condition.
+*
+* @param tab
+*          the table object
+* @param expr
+*          the pruner expression for the table
+*/
+public static boolean onlycontainspartncols table tab  exprnodedesc expr
+if   tab ispartitioned       expr    null
+return true
+if  expr instanceof exprnodecolumndesc
+string colname     exprnodecolumndesc  expr  getcolumn
+return tab ispartitionkey colname
+// it cannot contain a non-deterministic function
+if   expr instanceof exprnodegenericfuncdesc
+functionregistry isdeterministic   exprnodegenericfuncdesc  expr
+getgenericudf
+return false
+// all columns of the expression must be parttioned columns
+list<exprnodedesc> children   expr getchildren
+if  children    null
+for  int i   0  i < children size    i
+if   onlycontainspartncols tab  children get i
+return false
+return true
+/**
+* get the partition list for the ts operator that satisfies the partition pruner
+* condition.
+*/
+public static prunedpartitionlist prune tablescanoperator ts  parsecontext parsectx
+string alias  throws hiveexception
+return prune parsectx gettoptotable   get ts   parsectx getoptopartpruner   get ts
+parsectx getconf    alias  parsectx getprunedpartitions
+/**
+* get the partition list for the table that satisfies the partition pruner
+* condition.
+*
+* @param tab
+*          the table object for the alias
+* @param prunerexpr
+*          the pruner expression for the alias
+* @param conf
+*          for checking whether "strict" mode is on.
+* @param alias
+*          for generating error message only.
+* @param prunedpartitionsmap
+*          cached result for the table
+* @return the partition list for the table that satisfies the partition
+*         pruner condition.
+* @throws hiveexception
+*/
+private static prunedpartitionlist prune table tab  exprnodedesc prunerexpr
+hiveconf conf  string alias  map<string  prunedpartitionlist> prunedpartitionsmap
+throws hiveexception
+log trace
+log trace     tab getdbname
+log trace     tab gettablename
+log trace     prunerexpr
+string key   tab getdbname         tab gettablename
+if  prunerexpr    null
+key   key   prunerexpr getexprstring
+prunedpartitionlist ret   prunedpartitionsmap get key
+if  ret    null
+return ret
+ret   getpartitionsfromserver tab  prunerexpr  conf  alias
+prunedpartitionsmap put key  ret
+return ret
+/**
+* taking a partition pruning expression, remove the null operands and non-partition columns.
+* the reason why there are null operands is exprprocfactory classes, for example
+* pprcolumnexprprocessor.
+* @param expr original partition pruning expression.
+* @return partition pruning expression that only contains partition columns.
+*/
+static private exprnodedesc compactexpr exprnodedesc expr
+if  expr instanceof exprnodeconstantdesc
+if    exprnodeconstantdesc expr  getvalue      null
+return null
+else
+return expr
+else if  expr instanceof exprnodegenericfuncdesc
+genericudf udf     exprnodegenericfuncdesc expr  getgenericudf
+boolean isand   udf instanceof genericudfopand
+if  isand    udf instanceof genericudfopor
+list<exprnodedesc> children   expr getchildren
+exprnodedesc left   children get 0
+children set 0  compactexpr left
+exprnodedesc right   children get 1
+children set 1  compactexpr right
+// note that one does not simply compact (not-null or null) to not-null.
+// only if we have an "and" is it valid to send one side to metastore.
+if  children get 0     null    children get 1     null
+return null
+else if  children get 0     null
+return isand ? children get 1    null
+else if  children get 1     null
+return isand ? children get 0    null
+return expr
+return expr
+/**
+* see compactexpr. some things in the expr are replaced with nulls for pruner, however
+* the virtual columns are not removed (exprnodecolumndesc cannot tell them apart from
+* partition columns), so we do it here.
+* the expression is only used to prune by partition name, so we have no business with vcs.
+* @param expr original partition pruning expression.
+* @param partcols list of partition columns for the table.
+* @return partition pruning expression that only contains partition columns from the list.
+*/
+static private exprnodedesc removenonpartcols exprnodedesc expr  list<string> partcols
+if  expr instanceof exprnodecolumndesc
+partcols contains   exprnodecolumndesc  expr  getcolumn
+// column doesn't appear to be a partition column for the table.
+return new exprnodeconstantdesc expr gettypeinfo    null
+if  expr instanceof exprnodegenericfuncdesc
+list<exprnodedesc> children   expr getchildren
+for  int i   0  i < children size      i
+children set i  removenonpartcols children get i   partcols
+return expr
+private static prunedpartitionlist getpartitionsfromserver table tab
+exprnodedesc prunerexpr  hiveconf conf  string alias  throws hiveexception
+try
+if   tab ispartitioned
+// if the table is not partitioned, return everything.
+return new prunedpartitionlist tab  hive get   getallpartitionsforpruner tab   false
+log debug     tab gettablename
+if    equalsignorecase hiveconf getvar conf  hiveconf confvars hivemapredmode
+hascolumnexpr prunerexpr
+// if the "strict" mode is on, we have to provide partition pruner for each table.
+throw new semanticexception errormsg no_partition_predicate
+getmsg
+if  prunerexpr    null
+// this can happen when hive.mapred.mode=nonstrict and there is no predicates at all.
+return new prunedpartitionlist tab  hive get   getallpartitionsforpruner tab   false
+// remove virtual columns. see javadoc for details.
+prunerexpr   removenonpartcols prunerexpr  extractpartcolnames tab
+// remove all unknown parts e.g. non-partition columns. see javadoc for details.
+exprnodedesc compactexpr   compactexpr prunerexpr clone
+string oldfilter   prunerexpr getexprstring
+if  compactexpr    null
+// this could happen when hive.mapred.mode=nonstrict and all the predicates
+// are on non-partition columns.
+log debug     oldfilter
+return new prunedpartitionlist tab  hive get   getallpartitionsforpruner tab   true
+set<partition> partitions   new linkedhashset<partition>
+boolean hasunknownpartitions   false
+string message   utilities checkjdopushdown tab  compactexpr  null
+if  message    null
+log info errormsg invalid_jdo_filter_expression getmsg
+message
+hasunknownpartitions   prunebysequentialscan tab  partitions  prunerexpr  conf
+else
+string filter   compactexpr getexprstring
+log debug     filter      oldfilter
+hasunknownpartitions    filter equals oldfilter
+partitions addall hive get   getpartitionsbyfilter tab  filter
+return new prunedpartitionlist tab  partitions  hasunknownpartitions
+catch  hiveexception e
+throw e
+catch  exception e
+throw new hiveexception e
+/**
+* pruning partition by getting the partition names first and pruning using hive expression
+* evaluator.
+* @param tab the table containing the partitions.
+* @param partitions the resulting partitions.
+* @param prunerexpr the sql predicate that involves partition columns.
+* @param conf hive configuration object, can not be null.
+* @return true iff the partition pruning expression contains non-partition columns.
+*/
+static private boolean prunebysequentialscan table tab  set<partition> partitions
+exprnodedesc prunerexpr  hiveconf conf  throws exception
+perflogger perflogger   perflogger getperflogger
+perflogger perflogbegin log  perflogger prune_listing
+list<string> partnames   hive get   getpartitionnames
+tab getdbname    tab gettablename     short   1
+string defaultpartitionname   conf getvar hiveconf confvars defaultpartitionname
+list<string> partcols   extractpartcolnames tab
+boolean hasunknownpartitions   prunepartitionnames
+partcols  prunerexpr  defaultpartitionname  partnames
+perflogger perflogend log  perflogger prune_listing
+perflogger perflogbegin log  perflogger partition_retrieving
+if   partnames isempty
+partitions addall hive get   getpartitionsbynames tab  partnames
+perflogger perflogend log  perflogger partition_retrieving
+return hasunknownpartitions
+private static list<string> extractpartcolnames table tab
+list<fieldschema> pcols   tab getpartcols
+list<string> partcols   new arraylist<string> pcols size
+for  fieldschema pcol   pcols
+partcols add pcol getname
+return partcols
+/**
+* prunes partition names to see if they match the prune expression.
+* @param columnnames name of partition columns
+* @param prunerexpr the expression to match.
+* @param defaultpartitionname name of default partition
+* @param partnames partition names to filter. the list is modified in place.
+* @return whether the list has any partitions for which the expression may or may not match.
+*/
+public static boolean prunepartitionnames list<string> columnnames  exprnodedesc prunerexpr
+string defaultpartitionname  list<string> partnames  throws hiveexception  metaexception
+// prepare the expression to filter on the columns.
+objectpair<primitiveobjectinspector  exprnodeevaluator> handle
+partexprevalutils prepareexpr prunerexpr  columnnames
+// filter the name list.
+list<string> values   new arraylist<string> columnnames size
+boolean hasunknownpartitions   false
+iterator<string> partiter   partnames iterator
+while  partiter hasnext
+string partname   partiter next
+linkedhashmap<string  string> partspec   warehouse makespecfromname partname
+values clear
+values addall partspec values
+// evaluate the expression tree.
+boolean isneeded    boolean partexprevalutils evaluateexpronpart handle  values
+boolean isunknown    isneeded    null
+if   isunknown     isneeded
+partiter remove
+continue
+if  isunknown    values contains defaultpartitionname
+// reject default partitions if we couldn't determine whether we should include it or not.
+// note that predicate would only contains partition column parts of original predicate.
+log debug     partname
+partiter remove
+continue
+hasunknownpartitions    isunknown
+log debug      isunknown ?              partname
+return hasunknownpartitions
+/**
+* whether the expression contains a column node or not.
+*/
+public static boolean hascolumnexpr exprnodedesc desc
+// return false for null
+if  desc    null
+return false
+// return true for exprnodecolumndesc
+if  desc instanceof exprnodecolumndesc
+return true
+// return true in case one of the children is column expr.
+list<exprnodedesc> children   desc getchildren
+if  children    null
+for  int i   0  i < children size    i
+if  hascolumnexpr children get i
+return true
+// return false otherwise
+return false

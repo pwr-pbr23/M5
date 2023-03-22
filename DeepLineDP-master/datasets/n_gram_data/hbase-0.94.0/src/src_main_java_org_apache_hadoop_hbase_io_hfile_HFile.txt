@@ -1,0 +1,552 @@
+/**
+* copyright 2009 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase io hfile
+import java io closeable
+import java io datainput
+import java io ioexception
+import java nio bytebuffer
+import java util arraylist
+import java util collection
+import java util list
+import java util map
+import java util concurrent arrayblockingqueue
+import java util concurrent blockingqueue
+import java util concurrent timeunit
+import java util concurrent atomic atomicinteger
+import java util concurrent atomic atomiclong
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs fsdatainputstream
+import org apache hadoop fs fsdataoutputstream
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop fs pathfilter
+import org apache hadoop hbase hcolumndescriptor
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase keyvalue keycomparator
+import org apache hadoop hbase fs hfilesystem
+import org apache hadoop hbase io hbasemapwritable
+import org apache hadoop hbase io encoding datablockencoding
+import org apache hadoop hbase regionserver metrics schemametrics
+import org apache hadoop hbase regionserver metrics schemametrics schemaaware
+import org apache hadoop hbase util bloomfilterwriter
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util checksumtype
+import org apache hadoop hbase util fsutils
+import org apache hadoop io rawcomparator
+import org apache hadoop io writable
+import com google common base preconditions
+import com google common collect lists
+/**
+* file format for hbase.
+* a file of sorted key/value pairs. both keys and values are byte arrays.
+* <p>
+* the memory footprint of a hfile includes the following (below is taken from the
+* <a
+* href=https://issues.apache.org/jira/browse/hadoop-3315>tfile</a> documentation
+* but applies also to hfile):
+* <ul>
+* <li>some constant overhead of reading or writing a compressed block.
+* <ul>
+* <li>each compressed block requires one compression/decompression codec for
+* i/o.
+* <li>temporary space to buffer the key.
+* <li>temporary space to buffer the value.
+* </ul>
+* <li>hfile index, which is proportional to the total number of data blocks.
+* the total amount of memory needed to hold the index can be estimated as
+* (56+avgkeysize)*numblocks.
+* </ul>
+* suggestions on performance optimization.
+* <ul>
+* <li>minimum block size. we recommend a setting of minimum block size between
+* 8kb to 1mb for general usage. larger block size is preferred if files are
+* primarily for sequential access. however, it would lead to inefficient random
+* access (because there are more data to decompress). smaller blocks are good
+* for random access, but require more memory to hold the block index, and may
+* be slower to create (because we must flush the compressor stream at the
+* conclusion of each data block, which leads to an fs i/o flush). further, due
+* to the internal caching in compression codec, the smallest possible block
+* size would be around 20kb-30kb.
+* <li>the current implementation does not offer true multi-threading for
+* reading. the implementation uses fsdatainputstream seek()+read(), which is
+* shown to be much faster than positioned-read call in single thread mode.
+* however, it also means that if multiple threads attempt to access the same
+* hfile (using multiple scanners) simultaneously, the actual i/o is carried out
+* sequentially even if they access different dfs blocks (reexamine! pread seems
+* to be 10% faster than seek+read in my testing -- stack).
+* <li>compression codec. use "none" if the data is not very compressable (by
+* compressable, i mean a compression ratio at least 2:1). generally, use "lzo"
+* as the starting point for experimenting. "gz" overs slightly better
+* compression ratio over "lzo" but requires 4x cpu to compress and 2x cpu to
+* decompress, comparing to "lzo".
+* </ul>
+*
+* for more on the background behind hfile, see <a
+* href=https://issues.apache.org/jira/browse/hbase-61>hbase-61</a>.
+* <p>
+* file is made of data blocks followed by meta data blocks (if any), a fileinfo
+* block, data block index, meta data block index, and a fixed size trailer
+* which records the offsets at which file changes content type.
+* <pre>&lt;data blocks>&lt;meta blocks>&lt;fileinfo>&lt;data index>&lt;meta index>&lt;trailer></pre>
+* each block has a bit of magic at its start.  block are comprised of
+* key/values.  in data blocks, they are both byte arrays.  metadata blocks are
+* a string key and a byte array value.  an empty file looks like this:
+* <pre>&lt;fileinfo>&lt;trailer></pre>.  that is, there are not data nor meta
+* blocks present.
+* <p>
+* todo: do scanners need to be able to take a start and end row?
+* todo: should blockindex know the name of its file?  should it have a path
+* that points at its file say for the case where an index lives apart from
+* an hfile instance?
+*/
+public class hfile
+static final log log   logfactory getlog hfile class
+/**
+* maximum length of key in hfile.
+*/
+public final static int maximum_key_length   integer max_value
+/**
+* default block size for an hfile.
+*/
+public final static int default_blocksize   64   1024
+/**
+* default compression: none.
+*/
+public final static compression algorithm default_compression_algorithm
+compression algorithm none
+/** minimum supported hfile format version */
+public static final int min_format_version   1
+/** maximum supported hfile format version */
+public static final int max_format_version   2
+/** default compression name: none. */
+public final static string default_compression
+default_compression_algorithm getname
+/**
+* we assume that hfile path ends with
+* root_dir/table_name/region_name/cf_name/hfile, so it has at least this
+* many levels of nesting. this is needed for identifying table and cf name
+* from an hfile path.
+*/
+public final static int min_num_hfile_path_levels   5
+/**
+* the number of bytes per checksum.
+*/
+public static final int default_bytes_per_checksum   16   1024
+public static final checksumtype default_checksum_type   checksumtype crc32
+// for measuring latency of "sequential" reads and writes
+private static final atomicinteger readops   new atomicinteger
+private static final atomiclong readtimenano   new atomiclong
+private static final atomicinteger writeops   new atomicinteger
+private static final atomiclong writetimenano   new atomiclong
+// for measuring latency of pread
+private static final atomicinteger preadops   new atomicinteger
+private static final atomiclong preadtimenano   new atomiclong
+// for measuring number of checksum failures
+static final atomiclong checksumfailures   new atomiclong
+// for getting more detailed stats on fs latencies
+// if, for some reason, the metrics subsystem stops polling for latencies,
+// i don't want data to pile up in a memory leak
+// so, after latency_buffer_size items have been enqueued for processing,
+// fs latency stats will be dropped (and this behavior will be logged)
+private static final int latency_buffer_size   5000
+private static final blockingqueue<long> fsreadlatenciesnanos
+new arrayblockingqueue<long> latency_buffer_size
+private static final blockingqueue<long> fswritelatenciesnanos
+new arrayblockingqueue<long> latency_buffer_size
+private static final blockingqueue<long> fspreadlatenciesnanos
+new arrayblockingqueue<long> latency_buffer_size
+public static final void offerreadlatency long latencynanos  boolean pread
+if  pread
+fspreadlatenciesnanos offer latencynanos      might be silently dropped  if the queue is full
+preadops incrementandget
+preadtimenano addandget latencynanos
+else
+fsreadlatenciesnanos offer latencynanos      might be silently dropped  if the queue is full
+readtimenano addandget latencynanos
+readops incrementandget
+public static final void offerwritelatency long latencynanos
+fswritelatenciesnanos offer latencynanos      might be silently dropped  if the queue is full
+writetimenano addandget latencynanos
+writeops incrementandget
+public static final collection<long> getreadlatenciesnanos
+final list<long> latencies
+lists newarraylistwithcapacity fsreadlatenciesnanos size
+fsreadlatenciesnanos drainto latencies
+return latencies
+public static final collection<long> getpreadlatenciesnanos
+final list<long> latencies
+lists newarraylistwithcapacity fspreadlatenciesnanos size
+fspreadlatenciesnanos drainto latencies
+return latencies
+public static final collection<long> getwritelatenciesnanos
+final list<long> latencies
+lists newarraylistwithcapacity fswritelatenciesnanos size
+fswritelatenciesnanos drainto latencies
+return latencies
+// for test purpose
+public static volatile atomiclong datablockreadcnt   new atomiclong 0
+// number of sequential reads
+public static final int getreadops
+return readops getandset 0
+public static final long getreadtimems
+return readtimenano getandset 0    1000000
+// number of positional reads
+public static final int getpreadops
+return preadops getandset 0
+public static final long getpreadtimems
+return preadtimenano getandset 0    1000000
+public static final int getwriteops
+return writeops getandset 0
+public static final long getwritetimems
+return writetimenano getandset 0    1000000
+/**
+* number of checksum verification failures. it also
+* clears the counter.
+*/
+public static final long getchecksumfailurescount
+return checksumfailures getandset 0
+/** api required to write an {@link hfile} */
+public interface writer extends closeable
+/** add an element to the file info map. */
+void appendfileinfo byte key  byte value  throws ioexception
+void append keyvalue kv  throws ioexception
+void append byte key  byte value  throws ioexception
+/** @return the path to this {@link hfile} */
+path getpath
+string getcolumnfamilyname
+void appendmetablock string bloomfiltermetakey  writable metawriter
+/**
+* adds an inline block writer such as a multi-level block index writer or
+* a compound bloom filter writer.
+*/
+void addinlineblockwriter inlineblockwriter bloomwriter
+/**
+* store general bloom filter in the file. this does not deal with bloom filter
+* internals but is necessary, since bloom filters are stored differently
+* in hfile version 1 and version 2.
+*/
+void addgeneralbloomfilter bloomfilterwriter bfw
+/**
+* store delete family bloom filter in the file, which is only supported in
+* hfile v2.
+*/
+void adddeletefamilybloomfilter bloomfilterwriter bfw  throws ioexception
+/**
+* this variety of ways to construct writers is used throughout the code, and
+* we want to be able to swap writer implementations.
+*/
+public static abstract class writerfactory
+protected final configuration conf
+protected final cacheconfig cacheconf
+protected filesystem fs
+protected path path
+protected fsdataoutputstream ostream
+protected int blocksize   hcolumndescriptor default_blocksize
+protected compression algorithm compression
+hfile default_compression_algorithm
+protected hfiledatablockencoder encoder   noopdatablockencoder instance
+protected keycomparator comparator
+protected checksumtype checksumtype   hfile default_checksum_type
+protected int bytesperchecksum   default_bytes_per_checksum
+writerfactory configuration conf  cacheconfig cacheconf
+this conf   conf
+this cacheconf   cacheconf
+public writerfactory withpath filesystem fs  path path
+preconditions checknotnull fs
+preconditions checknotnull path
+this fs   fs
+this path   path
+return this
+public writerfactory withoutputstream fsdataoutputstream ostream
+preconditions checknotnull ostream
+this ostream   ostream
+return this
+public writerfactory withblocksize int blocksize
+this blocksize   blocksize
+return this
+public writerfactory withcompression compression algorithm compression
+preconditions checknotnull compression
+this compression   compression
+return this
+public writerfactory withcompression string compressalgo
+preconditions checknotnull compression
+this compression   abstracthfilewriter compressionbyname compressalgo
+return this
+public writerfactory withdatablockencoder hfiledatablockencoder encoder
+preconditions checknotnull encoder
+this encoder   encoder
+return this
+public writerfactory withcomparator keycomparator comparator
+preconditions checknotnull comparator
+this comparator   comparator
+return this
+public writerfactory withchecksumtype checksumtype checksumtype
+preconditions checknotnull checksumtype
+this checksumtype   checksumtype
+return this
+public writerfactory withbytesperchecksum int bytesperchecksum
+this bytesperchecksum   bytesperchecksum
+return this
+public writer create   throws ioexception
+if   path    null ? 1   0     ostream    null ? 1   0     1
+throw new assertionerror
+if  path    null
+ostream   abstracthfilewriter createoutputstream conf  fs  path
+return createwriter fs  path  ostream  blocksize
+compression  encoder  comparator  checksumtype  bytesperchecksum
+protected abstract writer createwriter filesystem fs  path path
+fsdataoutputstream ostream  int blocksize
+compression algorithm compress
+hfiledatablockencoder datablockencoder
+keycomparator comparator  checksumtype checksumtype
+int bytesperchecksum  throws ioexception
+/** the configuration key for hfile version to use for new files */
+public static final string format_version_key
+public static int getformatversion configuration conf
+int version   conf getint format_version_key  max_format_version
+checkformatversion version
+return version
+/**
+* returns the factory to be used to create {@link hfile} writers.
+* disables block cache access for all writers created through the
+* returned factory.
+*/
+public static final writerfactory getwriterfactorynocache configuration
+conf
+configuration tempconf   new configuration conf
+tempconf setfloat hconstants hfile_block_cache_size_key  0 0f
+return hfile getwriterfactory conf  new cacheconfig tempconf
+/**
+* returns the factory to be used to create {@link hfile} writers
+*/
+public static final writerfactory getwriterfactory configuration conf
+cacheconfig cacheconf
+schemametrics configureglobally conf
+int version   getformatversion conf
+switch  version
+case 1
+return new hfilewriterv1 writerfactoryv1 conf  cacheconf
+case 2
+return new hfilewriterv2 writerfactoryv2 conf  cacheconf
+default
+throw new illegalargumentexception
+version
+/** an abstraction used by the block index */
+public interface cachingblockreader
+hfileblock readblock long offset  long ondiskblocksize
+boolean cacheblock  final boolean pread  final boolean iscompaction
+blocktype expectedblocktype
+throws ioexception
+/** an interface used by clients to open and iterate an {@link hfile}. */
+public interface reader extends closeable  cachingblockreader
+schemaaware
+/**
+* returns this reader's "name". usually the last component of the path.
+* needs to be constant as the file is being moved to support caching on
+* write.
+*/
+string getname
+string getcolumnfamilyname
+rawcomparator<byte > getcomparator
+hfilescanner getscanner boolean cacheblocks
+final boolean pread  final boolean iscompaction
+bytebuffer getmetablock string metablockname
+boolean cacheblock  throws ioexception
+map<byte  byte> loadfileinfo   throws ioexception
+byte getlastkey
+byte midkey   throws ioexception
+long length
+long getentries
+byte getfirstkey
+long indexsize
+byte getfirstrowkey
+byte getlastrowkey
+fixedfiletrailer gettrailer
+hfileblockindex blockindexreader getdatablockindexreader
+hfilescanner getscanner boolean cacheblocks  boolean pread
+compression algorithm getcompressionalgorithm
+/**
+* retrieves general bloom filter metadata as appropriate for each
+* {@link hfile} version.
+* knows nothing about how that metadata is structured.
+*/
+datainput getgeneralbloomfiltermetadata   throws ioexception
+/**
+* retrieves delete family bloom filter metadata as appropriate for each
+* {@link hfile}  version.
+* knows nothing about how that metadata is structured.
+*/
+datainput getdeletebloomfiltermetadata   throws ioexception
+path getpath
+/** close method with optional evictonclose */
+void close boolean evictonclose  throws ioexception
+datablockencoding getencodingondisk
+private static reader pickreaderversion path path  fsdatainputstream fsdis
+fsdatainputstream fsdisnofschecksum
+long size  boolean closeistream  cacheconfig cacheconf
+datablockencoding preferredencodingincache  hfilesystem hfs
+throws ioexception
+fixedfiletrailer trailer   fixedfiletrailer readfromstream fsdis  size
+switch  trailer getmajorversion
+case 1
+return new hfilereaderv1 path  trailer  fsdis  size  closeistream
+cacheconf
+case 2
+return new hfilereaderv2 path  trailer  fsdis  fsdisnofschecksum
+size  closeistream
+cacheconf  preferredencodingincache  hfs
+default
+throw new ioexception
+trailer getmajorversion
+public static reader createreaderwithencoding
+filesystem fs  path path  cacheconfig cacheconf
+datablockencoding preferredencodingincache  throws ioexception
+final boolean closeistream   true
+hfilesystem hfs   null
+fsdatainputstream fsdis   fs open path
+fsdatainputstream fsdisnofschecksum   fsdis
+// if the fs is not an instance of hfilesystem, then create an
+// instance of hfilesystem that wraps over the specified fs.
+// in this case, we will not be able to avoid checksumming inside
+// the filesystem.
+if    fs instanceof hfilesystem
+hfs   new hfilesystem fs
+else
+hfs    hfilesystem fs
+// open a stream to read data without checksum verification in
+// the filesystem
+if  hfs    null
+fsdisnofschecksum   hfs getnochecksumfs   open path
+return pickreaderversion path  fsdis  fsdisnofschecksum
+fs getfilestatus path  getlen    closeistream  cacheconf
+preferredencodingincache  hfs
+public static reader createreader
+filesystem fs  path path  cacheconfig cacheconf  throws ioexception
+return createreaderwithencoding fs  path  cacheconf
+datablockencoding none
+/**
+* this factory method is used only by unit tests
+*/
+static reader createreaderfromstream path path
+fsdatainputstream fsdis  long size  cacheconfig cacheconf
+throws ioexception
+final boolean closeistream   false
+return pickreaderversion path  fsdis  fsdis  size  closeistream  cacheconf
+datablockencoding none  null
+/*
+* metadata for this file.  conjured by the writer.  read in by the reader.
+*/
+static class fileinfo extends hbasemapwritable<byte   byte >
+static final string reserved_prefix
+static final byte reserved_prefix_bytes   bytes tobytes reserved_prefix
+static final byte  lastkey   bytes tobytes reserved_prefix
+static final byte  avg_key_len
+bytes tobytes reserved_prefix
+static final byte  avg_value_len
+bytes tobytes reserved_prefix
+static final byte  comparator
+bytes tobytes reserved_prefix
+/**
+* append the given key/value pair to the file info, optionally checking the
+* key prefix.
+*
+* @param k key to add
+* @param v value to add
+* @param checkprefix whether to check that the provided key does not start
+*          with the reserved prefix
+* @return this file info object
+* @throws ioexception if the key or value is invalid
+*/
+public fileinfo append final byte k  final byte v
+final boolean checkprefix  throws ioexception
+if  k    null    v    null
+throw new nullpointerexception
+if  checkprefix    isreservedfileinfokey k
+throw new ioexception     fileinfo reserved_prefix
+put k  v
+return this
+/** return true if the given file info key is reserved for internal use. */
+public static boolean isreservedfileinfokey byte key
+return bytes startswith key  fileinfo reserved_prefix_bytes
+/**
+* get names of supported compression algorithms. the names are acceptable by
+* hfile.writer.
+*
+* @return array of strings, each represents a supported compression
+*         algorithm. currently, the following compression algorithms are
+*         supported.
+*         <ul>
+*         <li>"none" - no compression.
+*         <li>"gz" - gzip compression.
+*         </ul>
+*/
+public static string getsupportedcompressionalgorithms
+return compression getsupportedalgorithms
+// utility methods.
+/*
+* @param l long to convert to an int.
+* @return <code>l</code> cast as an int.
+*/
+static int longtoint final long l
+// expecting the size() of a block not exceeding 4gb. assuming the
+// size() will wrap to negative integer if it exceeds 2gb (from tfile).
+return  int  l   0x00000000ffffffffl
+/**
+* returns all files belonging to the given region directory. could return an
+* empty list.
+*
+* @param fs  the file system reference.
+* @param regiondir  the region directory to scan.
+* @return the list of files found.
+* @throws ioexception when scanning the files fails.
+*/
+static list<path> getstorefiles filesystem fs  path regiondir
+throws ioexception
+list<path> res   new arraylist<path>
+pathfilter dirfilter   new fsutils dirfilter fs
+filestatus familydirs   fs liststatus regiondir  dirfilter
+for filestatus dir   familydirs
+filestatus files   fs liststatus dir getpath
+for  filestatus file   files
+if   file isdir
+res add file getpath
+return res
+public static void main string args  throws ioexception
+hfileprettyprinter prettyprinter   new hfileprettyprinter
+system exit prettyprinter run args
+/**
+* checks the given {@link hfile} format version, and throws an exception if
+* invalid. note that if the version number comes from an input file and has
+* not been verified, the caller needs to re-throw an {@link ioexception} to
+* indicate that this is not a software error, but corrupted input.
+*
+* @param version an hfile version
+* @throws illegalargumentexception if the version is invalid
+*/
+public static void checkformatversion int version
+throws illegalargumentexception
+if  version < min_format_version    version > max_format_version
+throw new illegalargumentexception     version
+min_format_version
+max_format_version

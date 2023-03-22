@@ -1,0 +1,312 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver snapshot
+import java io ioexception
+import java util arraylist
+import java util collection
+import java util list
+import java util concurrent callable
+import java util concurrent executionexception
+import java util concurrent executorcompletionservice
+import java util concurrent future
+import java util concurrent linkedblockingqueue
+import java util concurrent threadpoolexecutor
+import java util concurrent timeunit
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop classification interfacestability
+import org apache hadoop conf configuration
+import org apache hadoop hbase daemonthreadfactory
+import org apache hadoop hbase errorhandling foreignexception
+import org apache hadoop hbase errorhandling foreignexceptiondispatcher
+import org apache hadoop hbase master snapshot mastersnapshotverifier
+import org apache hadoop hbase master snapshot snapshotmanager
+import org apache hadoop hbase procedure proceduremember
+import org apache hadoop hbase procedure procedurememberrpcs
+import org apache hadoop hbase procedure subprocedure
+import org apache hadoop hbase procedure subprocedurefactory
+import org apache hadoop hbase procedure zkprocedurememberrpcs
+import org apache hadoop hbase protobuf generated hbaseprotos snapshotdescription
+import org apache hadoop hbase regionserver hregion
+import org apache hadoop hbase regionserver hregionserver
+import org apache hadoop hbase regionserver regionserverservices
+import org apache hadoop hbase exceptions snapshotcreationexception
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase zookeeper zookeeperwatcher
+import org apache zookeeper keeperexception
+import com google protobuf invalidprotocolbufferexception
+/**
+* this manager class handles the work dealing with snapshots for a {@link hregionserver}.
+* <p>
+* this provides the mechanism necessary to kick off a online snapshot specific
+* {@link subprocedure} that is responsible for the regions being served by this region server.
+* if any failures occur with the subprocedure, the regionseversnapshotmanager's subprocedure
+* handler, {@link proceduremember}, notifies the master's procedurecoordinator to abort all
+* others.
+* <p>
+* on startup, requires {@link #start()} to be called.
+* <p>
+* on shutdown, requires {@link #stop(boolean)} to be called
+*/
+@interfaceaudience private
+@interfacestability unstable
+public class regionserversnapshotmanager
+private static final log log   logfactory getlog regionserversnapshotmanager class
+/** maximum number of snapshot region tasks that can run concurrently */
+private static final string concurent_snapshot_tasks_key
+private static final int default_concurrent_snapshot_tasks   3
+/** conf key for number of request threads to start snapshots on regionservers */
+public static final string snapshot_request_threads_key
+/** # of threads for snapshotting regions on the rs. */
+public static final int snapshot_request_threads_default   10
+/** conf key for max time to keep threads in snapshot request pool waiting */
+public static final string snapshot_timeout_millis_key
+/** keep threads alive in request pool for max of 60 seconds */
+public static final long snapshot_timeout_millis_default   60000
+/** conf key for millis between checks to see if snapshot completed or if there are errors*/
+public static final string snapshot_request_wake_millis_key
+/** default amount of time to check for errors while regions finish snapshotting */
+private static final long snapshot_request_wake_millis_default   500
+private final regionserverservices rss
+private final procedurememberrpcs memberrpcs
+private final proceduremember member
+/**
+* exposed for testing.
+* @param conf hbase configuration.
+* @param parent parent running the snapshot handler
+* @param memberrpc use specified memberrpc instance
+* @param procmember use specified proceduremember
+*/
+regionserversnapshotmanager configuration conf  hregionserver parent
+procedurememberrpcs memberrpc  proceduremember procmember
+this rss   parent
+this memberrpcs   memberrpc
+this member   procmember
+/**
+* create a default snapshot handler - uses a zookeeper based member controller.
+* @param rss region server running the handler
+* @throws keeperexception if the zookeeper cluster cannot be reached
+*/
+public regionserversnapshotmanager regionserverservices rss
+throws keeperexception
+this rss   rss
+zookeeperwatcher zkw   rss getzookeeper
+string nodename   rss getservername   tostring
+this memberrpcs   new zkprocedurememberrpcs zkw
+snapshotmanager online_snapshot_controller_description  nodename
+// read in the snapshot request configuration properties
+configuration conf   rss getconfiguration
+long wakemillis   conf getlong snapshot_request_wake_millis_key  snapshot_request_wake_millis_default
+long keepalive   conf getlong snapshot_timeout_millis_key  snapshot_timeout_millis_default
+int opthreads   conf getint snapshot_request_threads_key  snapshot_request_threads_default
+// create the actual snapshot procedure member
+threadpoolexecutor pool   proceduremember defaultpool wakemillis  keepalive  opthreads  nodename
+this member   new proceduremember memberrpcs  pool  new snapshotsubprocedurebuilder
+/**
+* start accepting snapshot requests.
+*/
+public void start
+this memberrpcs start member
+/**
+* close <tt>this</tt> and all running snapshot tasks
+* @param force forcefully stop all running tasks
+* @throws ioexception
+*/
+public void stop boolean force  throws ioexception
+string mode   force ?
+log info     mode
+try
+this member close
+finally
+this memberrpcs close
+/**
+* if in a running state, creates the specified subprocedure for handling an online snapshot.
+*
+* because this gets the local list of regions to snapshot and not the set the master had,
+* there is a possibility of a race where regions may be missed.  this detected by the master in
+* the snapshot verification step.
+*
+* @param snapshot
+* @return subprocedure to submit to the procedurememeber.
+*/
+public subprocedure buildsubprocedure snapshotdescription snapshot
+// don't run a snapshot if the parent is stop(ping)
+if  rss isstopping      rss isstopped
+throw new illegalstateexception     rss getservername
+// check to see if this server is hosting any regions for the snapshots
+// check to see if we have regions for the snapshot
+list<hregion> involvedregions
+try
+involvedregions   getregionstosnapshot snapshot
+catch  ioexception e1
+throw new illegalstateexception
+e1
+// we need to run the subprocedure even if we have no relevant regions.  the coordinator
+// expects participation in the procedure and without sending message the snapshot attempt
+// will hang and fail.
+log debug     snapshot getname
+snapshot gettable
+foreignexceptiondispatcher exndispatcher   new foreignexceptiondispatcher
+configuration conf   rss getconfiguration
+long timeoutmillis   conf getlong snapshot_timeout_millis_key
+snapshot_timeout_millis_default
+long wakemillis   conf getlong snapshot_request_wake_millis_key
+snapshot_request_wake_millis_default
+switch  snapshot gettype
+case flush
+snapshotsubprocedurepool taskmanager
+new snapshotsubprocedurepool rss getservername   tostring    conf
+return new flushsnapshotsubprocedure member  exndispatcher  wakemillis
+timeoutmillis  involvedregions  snapshot  taskmanager
+default
+throw new unsupportedoperationexception     snapshot gettype
+/**
+* determine if the snapshot should be handled on this server
+*
+* note: this is racy -- the master expects a list of regionservers.
+* this means if a region moves somewhere between the calls we'll miss some regions.
+* for example, a region move during a snapshot could result in a region to be skipped or done
+* twice.  this is manageable because the {@link mastersnapshotverifier} will double check the
+* region lists after the online portion of the snapshot completes and will explicitly fail the
+* snapshot.
+*
+* @param snapshot
+* @return the list of online regions. empty list is returned if no regions are responsible for
+*         the given snapshot.
+* @throws ioexception
+*/
+private list<hregion> getregionstosnapshot snapshotdescription snapshot  throws ioexception
+byte table   bytes tobytes snapshot gettable
+return rss getonlineregions table
+/**
+* build the actual snapshot runner that will do all the 'hard' work
+*/
+public class snapshotsubprocedurebuilder implements subprocedurefactory
+@override
+public subprocedure buildsubprocedure string name  byte data
+try
+// unwrap the snapshot information
+snapshotdescription snapshot   snapshotdescription parsefrom data
+return regionserversnapshotmanager this buildsubprocedure snapshot
+catch  invalidprotocolbufferexception e
+throw new illegalargumentexception
+/**
+* we use the snapshotsubprocedurepool, a class specific thread pool instead of
+* {@link org.apache.hadoop.hbase.executor.executorservice}.
+*
+* it uses a {@link java.util.concurrent.executorcompletionservice} which provides queuing of
+* completed tasks which lets us efficiently cancel pending tasks upon the earliest operation
+* failures.
+*
+* hbase's executorservice (different from {@link java.util.concurrent.executorservice}) isn't
+* really built for coordinated tasks where multiple threads as part of one larger task.  in
+* rs's the hbase executor services are only used for open and close and not other threadpooled
+* operations such as compactions and replication  sinks.
+*/
+static class snapshotsubprocedurepool
+private final executorcompletionservice<void> taskpool
+private final threadpoolexecutor executor
+private volatile boolean stopped
+private final list<future<void>> futures   new arraylist<future<void>>
+private final string name
+snapshotsubprocedurepool string name  configuration conf
+// configure the executor service
+long keepalive   conf getlong
+regionserversnapshotmanager snapshot_timeout_millis_key
+regionserversnapshotmanager snapshot_timeout_millis_default
+int threads   conf getint concurent_snapshot_tasks_key  default_concurrent_snapshot_tasks
+this name   name
+executor   new threadpoolexecutor 1  threads  keepalive  timeunit milliseconds
+new linkedblockingqueue<runnable>    new daemonthreadfactory
+name
+taskpool   new executorcompletionservice<void> executor
+boolean hastasks
+return futures size      0
+/**
+* submit a task to the pool.
+*
+* note: all must be submitted before you can safely {@link #waitforoutstandingtasks()}. this
+* version does not support issuing tasks from multiple concurrent table snapshots requests.
+*/
+void submittask final callable<void> task
+future<void> f   this taskpool submit task
+futures add f
+/**
+* wait for all of the currently outstanding tasks submitted via {@link #submittask(callable)}.
+* this *must* be called after all tasks are submitted via submittask.
+*
+* @return <tt>true</tt> on success, <tt>false</tt> otherwise
+* @throws interruptedexception
+* @throws snapshotcreationexception if the snapshot failed while we were waiting
+*/
+boolean waitforoutstandingtasks   throws foreignexception  interruptedexception
+log debug
+int sz   futures size
+try
+// using the completion service to process the futures that finish first first.
+for  int i   0  i < sz  i
+future<void> f   taskpool take
+f get
+if   futures remove f
+log warn     f
+log debug      i 1        sz
+log debug     sz
+return true
+catch  interruptedexception e
+log warn    e
+if   stopped
+thread currentthread   interrupt
+throw new foreignexception    e
+// we are stopped so we can just exit.
+catch  executionexception e
+if  e getcause   instanceof foreignexception
+log warn    e
+throw  foreignexception e getcause
+log warn    e
+throw new foreignexception name  e getcause
+finally
+canceltasks
+return false
+/**
+* this attempts to cancel out all pending and in progress tasks (interruptions issues)
+* @throws interruptedexception
+*/
+void canceltasks   throws interruptedexception
+collection<future<void>> tasks   futures
+log debug     tasks size         name
+for  future<void> f  tasks
+// todo ideally we'd interrupt hbase threads when we cancel.  however it seems that there
+// are places in the hbase code where row/region locks are taken and not released in a
+// finally block.  thus we cancel without interrupting.  cancellations will be slower to
+// complete but we won't suffer from unreleased locks due to poor code discipline.
+f cancel false
+// evict remaining tasks and futures from taskpool.
+log debug taskpool
+while   futures isempty
+// block to remove cancelled futures;
+log warn
+futures remove taskpool take
+stop
+/**
+* abruptly shutdown the thread pool.  call when exiting a region server.
+*/
+void stop
+if  this stopped  return
+this stopped   true
+this executor shutdownnow

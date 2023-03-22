@@ -1,0 +1,819 @@
+/*
+derby - class org.apache.derby.impl.jdbc.embedblob
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl jdbc
+import org apache derby iapi reference sqlstate
+import org apache derby iapi error standardexception
+import org apache derby iapi jdbc enginelob
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi types resetable
+import org apache derby iapi services io inputstreamutil
+import java sql sqlexception
+import java sql blob
+import java io eofexception
+import java io inputstream
+import java io ioexception
+/**
+implements java.sql.blob (see the jdbc 2.0 spec).
+a blob sits on top of a binary, varbinary or long varbinary column.
+if its data is small (less than 1 page) it is a byte array taken from
+the sqlbit class. if it is large (more than 1 page) it is a long column
+in the database. the long column is accessed as a stream, and is implemented
+in store as an overflowinputstream.  the resetable interface allows sending
+messages to that stream to initialize itself (reopen its container and
+lock the corresponding row) and to reset itself to the beginning.
+note: in the case that the data is large, it is represented as a stream.
+this stream is returned to the user in the getbinarystream() method.
+this means that we have limited control over the state of the stream,
+since the user can read bytes from it at any time.  thus all methods
+here reset the stream to the beginning before doing any work.
+caveat: the methods may not behave correctly if a user sets up
+multiple threads and sucks data from the stream (returned from
+getbinarystream()) at the same time as calling the blob methods.
+<p><b>supports</b>
+<ul>
+<li> jsr169 - no subsetting for java.sql.blob
+<li> jdbc 2.0
+<li> jdbc 3.0 - no new dependencies on new jdbc 3.0 or jdk 1.4 classes,
+new update methods can safely be added into implementation.
+</ul>
+*/
+final class embedblob extends connectionchild implements blob  enginelob
+/**
+* tells whether the blob has been materialized or not.
+* <p>
+* materialization happens when the blob is updated by the user. a
+* materialized blob is represented either in memory or in a temporary file
+* on disk, depending on size.
+* <p>
+* a blob that has not been materialized is represented by a stream into the
+* derby store, and is read-only.
+*/
+private boolean         materialized
+/**
+* the underlying positionable store stream, if any.
+* <p>
+* if {@link #materialized} is {@code true}, the stream is {@code null}.
+*/
+private positionedstorestream mystream
+/**
+* locator value for this blob, used as a handle by the client driver to
+* map operations to the correct blob on the server side.
+*
+* @see #getlocator()
+*/
+private int locator   0
+/**
+* length of the stream representing the blob.
+* <p>
+* set to -1 when the stream has been {@link #materialized} or
+* the length of the stream is not currently known.
+*/
+private long streamlength    1
+/**
+* position offset for the stream representing the blob, if any.
+* <p>
+* this offset accounts for the bytes encoding the stream length at the
+* head of the stream. data byte {@code pos} is at
+* {@code pos + streampositionoffset} in the underlying stream.
+* set to {@code integer.min_value} if the blob isn't represented by a
+* store stream.
+*/
+private final int streampositionoffset
+//this boolean variable indicates whether the blob object has
+//been invalidated by calling free() on it
+private boolean isvalid   true
+private lobstreamcontrol control
+/**
+* this constructor is used to create a empty blob object. it is used by the
+* connection interface method createblob().
+*
+* @param blobbytes a byte array containing the data to be stores in the
+*        blob.
+*
+* @param con the embedconnection object associated with this blob object.
+*
+*/
+embedblob byte  blobbytes embedconnection con  throws sqlexception
+super con
+try
+control   new lobstreamcontrol  con  blobbytes
+materialized   true
+streampositionoffset   integer min_value
+//add entry in connection so it can be cleared
+//when transaction is not valid
+con addlobreference  this
+catch  ioexception e
+throw util setstreamfailure  e
+catch  standardexception se
+throw util generatecssqlexception  se
+/*
+this constructor should only be called by embedresultset.getblob
+*/
+protected embedblob datavaluedescriptor dvd  embedconnection con
+throws standardexception
+super con
+// if the underlying column is null, resultset.getblob will return null,
+// never should get this far
+if  sanitymanager debug
+sanitymanager assert  dvd isnull
+inputstream dvdstream   dvd getstream
+if  dvdstream    null
+materialized   true
+streampositionoffset   integer min_value
+// copy bytes into memory so that blob can live after result set
+// is closed
+byte dvdbytes   dvd getbytes
+if  sanitymanager debug
+sanitymanager assert dvdbytes    null
+try
+control   new lobstreamcontrol
+getembedconnection    dvdbytes
+catch  ioexception e
+throw standardexception newexception
+sqlstate set_stream_failure  e
+else
+materialized   false
+/*
+we are expecting this stream to be a formatidinputstream with an
+overflowinputstream inside. formatidinputstream implements
+resetable. this should be the case when retrieving
+data from a long column. however, sqlbit, which is the class
+implementing the getstream() method for dvd.getstream(), does not
+guarantee this for us
+*/
+if  sanitymanager debug
+sanitymanager assert dvdstream instanceof resetable
+// create a position aware stream on top of dvdstream so we can
+// more easily move back and forth in the blob.
+try
+mystream   new positionedstorestream dvdstream
+// the binarytorawstream will read the encoded length bytes.
+binarytorawstream tmpstream
+new binarytorawstream mystream  con
+streampositionoffset    int mystream getposition
+// check up front if the stream length is specified.
+streamlength   tmpstream getlength
+tmpstream close
+catch  standardexception se
+if  se getmessageid   equals sqlstate data_container_closed
+throw standardexception
+newexception sqlstate blob_accessed_after_commit
+else
+throw se
+catch  ioexception ioe
+throw standardexception newexception
+sqlstate lang_streaming_column_i_o_exception  ioe
+//add entry in connection so it can be cleared
+//when transaction is not valid
+con addlobreference  this
+/**
+* sets the position of the blob to {@code logicalpos}, where position 0 is
+* the beginning of the blob content.
+* <p>
+* the position is only guaranteed to be valid from the time this method is
+* invoked until the synchronization monitor is released, or until the next
+* invokation of this method.
+* <p>
+* the position is logical in the sense that it specifies the requested
+* position in the blob content. this position might be at a different
+* position in the underlying representation, for instance the derby store
+* stream prepends the blob content with a length field.
+*
+* @param logicalpos requested blob position, 0-based
+* @return the new position, which will be equal to the requested position.
+* @throws ioexception if reading/accessing the blob fails
+* @throws standardexception throws blob_position_too_large if the requested
+*      position is larger than the blob length, throws other sql states if
+*      resetting the stream fails
+*/
+//@guardedby(getconnectionsynchronization())
+private long setblobposition long logicalpos
+throws standardexception  ioexception
+if  sanitymanager debug
+sanitymanager assert logicalpos >  0
+if  materialized
+// nothing to do here, except checking if the position is valid.
+if  logicalpos >  control getlength
+throw standardexception newexception
+sqlstate blob_position_too_large  new long logicalpos
+else
+// reposition the store stream, account for the length field offset.
+try
+this mystream reposition
+logicalpos   this streampositionoffset
+catch  eofexception eofe
+throw standardexception newexception
+sqlstate blob_position_too_large  eofe
+new long logicalpos
+return logicalpos
+/**
+* reads one byte from the blob at the specified position.
+* <p>
+* depending on the representation, this might result in a read from a byte
+* array, a temporary file on disk or from a derby store stream.
+*
+* @return the byte at the current position, or -1 if end of file has been
+* reached
+* @throws ioexception if reading from the underlying data representation
+*      fails
+*/
+private int read long pos
+throws ioexception  standardexception
+int c
+if  materialized
+if  pos >  control getlength
+return  1
+else
+c   control read  pos
+else
+// make sure we're at the right position.
+this mystream reposition pos   this streampositionoffset
+// read one byte from the stream.
+c   this mystream read
+return c
+/**
+* returns the number of bytes in the <code>blob</code> value
+* designated by this <code>blob</code> object.
+* @return length of the <code>blob</code> in bytes
+* @exception sqlexception if there is an error accessing the
+* length of the <code>blob</code>
+*/
+// pt stream part may get pushed to store
+public long length
+throws sqlexception
+//call checkvalidity to exit by throwing a sqlexception if
+//the blob object has been freed by calling free() on it
+checkvalidity
+try
+if  materialized
+return control getlength
+catch  ioexception e
+throw util setstreamfailure  e
+if  streamlength     1
+return streamlength
+boolean pushstack   false
+try
+// we have a stream
+synchronized  getconnectionsynchronization
+pushstack    getembedconnection   isclosed
+if  pushstack
+setupcontextstack
+// we have to read the entire stream!
+mystream resetstream
+binarytorawstream tmpstream
+new binarytorawstream mystream  this
+if  sanitymanager debug
+sanitymanager assert tmpstream getlength       1
+streamlength   inputstreamutil skipuntileof tmpstream
+tmpstream close
+// save for future uses.
+return streamlength
+catch  throwable t
+throw handlemyexceptions t
+finally
+if  pushstack
+restorecontextstack
+/**
+* returns as an array of bytes part or all of the <code>blob</code>
+* value that this <code>blob</code> object designates.  the byte
+* array contains up to <code>length</code> consecutive bytes
+* starting at position <code>startpos</code>.
+* the starting position must be between 1 and the length
+* of the blob plus 1. this allows for zero-length blob values, from
+* which only zero-length byte arrays can be returned.
+* if a larger length is requested than there are bytes available,
+* characters from the start position to the end of the blob are returned.
+* @param startpos the ordinal position of the first byte in the
+* <code>blob</code> value to be extracted; the first byte is at
+* position 1
+* @param length is the number of consecutive bytes to be copied
+* @return a byte array containing up to <code>length</code>
+* consecutive bytes from the <code>blob</code> value designated
+* by this <code>blob</code> object, starting with the
+* byte at position <code>startpos</code>.
+* @exception sqlexception if there is an error accessing the
+* <code>blob</code>
+* note: if the starting position is the length of the blob plus 1,
+* zero bytess are returned regardless of the length requested.
+*/
+public byte getbytes long startpos  int length
+throws sqlexception
+//call checkvalidity to exit by throwing a sqlexception if
+//the blob object has been freed by calling free() on it
+checkvalidity
+boolean pushstack   false
+try
+if  startpos < 1
+throw standardexception newexception
+sqlstate blob_bad_position  new long startpos
+if  length < 0
+throw standardexception newexception
+sqlstate blob_nonpositive_length  new integer length
+byte result
+// if the blob is materialized
+if  materialized
+result   new byte
+int sz   control read  result  0  result length  startpos   1
+if  sz     1
+return new byte
+if  sz < length
+byte  tmparray   new byte
+system arraycopy  result  0  tmparray  0  sz
+result   tmparray
+else    we have a stream
+synchronized  getconnectionsynchronization
+pushstack    getembedconnection   isclosed
+if  pushstack
+setupcontextstack
+setblobposition startpos 1
+// read length bytes into a string
+result   new byte
+int n   inputstreamutil readloop mystream result 0 length
+/*
+according to the spec, if there are only n < length bytes
+to return, we should just return these bytes. rather than
+return them in an array of size length, where the trailing
+bytes are not initialized, and the user cannot tell how
+many bytes were actually returned, we should return an
+array of n bytes.
+*/
+if  n < length
+byte result2   new byte
+system arraycopy result 0 result2 0 n
+return result2
+return result
+catch  standardexception e
+if this is a setposition exception then we ran out of blob
+if  e getmessageid   equals sqlstate blob_length_too_long
+e   standardexception newexception
+sqlstate blob_position_too_large  new long startpos
+throw handlemyexceptions e
+catch  throwable t
+throw handlemyexceptions t
+finally
+if  pushstack
+restorecontextstack
+/**
+* retrieves the <code>blob</code> designated by this
+* <code>blob</code> instance as a stream.
+* @return a stream containing the <code>blob</code> data
+* @exception sqlexception if there is an error accessing the
+* <code>blob</code>
+*/
+public java io inputstream getbinarystream
+throws sqlexception
+//call checkvalidity to exit by throwing a sqlexception if
+//the blob object has been freed by calling free() on it
+checkvalidity
+boolean pushstack   false
+try
+// if we have byte array, not a stream
+if  materialized
+return control getinputstream 0
+else
+// have a stream
+synchronized  getconnectionsynchronization
+pushstack    getembedconnection   isclosed
+if  pushstack
+setupcontextstack
+// reset stream, because autopositionigstream wants to read
+// the encoded length bytes.
+mystream resetstream
+return new updatableblobstream  this
+new autopositioningstream  this  mystream  this
+catch  throwable t
+throw handlemyexceptions t
+finally
+if  pushstack
+restorecontextstack
+/**
+* determines the byte position at which the specified byte
+* <code>pattern</code> begins within the <code>blob</code>
+* value that this <code>blob</code> object represents.  the
+* search for <code>pattern</code. begins at position
+* <code>start</code>
+* @param pattern the byte array for which to search
+* @param start the position at which to begin searching; the
+*        first position is 1
+* @return the position at which the pattern appears, else -1.
+* @exception sqlexception if there is an error accessing the
+* <code>blob</code>
+*/
+public long position byte pattern  long start
+throws sqlexception
+//call checkvalidity to exit by throwing a sqlexception if
+//the blob object has been freed by calling free() on it
+checkvalidity
+boolean pushstack   false
+try
+if  start < 1
+throw standardexception newexception
+sqlstate blob_bad_position  new long start
+if  pattern    null
+throw standardexception newexception sqlstate blob_null_pattern_or_search_str
+if  pattern length    0
+return start     match db2's sql locate function
+synchronized  getconnectionsynchronization
+pushstack    getembedconnection   isclosed
+if  pushstack
+setupcontextstack
+long pos   setblobposition start  1
+// look for first character
+int lookfor   pattern
+long curpos
+int c
+while  true
+c   read pos        note the position increment
+if  c     1      run out of stream
+return  1
+if  c    lookfor
+curpos   pos
+if  checkmatch pattern  pos
+return curpos
+else
+pos   setblobposition curpos
+catch  standardexception e
+throw handlemyexceptions e
+catch  throwable t
+throw handlemyexceptions t
+finally
+if  pushstack
+restorecontextstack
+/**
+* checks if the pattern (starting from the second byte) appears inside
+* the blob content.
+* <p>
+* at this point, the first byte of the pattern must already have been
+* matched, and {@code pos} must be pointing at the second byte to compare.
+*
+* @param pattern the byte array to search for, passed in by the user
+* @param pos the position in the blob content to start searching from
+* @return {@code true} if a match is found, {@code false} if not.
+*/
+private boolean checkmatch byte pattern  long pos
+throws ioexception  standardexception
+// check whether rest matches
+// might improve performance by reading more
+for  int i   1  i < pattern length  i
+int b   read pos
+if   b < 0      b    pattern       mismatch or stream runs out
+return false
+return true
+/**
+* determines the byte position in the <code>blob</code> value
+* designated by this <code>blob</code> object at which
+* <code>pattern</code> begins.  the search begins at position
+* <code>start</code>.
+* @param pattern the <code>blob</code> object designating
+* the <code>blob</code> value for which to search
+* @param start the position in the <code>blob</code> value
+*        at which to begin searching; the first position is 1
+* @return the position at which the pattern begins, else -1
+* @exception sqlexception if there is an error accessing the
+* <code>blob</code>
+*/
+public long position blob pattern  long start
+throws sqlexception
+//call checkvalidity to exit by throwing a sqlexception if
+//the blob object has been freed by calling free() on it
+checkvalidity
+boolean pushstack   false
+try
+if  start < 1
+throw standardexception newexception
+sqlstate blob_bad_position  new long start
+if  pattern    null
+throw standardexception newexception sqlstate blob_null_pattern_or_search_str
+synchronized  getconnectionsynchronization
+pushstack    getembedconnection   isclosed
+if  pushstack
+setupcontextstack
+long pos   setblobposition start 1
+// look for first character
+byte b
+try
+pattern is not necessarily a derby blob
+b   pattern getbytes 1 1
+catch  sqlexception e
+throw standardexception newexception sqlstate blob_unable_to_read_pattern
+if  b    null    b length < 1      the   blob
+return start     match db2's sql locate function
+int lookfor   b
+int c
+long curpos
+while  true
+c   read pos        note the position increment
+if  c     1      run out of stream
+return  1
+if  c    lookfor
+curpos   pos
+if  checkmatch pattern  pos
+return curpos
+else
+pos   setblobposition curpos
+catch  standardexception e
+throw handlemyexceptions e
+catch  throwable t
+throw handlemyexceptions t
+finally
+if  pushstack
+restorecontextstack
+/**
+* checks if the pattern (starting from the second byte) appears inside
+* the blob content.
+*
+* @param pattern the blob to search for, passed in by the user
+* @param pos the position in the blob (this) content to start searching
+* @return {@code true} if a match is found, {@code false} if not.
+*/
+private boolean checkmatch blob pattern  long pos
+throws ioexception  standardexception
+// check whether rest matches
+// might improve performance by reading buffer at a time
+inputstream pstream
+try
+pstream   pattern getbinarystream
+catch  sqlexception e
+return false
+if  pstream    null
+return false
+// throw away first character since we already read it in the calling
+// method
+int b1   pstream read
+if  b1 < 0
+return false
+while  true
+b1   pstream read
+if  b1 < 0      search blob runs out
+return true
+int b2   read pos
+if   b1    b2      b2 < 0       mismatch or stream runs out
+return false
+/*
+convert exceptions where needed before calling handleexception to convert
+them to sqlexceptions.
+*/
+private sqlexception handlemyexceptions throwable t
+throws sqlexception
+if  t instanceof standardexception
+// container closed means the blob or clob was accessed after commit
+if    standardexception  t  getmessageid   equals sqlstate data_container_closed
+t   standardexception newexception sqlstate blob_accessed_after_commit
+return handleexception t
+/*
+if we have a stream, release the resources associated with it.
+*/
+protected void finalize
+if   materialized
+mystream closestream
+/**
+following methods are for the new jdbc 3.0 methods in java.sql.blob
+(see the jdbc 3.0 spec). we have the jdbc 3.0 methods in local20
+package, so we don't have to have a new class in local30.
+the new jdbc 3.0 methods don't make use of any new jdbc3.0 classes and
+so this will work fine in jdbc2.0 configuration.
+*/
+/////////////////////////////////////////////////////////////////////////
+//
+//	jdbc 3.0	-	new public methods
+//
+/////////////////////////////////////////////////////////////////////////
+/**
+* writes the given array of bytes to the blob value that this blob object
+* represents, starting at position pos, and returns the number of bytes
+* written.
+*
+* @param pos the position in the blob object at which to start writing
+* @param bytes the array of bytes to be written to the blob value that this
+*       blob object represents
+* @return the number of bytes written to the blob.
+* @throws sqlexception if writing the bytes to the blob fails
+* @since 1.4
+*/
+public int setbytes long pos  byte bytes  throws sqlexception
+return setbytes pos  bytes  0  bytes length
+/**
+* writes all or part of the given array of byte array to the blob value
+* that this blob object represents and returns the number of bytes written.
+* writing starts at position pos in the blob value; len bytes from the
+* given byte array are written.
+*
+* @param pos the position in the blob object at which to start writing
+* @param bytes the array of bytes to be written to the blob value that this
+*       blob object represents
+* @param offset the offset into the byte array at which to start reading
+*       the bytes to be written
+* @param len the number of bytes to be written to the blob value from the
+*       array of bytes bytes
+* @return the number of bytes written to the blob.
+* @throws sqlexception if writing the bytes to the blob fails
+* @throws indexoutofboundsexception if {@code len} is larger than
+*       {@code bytes.length - offset}
+* @since 1.4
+*/
+public int setbytes long pos
+byte bytes
+int offset
+int len  throws sqlexception
+checkvalidity
+try
+if  materialized
+if  pos   1 > length
+throw util generatecssqlexception
+sqlstate blob_position_too_large  new long pos
+if  pos < 1
+throw util generatecssqlexception
+sqlstate blob_bad_position  new long pos
+control write  bytes  offset  len  pos   1
+else
+control   new lobstreamcontrol  getembedconnection
+control copydata  mystream  length
+control write bytes  offset  len  pos   1
+mystream close
+streamlength    1
+materialized   true
+return len
+catch  ioexception e
+throw util setstreamfailure  e
+catch  standardexception se
+throw util generatecssqlexception  se
+/**
+* jdbc 3.0
+*
+* retrieves a stream that can be used to write to the blob value that this
+* blob object represents. the stream begins at position pos.
+*
+* @param pos - the position in the blob object at which to start writing
+* @return a java.io.outputstream object to which data can be written
+* @exception sqlexception feature not implemented for now.
+*/
+public java io outputstream setbinarystream  long pos
+throws sqlexception
+checkvalidity
+if  pos   1 > length
+throw util generatecssqlexception
+sqlstate blob_position_too_large  new long pos
+if  pos < 1
+throw util generatecssqlexception
+sqlstate blob_bad_position  new long pos
+try
+if  materialized
+return control getoutputstream  pos   1
+else
+control   new lobstreamcontrol
+getembedconnection
+control copydata  mystream  pos   1
+mystream close
+streamlength    1
+materialized   true
+return control getoutputstream pos   1
+catch  ioexception e
+throw util setstreamfailure  e
+catch  standardexception se
+throw util generatecssqlexception  se
+/**
+* jdbc 3.0
+*
+* truncates the blob value that this blob object represents to be len bytes
+* in length.
+*
+* @param len - the length, in bytes, to which the blob value that this blob
+* object represents should be truncated
+* @exception sqlexception feature not implemented for now.
+*/
+public void truncate long len
+throws sqlexception
+if  len > length
+throw util generatecssqlexception
+sqlstate blob_length_too_long  new long len
+try
+if  materialized
+control truncate  len
+else
+control   new lobstreamcontrol  getembedconnection
+control copydata  mystream  len
+mystream close
+streamlength    1
+materialized   true
+catch  ioexception e
+throw util setstreamfailure  e
+catch  standardexception se
+throw util generatecssqlexception  se
+/////////////////////////////////////////////////////////////////////////
+//
+//	jdbc 4.0	-	new public methods
+//
+/////////////////////////////////////////////////////////////////////////
+/**
+* this method frees the <code>blob</code> object and releases the resources that
+* it holds. the object is invalid once the <code>free</code>
+* method is called. if <code>free</code> is called multiple times, the subsequent
+* calls to <code>free</code> are treated as a no-op.
+*
+* @throws sqlexception if an error occurs releasing
+* the blob's resources
+*/
+public void free
+throws sqlexception
+//calling free() on a already freed object is treated as a no-op
+if   isvalid  return
+//now that free has been called the blob object is no longer
+//valid
+isvalid   false
+// remove entry from connection if a locator has been created.
+if  this locator    0
+localconn removelobmapping locator
+//initialialize length to default value -1
+streamlength    1
+//if it is a stream then close it.
+//if a array of bytes then initialize it to null
+//to free up space
+if   materialized
+mystream closestream
+mystream   null
+else
+try
+control free
+control   null
+catch  ioexception e
+throw util setstreamfailure  e
+/**
+* returns an <code>inputstream</code> object that contains a partial
+* <code>blob</code> value, starting with the byte specified by pos,
+* which is length bytes in length.
+*
+* @param pos the offset to the first byte of the partial value to be
+*      retrieved. the first byte in the <code>blob</code> is at
+*      position 1
+* @param length the length in bytes of the partial value to be retrieved
+* @return through which the partial <code>blob</code> value can be read.
+* @throws sqlexception if pos is less than 1 or if pos is greater than
+*      the number of bytes in the {@code blob} or if {@code pos + length}
+*      is greater than {@code blob.length() +1}
+*/
+public inputstream getbinarystream long pos  long length
+throws sqlexception
+//call checkvalidity to exit by throwing a sqlexception if
+//the blob object has been freed by calling free() on it
+checkvalidity
+if  pos <  0
+throw util generatecssqlexception
+sqlstate blob_bad_position
+new long pos
+if  length < 0
+throw util generatecssqlexception
+sqlstate blob_nonpositive_length
+new long length
+if  length >  this length      pos  1
+throw util generatecssqlexception
+sqlstate pos_and_length_greater_than_lob
+new long pos   new long length
+try
+return new updatableblobstream this
+getbinarystream
+pos 1
+length
+catch  ioexception ioe
+throw util setstreamfailure ioe
+/*
+* checks is isvalid is true. if it is not true throws
+* a sqlexception stating that a method has been called on
+* an invalid lob object
+*
+* throws sqlexception if isvalid is not true.
+*/
+private void checkvalidity   throws sqlexception
+//check for connection to maintain sqlcode for closed
+//connection
+getembedconnection   checkifclosed
+if  isvalid
+throw newsqlexception sqlstate lob_object_invalid
+/**
+* returns if blob data is stored locally (using lobstreamcontrol).
+* @return true if materialized else false
+*/
+boolean ismaterialized
+return materialized
+/**
+* return locator for this lob.
+*
+* @return the locator identifying this lob.
+*/
+public int getlocator
+if  locator    0
+locator   localconn addlobmapping this
+return locator

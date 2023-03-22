@@ -1,0 +1,2761 @@
+package org jruby ir
+import org jruby ruby
+import org jruby rubyinstanceconfig compilemode
+import org jruby ast
+import org jruby compiler notcompilableexception
+import org jruby ir instructions
+import org jruby ir instructions defined backrefismatchdatainstr
+import org jruby ir instructions defined classvarisdefinedinstr
+import org jruby ir instructions defined getdefinedconstantormethodinstr
+import org jruby ir instructions defined geterrorinfoinstr
+import org jruby ir instructions defined globalisdefinedinstr
+import org jruby ir instructions defined hasinstancevarinstr
+import org jruby ir instructions defined ismethodboundinstr
+import org jruby ir instructions defined methoddefinedinstr
+import org jruby ir instructions defined methodispublicinstr
+import org jruby ir instructions defined restoreerrorinfoinstr
+import org jruby ir instructions defined setwithindefinedinstr
+import org jruby ir instructions defined supermethodboundinstr
+import org jruby ir instructions ruby18 receiveoptarginstr18
+import org jruby ir instructions ruby18 receiverestarginstr18
+import org jruby ir operands array
+import org jruby ir operands asstring
+import org jruby ir operands backref
+import org jruby ir operands backtickstring
+import org jruby ir operands bignum
+import org jruby ir operands compoundarray
+import org jruby ir operands compoundstring
+import org jruby ir operands scopemodule
+import org jruby ir operands currentscope
+import org jruby ir operands dynamicsymbol
+import org jruby ir operands fixnum
+import org jruby ir operands float
+import org jruby ir operands hash
+import org jruby ir operands irexception
+import org jruby ir operands keyvaluepair
+import org jruby ir operands label
+import org jruby ir operands localvariable
+import org jruby ir operands methaddr
+import org jruby ir operands nthref
+import org jruby ir operands objectclass
+import org jruby ir operands operand
+import org jruby ir operands range
+import org jruby ir operands regexp
+import org jruby ir operands svalue
+import org jruby ir operands splat
+import org jruby ir operands stringliteral
+import org jruby ir operands symbol
+import org jruby ir operands temporaryvariable
+import org jruby ir operands undefinedvalue
+import org jruby ir operands unexecutablenil
+import org jruby ir operands variable
+import org jruby ir operands wrappedirclosure
+import org jruby parser staticscope
+import org jruby runtime arity
+import org jruby runtime blockbody
+import org jruby runtime calltype
+import org jruby util bytelist
+import java io file
+import java io fileinputstream
+import java io ioexception
+import java util arraylist
+import java util hashmap
+import java util list
+import java util map
+import java util stack
+// this class converts an ast into a bunch of ir instructions
+// ir building notes
+// -----------------
+//
+// 1. more copy instructions added than necessary
+// ----------------------------------------------
+// note that in general, there will be lots of a = b kind of copies
+// introduced in the ir because the translation is entirely single-node focused.
+// an example will make this clear
+//
+// ruby:
+//     v = @f
+// will translate to
+//
+// ast:
+//     localasgnnode v
+//       instrvarnode f
+// will translate to
+//
+// ir:
+//     tmp = self.f [ get_field(tmp,self,f) ]
+//     v = tmp      [ copy(v, tmp) ]
+//
+// instead of
+//     v = self.f   [ get_field(v, self, f) ]
+//
+// we could get smarter and pass in the variable into which this expression is going to get evaluated
+// and use that to store the value of the expression (or not build the expression if the variable is null).
+//
+// but, that makes the code more complicated, and in any case, all this will get fixed in a single pass of
+// copy propagation and dead-code elimination.
+//
+// something to pay attention to and if this extra pass becomes a concern (not convinced that it is yet),
+// this smart can be built in here.  right now, the goal is to do something simple and straightforward that is going to be correct.
+//
+// 2. returning null vs manager.getnil()
+// ----------------------------
+// - we should be returning null from the build methods where it is a normal "error" condition
+// - we should be returning manager.getnil() where the actual return value of a build is the ruby nil operand
+//   look in buildif for an example of this
+//
+// 3. temporary variable reuse
+// ---------------------------
+// i am reusing variables a lot in places in this code.  should i instead always get a new variable when i need it
+// this introduces artificial data dependencies, but fewer variables.  but, if we are going to implement ssa pass
+// this is not a big deal.  think this through!
+public class irbuilder
+protected static final operand no_args   new operand
+protected static final unexecutablenil u_nil   unexecutablenil u_nil
+private static string  rubyversion         default is 1 8
+public static void setrubyversion string rubyversion
+irbuilder rubyversion   rubyversion
+}
+public boolean is1_9
+return false
+}
+/* -----------------------------------------------------------------------------------
+* every ensure block has a start label and end label, and at the end, it will jump
+* to an address stored in a return address variable.
+*
+* this ruby code will translate to the ir shown below
+* -----------------
+*   begin
+*       ... protected body ...
+*   ensure
+*       ... ensure block to run
+*   end
+* -----------------
+*  l_region_start
+*     ir instructions for the protected body
+*  l_start:
+*     .. ensure block ir ...
+*     jump %ret_addr
+*  l_end:
+* -----------------
+*
+* if n is a node in the protected body that might exit this scope (exception rethrows
+* and returns), n has to first jump to the ensure block and let the ensure block run.
+* in addition, n has to set up a return address label in the return address var of
+* this ensure block so that the ensure block can transfer control block to n.
+*
+* since we can have a nesting of ensure blocks, we are maintaining a stack of these
+* well-nested ensure blocks.  every node n that will exit this scope will have to
+* co-ordinate the jumps in-and-out of the ensure blocks in the top-to-bottom stacked
+* order.
+* ----------------------------------------------------------------------------------- */
+private static class ensureblockinfo
+label    regionstart
+label    start
+label    end
+label    dummyrescueblocklabel
+variable returnaddr
+variable savedglobalexception
+// innermost loop within which this ensure block is nested, if any
+irloop   innermostloop
+// ast node for any associated rescue node in the case of begin-rescue-ensure-end block
+// will be null in the case of begin-ensure-end block
+rescuenode matchingrescuenode
+public ensureblockinfo irscope s  rescuenode n  irloop l
+regionstart   s getnewlabel
+start         s getnewlabel
+end           s getnewlabel
+returnaddr    s getnewtemporaryvariable
+dummyrescueblocklabel   s getnewlabel
+savedglobalexception   null
+innermostloop   l
+matchingrescuenode   n
+}
+// emit jump chain by walking up the ensure block stack
+// if we have been passed a loop value, then emit values that are nested within that loop
+public static void emitjumpchain irscope s  stack<ensureblockinfo> ebstack  irloop loop
+// sss: there are 2 ways of encoding this:
+// 1. jump to ensure block 1, return back here, jump ensure block 2, return back here, ...
+//    generates 3*n instrs. where n is the # of ensure blocks to execute
+// 2. jump to ensure block 1, then to block 2, then to 3, ...
+//    generates n+1 instrs. where n is the # of ensure blocks to execute
+// doesn't really matter all that much since we shouldn't have deep nesting of ensure blocks often
+// but is there a reason to go with technique 1 at all??
+int n   ebstack size
+ensureblockinfo ebarray   ebstack toarray new ensureblockinfo
+for  int i   n 1  i >  0  i
+ensureblockinfo ebi   ebarray
+//
+if  ebi innermostloop    loop  break
+label retlabel   s getnewlabel
+if  ebi savedglobalexception    null
+s addinstr new putglobalvarinstr    ebi savedglobalexception
+}
+s addinstr new setreturnaddressinstr ebi returnaddr  retlabel
+s addinstr new jumpinstr ebi start
+s addinstr new labelinstr retlabel
+}
+}
+}
+// stack encoding nested ensure blocks
+private stack<ensureblockinfo> _ensureblockstack   new stack<ensureblockinfo>
+private static class rescueblockinfo
+rescuenode rescuenode                 rescue node for which we are tracking info
+label      entrylabel                 entry of the rescue block
+variable   savedexceptionvariable     variable that contains the saved $  variable
+irloop     innermostloop              innermost loop within which this ensure block is nested  if any
+public rescueblockinfo rescuenode n  label l  variable v  irloop loop
+rescuenode   n
+entrylabel   l
+savedexceptionvariable   v
+innermostloop   loop
+}
+public void restoreexception irscope s  irloop currloop
+if  currloop    innermostloop  s addinstr new putglobalvarinstr    savedexceptionvariable
+}
+}
+// stack encoding nested rescue blocks -- this just tracks the start label of the blocks
+private stack<rescueblockinfo> _rescueblockstack   new stack<rescueblockinfo>
+private int _lastprocessedlinenum    1
+// since we are processing asts, loop bodies are processed in depth-first manner
+// with outer loops encountered before inner loops, and inner loops finished before outer ones.
+//
+// so, we can keep track of loops in a loop stack which  keeps track of loops as they are encountered.
+// this lets us implement next/redo/break/retry easily for the non-closure cases
+private stack<irloop> loopstack   new stack<irloop>
+public irloop getcurrentloop
+return loopstack isempty   ? null   loopstack peek
+}
+protected irmanager manager
+public irbuilder irmanager manager
+this manager   manager
+}
+public static node buildast boolean iscommandlinescript  string arg
+ruby ruby   ruby getglobalruntime
+// set to ir mode, since we use different scopes, etc for ir
+ruby getinstanceconfig   setcompilemode compilemode offir
+// inline script
+if  iscommandlinescript  return ruby parse bytelist create arg      null  0  false
+// from file
+fileinputstream fis   null
+try
+file file   new file arg
+fis   new fileinputstream file
+long size   file length
+byte bytes   new byte
+fis read bytes
+system out println     arg
+return ruby parse new bytelist bytes   arg  null  0  false
+catch  ioexception ioe
+throw new runtimeexception ioe
+finally
+try   if  fis    null  fis close      catch exception e
+}
+}
+public static irbuilder createirbuilder irmanager manager  boolean is19
+return is19 ? new irbuilder19 manager    new irbuilder manager
+}
+public node skipovernewlines irscope s  node n
+if  n getnodetype      nodetype newlinenode
+// do not emit multiple line number instrs for the same line
+int currlinenum   n getposition   getstartline
+if  currlinenum    _lastprocessedlinenum
+s addinstr new linenumberinstr s  currlinenum
+_lastprocessedlinenum   currlinenum
+}
+}
+while  n getnodetype      nodetype newlinenode
+n     newlinenode n  getnextnode
+return n
+}
+public operand build node node  irscope s
+if  node    null  return null
+if  s    null
+system out println
+throw new notcompilableexception     node
+}
+switch  node getnodetype
+case aliasnode  return buildalias  aliasnode  node  s
+case andnode  return buildand  andnode  node  s
+case argscatnode  return buildargscat  argscatnode  node  s
+case argspushnode  return buildargspush  argspushnode  node  s
+case arraynode  return buildarray node  s
+case attrassignnode  return buildattrassign  attrassignnode  node  s
+case backrefnode  return buildbackref  backrefnode  node  s
+case beginnode  return buildbegin  beginnode  node  s
+case bignumnode  return buildbignum  bignumnode  node  s
+case blocknode  return buildblock  blocknode  node  s
+case breaknode  return buildbreak  breaknode  node  s
+case callnode  return buildcall  callnode  node  s
+case casenode  return buildcase  casenode  node  s
+case classnode  return buildclass  classnode  node  s
+case classvarnode  return buildclassvar  classvarnode  node  s
+case classvarasgnnode  return buildclassvarasgn  classvarasgnnode  node  s
+case classvardeclnode  return buildclassvardecl  classvardeclnode  node  s
+case colon2node  return buildcolon2  colon2node  node  s
+case colon3node  return buildcolon3  colon3node  node  s
+case constdeclnode  return buildconstdecl  constdeclnode  node  s
+case constnode  return searchconst s  s    constnode  node  getname
+case dasgnnode  return builddasgn  dasgnnode  node  s
+case definednode  return buildgetdefinitionbase   definednode  node  getexpressionnode    s
+case defnnode  return builddefn  methoddefnode  node  s
+case defsnode  return builddefs  defsnode  node  s
+case dotnode  return builddot  dotnode  node  s
+case dregexpnode  return builddregexp  dregexpnode  node  s
+case dstrnode  return builddstr  dstrnode  node  s
+case dsymbolnode  return builddsymbol  dsymbolnode  node  s
+case dvarnode  return builddvar  dvarnode  node  s
+case dxstrnode  return builddxstr  dxstrnode  node  s
+case ensurenode  return buildensurenode  ensurenode  node  s
+case evstrnode  return buildevstr  evstrnode  node  s
+case falsenode  return buildfalse node  s
+case fcallnode  return buildfcall  fcallnode  node  s
+case fixnumnode  return buildfixnum  fixnumnode  node  s
+case flipnode  return buildflip  flipnode  node  s
+case floatnode  return buildfloat  floatnode  node  s
+case fornode  return buildfor  fornode  node  s
+case globalasgnnode  return buildglobalasgn  globalasgnnode  node  s
+case globalvarnode  return buildglobalvar  globalvarnode  node  s
+case hashnode  return buildhash  hashnode  node  s
+case ifnode  return buildif  ifnode  node  s
+case instasgnnode  return buildinstasgn  instasgnnode  node  s
+case instvarnode  return buildinstvar  instvarnode  node  s
+case iternode  return builditer  iternode  node  s
+case literalnode  return buildliteral  literalnode  node  s
+case localasgnnode  return buildlocalasgn  localasgnnode  node  s
+case localvarnode  return buildlocalvar  localvarnode  node  s
+case match2node  return buildmatch2  match2node  node  s
+case match3node  return buildmatch3  match3node  node  s
+case matchnode  return buildmatch  matchnode  node  s
+case modulenode  return buildmodule  modulenode  node  s
+case multipleasgnnode  return buildmultipleasgn  multipleasgnnode  node  s      only for 1 8
+case newlinenode  return buildnewline  newlinenode  node  s
+case nextnode  return buildnext  nextnode  node  s
+case nthrefnode  return buildnthref  nthrefnode  node  s
+case nilnode  return buildnil node  s
+case notnode  return buildnot  notnode  node  s
+case opasgnandnode  return buildopasgnand  opasgnandnode  node  s
+case opasgnnode  return buildopasgn  opasgnnode  node  s
+case opasgnornode  return buildopasgnor  opasgnornode  node  s
+case opelementasgnnode  return buildopelementasgn  opelementasgnnode  node  s
+case ornode  return buildor  ornode  node  s
+case preexenode  return buildpreexe  preexenode  node  s
+case postexenode  return buildpostexe  postexenode  node  s
+case redonode  return buildredo node  s
+case regexpnode  return buildregexp  regexpnode  node  s
+case rescuebodynode
+throw new notcompilableexception     node getposition
+case rescuenode  return buildrescue  rescuenode  node  s
+case retrynode  return buildretry node  s
+case returnnode  return buildreturn  returnnode  node  s
+case rootnode
+throw new notcompilableexception     node getposition
+case sclassnode  return buildsclass  sclassnode  node  s
+case selfnode  return buildself  selfnode  node  s
+case splatnode  return buildsplat  splatnode  node  s
+case strnode  return buildstr  strnode  node  s
+case supernode  return buildsuper  supernode  node  s
+case svaluenode  return buildsvalue  svaluenode  node  s
+case symbolnode  return buildsymbol  symbolnode  node  s
+case toarynode  return buildtoary  toarynode  node  s
+case truenode  return buildtrue node  s
+case undefnode  return buildundef node  s
+case untilnode  return builduntil  untilnode  node  s
+case valiasnode  return buildvalias node  s
+case vcallnode  return buildvcall  vcallnode  node  s
+case whilenode  return buildwhile  whilenode  node  s
+case whennode  assert false      return null
+case xstrnode  return buildxstr  xstrnode  node  s
+case yieldnode  return buildyield  yieldnode  node  s
+case zarraynode  return buildzarray node  s
+case zsupernode  return buildzsuper  zsupernode  node  s
+default  return buildversionspecificnodes node  s
+}
+}
+protected operand buildversionspecificnodes node node  irscope s
+throw new notcompilableexception     node getclass
+}
+protected variable getself irscope s
+return s getself
+}
+protected variable copyandreturnvalue irscope s  operand val
+variable v   s getnewtemporaryvariable
+s addinstr new copyinstr v  val
+return v
+}
+protected variable getvalueintemporaryvariable irscope s  operand val
+if  val    null    val instanceof temporaryvariable  return  variable  val
+return copyandreturnvalue s  val
+}
+// return the last argument in the list -- attrassign needs it
+protected operand buildcallargs list<operand> argslist  node args  irscope s
+// unwrap newline nodes to get their actual type
+args   skipovernewlines s  args
+switch  args getnodetype
+case argscatnode
+compoundarray a    compoundarray build args  s
+argslist add new splat a
+return a getappendedarg
+}
+case argspushnode
+argspushnode ap    argspushnode args
+operand v1   build ap getfirstnode    s
+operand v2   build ap getsecondnode    s
+argslist add new splat new compoundarray v1  v2  true
+return v2
+}
+case arraynode
+arraynode arraynode    arraynode args
+if  arraynode islightweight
+list<node> children   arraynode childnodes
+if  children size      1
+// skipovernewlines is required because the parser inserts a newlinenode in between!
+node child   skipovernewlines s  children get 0
+if  child instanceof splatnode
+// sss: if the only child is a splat, the splat is supposed to get through
+// as an array without being expanded into the call arg list.
+//
+// the ast for the foo([*1]) is: arraynode(splat19node(..))
+// the ast for the foo(*1) is: splat19node(..)
+//
+// since a lone splat in call args is always expanded, we convert the splat
+// into a compound array: *n --> args-cat([], *n)
+splatnode splat    splatnode child
+variable splatarray   getvalueintemporaryvariable s  build splat getvalue    s
+argslist add new compoundarray new array    splatarray
+return new splat splatarray
+else
+operand childoperand   build child  s
+argslist add childoperand
+return childoperand
+}
+else
+// explode array, it's an internal "args" array
+for  node n  children
+argslist add build n  s
+}
+}
+else
+// use array as-is, it's a literal array
+argslist add build arraynode  s
+}
+break
+}
+default
+argslist add build args  s
+break
+}
+}
+return argslist isempty   ? manager getnil     argslist get argslist size     1
+}
+public list<operand> setupcallargs node args  irscope s
+list<operand> argslist   new arraylist<operand>
+if  args    null  buildcallargs argslist  args  s
+return argslist
+}
+public void buildversionspecificassignment node node  irscope s  variable v
+switch  node getnodetype
+case multipleasgnnode
+operand valuesarg
+multipleasgnnode childnode    multipleasgnnode  node
+if  childnode getheadnode      null      listnode childnode getheadnode    childnodes   size   > 0
+// invoke to_ary on the operand only if it is not an array already
+variable result   s getnewtemporaryvariable
+s addinstr new toaryinstr result  v  manager gettrue
+valuesarg   result
+else
+s addinstr new ensurerubyarrayinstr v  v
+valuesarg   v
+}
+buildmultipleasgnassignment childnode  s  null  valuesarg
+break
+}
+default
+throw new notcompilableexception     node
+}
+}
+// this method is called to build assignments for a multiple-assignment instruction
+public void buildassignment node node  irscope s  variable rhsval
+switch  node getnodetype
+case attrassignnode
+buildattrassignassignment node  s  rhsval
+break
+case classvarasgnnode
+s addinstr new putclassvariableinstr classvardefinitioncontainer s     classvarasgnnode node  getname    rhsval
+break
+case classvardeclnode
+s addinstr new putclassvariableinstr classvardeclarationcontainer s     classvardeclnode node  getname    rhsval
+break
+case constdeclnode
+buildconstdeclassignment  constdeclnode  node  s  rhsval
+break
+case dasgnnode
+dasgnnode variable    dasgnnode  node
+int depth   variable getdepth
+s addinstr new copyinstr s getlocalvariable variable getname    depth   rhsval
+break
+}
+case globalasgnnode
+s addinstr new putglobalvarinstr   globalasgnnode node  getname    rhsval
+break
+case instasgnnode
+// note: if 's' happens to the a class, this is effectively an assignment of a class instance variable
+s addinstr new putfieldinstr getself s     instasgnnode node  getname    rhsval
+break
+case localasgnnode
+localasgnnode localvariable    localasgnnode  node
+int depth   localvariable getdepth
+s addinstr new copyinstr s getlocalvariable localvariable getname    depth   rhsval
+break
+}
+case zeroargnode
+throw new notcompilableexception     node
+default
+buildversionspecificassignment node  s  rhsval
+}
+}
+protected localvariable getblockargvariable irscope cl  string name  int depth
+return cl getlocalvariable name  depth
+}
+protected void receiveblockarg irscope s  variable v  operand argsarray  int argindex  boolean isclosurearg  boolean issplat
+if  argsarray    null
+// we are in a nested receive situation -- when we are not at the root of a masgn tree
+// ex: we are trying to receive (b,c) in this example: "|a, (b,c), d| = ..."
+if  issplat  s addinstr new restargmultipleasgninstr v  argsarray  argindex
+else s addinstr new reqdargmultipleasgninstr v  argsarray  argindex
+else
+// argsarray can be null when the first node in the args-node-ast is a multiple-assignment
+// for example, for-nodes
+s addinstr isclosurearg ? new receiveclosureinstr v     issplat ? new receiverestarginstr18 v  argindex    new receiveprereqdarginstr v  argindex
+}
+}
+public void buildversionspecificblockargsassignment node node  irscope s  operand argsarray  int argindex  boolean ismasgnroot  boolean isclosurearg  boolean issplat
+switch  node getnodetype
+case multipleasgnnode
+variable oldargs   null
+multipleasgnnode childnode    multipleasgnnode  node
+if   ismasgnroot
+// vars used to receive args should always be local-variables because
+// these arg values may need to be accessed by some zsuper instruction.
+// during interpretation, only local-vars are accessible (at least right now)
+// outside the scope they are defined in.
+variable v   s getlocalvariable     argindex  0
+receiveblockarg s  v  argsarray  argindex  isclosurearg  issplat
+boolean runtoary   childnode getheadnode      null       listnode childnode getheadnode    childnodes   size   > 0
+if  runtoary
+s addinstr new toaryinstr v  v  manager getfalse
+else
+s addinstr new ensurerubyarrayinstr v  v
+}
+argsarray   v
+// sss fixme: are we guaranteed that splats dont head to multiple-assignment nodes!  i.e. |*(a,b)|?
+}
+// build
+buildmultipleasgnassignment childnode  s  argsarray  null
+break
+}
+default  throw new notcompilableexception     node
+}
+}
+// this method is called to build arguments for a block!
+public void buildblockargsassignment node node  irscope s  operand argsarray  int argindex  boolean ismasgnroot  boolean isclosurearg  boolean issplat
+variable v
+switch  node getnodetype
+case attrassignnode
+v   s getnewtemporaryvariable
+receiveblockarg s  v  argsarray  argindex  isclosurearg  issplat
+buildattrassignassignment node  s  v
+break
+case dasgnnode
+dasgnnode dynamicasgn    dasgnnode  node
+v   getblockargvariable  irclosure s  dynamicasgn getname    dynamicasgn getdepth
+receiveblockarg s  v  argsarray  argindex  isclosurearg  issplat
+break
+}
+case classvarasgnnode
+v   s getnewtemporaryvariable
+receiveblockarg s  v  argsarray  argindex  isclosurearg  issplat
+s addinstr new putclassvariableinstr classvardefinitioncontainer s     classvarasgnnode node  getname    v
+break
+case classvardeclnode
+v   s getnewtemporaryvariable
+receiveblockarg s  v  argsarray  argindex  isclosurearg  issplat
+s addinstr new putclassvariableinstr classvardeclarationcontainer s     classvardeclnode node  getname    v
+break
+case constdeclnode
+v   s getnewtemporaryvariable
+receiveblockarg s  v  argsarray  argindex  isclosurearg  issplat
+buildconstdeclassignment  constdeclnode  node  s  v
+break
+case globalasgnnode
+v   s getnewtemporaryvariable
+receiveblockarg s  v  argsarray  argindex  isclosurearg  issplat
+s addinstr new putglobalvarinstr   globalasgnnode node  getname    v
+break
+case instasgnnode
+v   s getnewtemporaryvariable
+receiveblockarg s  v  argsarray  argindex  isclosurearg  issplat
+// note: if 's' happens to the a class, this is effectively an assignment of a class instance variable
+s addinstr new putfieldinstr getself s     instasgnnode node  getname    v
+break
+case localasgnnode
+localasgnnode localvariable    localasgnnode  node
+int depth   localvariable getdepth
+v   getblockargvariable  irclosure s  localvariable getname    depth
+receiveblockarg s  v  argsarray  argindex  isclosurearg  issplat
+break
+}
+case zeroargnode
+throw new notcompilableexception     node
+default
+buildversionspecificblockargsassignment node  s  argsarray  argindex  ismasgnroot  isclosurearg  issplat
+}
+}
+public operand buildalias final aliasnode alias  irscope s
+operand newname   build alias getnewname    s
+operand oldname   build alias getoldname    s
+s addinstr new aliasinstr getself s   newname  oldname
+return manager getnil
+}
+// translate "ret = (a && b)" --> "ret = (a ? b : false)" -->
+//
+//    v1 = -- build(a) --
+//       opt: ret can be set to v1, but effectively v1 is false if we take the branch to l.
+//            while this info can be inferred by using attributes, why bother if we can do this?
+//    ret = v1
+//    beq(v1, false, l)
+//    v2 = -- build(b) --
+//    ret = v2
+// l:
+//
+public operand buildand final andnode andnode  irscope s
+if  andnode getfirstnode   getnodetype   alwaystrue
+// build first node (and ignore its result) and then second node
+build andnode getfirstnode    s
+return build andnode getsecondnode    s
+else if  andnode getfirstnode   getnodetype   alwaysfalse
+// build first node only and return its value
+return build andnode getfirstnode    s
+else
+label    l     s getnewlabel
+operand  v1    build andnode getfirstnode    s
+variable ret   getvalueintemporaryvariable s  v1
+s addinstr beqinstr create v1  manager getfalse    l
+operand  v2    build andnode getsecondnode    s
+s addinstr new copyinstr ret  v2
+s addinstr new labelinstr l
+return ret
+}
+}
+public operand buildarray node node  irscope s
+list<operand> elts   new arraylist<operand>
+for  node e  node childnodes
+elts add build e  s
+return copyandreturnvalue s  new array elts
+}
+public operand buildargscat final argscatnode argscatnode  irscope s
+operand v1   build argscatnode getfirstnode    s
+operand v2   build argscatnode getsecondnode    s
+return new compoundarray v1  v2
+}
+public operand buildargspush final argspushnode node  irscope s
+throw new notcompilableexception     node
+}
+private operand buildattrassign final attrassignnode attrassignnode  irscope s
+operand obj   build attrassignnode getreceivernode    s
+list<operand> args   new arraylist<operand>
+node argsnode   attrassignnode getargsnode
+operand lastarg    argsnode    null  ? manager getnil     buildcallargs args  argsnode  s
+s addinstr new attrassigninstr obj  new methaddr attrassignnode getname     args toarray new operand
+return lastarg
+}
+public operand buildattrassignassignment node node  irscope s  operand value
+final attrassignnode attrassignnode    attrassignnode  node
+operand obj   build attrassignnode getreceivernode    s
+list<operand> args   setupcallargs attrassignnode getargsnode    s
+args add value
+s addinstr new attrassigninstr obj  new methaddr attrassignnode getname     args toarray new operand
+return value
+}
+public operand buildbackref backrefnode node  irscope s
+// sss fixme: required? verify with tom/charlie
+return copyandreturnvalue s  new backref node gettype
+}
+public operand buildbegin beginnode beginnode  irscope s
+return build beginnode getbodynode    s
+}
+public operand buildbignum bignumnode node  irscope s
+// sss: since bignum literals are effectively interned objects, no need to copyandreturnvalue(...)
+// or is this a premature optimization?
+return new bignum node getvalue
+}
+public operand buildblock blocknode node  irscope s
+operand retval   null
+for  node child   node childnodes
+retval   build child  s
+}
+// value of the last expression in the block
+return retval
+}
+public operand buildbreak breaknode breaknode  irscope s
+irloop currloop   getcurrentloop
+operand rv   build breaknode getvaluenode    s
+// if we have ensure blocks, have to run those first!
+if   _ensureblockstack empty    ensureblockinfo emitjumpchain s  _ensureblockstack  currloop
+else if   _rescueblockstack empty    _rescueblockstack peek   restoreexception s  currloop
+if  currloop    null
+s addinstr new copyinstr currloop loopresult  rv
+s addinstr new jumpinstr currloop loopendlabel
+else
+if  s instanceof irclosure
+// this lexical scope value is only used (and valid) in regular block contexts.
+// if this instruction is executed in a proc or lambda context, the lexical scope value is useless.
+s addinstr new breakinstr rv  s getlexicalparent
+else
+// sss fixme: if we are not in a closure or a loop, the break instruction will throw a runtime exception
+// since we know this right now, should we build an exception instruction here?
+s addinstr new breakinstr rv  null
+}
+}
+// once the break instruction executes, control exits this scope
+return unexecutablenil u_nil
+}
+public operand buildcall callnode callnode  irscope s
+node          callargsnode   callnode getargsnode
+node          receivernode   callnode getreceivernode
+// though you might be tempted to move this build into the callinstr as:
+//    new callinstr( ... , build(receivernode, s), ...)
+// that is incorrect ir because the receiver has to be built *before* call arguments are built
+// to preserve expected code execution order
+operand       receiver       build receivernode  s
+list<operand> args           setupcallargs callargsnode  s
+operand       block          setupcallclosure callnode getiternode    s
+variable      callresult     s getnewtemporaryvariable
+instr         callinstr      callinstr create callresult  new methaddr callnode getname     receiver  args toarray new operand   block
+s addinstr callinstr
+return callresult
+}
+public operand buildcase casenode casenode  irscope s
+// get the incoming case value
+operand value   build casenode getcasenode    s
+// this is for handling case statements without a value (see example below)
+//   case
+//     when true <blah>
+//     when false <blah>
+//   end
+if  value    null  value   undefinedvalue undefined
+label     endlabel    s getnewlabel
+boolean   haselse      casenode getelsenode      null
+label     elselabel   s getnewlabel
+variable  result      s getnewtemporaryvariable
+list<label> labels   new arraylist<label>
+map<label  node> bodies   new hashmap<label  node>
+// build each "when"
+for  node acase   casenode getcases   childnodes
+whennode whennode    whennode acase
+label bodylabel   s getnewlabel
+variable eqqresult   s getnewtemporaryvariable
+labels add bodylabel
+operand v1  v2
+if  whennode getexpressionnodes   instanceof listnode
+// sss fixme: note about refactoring:
+// - beqinstr has a quick implementation when the second operand is a boolean literal
+//   if it can be fixed to do this even on the first operand, we can switch around
+//   v1 and v2 in the undefinedvalue scenario and dry out this code.
+// - even with this asymmetric implementation of beqinstr, you might be tempted to
+//   switch around v1 and v2 in the else case.  but, that is equivalent to this ruby code change:
+//      (v1 == value) instead of (value == v1)
+//   it seems that they should be identical, but the first one is v1.==(value) and the second one is
+//   value.==(v1).  this is just fine *if* the ruby programmer has implemented an algebraically
+//   symmetric "==" method on those objects.  if not, then, the results might be unexpected where the
+//   code (intentionally or otherwise) relies on this asymmetry of "==".  while it could be argued
+//   that this a ruby code bug, we will just try to preserve the order of the == check as it appears
+//   in the ruby code.
+if  value    undefinedvalue undefined
+v1   build whennode getexpressionnodes    s
+v2   manager gettrue
+else
+v1   value
+v2   build whennode getexpressionnodes    s
+}
+else
+s addinstr new eqqinstr eqqresult  build whennode getexpressionnodes    s   value
+v1   eqqresult
+v2   manager gettrue
+}
+s addinstr beqinstr create v1  v2  bodylabel
+// sss fixme: this doesn't preserve original order of when clauses.  we could consider
+// preserving the order (or maybe not, since we would have to sort the constants first
+// in any case) for outputing jump tables in certain situations.
+//
+// add body to map for emitting later
+bodies put bodylabel  whennode getbodynode
+}
+// jump to else in case nothing matches!
+s addinstr new jumpinstr elselabel
+// build "else" if it exists
+if  haselse
+labels add elselabel
+bodies put elselabel  casenode getelsenode
+}
+// now emit bodies while preserving when clauses order
+for  label whenlabel  labels
+s addinstr new labelinstr whenlabel
+operand bodyvalue   build bodies get whenlabel   s
+// bodyvalue can be null if the body ends with a return!
+if  bodyvalue    null
+// sss fixme: do local optimization of break results (followed by a copy & jump) to short-circuit the jump right away
+// rather than wait to do it during an optimization pass when a dead jump needs to be removed.  for this, you have
+// to look at what the last generated instruction was.
+label tgt   endlabel
+s addinstr new copyinstr result  bodyvalue
+s addinstr new jumpinstr tgt
+}
+}
+if   haselse
+s addinstr new labelinstr elselabel
+s addinstr new copyinstr result  manager getnil
+s addinstr new jumpinstr endlabel
+}
+// close it out
+s addinstr new labelinstr endlabel
+// sss: got rid of the marker case label instruction
+return result
+}
+/**
+* build a new class and add it to the current scope (s).
+*/
+public operand buildclass classnode classnode  irscope s
+node supernode   classnode getsupernode
+colon3node cpath   classnode getcpath
+operand superclass    supernode    null  ? null   build supernode  s
+string classname   cpath getname
+operand container   getcontainerfromcpath cpath  s
+irclassbody c   new irclassbody manager  s  classname  classnode getposition   getline    classnode getscope
+variable classbody   s getnewtemporaryvariable
+s addinstr new defineclassinstr classbody  c  container  superclass
+variable ret   s getnewtemporaryvariable
+s addinstr new processmodulebodyinstr ret  classbody
+c addinstr new receiveselfinstr c getself
+// set %current_scope = <c>
+// set %current_module = module<c>
+c addinstr new copyinstr c getcurrentscopevariable    new currentscope c
+c addinstr new copyinstr c getcurrentmodulevariable    new scopemodule c
+// create a new nested builder to ensure this gets its own ir builder state
+operand rv   createirbuilder manager  is1_9    build classnode getbodynode    c
+if  rv    null  c addinstr new returninstr rv
+return ret
+}
+public operand buildsclass sclassnode sclassnode  irscope s
+//  class foo
+//  ...
+//    class << self
+//    ...
+//    end
+//  ...
+//  end
+//
+// here, the class << self declaration is in foo's body.
+// foo is the class in whose context this is being defined.
+operand receiver   build sclassnode getreceivernode    s
+// create a dummy meta class and record it as being lexically defined in scope s
+irmodulebody mc   new irmetaclassbody manager  s  manager getmetaclassname    sclassnode getposition   getline    sclassnode getscope
+variable classbody   s getnewtemporaryvariable
+s addinstr new definemetaclassinstr classbody  receiver  mc
+variable ret   s getnewtemporaryvariable
+s addinstr new processmodulebodyinstr ret  classbody
+mc addinstr new receiveselfinstr mc getself
+// set %current_scope = <current-scope>
+// set %current_module = <current-module>
+mc addinstr new receiveclosureinstr mc getimplicitblockarg
+mc addinstr new copyinstr mc getcurrentscopevariable    new currentscope mc
+mc addinstr new copyinstr mc getcurrentmodulevariable    new scopemodule mc
+// create a new nested builder to ensure this gets its own ir builder state
+operand rv   createirbuilder manager  is1_9    build sclassnode getbodynode    mc
+if  rv    null  mc addinstr new returninstr rv
+return ret
+}
+// @@c
+public operand buildclassvar classvarnode node  irscope s
+variable ret   s getnewtemporaryvariable
+s addinstr new getclassvariableinstr ret  classvardefinitioncontainer s   node getname
+return ret
+}
+// classvarasgn node is assignment within a method/closure scope
+//
+// def foo
+//   @@c = 1
+// end
+public operand buildclassvarasgn final classvarasgnnode classvarasgnnode  irscope s
+operand val   build classvarasgnnode getvaluenode    s
+s addinstr new putclassvariableinstr classvardefinitioncontainer s   classvarasgnnode getname    val
+return val
+}
+// classvardecl node is assignment outside method/closure scope (top-level, class, module)
+//
+// class c
+//   @@c = 1
+// end
+public operand buildclassvardecl final classvardeclnode classvardeclnode  irscope s
+operand val   build classvardeclnode getvaluenode    s
+s addinstr new putclassvariableinstr classvardeclarationcontainer s   classvardeclnode getname    val
+return val
+}
+public operand classvardeclarationcontainer irscope s
+return classvarcontainer s  true
+}
+public operand classvardefinitioncontainer irscope s
+return classvarcontainer s  false
+}
+// sss fixme: this feels a little ugly.  is there a better way of representing this?
+public operand classvarcontainer irscope s  boolean declcontext
+/* -------------------------------------------------------------------------------
+* we are looking for the nearest enclosing scope that is a non-singleton class body
+* without running into an eval-scope in between.
+*
+* stop lexical scope walking at an eval script boundary.  evals are essentially
+* a way for a programmer to splice an entire tree of lexical scopes at the point
+* where the eval happens.  so, when we hit an eval-script boundary at compile-time,
+* defer scope traversal to when we know where this scope has been spliced in.
+* ------------------------------------------------------------------------------- */
+irscope cvarscope   s
+while  cvarscope    null      cvarscope instanceof irevalscript      cvarscope isnonsingletonclassbody
+cvarscope   cvarscope getlexicalparent
+}
+if   cvarscope    null     cvarscope isnonsingletonclassbody
+return new scopemodule cvarscope
+else
+variable tmp   s getnewtemporaryvariable
+s addinstr new getclassvarcontainermoduleinstr tmp  s getcurrentscopevariable    declcontext ? null   getself s
+return tmp
+}
+}
+public operand buildconstdecl constdeclnode node  irscope s
+operand val   build node getvaluenode    s
+return buildconstdeclassignment node  s  val
+}
+private operand findcontainermodule irscope s
+irscope nearestmodulebody   s getnearestmodulereferencingscope
+return  nearestmodulebody    null  ? s getcurrentmodulevariable     new scopemodule nearestmodulebody
+}
+private operand startingsearchscope irscope s
+irscope nearestmodulebody   s getnearestmodulereferencingscope
+return nearestmodulebody    null ? s getcurrentscopevariable     new currentscope nearestmodulebody
+}
+public operand buildconstdeclassignment constdeclnode constdeclnode  irscope s  operand val
+node constnode   constdeclnode getconstnode
+if  constnode    null
+s addinstr new putconstinstr findcontainermodule s   constdeclnode getname    val
+else if  constnode getnodetype      nodetype colon2node
+operand module   build   colon2node  constnode  getleftnode    s
+s addinstr new putconstinstr module  constdeclnode getname    val
+else      colon3  assign in object
+scopemodule object   new scopemodule manager getobject
+s addinstr new putconstinstr object  constdeclnode getname    val
+}
+return val
+}
+private void geninheritancesearchinstrs irscope s  operand startingmodule  variable constval  label foundlabel  boolean noprivateconstants  string name
+s addinstr new inheritancesearchconstinstr constval  startingmodule  name  noprivateconstants
+s addinstr bneinstr create constval  undefinedvalue undefined  foundlabel
+s addinstr new constmissinginstr constval  startingmodule  name
+s addinstr new labelinstr foundlabel
+}
+private operand searchconstininheritancehierarchy irscope s  operand startingmodule  string name
+variable constval   s getnewtemporaryvariable
+geninheritancesearchinstrs s  startingmodule  constval  s getnewlabel    true  name
+return constval
+}
+private operand searchconst irscope s  irscope startingscope  string name
+boolean noprivateconstants    s    startingscope
+variable v   s getnewtemporaryvariable
+/**
+* sss fixme: go back to a single instruction for now.
+*
+* do not split search into lexical-search, inheritance-search, and const-missing instrs.
+*
+label foundlabel = s.getnewlabel();
+s.addinstr(new lexicalsearchconstinstr(v, startingsearchscope(startingscope), name));
+s.addinstr(bneinstr.create(v, undefinedvalue.undefined, foundlabel));
+geninheritancesearchinstrs(s, findcontainermodule(startingscope), v, foundlabel, noprivateconstants, name);
+**/
+s addinstr new searchconstinstr v  name  startingsearchscope startingscope   noprivateconstants
+return v
+}
+public operand buildcolon2 final colon2node ivisited  irscope s
+node leftnode   ivisited getleftnode
+final string name   ivisited getname
+// enebo: does this really happen?
+if  leftnode    null  return searchconst s  s  name
+if  ivisited instanceof colon2constnode
+// 1. load the module first (lhs of node)
+// 2. then load the constant from the module
+operand module   build leftnode  s
+return searchconstininheritancehierarchy s  module  name
+else if  ivisited instanceof colon2methodnode
+colon2methodnode c2mnode    colon2methodnode ivisited
+list<operand> args         setupcallargs null  s
+operand       block        setupcallclosure null  s
+variable      callresult   s getnewtemporaryvariable
+instr         callinstr    callinstr create callresult  new methaddr c2mnode getname
+null  args toarray new operand   block
+s addinstr callinstr
+return callresult
+else
+throw new notcompilableexception     ivisited
+}
+}
+public operand buildcolon3 colon3node node  irscope s
+return searchconstininheritancehierarchy s  new objectclass    node getname
+}
+interface codeblock
+public operand run object args
+}
+private variable protectcodewithensure irscope s  codeblock protectedcode  object protectedcodeargs  codeblock ensurecode  object ensurecodeargs
+// this effectively mimics a begin-ensure-end code block
+// except this silently swallows all exceptions raised by the protected code
+variable ret   s getnewtemporaryvariable
+// push a new ensure block info node onto the stack of ensure block
+ensureblockinfo ebi   new ensureblockinfo s  null  getcurrentloop
+_ensureblockstack push ebi
+label rbeginlabel   ebi regionstart
+label rendlabel     ebi end
+// protected region code
+s addinstr new labelinstr rbeginlabel
+s addinstr new exceptionregionstartmarkerinstr rbeginlabel  rendlabel  ebi dummyrescueblocklabel  ebi dummyrescueblocklabel
+operand v1   protectedcode run protectedcodeargs      yield  run the protected code block
+s addinstr new copyinstr ret  v1
+s addinstr new jumpinstr ebi start
+s addinstr new exceptionregionendmarkerinstr
+// rescue block code
+// sss fixme: how do we get this to catch all exceptions, not just ruby exceptions?
+s addinstr new labelinstr ebi dummyrescueblocklabel
+s addinstr new copyinstr ret  manager getnil
+_ensureblockstack pop
+// ensure block code -- this should not throw exceptions
+s addinstr new labelinstr ebi start
+ensurecode run ensurecodeargs      yield  run the ensure code block
+// end
+s addinstr new labelinstr rendlabel
+return ret
+}
+private operand protectcodewithrescue irscope m  codeblock protectedcode  object protectedcodeargs  codeblock rescueblock  object rescueblockargs
+// this effectively mimics a begin-rescue-end code block
+// except this catches all exceptions raised by the protected code
+variable rv   m getnewtemporaryvariable
+label rbeginlabel   m getnewlabel
+label rendlabel     m getnewlabel
+label rescuelabel   m getnewlabel
+// protected region code
+m addinstr new labelinstr rbeginlabel
+m addinstr new exceptionregionstartmarkerinstr rbeginlabel  rendlabel  null  rescuelabel
+object v1   protectedcode run protectedcodeargs      yield  run the protected code block
+m addinstr new copyinstr rv   operand v1
+m addinstr new jumpinstr rendlabel
+m addinstr new exceptionregionendmarkerinstr
+// rescue code
+label uncaughtlabel   m getnewlabel
+variable exc   m getnewtemporaryvariable
+variable eqqresult   m getnewtemporaryvariable
+m addinstr new labelinstr rescuelabel
+m addinstr new receiveexceptioninstr exc
+// verify that the exception is of type 'rubyexception'.
+// since this is jruby implementation java code, we dont need eqq here.
+// sss fixme: hardcoded exception class name!
+m addinstr new instanceofinstr eqqresult  exc
+m addinstr beqinstr create eqqresult  manager getfalse    uncaughtlabel
+object v2   rescueblock run rescueblockargs      yield  run the protected code block
+if  v2    null  m addinstr new copyinstr rv  manager getnil
+m addinstr new jumpinstr rendlabel
+m addinstr new labelinstr uncaughtlabel
+m addinstr new throwexceptioninstr exc
+// end
+m addinstr new labelinstr rendlabel
+return rv
+}
+protected operand buildgenericgetdefinitionir node node  irscope s
+s addinstr new setwithindefinedinstr manager gettrue
+// protected code
+codeblock protectedcode   new codeblock
+public operand run object args
+return buildgetdefinition  node args   irscope args
+}
+// ensure code
+codeblock ensurecode   new codeblock
+public operand run object args
+irscope m    irscope args
+m addinstr new setwithindefinedinstr manager getfalse
+return manager getnil
+}
+return protectcodewithensure s  protectedcode  new object  node  s   ensurecode  new object  s
+}
+protected operand buildversionspecificgetdefinitionir node node  irscope s
+switch  node getnodetype
+case dvarnode
+case backrefnode
+return buildgetdefinition node  s
+default
+return buildgenericgetdefinitionir node  s
+}
+}
+public operand buildgetdefinitionbase node node  irscope s
+node   skipovernewlines s  node
+switch  node getnodetype
+case classvarasgnnode
+case classvardeclnode
+case constdeclnode
+case dasgnnode
+case globalasgnnode
+case localasgnnode
+case multipleasgnnode
+case opasgnnode
+case opelementasgnnode
+case falsenode
+case truenode
+case localvarnode
+case instvarnode
+case selfnode
+case vcallnode
+case yieldnode
+case globalvarnode
+case constnode
+case fcallnode
+case classvarnode
+// these are all "simple" cases that don't require the heavier defined logic
+return buildgetdefinition node  s
+default
+return buildversionspecificgetdefinitionir node  s
+}
+}
+protected variable builddefncheckifthenpaths irscope s  label undeflabel  operand defval
+label deflabel   s getnewlabel
+variable tmpvar   getvalueintemporaryvariable s  defval
+s addinstr new jumpinstr deflabel
+s addinstr new labelinstr undeflabel
+s addinstr new copyinstr tmpvar  manager getnil
+s addinstr new labelinstr deflabel
+return tmpvar
+}
+protected variable builddefinitioncheck irscope s  resultinstr definedinstr  string definedreturnvalue
+label undeflabel   s getnewlabel
+s addinstr  instr  definedinstr
+s addinstr beqinstr create definedinstr getresult    manager getfalse    undeflabel
+return builddefncheckifthenpaths s  undeflabel  new stringliteral definedreturnvalue
+}
+public operand buildgetargumentdefinition final node node  irscope s  string type
+if  node    null  return new stringliteral type
+operand rv   new stringliteral type
+boolean failpathreqd   false
+label faillabel   s getnewlabel
+if  node instanceof arraynode
+for  int i   0  i <   arraynode  node  size    i
+node iternode     arraynode  node  get i
+operand def   buildgetdefinition iternode  s
+if  def    manager getnil         optimization
+rv   manager getnil
+break
+else if   def hasknownvalue         optimization
+failpathreqd   true
+s addinstr beqinstr create def  manager getnil    faillabel
+}
+}
+else
+operand def   buildgetdefinition node  s
+if  def    manager getnil         optimization
+rv   manager getnil
+else if   def hasknownvalue         optimization
+failpathreqd   true
+s addinstr beqinstr create def  manager getnil    faillabel
+}
+}
+// optimization!
+return failpathreqd ? builddefncheckifthenpaths s  faillabel  rv    rv
+}
+public operand buildgetdefinition node defnnode  irscope s
+final node node   skipovernewlines s  defnnode
+switch  node getnodetype
+case classvarasgnnode
+case classvardeclnode
+case constdeclnode
+case dasgnnode
+case globalasgnnode
+case localasgnnode
+case multipleasgnnode
+case opasgnnode
+case opasgnandnode
+case opasgnornode
+case opelementasgnnode
+case instasgnnode     simple assignment cases
+return new stringliteral
+case dvarnode
+return new stringliteral
+case falsenode
+return new stringliteral
+case truenode
+return new stringliteral
+case localvarnode
+return new stringliteral
+case match2node
+case match3node
+return new stringliteral
+case nilnode
+return new stringliteral
+case selfnode
+return new stringliteral
+case constnode
+label deflabel   s getnewlabel
+label donelabel   s getnewlabel
+variable tmpvar    s getnewtemporaryvariable
+string constname     constnode  node  getname
+s addinstr new lexicalsearchconstinstr tmpvar  startingsearchscope s   constname
+s addinstr bneinstr create tmpvar  undefinedvalue undefined  deflabel
+s addinstr new inheritancesearchconstinstr tmpvar  findcontainermodule s   constname  false       sss fixme  should this be the current module var or something else?
+s addinstr bneinstr create tmpvar  undefinedvalue undefined  deflabel
+s addinstr new copyinstr tmpvar  manager getnil
+s addinstr new jumpinstr donelabel
+s addinstr new labelinstr deflabel
+s addinstr new copyinstr tmpvar  new stringliteral
+s addinstr new labelinstr donelabel
+return tmpvar
+}
+case globalvarnode
+return builddefinitioncheck s  new globalisdefinedinstr s getnewtemporaryvariable    new stringliteral   globalvarnode  node  getname
+case instvarnode
+return builddefinitioncheck s  new hasinstancevarinstr s getnewtemporaryvariable    getself s   new stringliteral   instvarnode  node  getname
+case yieldnode
+return builddefinitioncheck s  new blockgiveninstr s getnewtemporaryvariable
+case backrefnode
+return builddefinitioncheck s  new backrefismatchdatainstr s getnewtemporaryvariable           backrefnode  node  gettype
+case nthrefnode
+// sss fixme: is there a reason to do this all with low-level ir?
+// can't this all be folded into a java method that would be part
+// of the runtime library, which then can be used by builddefinitioncheck method above?
+// this runtime library would be used both by the interpreter & the compiled code!
+/* -------------------------------------------------------------------------------------
+* we have to generate ir for this:
+*    v = backref; (!(v instanceof rubymatchdata) || v.group(n).nil?) ? nil : "$#{n}"
+*
+* which happens to be identical to: (where nthref implicitly fetches backref again!)
+*    v = backref; (!(v instanceof rubymatchdata) || nthref(n).nil?) ? nil : "$#{n}"
+*
+* i am using the second form since it let us encode it in fewer ir instructions.
+* but, note that this second form is not as clean as the first one plus it fetches backref twice!
+* ------------------------------------------------------------------------------------- */
+int n     nthrefnode  node  getmatchnumber
+label undeflabel   s getnewlabel
+variable tmpvar   s getnewtemporaryvariable
+s addinstr new backrefismatchdatainstr tmpvar
+s addinstr beqinstr create tmpvar  manager getfalse    undeflabel
+// sss fixme:
+// - can/should i use beqinstr(new nthref(n), manager.getnil(), undeflabel)? instead of .nil? & compare with flag?
+// - or, even create a new isnilinstr and notnilinstr to represent optimized scenarios where
+//   the nil? method is not monkey-patched?
+// this matters because if string.nil? is monkey-patched, the two sequences can behave differently.
+s addinstr callinstr create tmpvar  new methaddr     new nthref n   no_args  null
+s addinstr beqinstr create tmpvar  manager gettrue    undeflabel
+return builddefncheckifthenpaths s  undeflabel  new stringliteral     n
+}
+case colon3node
+case colon2node
+// sss fixme: is there a reason to do this all with low-level ir?
+// can't this all be folded into a java method that would be part
+// of the runtime library, which then can be used by builddefinitioncheck method above?
+// this runtime library would be used both by the interpreter & the compiled code!
+final colon3node ivisited    colon3node  node
+final string name   ivisited getname
+// store previous exception for restoration if we rescue something
+variable errinfo   s getnewtemporaryvariable
+s addinstr new geterrorinfoinstr errinfo
+codeblock protectedcode   new codeblock
+public operand run object args
+irscope s       irscope args
+node    n       node args
+string  name    string args
+operand v       n instanceof colon2node  ? build   colon2node n  getleftnode    s    new objectclass
+variable tmpvar   s getnewtemporaryvariable
+s addinstr new getdefinedconstantormethodinstr tmpvar  v  new stringliteral name
+return tmpvar
+}
+// rescue block
+codeblock rescueblock   new codeblock
+public operand run object args
+// nothing to do -- ignore the exception, and restore stashed error info!
+irscope  m     irscope args
+m addinstr new restoreerrorinfoinstr  operand  args
+return manager getnil
+}
+// try verifying definition, and if we get an jumpexception exception, process it with the rescue block above
+return protectcodewithrescue s  protectedcode  new object s  ivisited  name   rescueblock  new object  s  errinfo
+}
+case fcallnode
+/* ------------------------------------------------------------------
+* generate ir for:
+*    r = self/receiver
+*    mc = r.metaclass
+*    return mc.methodbound(meth) ? buildgetargumentdefn(..) : false
+* ----------------------------------------------------------------- */
+label undeflabel   s getnewlabel
+variable tmpvar   s getnewtemporaryvariable
+stringliteral mname   new stringliteral   fcallnode node  getname
+s addinstr new ismethodboundinstr tmpvar  getself s   mname
+s addinstr beqinstr create tmpvar  manager getfalse    undeflabel
+operand argscheckdefn   buildgetargumentdefinition   fcallnode  node  getargsnode    s
+return builddefncheckifthenpaths s  undeflabel  argscheckdefn
+}
+case vcallnode
+return builddefinitioncheck s  new ismethodboundinstr s getnewtemporaryvariable    getself s   new stringliteral   vcallnode  node  getname
+case callnode
+// sss fixme: is there a reason to do this all with low-level ir?
+// can't this all be folded into a java method that would be part
+// of the runtime library?
+label    undeflabel   s getnewlabel
+callnode ivisited    callnode  node
+operand  receiverdefn   buildgetdefinition ivisited getreceivernode    s
+s addinstr beqinstr create receiverdefn  manager getnil    undeflabel
+// protected main block
+codeblock protectedcode   new codeblock
+public operand run object args
+irscope  s             irscope args
+callnode ivisited      callnode args
+string   methodname   ivisited getname
+variable tmpvar       s getnewtemporaryvariable
+operand  receiver     build ivisited getreceivernode    s
+s addinstr new methoddefinedinstr tmpvar  receiver  new stringliteral methodname
+return builddefncheckifthenpaths s   label args  tmpvar
+}
+// rescue block
+codeblock rescueblock   new codeblock
+public operand run object args    return manager getnil         nothing to do if we got an exception
+// try verifying definition, and if we get an exception, throw it out, and return nil
+return protectcodewithrescue s  protectedcode  new object s  ivisited  undeflabel   rescueblock  null
+}
+case classvarnode
+// sss fixme: is there a reason to do this all with low-level ir?
+// can't this all be folded into a java method that would be part
+// of the runtime library, which would be used both by the interpreter & the compiled code!
+/* --------------------------------------------------------------------------
+* generate ir for this ruby pseudo-code:
+*   cm = tc.getcurrentscope.getstaticscope.getmodule || self.metaclass
+*   cm.isclassvardefined ? "class variable" : nil
+* ------------------------------------------------------------------------------ */
+classvarnode ivisited    classvarnode  node
+operand cm   classvardefinitioncontainer s
+return builddefinitioncheck s  new classvarisdefinedinstr s getnewtemporaryvariable    cm  new stringliteral ivisited getname
+}
+case attrassignnode
+label  undeflabel   s getnewlabel
+attrassignnode ivisited    attrassignnode  node
+operand receiverdefn   buildgetdefinition ivisited getreceivernode    s
+s addinstr beqinstr create receiverdefn  manager getnil    undeflabel
+// protected main block
+codeblock protectedcode   new codeblock
+public operand run object args
+/* --------------------------------------------------------------------------
+* this basically combines checks from callnode and fcallnode
+*
+* generate ir for this sequence
+*
+*    1. r  = receiver
+*    2. mc = r.metaclass
+*    3. v  = mc.getvisibility(methodname)
+*    4. f  = !v || v.isprivate? || (v.isprotected? && receiver/self?.kindof(mc.getrealclass))
+*    5. return !f && mc.methodbound(attrmethod) ? buildgetargumentdefn(..) : false
+*
+* hide the complexity of instrs 2-4 into a verifymethodispublicaccessible call
+* which can executely entirely in java-land.  no reason to expose the guts in ir.
+* ------------------------------------------------------------------------------ */
+irscope s    irscope args
+attrassignnode ivisited    attrassignnode args
+label undeflabel    label args
+stringliteral attrmethodname   new stringliteral ivisited getname
+variable tmpvar       s getnewtemporaryvariable
+operand  receiver     build ivisited getreceivernode    s
+s addinstr new methodispublicinstr tmpvar  receiver  attrmethodname
+s addinstr beqinstr create tmpvar  manager getfalse    undeflabel
+s addinstr new ismethodboundinstr tmpvar  getself s   attrmethodname
+s addinstr beqinstr create tmpvar  manager getfalse    undeflabel
+operand argscheckdefn   buildgetargumentdefinition   attrassignnode  node  getargsnode    s
+return builddefncheckifthenpaths s  undeflabel  argscheckdefn
+}
+// rescue block
+codeblock rescueblock   new codeblock
+public operand run object args    return manager getnil         nothing to do if we got an exception
+// try verifying definition, and if we get an jumpexception exception, process it with the rescue block above
+return protectcodewithrescue s  protectedcode  new object s  ivisited  undeflabel   rescueblock  null
+}
+case zsupernode
+return builddefinitioncheck s  new supermethodboundinstr s getnewtemporaryvariable    getself s
+case supernode
+label undeflabel   s getnewlabel
+variable tmpvar    s getnewtemporaryvariable
+s addinstr new supermethodboundinstr tmpvar  getself s
+s addinstr beqinstr create tmpvar  manager getfalse    undeflabel
+operand superdefnval   buildgetargumentdefinition   supernode  node  getargsnode    s
+return builddefncheckifthenpaths s  undeflabel  superdefnval
+}
+default
+// protected code
+codeblock protectedcode   new codeblock
+public operand run object args
+build  node args   irscope args
+// always an expression as long as we get through here without an exception!
+return new stringliteral
+}
+// rescue block
+codeblock rescueblock   new codeblock
+public operand run object args    return manager getnil         nothing to do if we got an exception
+// try verifying definition, and if we get an jumpexception exception, process it with the rescue block above
+return protectcodewithrescue s  protectedcode  new object node  s   rescueblock  null
+}
+}
+}
+public operand builddasgn final dasgnnode dasgnnode  irscope s
+// sss: looks like we receive the arg in buildblockargsassignment via the iternode
+// we won't get here for argument receives!  so, builddasgn is called for
+// assignments to block variables within a block.  as far as the ir is concerned,
+// this is just a simple copy
+int depth   dasgnnode getdepth
+variable arg   s getlocalvariable dasgnnode getname    depth
+operand  value   build dasgnnode getvaluenode    s
+s addinstr new copyinstr arg  value
+return value
+// important: the return value of this method is value, not arg!
+//
+// consider this ruby code: foo((a = 1), (a = 2))
+//
+// if we return 'value' this will get translated to:
+//    a = 1
+//    a = 2
+//    call("foo", [1,2]) <---- correct
+//
+// if we return 'arg' this will get translated to:
+//    a = 1
+//    a = 2
+//    call("foo", [a,a]) <---- buggy
+//
+// this technique only works if 'value' is an immutable value (ex: fixnum) or a variable
+// so, for ruby code like this:
+//     def foo(x); x << 5; end;
+//     foo(a=[1,2]);
+//     p a
+// we are guaranteed that the value passed into foo and 'a' point to the same object
+// because of the use of copyandreturnvalue method for literal objects.
+}
+private irmethod definenewmethod methoddefnode defnode  irscope s  boolean isinstancemethod
+irmethod method   new irmethod manager  s  defnode getname    isinstancemethod  defnode getposition   getline    defnode getscope
+s addinstr new receiveselfinstr getself s
+// set %current_scope = <current-scope>
+// set %current_module = isinstancemethod ? %self.metaclass : %self
+irscope nearestscope   s getnearestmodulereferencingscope
+method addinstr new copyinstr method getcurrentscopevariable    new currentscope nearestscope    null ? s   nearestscope
+method addinstr new copyinstr method getcurrentmodulevariable    new scopemodule nearestscope    null ? s   nearestscope
+// build ir for arguments (including the block arg)
+receivemethodargs defnode getargsnode    method
+// thread poll on entry to method
+method addinstr new threadpollinstr
+// build ir for body
+node bodynode   defnode getbodynode
+if  bodynode    null
+// create a new nested builder to ensure this gets its own ir builder state
+operand rv   createirbuilder manager  is1_9    build bodynode  method
+if  rv    null  method addinstr new returninstr rv
+else
+method addinstr new returninstr manager getnil
+}
+return method
+}
+public operand builddefn methoddefnode node  irscope s       instance method
+irmethod method   definenewmethod node  s  true
+s addinstr new defineinstancemethodinstr new stringliteral     method
+return manager getnil
+}
+public operand builddefs defsnode node  irscope s       class method
+operand container    build node getreceivernode    s
+irmethod method   definenewmethod node  s  false
+s addinstr new defineclassmethodinstr container  method
+return manager getnil
+}
+protected int receiveoptargs final argsnode argsnode  irscope s  int opt  int argindex
+listnode optargs   argsnode getoptargs
+for  int j   0  j < opt  j    argindex
+// jump to 'l' if this arg is not null.  if null, fall through and build the default value!
+label l   s getnewlabel
+localasgnnode n    localasgnnode optargs get j
+string argname   n getname
+variable av   s getlocalvariable argname  0
+if  s instanceof irmethod    irmethod s  addargdesc    argname
+s addinstr new receiveoptarginstr18 av  argindex
+s addinstr bneinstr create av  undefinedvalue undefined  l       if   is not undefined  go to default
+build n  s
+s addinstr new labelinstr l
+}
+return argindex
+}
+public void receivemethodargs final argsnode argsnode  irscope s
+final int required   argsnode getrequiredargscount
+final int opt   argsnode getoptionalargscount
+final int rest   argsnode getrestarg
+s getstaticscope   setarities required  opt  rest
+// fixme: expensive to do this explicitly?  but, two advantages:
+// (a) on inlining, we'll be able to get rid of these checks in almost every case.
+// (b) compiler to bytecode will anyway generate this and this is explicit.
+// for now, we are going explicit instruction route.  but later, perhaps can make this implicit in the method setup preamble?
+s addinstr new checkarityinstr required  opt  rest
+// other args begin at index 0
+int argindex   0
+// both for fixed arity and variable arity methods
+listnode preargs    argsnode getpre
+for  int i   0  i < required  i    argindex
+argumentnode a    argumentnode preargs get i
+string argname   a getname
+s addinstr new receiveprereqdarginstr s getlocalvariable argname  0   argindex
+if  s instanceof irmethod    irmethod s  addargdesc    argname
+}
+if  opt > 0
+argindex   receiveoptargs argsnode  s  opt  argindex
+}
+if  rest >  1
+// consider: def foo(*); .. ; end
+// for this code, there is no argument name available from the ruby code.
+// so, we generate an implicit arg name
+string argname   argsnode getrestargnode   getname
+if  s instanceof irmethod    irmethod s  addargdesc    argname
+argname    argname equals     ?     argname
+s addinstr new receiverestarginstr18 s getlocalvariable argname  0   argindex
+}
+// receive block
+receivemethodclosurearg argsnode  s
+}
+private void receivemethodclosurearg argsnode argsnode  irscope s
+variable blockvar   null
+if  argsnode getblock      null
+string blockargname   argsnode getblock   getname
+blockvar   s getlocalvariable blockargname  0
+if  s instanceof irmethod    irmethod s  addargdesc    blockargname
+s addinstr new receiveclosureinstr blockvar
+}
+// sss fixme: this instruction is only needed if there is an yield instr somewhere!
+// in addition, store the block argument in an implicit block variable
+variable implicitblockarg   s getimplicitblockarg
+if  blockvar    null  s addinstr new receiveclosureinstr implicitblockarg
+else s addinstr new copyinstr implicitblockarg  blockvar
+}
+public void receiveblockargs final iternode node  irscope s
+buildblockargsassignment node getvarnode    s  null  0  true  false  false
+}
+public void receiveblockclosurearg final node node  irscope s
+if  node    null  buildblockargsassignment node  s  null  0  true  true  false
+}
+public string buildtype node typenode
+switch  typenode getnodetype
+case constnode
+return   constnode typenode  getname
+case symbolnode
+return   symbolnode typenode  getname
+default
+return
+}
+}
+public operand builddot final dotnode dotnode  irscope s
+return copyandreturnvalue s  new range build dotnode getbeginnode    s   build dotnode getendnode    s   dotnode isexclusive
+}
+private operand dynamicpiece node piecenode  irscope s
+operand piece   build piecenode  s
+return piece    null ? manager getnil     piece
+}
+public operand builddregexp dregexpnode dregexpnode  irscope s
+list<operand> strpieces   new arraylist<operand>
+for  node n   dregexpnode childnodes
+strpieces add dynamicpiece n  s
+}
+return copyandreturnvalue s  new regexp new compoundstring strpieces   dregexpnode getoptions
+}
+public operand builddstr dstrnode dstrnode  irscope s
+list<operand> strpieces   new arraylist<operand>
+for  node n   dstrnode childnodes
+strpieces add dynamicpiece n  s
+}
+return copyandreturnvalue s  new compoundstring strpieces  dstrnode getencoding
+}
+public operand builddsymbol dsymbolnode node  irscope s
+list<operand> strpieces   new arraylist<operand>
+for  node n   node childnodes
+strpieces add dynamicpiece n  s
+}
+return copyandreturnvalue s  new dynamicsymbol new compoundstring strpieces  node getencoding
+}
+public operand builddvar dvarnode node  irscope s
+return s getlocalvariable node getname    node getdepth
+}
+public operand builddxstr final dxstrnode dstrnode  irscope s
+list<operand> strpieces   new arraylist<operand>
+for  node nextnode   dstrnode childnodes
+strpieces add dynamicpiece nextnode  s
+}
+return copyandreturnvalue s  new backtickstring strpieces
+}
+/* ****************************************************************
+* consider the ensure-protected ruby code below:
+begin
+.. protected body ..
+ensure
+.. eb code
+end
+this ruby code is effectively rewritten into the following ruby code
+begin
+.. protected body ..
+rescue <any-exception-or-error> => e
+jump to eb-code, execute it, and come back here
+raise e
+end
+which in ir looks like this:
+l1:
+exception region start marker
+... ir for protected body ...
+exception region end marker
+%v = l3       <--- skipped if the protected body had a return!
+l2:
+.. ir for ensure block ..
+jump_indirect %v
+l10:            <--- dummy rescue block
+e = recv_exception
+%v = l11
+jump l2
+l11:
+throw e
+l3:
+* ****************************************************************/
+public operand buildensurenode ensurenode ensurenode  irscope s
+node bodynode   ensurenode getbodynode
+// push a new ensure block info node onto the stack of ensure block
+ensureblockinfo ebi   new ensureblockinfo s   bodynode instanceof rescuenode  ?  rescuenode bodynode   null  getcurrentloop
+_ensureblockstack push ebi
+label rbeginlabel   ebi regionstart
+label rendlabel     ebi end
+// start of protected region
+s addinstr new labelinstr rbeginlabel
+s addinstr new exceptionregionstartmarkerinstr rbeginlabel  rendlabel  ebi dummyrescueblocklabel  ebi dummyrescueblocklabel
+// generate ir for code being protected
+operand rv
+if  bodynode instanceof rescuenode
+// the rescue code will ensure that the region is ended
+rv   buildrescueinternal  rescuenode  bodynode  s  ebi
+else
+rv   build bodynode  s
+// jump to start of ensure block -- dont bother if we had a return in the protected body
+if  rv    u_nil  s addinstr new setreturnaddressinstr ebi returnaddr  rendlabel
+}
+// end of protected region
+s addinstr new exceptionregionendmarkerinstr
+// pop the current ensure block info node *before* generating the ensure code for this block itself!
+_ensureblockstack pop
+// run the ensure block now
+s addinstr new jumpinstr ebi start
+// now build the dummy rescue block that:
+// * catches all exceptions thrown by the body
+// * jumps to the ensure block code
+// * returns back (via set_retaddr instr)
+label rethrowexclabel   s getnewlabel
+variable exc   s getnewtemporaryvariable
+s addinstr new labelinstr ebi dummyrescueblocklabel
+s addinstr new receiveexceptioninstr exc  false       dont check type since we are simply throwing it back
+s addinstr new setreturnaddressinstr ebi returnaddr  rethrowexclabel
+// generate the ensure block now
+s addinstr new labelinstr ebi start
+// two cases:
+// 1. ensure block has no explicit return => the result of the entire ensure expression is the result of the protected body.
+// 2. ensure block has an explicit return => the result of the protected body is ignored.
+operand ensureretval    ensurenode getensurenode      null  ? manager getnil     build ensurenode getensurenode    s
+// u_nil => there was a return from within the ensure block!
+if  ensureretval    u_nil  rv   u_nil
+// return (rethrow exception/end)
+s addinstr new jumpindirectinstr ebi returnaddr
+// rethrows the caught exception from the dummy ensure block
+s addinstr new labelinstr rethrowexclabel
+s addinstr new throwexceptioninstr exc
+// end label for the exception region
+s addinstr new labelinstr rendlabel
+return rv
+}
+public operand buildevstr evstrnode node  irscope s
+return new asstring build node getbody    s
+}
+public operand buildfalse node node  irscope s
+return manager getfalse
+}
+public operand buildfcall fcallnode fcallnode  irscope s
+node          callargsnode   fcallnode getargsnode
+list<operand> args           setupcallargs callargsnode  s
+operand       block          setupcallclosure fcallnode getiternode    s
+variable      callresult     s getnewtemporaryvariable
+instr         callinstr      callinstr create calltype functional  callresult  new methaddr fcallnode getname     getself s   args toarray new operand   block
+s addinstr callinstr
+return callresult
+}
+private operand setupcallclosure node node  irscope s
+if  node    null  return null
+switch  node getnodetype
+case iternode
+return build  iternode node  s
+case blockpassnode
+return build   blockpassnode node  getbodynode    s
+default
+throw new notcompilableexception     node
+}
+}
+public operand buildfixnum fixnumnode node  irscope s
+return new fixnum node getvalue
+}
+public operand buildflip flipnode flipnode  irscope s
+/* ----------------------------------------------------------------------
+* consider a simple 2-state (s1, s2) fsm with the following transitions:
+*
+*     new_state(s1, f) = s1
+*     new_state(s1, t) = s2
+*     new_state(s2, f) = s2
+*     new_state(s2, t) = s1
+*
+* here is the pseudo-code for evaluating the flip-node.
+* let 'v' holds the value of the current state.
+*
+*    1. if (v == 's1') f1 = eval_condition(s1-condition); v = new_state(v, f1); ret = f1
+*    2. if (v == 's2') f2 = eval_condition(s2-condition); v = new_state(v, f2); ret = true
+*    3. return ret
+*
+* for exclusive flip conditions, line 2 changes to:
+*    2. if (!f1 && (v == 's2')) f2 = eval_condition(s2-condition); v = new_state(v, f2)
+*
+* in ir code below, we are representing the two states as 1 and 2.  any
+* two values are good enough (even true and false), but 1 and 2 is simple
+* enough and also makes the ir output readable
+* ---------------------------------------------------------------------- */
+fixnum s1   new fixnum  long 1
+fixnum s2   new fixnum  long 2
+// create a variable to hold the flip state
+irscope nearestnonclosure   s getnearestflipvariablescope
+variable flipstate   nearestnonclosure getnewflipstatevariable
+nearestnonclosure initflipstatevariable flipstate  s1
+if  s instanceof irclosure
+// clone the flip variable to be usable at the proper-depth.
+int n   0
+irscope x   s
+while   x isflipscope
+if   x isforloopbody    n
+x   x getlexicalparent
+}
+if  n > 0  flipstate     localvariable flipstate  clonefordepth n
+}
+// variables and labels needed for the code
+variable returnval   s getnewtemporaryvariable
+label    s2label     s getnewlabel
+label    donelabel   s getnewlabel
+// init
+s addinstr new copyinstr returnval  manager getfalse
+// are we in state 1?
+s addinstr bneinstr create flipstate  s1  s2label
+// ----- code for when we are in state 1 -----
+operand s1val   build flipnode getbeginnode    s
+s addinstr bneinstr create s1val  manager gettrue    s2label
+// s1 condition is true => set returnval to true & move to state 2
+s addinstr new copyinstr returnval  manager gettrue
+s addinstr new copyinstr flipstate  s2
+// check for state 2
+s addinstr new labelinstr s2label
+// for exclusive ranges/flips, we dont evaluate s2's condition if s1's condition was satisfied
+if  flipnode isexclusive    s addinstr beqinstr create returnval  manager gettrue    donelabel
+// are we in state 2?
+s addinstr bneinstr create flipstate  s2  donelabel
+// ----- code for when we are in state 2 -----
+operand s2val   build flipnode getendnode    s
+s addinstr new copyinstr returnval  manager gettrue
+s addinstr bneinstr create s2val  manager gettrue    donelabel
+// s2 condition is true => move to state 1
+s addinstr new copyinstr flipstate  s1
+// done testing for s1's and s2's conditions.
+// returnval will have the result of the flip condition
+s addinstr new labelinstr donelabel
+return returnval
+}
+public operand buildfloat floatnode node  irscope s
+// sss: since flaot literals are effectively interned objects, no need to copyandreturnvalue(...)
+// or is this a premature optimization?
+return new float node getvalue
+}
+public operand buildfor fornode fornode  irscope s
+variable result   s getnewtemporaryvariable
+operand  receiver   build fornode getiternode    s
+operand  forblock   buildforiter fornode  s
+// sss fixme: really?  why the internal call?
+s addinstr new callinstr calltype normal  result  new methaddr     receiver  no_args  forblock
+return result
+}
+public operand buildforiter final fornode fornode  irscope s
+// create a new closure context
+irclosure closure   new irclosure manager  s  true  fornode getposition   getstartline    fornode getscope    arity procarityof fornode getvarnode     fornode getargumenttype    is1_9
+s addclosure closure
+// create a new nested builder to ensure this gets its own ir builder state
+// like the ensure block stack
+irbuilder forbuilder   createirbuilder manager  is1_9
+// receive self
+closure addinstr new receiveselfinstr getself closure
+// build args
+node varnode   fornode getvarnode
+if  varnode    null    varnode getnodetype      null  forbuilder receiveblockargs fornode  closure
+// set %current_scope = <current-scope>
+// set %current_module = <current-module>
+closure addinstr new copyinstr closure getcurrentscopevariable    new currentscope closure
+closure addinstr new copyinstr closure getcurrentmodulevariable    new scopemodule closure
+// thread poll on entry of closure
+closure addinstr new threadpollinstr
+// start label -- used by redo!
+closure addinstr new labelinstr closure startlabel
+// build closure body and return the result of the closure
+operand closureretval   fornode getbodynode      null ? manager getnil     forbuilder build fornode getbodynode    closure
+if  closureretval    u_nil      can be null if the node is an if node with returns in both branches
+closure addinstr new closurereturninstr closureretval
+return new wrappedirclosure closure
+}
+public operand buildglobalasgn globalasgnnode globalasgnnode  irscope s
+operand value   build globalasgnnode getvaluenode    s
+s addinstr new putglobalvarinstr globalasgnnode getname    value
+return value
+}
+public operand buildglobalvar globalvarnode node  irscope s
+variable rv    s getnewtemporaryvariable
+s addinstr new getglobalvariableinstr rv  node getname
+return rv
+}
+public operand buildhash hashnode hashnode  irscope s
+if  hashnode getlistnode      null    hashnode getlistnode   size      0
+return copyandreturnvalue s  new hash new arraylist<keyvaluepair>
+else
+int     i       0
+operand key     null
+operand value   null
+list<keyvaluepair> args   new arraylist<keyvaluepair>
+for  node nextnode   hashnode getlistnode   childnodes
+operand v   build nextnode  s
+if  key    null
+key   v
+else
+args add new keyvaluepair key  v
+key   null
+}
+}
+return copyandreturnvalue s  new hash args
+}
+}
+// translate "r = if (cond); .. thenbody ..; else; .. elsebody ..; end" to
+//
+//     v = -- build(cond) --
+//     beq(v, false, l1)
+//     r = -- build(thenbody) --
+//     jump l2
+// l1:
+//     r = -- build(elsebody) --
+// l2:
+//     --- r is the result of the if expression --
+//
+public operand buildif final ifnode ifnode  irscope s
+node actualcondition   skipovernewlines s  ifnode getcondition
+variable result
+label    falselabel   s getnewlabel
+label    donelabel    s getnewlabel
+operand  thenresult
+s addinstr beqinstr create build actualcondition  s   manager getfalse    falselabel
+boolean thennull   false
+boolean elsenull   false
+boolean thenunil   false
+boolean elseunil   false
+// build the then part of the if-statement
+if  ifnode getthenbody      null
+thenresult   build ifnode getthenbody    s
+if  thenresult    u_nil       thenresult can be u_nil if then body ended with a return
+// sss fixme: can look at the last instr and short-circuit this jump if it is a break rather
+// than wait for dead code elimination to do it
+label tgt   donelabel
+result   getvalueintemporaryvariable s  thenresult
+s addinstr new jumpinstr tgt
+else
+result   s getnewtemporaryvariable
+thenunil   true
+}
+else
+thennull   true
+result   s getnewtemporaryvariable
+s addinstr new copyinstr result  manager getnil
+s addinstr new jumpinstr donelabel
+}
+// build the else part of the if-statement
+s addinstr new labelinstr falselabel
+if  ifnode getelsebody      null
+operand elseresult   build ifnode getelsebody    s
+// elseresult can be u_nil if then-body ended with a return!
+if  elseresult    u_nil
+s addinstr new copyinstr result  elseresult
+else
+elseunil   true
+}
+else
+elsenull   true
+s addinstr new copyinstr result  manager getnil
+}
+if  thennull    elsenull
+s addinstr new labelinstr donelabel
+return manager getnil
+else if  thenunil    elseunil
+return u_nil
+else
+s addinstr new labelinstr donelabel
+return result
+}
+}
+public operand buildinstasgn final instasgnnode instasgnnode  irscope s
+operand val   build instasgnnode getvaluenode    s
+// note: if 's' happens to the a class, this is effectively an assignment of a class instance variable
+s addinstr new putfieldinstr getself s   instasgnnode getname    val
+return val
+}
+public operand buildinstvar instvarnode node  irscope s
+variable ret   s getnewtemporaryvariable
+s addinstr new getfieldinstr ret  getself s   node getname
+return ret
+}
+public operand builditer final iternode iternode  irscope s
+irclosure closure   new irclosure manager  s  false  iternode getposition   getstartline    iternode getscope    arity procarityof iternode getvarnode     iternode getargumenttype    is1_9
+s addclosure closure
+// create a new nested builder to ensure this gets its own ir builder state
+// like the ensure block stack
+irbuilder closurebuilder   createirbuilder manager  is1_9
+// receive self
+closure addinstr new receiveselfinstr getself closure
+// build args
+nodetype argsnodeid   blockbody getargumenttypewackyhack iternode
+if   iternode getvarnode      null      argsnodeid    null
+closurebuilder receiveblockargs iternode  closure
+closurebuilder receiveblockclosurearg iternode getblockvarnode    closure
+// set %current_scope = <current-scope>
+// set %current_module = <current-module>
+closure addinstr new copyinstr closure getcurrentscopevariable    new currentscope closure
+closure addinstr new copyinstr closure getcurrentmodulevariable    new scopemodule closure
+// thread poll on entry of closure
+closure addinstr new threadpollinstr
+// start label -- used by redo!
+closure addinstr new labelinstr closure startlabel
+// build closure body and return the result of the closure
+operand closureretval   iternode getbodynode      null ? manager getnil     closurebuilder build iternode getbodynode    closure
+if  closureretval    u_nil      can be u_nil if the node is an if node with returns in both branches
+closure addinstr new closurereturninstr closureretval
+return new wrappedirclosure closure
+}
+public operand buildliteral literalnode literalnode  irscope s
+return copyandreturnvalue s  new stringliteral literalnode getname
+}
+public operand buildlocalasgn localasgnnode localasgnnode  irscope s
+variable var    s getlocalvariable localasgnnode getname    localasgnnode getdepth
+operand value   build localasgnnode getvaluenode    s
+s addinstr new copyinstr var  value
+return value
+// important: the return value of this method is value, not var!
+//
+// consider this ruby code: foo((a = 1), (a = 2))
+//
+// if we return 'value' this will get translated to:
+//    a = 1
+//    a = 2
+//    call("foo", [1,2]) <---- correct
+//
+// if we return 'var' this will get translated to:
+//    a = 1
+//    a = 2
+//    call("foo", [a,a]) <---- buggy
+//
+// this technique only works if 'value' is an immutable value (ex: fixnum) or a variable
+// so, for ruby code like this:
+//     def foo(x); x << 5; end;
+//     foo(a=[1,2]);
+//     p a
+// we are guaranteed that the value passed into foo and 'a' point to the same object
+// because of the use of copyandreturnvalue method for literal objects.
+}
+public operand buildlocalvar localvarnode node  irscope s
+return s getlocalvariable node getname    node getdepth
+}
+public operand buildmatch matchnode matchnode  irscope s
+operand regexp   build matchnode getregexpnode    s
+variable result   s getnewtemporaryvariable
+s addinstr new matchinstr result  regexp
+return result
+}
+public operand buildmatch2 match2node matchnode  irscope s
+operand receiver   build matchnode getreceivernode    s
+operand value      build matchnode getvaluenode    s
+variable result   s getnewtemporaryvariable
+s addinstr new match2instr result  receiver  value
+return result
+}
+public operand buildmatch3 match3node matchnode  irscope s
+operand receiver   build matchnode getreceivernode    s
+operand value      build matchnode getvaluenode    s
+variable result   s getnewtemporaryvariable
+s addinstr new match3instr result  receiver  value
+return result
+}
+private operand getcontainerfromcpath colon3node cpath  irscope s
+operand container
+if  cpath instanceof colon2node
+node leftnode     colon2node  cpath  getleftnode
+if  leftnode    null       foo  bar
+container   build leftnode  s
+else      only name with no left side bar <  note no    on left
+container   findcontainermodule s
+}
+else       bar
+container   new scopemodule manager getobject
+}
+return container
+}
+public operand buildmodule modulenode modulenode  irscope s
+colon3node cpath   modulenode getcpath
+string modulename   cpath getname
+operand container   getcontainerfromcpath cpath  s
+// build the new module
+irmodulebody m   new irmodulebody manager  s  modulename  modulenode getposition   getline    modulenode getscope
+variable modulebody   s getnewtemporaryvariable
+s addinstr new definemoduleinstr modulebody  m  container
+variable ret   s getnewtemporaryvariable
+s addinstr new processmodulebodyinstr ret  modulebody
+m addinstr new receiveselfinstr m getself
+// set %current_scope = <c>
+// set %current_module = module<c>
+m addinstr new copyinstr m getcurrentscopevariable    new currentscope m
+m addinstr new copyinstr m getcurrentmodulevariable    new scopemodule m
+// create a new nested builder to ensure this gets its own ir builder state
+operand rv   createirbuilder manager  is1_9    build modulenode getbodynode    m
+if  rv    null  m addinstr new returninstr rv
+return ret
+}
+public operand buildmultipleasgn multipleasgnnode multipleasgnnode  irscope s
+operand  values   build multipleasgnnode getvaluenode    s
+variable ret   getvalueintemporaryvariable s  values
+buildmultipleasgnassignment multipleasgnnode  s  null  ret
+return ret
+}
+// sss: this method is called both for regular multiple assignment as well as argument passing
+//
+// ex: a,b,*c=v  is a regular assignment and in this case, the "values" operand will be non-null
+// ex: { |a,b,*c| ..} is the argument passing case
+public void buildmultipleasgnassignment final multipleasgnnode multipleasgnnode  irscope s  operand argsarray  operand values
+final listnode sourcearray   multipleasgnnode getheadnode
+// first, build assignments for specific named arguments
+int i   0
+if  sourcearray    null
+for  node an  sourcearray childnodes
+if  values    null
+buildblockargsassignment an  s  argsarray  i  false  false  false
+else
+variable rhsval   s getnewtemporaryvariable
+s addinstr new reqdargmultipleasgninstr rhsval  values  i
+buildassignment an  s  rhsval
+}
+i
+}
+}
+// first, build an assignment for a splat, if any, with the rest of the args!
+node argsnode   multipleasgnnode getargsnode
+if  argsnode    null
+if  sourcearray    null
+throw new notcompilableexception     multipleasgnnode getposition
+else if  argsnode instanceof starnode
+// do nothing
+else if  values    null
+variable rhsval   s getnewtemporaryvariable
+s addinstr new restargmultipleasgninstr rhsval  values  i
+buildassignment argsnode  s  rhsval      rest of the argument array
+else
+buildblockargsassignment argsnode  s  argsarray  i  false  false  true      rest of the argument array
+}
+}
+public operand buildnewline newlinenode node  irscope s
+return build skipovernewlines s  node   s
+}
+public operand buildnext final nextnode nextnode  irscope s
+irloop currloop   getcurrentloop
+operand rv    nextnode getvaluenode      null  ? manager getnil     build nextnode getvaluenode    s
+// if we have ensure blocks, have to run those first!
+if   _ensureblockstack empty    ensureblockinfo emitjumpchain s  _ensureblockstack  currloop
+else if   _rescueblockstack empty    _rescueblockstack peek   restoreexception s  currloop
+if  currloop    null
+// if a regular loop, the next is simply a jump to the end of the iteration
+s addinstr new jumpinstr currloop iterendlabel
+else
+s addinstr new threadpollinstr true
+// if a closure, the next is simply a return from the closure!
+if  s instanceof irclosure  s addinstr new closurereturninstr rv
+else s addinstr new throwexceptioninstr irexception next_localjumperror
+}
+// once the "next instruction" (closure-return) executes, control exits this scope
+return unexecutablenil u_nil
+}
+public operand buildnthref nthrefnode nthrefnode  irscope s
+return copyandreturnvalue s  new nthref nthrefnode getmatchnumber
+}
+public operand buildnil node node  irscope s
+return manager getnil
+}
+public operand buildnot notnode node  irscope s
+variable ret   s getnewtemporaryvariable
+s addinstr new notinstr ret  build node getconditionnode    s
+return ret
+}
+public operand buildopasgn opasgnnode opasgnnode  irscope s
+label l
+variable readervalue   s getnewtemporaryvariable
+variable writervalue   s getnewtemporaryvariable
+// get attr
+operand  v1   build opasgnnode getreceivernode    s
+s addinstr callinstr create readervalue  new methaddr opasgnnode getvariablename     v1  no_args  null
+// ex: e.val ||= n
+//     e.val &&= n
+string opname   opasgnnode getoperatorname
+if  opname equals       opname equals
+l   s getnewlabel
+s addinstr beqinstr create readervalue  opname equals    ? manager gettrue     manager getfalse    l
+// compute value and set it
+operand  v2   build opasgnnode getvaluenode    s
+s addinstr callinstr create writervalue  new methaddr opasgnnode getvariablenameasgn     v1  new operand  v2   null
+// it is readervalue = v2.
+// readervalue = writervalue is incorrect because the assignment method
+// might return something else other than the value being set!
+s addinstr new copyinstr readervalue  v2
+s addinstr new labelinstr l
+return readervalue
+}
+// ex: e.val = e.val.f(n)
+else
+// call operator
+operand  v2   build opasgnnode getvaluenode    s
+variable setvalue   s getnewtemporaryvariable
+s addinstr callinstr create setvalue  new methaddr opasgnnode getoperatorname     readervalue  new operand v2   null
+// set attr
+s addinstr callinstr create writervalue  new methaddr opasgnnode getvariablenameasgn     v1  new operand  setvalue   null
+// returning writervalue is incorrect becuase the assignment method
+// might return something else other than the value being set!
+return setvalue
+}
+}
+// translate "x &&= y" --> "x = y if is_true(x)" -->
+//
+//    x = -- build(x) should return a variable! --
+//    f = is_true(x)
+//    beq(f, false, l)
+//    x = -- build(y) --
+// l:
+//
+public operand buildopasgnand opasgnandnode andnode  irscope s
+label    l    s getnewlabel
+operand  v1   build andnode getfirstnode    s
+variable result   getvalueintemporaryvariable s  v1
+s addinstr beqinstr create v1  manager getfalse    l
+operand v2   build andnode getsecondnode    s       this does the assignment
+s addinstr new copyinstr result  v2
+s addinstr new labelinstr l
+return result
+}
+// fixme: this logic is not quite right....marked extra branch checks
+// to make sure the value is not defined but nil.  nil will trigger ||=
+// rhs expression.
+//
+// translate "x ||= y" --> "x = (is_defined(x) && is_true(x) ? x : y)" -->
+//
+//    v = -- build(x) should return a variable! --
+//    f = is_true(v)
+//    beq(f, true, l)
+//    -- build(x = y) --
+// l:
+//
+public operand buildopasgnor final opasgnornode ornode  irscope s
+label    l1   s getnewlabel
+label    l2   null
+variable flag   s getnewtemporaryvariable
+operand  v1
+boolean  needsdefncheck   needsdefinitioncheck ornode getfirstnode
+if  needsdefncheck
+l2   s getnewlabel
+v1   buildgetdefinitionbase ornode getfirstnode    s
+s addinstr new copyinstr flag  v1
+s addinstr beqinstr create flag  manager getnil    l2       if v1 is undefined  go to v2's computation
+}
+v1   build ornode getfirstnode    s      build of
+s addinstr new copyinstr flag  v1
+variable result   getvalueintemporaryvariable s  v1
+if  needsdefncheck
+s addinstr new labelinstr l2
+}
+s addinstr beqinstr create flag  manager gettrue    l1        if v1 is defined and true  we are done
+operand v2   build ornode getsecondnode    s      this is an ast node that sets x   y  so nothing special to do here
+s addinstr new copyinstr result  v2
+s addinstr new labelinstr l1
+// return value of x ||= y is always 'x'
+return result
+}
+/**
+* check whether the given node is considered always "defined" or whether it
+* has some form of definition check.
+*
+* @param node then node to check
+* @return whether the type of node represents a possibly undefined construct
+*/
+private boolean needsdefinitioncheck node node
+switch  node getnodetype
+case classvarasgnnode
+case classvardeclnode
+case constdeclnode
+case dasgnnode
+case globalasgnnode
+case localasgnnode
+case multipleasgnnode
+case opasgnnode
+case opelementasgnnode
+case dvarnode
+case falsenode
+case truenode
+case localvarnode
+case match2node
+case match3node
+case nilnode
+case selfnode
+// all these types are immediately considered "defined"
+return false
+default
+return true
+}
+}
+public operand buildopelementasgn opelementasgnnode node  irscope s
+if  node isor    return buildopelementasgnwithor node  s
+if  node isand    return buildopelementasgnwithand node  s
+return buildopelementasgnwithmethod node  s
+}
+// translate "a[x] ||= n" --> "a[x] = n if !is_true(a[x])"
+//
+//    tmp = build(a) <-- receiver
+//    arg = build(x) <-- args
+//    val = buildcall([], tmp, arg)
+//    f = is_true(val)
+//    beq(f, true, l)
+//    val = build(n) <-- val
+//    buildcall([]= tmp, arg, val)
+// l:
+//
+public operand buildopelementasgnwithor opelementasgnnode opelementasgnnode  irscope s
+operand array   build opelementasgnnode getreceivernode    s
+label    l       s getnewlabel
+variable elt     s getnewtemporaryvariable
+list<operand> arglist   setupcallargs opelementasgnnode getargsnode    s
+s addinstr callinstr create elt  new methaddr     array  arglist toarray new operand   null
+s addinstr beqinstr create elt  manager gettrue    l
+operand value   build opelementasgnnode getvaluenode    s
+arglist add value
+s addinstr callinstr create elt  new methaddr     array  arglist toarray new operand   null
+s addinstr new copyinstr elt  value
+s addinstr new labelinstr l
+return elt
+}
+// translate "a[x] &&= n" --> "a[x] = n if is_true(a[x])"
+public operand buildopelementasgnwithand opelementasgnnode opelementasgnnode  irscope s
+operand array   build opelementasgnnode getreceivernode    s
+label    l       s getnewlabel
+variable elt     s getnewtemporaryvariable
+list<operand> arglist   setupcallargs opelementasgnnode getargsnode    s
+s addinstr callinstr create elt  new methaddr     array  arglist toarray new operand   null
+s addinstr beqinstr create elt  manager getfalse    l
+operand value   build opelementasgnnode getvaluenode    s
+arglist add value
+s addinstr callinstr create elt  new methaddr     array  arglist toarray new operand   null
+s addinstr new copyinstr elt  value
+s addinstr new labelinstr l
+return elt
+}
+// a[i] *= n, etc.  anything that is not "a[i] &&= .. or a[i] ||= .."
+//    arr = build(a) <-- receiver
+//    arg = build(x) <-- args
+//    elt = buildcall([], arr, arg)
+//    val = build(n) <-- val
+//    val = buildcall(meth, elt, val)
+//    val = buildcall([]=, arr, arg, val)
+public operand buildopelementasgnwithmethod opelementasgnnode opelementasgnnode  irscope s
+operand array   build opelementasgnnode getreceivernode    s
+list<operand> arglist   setupcallargs opelementasgnnode getargsnode    s
+variable elt   s getnewtemporaryvariable
+s addinstr callinstr create elt  new methaddr     array  arglist toarray new operand   null       elt   a
+operand value   build opelementasgnnode getvaluenode    s                                            load
+string  operation   opelementasgnnode getoperatorname
+s addinstr callinstr create elt  new methaddr operation   elt  new operand   value    null       elt   elt operation value
+// sss: do not load the call result into 'elt' to eliminate the raw dependency on the call
+// we already know what the result is going be .. we are just storing it back into the array
+variable tmp   s getnewtemporaryvariable
+arglist add elt
+s addinstr callinstr create tmp  new methaddr     array  arglist toarray new operand   null         a   elt
+return elt
+}
+// translate ret = (a || b) to ret = (a ? true : b) as follows
+//
+//    v1 = -- build(a) --
+//       opt: ret can be set to v1, but effectively v1 is true if we take the branch to l.
+//            while this info can be inferred by using attributes, why bother if we can do this?
+//    ret = v1
+//    beq(v1, true, l)
+//    v2 = -- build(b) --
+//    ret = v2
+// l:
+//
+public operand buildor final ornode ornode  irscope s
+if  ornode getfirstnode   getnodetype   alwaystrue
+// build first node only and return true
+return build ornode getfirstnode    s
+else if  ornode getfirstnode   getnodetype   alwaysfalse
+// build first node as non-expr and build second node
+build ornode getfirstnode    s
+return build ornode getsecondnode    s
+else
+label    l     s getnewlabel
+operand  v1    build ornode getfirstnode    s
+variable ret   getvalueintemporaryvariable s  v1
+s addinstr beqinstr create v1  manager gettrue    l
+operand  v2    build ornode getsecondnode    s
+s addinstr new copyinstr ret  v2
+s addinstr new labelinstr l
+return ret
+}
+}
+public operand buildpostexe postexenode postexenode  irscope s
+irclosure endclosure   new irclosure manager  s  false  postexenode getposition   getstartline    postexenode getscope    arity procarityof postexenode getvarnode     postexenode getargumenttype    is1_9
+// set up %current_scope and %current_module
+endclosure addinstr new copyinstr endclosure getcurrentscopevariable    new currentscope endclosure
+endclosure addinstr new copyinstr endclosure getcurrentmodulevariable    new scopemodule endclosure
+build postexenode getbodynode    endclosure
+// add an instruction to record the end block at runtime
+s addinstr new recordendblockinstr s  endclosure
+return manager getnil
+}
+public operand buildpreexe preexenode preexenode  irscope s
+irclosure beginclosure   new irclosure manager  s  false  preexenode getposition   getstartline    preexenode getscope    arity procarityof preexenode getvarnode     preexenode getargumenttype    is1_9
+// set up %current_scope and %current_module
+beginclosure addinstr new copyinstr beginclosure getcurrentscopevariable    new currentscope beginclosure
+beginclosure addinstr new copyinstr beginclosure getcurrentmodulevariable    new scopemodule beginclosure
+build preexenode getbodynode    beginclosure
+// record the begin block at ir build time
+s gettoplevelscope   recordbeginblock beginclosure
+return manager getnil
+}
+public operand buildredo node node  irscope s
+// if in a loop, a redo is a jump to the beginning of the loop.
+// if not, for closures, a redo is a jump to the beginning of the closure.
+// if not in a loop or a closure, it is a local jump error
+irloop currloop   getcurrentloop
+if  currloop    null
+s addinstr new jumpinstr currloop iterstartlabel
+else
+if  s instanceof irclosure
+s addinstr new threadpollinstr true
+s addinstr new jumpinstr   irclosure s  startlabel
+else
+s addinstr new throwexceptioninstr irexception redo_localjumperror
+}
+}
+return manager getnil
+}
+public operand buildregexp regexpnode renode  irscope s
+return copyandreturnvalue s  new regexp new stringliteral renode getvalue     renode getoptions
+}
+public operand buildrescue rescuenode node  irscope s
+return buildrescueinternal node  s  null
+}
+private operand buildrescueinternal rescuenode rescuenode  irscope s  ensureblockinfo ensure
+// labels marking start, else, end of the begin-rescue(-ensure)-end block
+label rbeginlabel   ensure    null ? s getnewlabel     ensure regionstart
+label rendlabel     ensure    null ? s getnewlabel     ensure end
+label rescuelabel   s getnewlabel       label marking start of the first rescue code
+if  ensure    null  s addinstr new labelinstr rbeginlabel
+// placeholder rescue instruction that tells rest of the compiler passes the boundaries of the rescue block.
+s addinstr new exceptionregionstartmarkerinstr rbeginlabel  rendlabel  ensure    null ? null   ensure dummyrescueblocklabel  rescuelabel
+// save $! in a temp var so it can be restored when the exception gets handled.
+// sss fixme: dont yet understand why an exception needs to be saved/restored.
+variable savedglobalexception   s getnewtemporaryvariable
+s addinstr new getglobalvariableinstr savedglobalexception
+if  ensure    null  ensure savedglobalexception   savedglobalexception
+// body
+operand tmp   manager getnil        default return value if for some strange reason  we neither have the body node or the else node
+variable rv   s getnewtemporaryvariable
+if  rescuenode getbodynode      null  tmp   build rescuenode getbodynode    s
+// push rescue block *after* body has been built.
+// if not, this messes up generation of retry in these scenarios like this:
+//
+//     begin    -- 1
+//       ...
+//     rescue
+//       begin  -- 2
+//         ...
+//         retry
+//       rescue
+//         ...
+//       end
+//     end
+//
+// the retry should jump to 1, not 2.
+// if we push the rescue block before building the body, we will jump to 2.
+_rescueblockstack push new rescueblockinfo rescuenode  rbeginlabel  savedglobalexception  getcurrentloop
+// since rescued regions are well nested within ruby, this bare marker is sufficient to
+// let us discover the edge of the region during linear traversal of instructions during cfg construction.
+exceptionregionendmarkerinstr rbendinstr   new exceptionregionendmarkerinstr
+s addinstr rbendinstr
+// else part of the body -- we simply fall through from the main body if there were no exceptions
+label elselabel   rescuenode getelsenode      null ? null   s getnewlabel
+if  elselabel    null
+s addinstr new labelinstr elselabel
+tmp   build rescuenode getelsenode    s
+}
+if  tmp    u_nil
+s addinstr new copyinstr rv  tmp
+// no explicit return from the protected body
+// - if we dont have any ensure blocks, simply jump to the end of the rescue block
+// - if we do, get the innermost ensure block, set up the return address to the end of the ensure block, and go execute the ensure code.
+if  ensure    null
+s addinstr new jumpinstr rendlabel
+else
+// note: rendlabel is identical to ensure.end, but less confusing to use rendlabel since that makes more semantic sense
+s addinstr new setreturnaddressinstr ensure returnaddr  rendlabel
+s addinstr new jumpinstr ensure start
+}
+else
+// if the body had an explicit return, the return instruction ir build takes care of setting
+// up execution of all necessary ensure blocks.  so, nothing to do here!
+//
+// additionally, the value in 'rv' will never be used, so need to set it to any specific value.
+// so, we can leave it undefined.  if on the other hand, there was an exception in that block,
+// 'rv' will get set in the rescue handler -- see the 'rv' being passed into
+// buildrescuebodyinternal below.  so, in either case, we are good!
+}
+// build the actual rescue block(s)
+s addinstr new labelinstr rescuelabel
+buildrescuebodyinternal s  rescuenode getrescuenode    rv  rendlabel
+// end label -- only if there is no ensure block!  with an ensure block, you end at ensureendlabel.
+if  ensure    null  s addinstr new labelinstr rendlabel
+_rescueblockstack pop
+return rv
+}
+private void outputexceptioncheck irscope s  operand exctype  operand excobj  label caughtlabel
+variable eqqresult   s getnewtemporaryvariable
+s addinstr new rescueeqqinstr eqqresult  exctype  excobj
+s addinstr beqinstr create eqqresult  manager gettrue    caughtlabel
+}
+private void buildrescuebodyinternal irscope s  node node  variable rv  label endlabel
+final rescuebodynode rescuebodynode    rescuebodynode  node
+final node exceptionlist   rescuebodynode getexceptionnodes
+// load exception & exception comparison type
+variable exc   s getnewtemporaryvariable
+s addinstr new receiveexceptioninstr exc
+// compare and branch as necessary!
+label uncaughtlabel   s getnewlabel
+label caughtlabel   s getnewlabel
+if  exceptionlist    null
+if  exceptionlist instanceof listnode
+for  node exctype     listnode  exceptionlist  childnodes
+outputexceptioncheck s  build exctype  s   exc  caughtlabel
+}
+else      splatnode  catch
+outputexceptioncheck s  build   splatnode exceptionlist  getvalue    s   exc  caughtlabel
+}
+else
+// fixme:
+// rescue => e and rescue implicitly eqq the exception object with standarderror
+// we generate explicit ir for this test here.  but, this can lead to inconsistent
+// behavior (when compared to mri) in certain scenarios.  see example:
+//
+//   self.class.const_set(:standarderror, 1)
+//   begin; raise typeerror.new; rescue; puts "aha"; end
+//
+// mri rescues the error, but we will raise an exception because of reassignment
+// of standarderror.  i am ignoring this for now and treating this as undefined behavior.
+//
+// sss fixme: create a 'standarderror' operand type to eliminate this.
+variable v   s getnewtemporaryvariable
+s addinstr new inheritancesearchconstinstr v  s getcurrentmodulevariable       false
+outputexceptioncheck s  v  exc  caughtlabel
+}
+// uncaught exception -- build other rescue nodes or rethrow!
+s addinstr new labelinstr uncaughtlabel
+if  rescuebodynode getoptrescuenode      null
+buildrescuebodyinternal s  rescuebodynode getoptrescuenode    rv  endlabel
+else
+s addinstr new throwexceptioninstr exc
+}
+// caught exception case -- build rescue body
+s addinstr new labelinstr caughtlabel
+node realbody   skipovernewlines s  rescuebodynode getbodynode
+operand x   build realbody  s
+if  x    u_nil       can be u_nil if the rescue block has an explicit return
+// restore "$!"
+rescueblockinfo rbi   _rescueblockstack peek
+s addinstr new putglobalvarinstr    rbi savedexceptionvariable
+// set up node return value 'rv'
+s addinstr new copyinstr rv  x
+// if we dont have a matching ensure block, jump to the end of the rescue block.
+// if we have a match, jump to that ensure block.  on return, jump to the end of the rescue block.
+if  _ensureblockstack empty
+s addinstr new jumpinstr endlabel
+else
+ensureblockinfo ebi   _ensureblockstack peek
+if  rbi rescuenode    ebi matchingrescuenode
+s addinstr new setreturnaddressinstr ebi returnaddr  endlabel
+s addinstr new jumpinstr ebi start
+else
+s addinstr new jumpinstr endlabel
+}
+}
+}
+}
+public operand buildretry node node  irscope s
+// jruby only supports retry when present in rescue blocks!
+// 1.9 doesn't support retry anywhere else.
+// jump back to the innermost rescue block
+// we either find it, or we add code to throw a runtime exception
+if  _rescueblockstack empty
+s addinstr new throwexceptioninstr irexception retry_localjumperror
+else
+s addinstr new threadpollinstr true
+// restore $! and jump back to the entry of the rescue block
+rescueblockinfo rbi   _rescueblockstack peek
+s addinstr new putglobalvarinstr    rbi savedexceptionvariable
+s addinstr new jumpinstr rbi entrylabel
+// retries effectively create a loop
+s sethasloopsflag true
+}
+return manager getnil
+}
+public operand buildreturn returnnode returnnode  irscope s
+operand retval    returnnode getvaluenode      null  ? manager getnil     build returnnode getvaluenode    s
+// before we return,
+// - have to go execute all the ensure blocks if there are any.
+//   this code also takes care of resetting "$!"
+// - if we dont have any ensure blocks, we have to clear "$!"
+if   _ensureblockstack empty    ensureblockinfo emitjumpchain s  _ensureblockstack  null
+else if   _rescueblockstack empty    s addinstr new putglobalvarinstr    manager getnil
+if  s instanceof irclosure
+// if 'm' is a block scope, a return returns from the closest enclosing method.
+// if this happens to be a module body, the runtime throws a local jump error if
+// the closure is a proc.  if the closure is a lambda, then this is just a normal
+// return and the static methodtoreturnfrom value is ignored
+s addinstr new returninstr retval  s getnearestmethod
+else if  s ismodulebody
+irmethod sm   s getnearestmethod
+// cannot return from top-level module bodies!
+if  sm    null  s addinstr new throwexceptioninstr irexception return_localjumperror
+else s addinstr new returninstr retval  sm
+else
+s addinstr new returninstr retval
+}
+// the value of the return itself in the containing expression can never be used because of control-flow reasons.
+// the expression that uses this result can never be executed beyond the return and hence the value itself is just
+// a placeholder operand.
+return unexecutablenil u_nil
+}
+public irevalscript buildevalroot staticscope staticscope  irscope containingscope  string file  int linenumber  rootnode rootnode
+// top-level script!
+irevalscript script   new irevalscript manager  containingscope  file  linenumber  staticscope
+// debug info: record line number
+script addinstr new linenumberinstr script  linenumber
+// set %current_scope = <current-scope>
+// set %current_module = <current-module>
+script addinstr new copyinstr script getcurrentscopevariable    new currentscope script
+script addinstr new copyinstr script getcurrentmodulevariable    new scopemodule script
+// build ir for the tree and return the result of the expression tree
+operand rval   rootnode getbodynode      null ? manager getnil     build rootnode getbodynode    script
+script addinstr new closurereturninstr rval
+return script
+}
+public irscope buildroot rootnode rootnode
+string file   rootnode getposition   getfile
+staticscope staticscope   rootnode getstaticscope
+// top-level script!
+irscriptbody script   new irscriptbody manager     file  staticscope
+script addinstr new receiveselfinstr script getself
+// set %current_scope = <current-scope>
+// set %current_module = <current-module>
+script addinstr new copyinstr script getcurrentscopevariable    new currentscope script
+script addinstr new copyinstr script getcurrentmodulevariable    new scopemodule script
+// build ir for the tree and return the result of the expression tree
+script addinstr new returninstr build rootnode getbodynode    script
+return script
+}
+public operand buildself node node  irscope s
+return getself s
+}
+public operand buildsplat splatnode splatnode  irscope s
+// sss: since splats can only occur in call argument lists, no need to copyandreturnvalue(...)
+// verify with tom / charlie
+return new splat build splatnode getvalue    s
+}
+public operand buildstr strnode strnode  irscope s
+return copyandreturnvalue s  new stringliteral strnode getvalue
+}
+private operand buildsuperinstr irscope s  operand block  operand args
+methaddr maddr
+variable ret   s getnewtemporaryvariable
+if   s instanceof irmethod      s getlexicalparent   instanceof irclassbody
+irmethod m    irmethod s
+if  m isinstancemethod
+s addinstr new instancesuperinstr ret  s getcurrentmodulevariable    new methaddr s getname     args  block
+else
+s addinstr new classsuperinstr ret  s getcurrentmodulevariable    new methaddr s getname     args  block
+}
+else
+// we dont always know the method name we are going to be invoking if the super occurs in a closure.
+// this is because the super can be part of a block that will be used by 'define_method' to define
+// a new method.  in that case, the method called by super will be determined by the 'name' argument
+// to 'define_method'.
+s addinstr new unresolvedsuperinstr ret  getself s   args  block
+}
+return ret
+}
+public operand buildsuper supernode supernode  irscope s
+if  s ismodulebody    return buildsuperinscriptbody s
+list<operand> args   setupcallargs supernode getargsnode    s
+operand  block   setupcallclosure supernode getiternode    s
+if  block    null  block   s getimplicitblockarg
+return buildsuperinstr s  block  args toarray new operand
+}
+private operand buildsuperinscriptbody irscope s
+variable ret   s getnewtemporaryvariable
+s addinstr new unresolvedsuperinstr ret  getself s   no_args  null
+return ret
+}
+public operand buildsvalue svaluenode node  irscope s
+// sss fixme: required? verify with tom/charlie
+return copyandreturnvalue s  new svalue build node getvalue    s
+}
+public operand buildsymbol symbolnode node  irscope s
+// sss: since symbols are interned objects, no need to copyandreturnvalue(...)
+return new symbol node getname
+}
+// enebo: this is it's own instruction, but an older note pointed out we
+// could make this an ordinary method and then depend on inlining.
+public operand buildtoary toarynode node  irscope s
+operand array   build node getvalue    s
+variable result   s getnewtemporaryvariable
+s addinstr new toaryinstr result  array  manager getfalse
+return result
+}
+public operand buildtrue node node  irscope s
+return manager gettrue
+}
+public operand buildundef node node  irscope s
+operand methname   build   undefnode  node  getname    s
+variable result   s getnewtemporaryvariable
+s addinstr new undefmethodinstr result  methname
+return result
+}
+private operand buildconditionalloop irscope s  node conditionnode
+node bodynode  boolean iswhile  boolean isloopheadcondition
+if  isloopheadcondition
+iswhile    conditionnode getnodetype   alwaysfalse
+iswhile    conditionnode getnodetype   alwaystrue
+// we won't enter the loop -- just build the condition node
+build conditionnode  s
+return manager getnil
+else
+irloop loop   new irloop s  getcurrentloop
+variable loopresult   loop loopresult
+label setupresultlabel   s getnewlabel
+// push new loop
+loopstack push loop
+// end of iteration jumps here
+s addinstr new labelinstr loop loopstartlabel
+if  isloopheadcondition
+operand cv   build conditionnode  s
+s addinstr beqinstr create cv  iswhile ? manager getfalse     manager gettrue    setupresultlabel
+}
+// redo jumps here
+s addinstr new labelinstr loop iterstartlabel
+// thread poll at start of iteration -- ensures that redos and nexts run one thread-poll per iteration
+s addinstr new threadpollinstr true
+// build body
+if  bodynode    null  build bodynode  s
+// next jumps here
+s addinstr new labelinstr loop iterendlabel
+if  isloopheadcondition
+s addinstr new jumpinstr loop loopstartlabel
+else
+operand cv   build conditionnode  s
+s addinstr beqinstr create cv  iswhile ? manager gettrue     manager getfalse    loop iterstartlabel
+}
+// loop result -- nil always
+s addinstr new labelinstr setupresultlabel
+s addinstr new copyinstr loopresult  manager getnil
+// loop end -- breaks jump here bypassing the result set up above
+s addinstr new labelinstr loop loopendlabel
+// done with loop
+loopstack pop
+return loopresult
+}
+}
+public operand builduntil final untilnode untilnode  irscope s
+return buildconditionalloop s  untilnode getconditionnode    untilnode getbodynode    false  untilnode evaluateatstart
+}
+public operand buildvalias node node  irscope s
+valiasnode valiasnode    valiasnode  node
+s addinstr new gvaraliasinstr new stringliteral valiasnode getnewname     new stringliteral valiasnode getoldname
+return manager getnil
+}
+public operand buildvcall vcallnode node  irscope s
+variable callresult   s getnewtemporaryvariable
+instr    callinstr    callinstr create calltype variable  callresult  new methaddr node getname     getself s   no_args  null
+s addinstr callinstr
+return callresult
+}
+public operand buildwhile final whilenode whilenode  irscope s
+return buildconditionalloop s  whilenode getconditionnode    whilenode getbodynode    true  whilenode evaluateatstart
+}
+public operand buildxstr xstrnode node  irscope s
+return copyandreturnvalue s  new backtickstring new stringliteral node getvalue
+}
+public operand buildyield yieldnode node  irscope s
+variable ret   s getnewtemporaryvariable
+s addinstr new yieldinstr ret  s getimplicitblockarg    build node getargsnode    s   node getexpandarguments
+return ret
+}
+public operand buildzarray node node  irscope s
+return copyandreturnvalue s  new array
+}
+/**
+private operand[] getzsuperargs(irscope s) {
+if (s instanceof irmethod) return ((irmethod)s).getcallargs();
+operand[] sargs = s.getnearestmethod().getcallargs();
+// update args to make them accessible at a different depth
+int n = ((irclosure)s).getnestingdepth();
+for (int i = 0; i < sargs.length; i++) {
+operand arg = sargs[i];
+sargs[i] = (arg instanceof splat) ? new splat(((localvariable)((splat)arg).getarray()).clonefordepth(n)) : ((localvariable)arg).clonefordepth(n);
+}
+return sargs;
+}
+**/
+public operand buildzsuper zsupernode zsupernode  irscope s
+if  s ismodulebody    return buildsuperinscriptbody s
+operand block   setupcallclosure zsupernode getiternode    s
+if  block    null  block   s getimplicitblockarg
+if  s instanceof irmethod
+operand args     irmethod s  getcallargs
+return buildsuperinstr s  block  args
+else
+// if we are in a block, we cannot make any assumptions about what args
+// the super instr is going to get -- if there were no 'define_method'
+// for defining methods, we could guarantee that the super is going to
+// receive args from the nearest method the block is embedded in.  but,
+// in the presence of 'define_method', all bets are off.
+variable ret   s getnewtemporaryvariable
+s addinstr new zsuperinstr ret  getself s   block
+return ret
+}
+}
+}

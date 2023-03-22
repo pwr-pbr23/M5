@@ -1,0 +1,960 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache camel builder xml
+import java io file
+import java io inputstream
+import java io stringreader
+import java util hashmap
+import java util hashset
+import java util linkedhashmap
+import java util list
+import java util map
+import java util properties
+import java util queue
+import java util concurrent concurrentlinkedqueue
+import javax xml namespace qname
+import javax xml transform dom domsource
+import javax xml xpath xpath
+import javax xml xpath xpathconstants
+import javax xml xpath xpathexpression
+import javax xml xpath xpathexpressionexception
+import javax xml xpath xpathfactory
+import javax xml xpath xpathfactoryconfigurationexception
+import javax xml xpath xpathfunction
+import javax xml xpath xpathfunctionexception
+import javax xml xpath xpathfunctionresolver
+import org w3c dom document
+import org w3c dom node
+import org w3c dom nodelist
+import org xml sax inputsource
+import org apache camel camelcontext
+import org apache camel exchange
+import org apache camel expression
+import org apache camel notypeconversionavailableexception
+import org apache camel predicate
+import org apache camel runtimeexpressionexception
+import org apache camel service
+import org apache camel wrappedfile
+import org apache camel component bean beaninvocation
+import org apache camel impl defaultexchange
+import org apache camel spi language
+import org apache camel spi namespaceaware
+import org apache camel support synchronizationadapter
+import org apache camel util exchangehelper
+import org apache camel util iohelper
+import org apache camel util messagehelper
+import org apache camel util objecthelper
+import org slf4j logger
+import org slf4j loggerfactory
+import static org apache camel builder xml namespaces default_namespace
+import static org apache camel builder xml namespaces function_namespace
+import static org apache camel builder xml namespaces in_namespace
+import static org apache camel builder xml namespaces out_namespace
+import static org apache camel builder xml namespaces ismatchingnamespaceoremptynamespace
+/**
+* creates an xpath expression builder which creates a nodeset result by default.
+* if you want to evaluate a string expression then call {@link #stringresult()}
+* <p/>
+* an xpath object is not thread-safe and not reentrant. in other words, it is the application's responsibility to make
+* sure that one xpath object is not used from more than one thread at any given time, and while the evaluate method
+* is invoked, applications may not recursively call the evaluate method.
+* <p/>
+* this implementation is thread safe by using thread locals and pooling to allow concurrency
+*
+* @see xpathconstants#nodeset
+*/
+public class xpathbuilder implements expression  predicate  namespaceaware  service
+private static final transient logger log   loggerfactory getlogger xpathbuilder class
+private static final string saxon_object_model_uri
+private static final string obtain_all_ns_xpath
+private static xpathfactory defaultxpathfactory;
+private final queue<xpathexpression> pool = new concurrentlinkedqueue<xpathexpression>();
+private final queue<xpathexpression> poollognamespaces = new concurrentlinkedqueue<xpathexpression>();
+private final string text;
+private final threadlocal<messagevariableresolver> variableresolver = new threadlocal<messagevariableresolver>();
+private final threadlocal<exchange> exchange = new threadlocal<exchange>();
+private xpathfactory xpathfactory;
+private class<?> documenttype = document.class;
+// for some reason the default expression of "a/b" on a document such as
+// <a><b>1</b><b>2</b></a>
+// will evaluate as just "1" by default which is bizarre. so by default
+// let's assume xpath expressions result in nodesets.
+private class<?> resulttype;
+private qname resultqname = xpathconstants.nodeset;
+private string objectmodeluri;
+private defaultnamespacecontext namespacecontext;
+private boolean lognamespaces;
+private xpathfunctionresolver functionresolver;
+private xpathfunction bodyfunction;
+private xpathfunction headerfunction;
+private xpathfunction outbodyfunction;
+private xpathfunction outheaderfunction;
+private xpathfunction propertiesfunction;
+private xpathfunction simplefunction;
+public xpathbuilder(string text) {
+this.text = text;
+}
+public static xpathbuilder xpath(string text) {
+return new xpathbuilder(text);
+}
+public static xpathbuilder xpath(string text, class<?> resulttype) {
+xpathbuilder builder = new xpathbuilder(text);
+builder.setresulttype(resulttype);
+return builder;
+}
+@override
+public string tostring() {
+return "xpath: " + text;
+}
+public boolean matches(exchange exchange) {
+// add on completion so the thread locals is removed when exchange is done
+exchange.addoncompletion(new xpathbuilderoncompletion());
+object booleanresult = evaluateas(exchange, xpathconstants.boolean);
+return exchange.getcontext().gettypeconverter().convertto(boolean.class, booleanresult);
+}
+public <t> t evaluate(exchange exchange, class<t> type) {
+// add on completion so the thread locals is removed when exchange is done
+exchange.addoncompletion(new xpathbuilderoncompletion());
+object result = evaluate(exchange);
+return exchange.getcontext().gettypeconverter().convertto(type, result);
+}
+/**
+* matches the given xpath using the provided body.
+*
+* @param context the camel context
+* @param body    the body
+* @return <tt>true</tt> if matches, <tt>false</tt> otherwise
+*/
+public boolean matches camelcontext context  object body
+objecthelper notnull context
+// create a dummy exchange to use during matching
+exchange dummy   new defaultexchange context
+dummy getin   setbody body
+try
+return matches dummy
+finally
+// remove the dummy from the thread local after usage
+variableresolver remove
+exchange remove
+}
+}
+/**
+* evaluates the given xpath using the provided body.
+*
+* @param context the camel context
+* @param body    the body
+* @param type    the type to return
+* @return result of the evaluation
+*/
+public <t> t evaluate camelcontext context  object body  class<t> type
+objecthelper notnull context
+// create a dummy exchange to use during evaluation
+exchange dummy   new defaultexchange context
+dummy getin   setbody body
+try
+return evaluate dummy  type
+finally
+// remove the dummy from the thread local after usage
+variableresolver remove
+exchange remove
+}
+}
+/**
+* evaluates the given xpath using the provided body as a string return type.
+*
+* @param context the camel context
+* @param body    the body
+* @return result of the evaluation
+*/
+public string evaluate camelcontext context  object body
+objecthelper notnull context
+// create a dummy exchange to use during evaluation
+exchange dummy   new defaultexchange context
+dummy getin   setbody body
+setresultqname xpathconstants string
+try
+return evaluate dummy  string class
+finally
+// remove the dummy from the thread local after usage
+variableresolver remove
+exchange remove
+}
+}
+// builder methods
+// -------------------------------------------------------------------------
+/**
+* sets the expression result type to boolean
+*
+* @return the current builder
+*/
+public xpathbuilder booleanresult
+resultqname   xpathconstants boolean
+return this
+}
+/**
+* sets the expression result type to boolean
+*
+* @return the current builder
+*/
+public xpathbuilder noderesult
+resultqname   xpathconstants node
+return this
+}
+/**
+* sets the expression result type to boolean
+*
+* @return the current builder
+*/
+public xpathbuilder nodesetresult
+resultqname   xpathconstants nodeset
+return this
+}
+/**
+* sets the expression result type to boolean
+*
+* @return the current builder
+*/
+public xpathbuilder numberresult
+resultqname   xpathconstants number
+return this
+}
+/**
+* sets the expression result type to boolean
+*
+* @return the current builder
+*/
+public xpathbuilder stringresult
+resultqname   xpathconstants string
+return this
+}
+/**
+* sets the expression result type to boolean
+*
+* @return the current builder
+*/
+public xpathbuilder resulttype class<?> resulttype
+setresulttype resulttype
+return this
+}
+/**
+* sets the object model uri to use
+*
+* @return the current builder
+*/
+public xpathbuilder objectmodel string uri
+// todo: careful! setting the object model uri this way will set the *default* xpath factory, which since is a static field,
+// will set the xpath factory system-wide. decide what to do, as changing this behaviour can break compatibility. provided the setobjectmodel which changes
+// this instance's xpath factory rather than the static field
+this objectmodeluri   uri
+return this
+}
+/**
+* configures to use saxon as the xpathfactory which allows you to use xpath 2.0 functions
+* which may not be part of the build in jdk xpath parser.
+*
+* @return the current builder
+*/
+public xpathbuilder saxon
+this objectmodeluri   saxon_object_model_uri
+return this
+}
+/**
+* sets the {@link xpathfunctionresolver} instance to use on these xpath
+* expressions
+*
+* @return the current builder
+*/
+public xpathbuilder functionresolver xpathfunctionresolver functionresolver
+this functionresolver   functionresolver
+return this
+}
+/**
+* registers the namespace prefix and uri with the builder so that the
+* prefix can be used in xpath expressions
+*
+* @param prefix is the namespace prefix that can be used in the xpath
+*               expressions
+* @param uri    is the namespace uri to which the prefix refers
+* @return the current builder
+*/
+public xpathbuilder namespace string prefix  string uri
+getnamespacecontext   add prefix  uri
+return this
+}
+/**
+* registers namespaces with the builder so that the registered
+* prefixes can be used in xpath expressions
+*
+* @param namespaces is namespaces object that should be used in the
+*                   xpath expression
+* @return the current builder
+*/
+public xpathbuilder namespaces namespaces namespaces
+namespaces configure this
+return this
+}
+/**
+* registers a variable (in the global namespace) which can be referred to
+* from xpath expressions
+*
+* @param name  name of variable
+* @param value value of variable
+* @return the current builder
+*/
+public xpathbuilder variable string name  object value
+getvariableresolver   addvariable name  value
+return this
+}
+/**
+* configures the document type to use.
+* <p/>
+* the document type controls which kind of class camel should convert the payload
+* to before doing the xpath evaluation.
+* <p/>
+* for example you can set it to {@link inputsource} to use sax streams.
+* by default camel uses {@link document} as the type.
+*
+* @param documenttype the document type
+* @return the current builder
+*/
+public xpathbuilder documenttype class<?> documenttype
+setdocumenttype documenttype
+return this
+}
+/**
+* configures to use the provided xpath factory.
+* <p/>
+* can be used to use saxon instead of the build in factory from the jdk.
+*
+* @param xpathfactory the xpath factory to use
+* @return the current builder.
+*/
+public xpathbuilder factory xpathfactory xpathfactory
+setxpathfactory xpathfactory
+return this
+}
+/**
+* activates trace logging of all discovered namespaces in the message - to simplify debugging namespace-related issues
+* <p/>
+* namespaces are printed in hashmap style <code>{xmlns:prefix=[namespaceuri], xmlns:prefix=[namespaceuri]}</code>.
+* <p/>
+* the implicit xml namespace is omitted (http://www.w3.org/xml/1998/namespace).
+* xml allows for namespace prefixes to be redefined/overridden due to hierarchical scoping, i.e. prefix abc can be mapped to http://abc.com,
+* and deeper in the document it can be mapped to http://def.com. when two prefixes are detected which are equal but are mapped to different
+* namespace uris, camel will show all namespaces uris it is mapped to in an array-style.
+* <p/>
+* this feature is disabled by default.
+*
+* @return the current builder.
+*/
+public xpathbuilder lognamespaces
+setlognamespaces true
+return this
+}
+// properties
+// -------------------------------------------------------------------------
+public xpathfactory getxpathfactory   throws xpathfactoryconfigurationexception
+if  xpathfactory    null
+return xpathfactory
+}
+if  objectmodeluri    null
+xpathfactory   xpathfactory newinstance objectmodeluri
+log info     objectmodeluri      defaultxpathfactory
+return xpathfactory
+}
+if  defaultxpathfactory    null
+initdefaultxpathfactory
+}
+return defaultxpathfactory
+}
+public void setxpathfactory xpathfactory xpathfactory
+this xpathfactory   xpathfactory
+}
+public class<?> getdocumenttype
+return documenttype
+}
+public void setdocumenttype class<?> documenttype
+this documenttype   documenttype
+}
+public string gettext
+return text
+}
+public qname getresultqname
+return resultqname
+}
+public void setresultqname qname resultqname
+this resultqname   resultqname
+}
+public defaultnamespacecontext getnamespacecontext
+if  namespacecontext    null
+try
+defaultnamespacecontext defaultnamespacecontext   new defaultnamespacecontext getxpathfactory
+populatedefaultnamespaces defaultnamespacecontext
+namespacecontext   defaultnamespacecontext
+catch  xpathfactoryconfigurationexception e
+throw new runtimeexpressionexception e
+}
+}
+return namespacecontext
+}
+public void setnamespacecontext defaultnamespacecontext namespacecontext
+this namespacecontext   namespacecontext
+}
+public xpathfunctionresolver getfunctionresolver
+return functionresolver
+}
+public void setfunctionresolver xpathfunctionresolver functionresolver
+this functionresolver   functionresolver
+}
+public void setnamespaces map<string  string> namespaces
+getnamespacecontext   setnamespaces namespaces
+}
+public xpathfunction getbodyfunction
+if  bodyfunction    null
+bodyfunction   new xpathfunction
+@suppresswarnings
+public object evaluate list list  throws xpathfunctionexception
+if  exchange    null
+return null
+}
+return exchange get   getin   getbody
+}
+}
+return bodyfunction
+}
+public void setbodyfunction xpathfunction bodyfunction
+this bodyfunction   bodyfunction
+}
+public xpathfunction getheaderfunction
+if  headerfunction    null
+headerfunction   new xpathfunction
+@suppresswarnings
+public object evaluate list list  throws xpathfunctionexception
+if  exchange    null     list isempty
+object value   list get 0
+if  value    null
+string text   exchange get   getcontext   gettypeconverter   convertto string class  value
+return exchange get   getin   getheader text
+}
+}
+return null
+}
+}
+return headerfunction
+}
+public void setheaderfunction xpathfunction headerfunction
+this headerfunction   headerfunction
+}
+public xpathfunction getoutbodyfunction
+if  outbodyfunction    null
+outbodyfunction   new xpathfunction
+@suppresswarnings
+public object evaluate list list  throws xpathfunctionexception
+if  exchange get      null    exchange get   hasout
+return exchange get   getout   getbody
+}
+return null
+}
+}
+return outbodyfunction
+}
+public void setoutbodyfunction xpathfunction outbodyfunction
+this outbodyfunction   outbodyfunction
+}
+public xpathfunction getoutheaderfunction
+if  outheaderfunction    null
+outheaderfunction   new xpathfunction
+@suppresswarnings
+public object evaluate list list  throws xpathfunctionexception
+if  exchange get      null     list isempty
+object value   list get 0
+if  value    null
+string text   exchange get   getcontext   gettypeconverter   convertto string class  value
+return exchange get   getout   getheader text
+}
+}
+return null
+}
+}
+return outheaderfunction
+}
+public void setoutheaderfunction xpathfunction outheaderfunction
+this outheaderfunction   outheaderfunction
+}
+public xpathfunction getpropertiesfunction
+if  propertiesfunction    null
+propertiesfunction   new xpathfunction
+@suppresswarnings
+public object evaluate list list  throws xpathfunctionexception
+if  exchange    null     list isempty
+object value   list get 0
+if  value    null
+string text   exchange get   getcontext   gettypeconverter   convertto string class  value
+try
+// use the property placeholder resolver to lookup the property for us
+object answer   exchange get   getcontext   resolvepropertyplaceholders     text
+return answer
+catch  exception e
+throw new xpathfunctionexception e
+}
+}
+}
+return null
+}
+}
+return propertiesfunction
+}
+public void setpropertiesfunction xpathfunction propertiesfunction
+this propertiesfunction   propertiesfunction
+}
+public xpathfunction getsimplefunction
+if  simplefunction    null
+simplefunction   new xpathfunction
+@suppresswarnings
+public object evaluate list list  throws xpathfunctionexception
+if  exchange    null     list isempty
+object value   list get 0
+if  value    null
+string text   exchange get   getcontext   gettypeconverter   convertto string class  value
+language simple   exchange get   getcontext   resolvelanguage
+expression exp   simple createexpression text
+object answer   exp evaluate exchange get    object class
+return answer
+}
+}
+return null
+}
+}
+return simplefunction
+}
+public void setsimplefunction xpathfunction simplefunction
+this simplefunction   simplefunction
+}
+public class<?> getresulttype
+return resulttype
+}
+public void setresulttype class<?> resulttype
+this resulttype   resulttype
+if  number class isassignablefrom resulttype
+numberresult
+else if  string class isassignablefrom resulttype
+stringresult
+else if  boolean class isassignablefrom resulttype
+booleanresult
+else if  node class isassignablefrom resulttype
+noderesult
+else if  nodelist class isassignablefrom resulttype
+nodesetresult
+}
+}
+public void setlognamespaces boolean lognamespaces
+this lognamespaces   lognamespaces
+}
+public boolean islognamespaces
+return lognamespaces
+}
+public string getobjectmodeluri
+return objectmodeluri
+}
+/**
+* enables saxon on this particular xpath expression, as {@link #saxon()} sets the default static xpathfactory which may have already been initialised
+* by previous xpath expressions
+*/
+public void enablesaxon
+this setobjectmodeluri saxon_object_model_uri
+}
+public void setobjectmodeluri string objectmodeluri
+this objectmodeluri   objectmodeluri
+}
+// implementation methods
+// -------------------------------------------------------------------------
+protected object evaluate exchange exchange
+object answer   evaluateas exchange  resultqname
+if  resulttype    null
+return exchangehelper converttotype exchange  resulttype  answer
+}
+return answer
+}
+/**
+* evaluates the expression as the given result type
+*/
+protected object evaluateas exchange exchange  qname resultqname
+// pool a pre compiled expression from pool
+xpathexpression xpathexpression   pool poll
+if  xpathexpression    null
+log trace
+// no avail in pool then create one
+try
+xpathexpression   createxpathexpression
+catch  xpathexpressionexception e
+throw new invalidxpathexpression gettext    e
+catch  exception e
+throw new runtimeexpressionexception    e
+}
+else
+log trace
+}
+try
+if  lognamespaces    log isinfoenabled
+lognamespaces exchange
+}
+return doinevaluateas xpathexpression  exchange  resultqname
+finally
+// release it back to the pool
+pool add xpathexpression
+log trace
+}
+}
+private void lognamespaces exchange exchange
+inputstream is   null
+nodelist answer   null
+xpathexpression xpathexpression   null
+try
+xpathexpression   poollognamespaces poll
+if  xpathexpression    null
+xpathexpression   createtracenamespaceexpression
+}
+// prepare the input
+object document
+if  isinputstreamneeded exchange
+is   exchange getin   getbody inputstream class
+document   getdocument exchange  is
+else
+object body   exchange getin   getbody
+document   getdocument exchange  body
+}
+// fetch all namespaces
+if  document instanceof inputsource
+inputsource inputsource    inputsource  document
+answer    nodelist  xpathexpression evaluate inputsource  xpathconstants nodeset
+else if  document instanceof domsource
+domsource source    domsource  document
+answer    nodelist  xpathexpression evaluate source getnode    xpathconstants nodeset
+else
+answer    nodelist  xpathexpression evaluate document  xpathconstants nodeset
+}
+catch  exception e
+log warn    e
+finally
+// iohelper can handle if is is null
+iohelper close is
+poollognamespaces add xpathexpression
+}
+if  answer    null
+logdiscoverednamespaces answer
+}
+}
+private void logdiscoverednamespaces nodelist namespaces
+hashmap<string  hashset<string>> map   new linkedhashmap<string  hashset<string>>
+for  int i   0  i < namespaces getlength    i
+node n   namespaces item i
+if  n getnodename   equals
+// skip the implicit xml namespace as it provides no value
+continue
+}
+string prefix   namespaces item i  getnodename
+if  prefix equals
+prefix
+}
+// add to map
+if   map containskey prefix
+map put prefix  new hashset<string>
+}
+map get prefix  add namespaces item i  getnodevalue
+}
+log info    map
+}
+protected object doinevaluateas xpathexpression xpathexpression  exchange exchange  qname resultqname
+log trace    exchange  resultqname
+object answer
+// set exchange and variable resolver as thread locals for concurrency
+this exchange set exchange
+// the underlying input stream, which we need to close to avoid locking files or other resources
+inputstream is   null
+try
+object document
+// only convert to input stream if really needed
+if  isinputstreamneeded exchange
+is   exchange getin   getbody inputstream class
+document   getdocument exchange  is
+else
+object body   exchange getin   getbody
+document   getdocument exchange  body
+}
+if  resultqname    null
+if  document instanceof inputsource
+inputsource inputsource    inputsource  document
+answer   xpathexpression evaluate inputsource  resultqname
+else if  document instanceof domsource
+domsource source    domsource  document
+answer   xpathexpression evaluate source getnode    resultqname
+else
+answer   xpathexpression evaluate document  resultqname
+}
+else
+if  document instanceof inputsource
+inputsource inputsource    inputsource  document
+answer   xpathexpression evaluate inputsource
+else if  document instanceof domsource
+domsource source    domsource  document
+answer   xpathexpression evaluate source getnode
+else
+answer   xpathexpression evaluate document
+}
+}
+catch  xpathexpressionexception e
+throw new invalidxpathexpression gettext    e
+finally
+// iohelper can handle if is is null
+iohelper close is
+}
+if  log istraceenabled
+log trace    new object exchange  resultqname  answer
+}
+return answer
+}
+protected synchronized xpathexpression createxpathexpression   throws xpathexpressionexception  xpathfactoryconfigurationexception
+// xpathfactory is not thread safe
+xpath xpath   getxpathfactory   newxpath
+if   lognamespaces    log istraceenabled
+log trace    getnamespacecontext   tostring
+else if  lognamespaces    log isinfoenabled
+log info    getnamespacecontext   tostring
+}
+xpath setnamespacecontext getnamespacecontext
+xpath setxpathvariableresolver getvariableresolver
+xpathfunctionresolver parentresolver   getfunctionresolver
+if  parentresolver    null
+parentresolver   xpath getxpathfunctionresolver
+}
+xpath setxpathfunctionresolver createdefaultfunctionresolver parentresolver
+return xpath compile text
+}
+protected synchronized xpathexpression createtracenamespaceexpression   throws xpathfactoryconfigurationexception  xpathexpressionexception
+// xpathfactory is not thread safe
+xpath xpath   getxpathfactory   newxpath
+return xpath compile obtain_all_ns_xpath
+}
+/**
+* populate a number of standard prefixes if they are not already there
+*/
+protected void populatedefaultnamespaces defaultnamespacecontext context
+setnamespaceifnotpresent context     in_namespace
+setnamespaceifnotpresent context     out_namespace
+setnamespaceifnotpresent context     namespaces environment_variables
+setnamespaceifnotpresent context     namespaces system_properties_namespace
+setnamespaceifnotpresent context     namespaces function_namespace
+}
+protected void setnamespaceifnotpresent defaultnamespacecontext context  string prefix  string uri
+if  context    null
+string current   context getnamespaceuri prefix
+if  current    null
+context add prefix  uri
+}
+}
+}
+protected xpathfunctionresolver createdefaultfunctionresolver final xpathfunctionresolver parent
+return new xpathfunctionresolver
+public xpathfunction resolvefunction qname qname  int argumentcount
+xpathfunction answer   null
+if  parent    null
+answer   parent resolvefunction qname  argumentcount
+}
+if  answer    null
+if  ismatchingnamespaceoremptynamespace qname getnamespaceuri    in_namespace
+ismatchingnamespaceoremptynamespace qname getnamespaceuri    default_namespace
+string localpart   qname getlocalpart
+if  localpart equals       argumentcount    0
+return getbodyfunction
+}
+if  localpart equals       argumentcount    1
+return getheaderfunction
+}
+}
+if  ismatchingnamespaceoremptynamespace qname getnamespaceuri    out_namespace
+string localpart   qname getlocalpart
+if  localpart equals       argumentcount    0
+return getoutbodyfunction
+}
+if  localpart equals       argumentcount    1
+return getoutheaderfunction
+}
+}
+if  ismatchingnamespaceoremptynamespace qname getnamespaceuri    function_namespace
+string localpart   qname getlocalpart
+if  localpart equals       argumentcount    1
+return getpropertiesfunction
+}
+if  localpart equals       argumentcount    1
+return getsimplefunction
+}
+}
+}
+return answer
+}
+}
+/**
+* checks whether we need an {@link inputstream} to access the message body.
+* <p/>
+* depending on the content in the message body, we may not need to convert
+* to {@link inputstream}.
+*
+* @param exchange the current exchange
+* @return <tt>true</tt> to convert to {@link inputstream} beforehand converting afterwards.
+*/
+protected boolean isinputstreamneeded exchange exchange
+object body   exchange getin   getbody
+if  body    null
+return false
+}
+if  body instanceof wrappedfile
+body     wrappedfile<?>  body  getfile
+}
+if  body instanceof file
+// input stream is needed for file to avoid locking the file in case of errors etc
+return true
+}
+// input stream is not needed otherwise
+return false
+}
+/**
+* strategy method to extract the document from the exchange.
+*/
+protected object getdocument exchange exchange  object body
+try
+return dogetdocument exchange  body
+catch  exception e
+throw objecthelper wrapruntimecamelexception e
+finally
+// call the reset if the in message body is streamcache
+messagehelper resetstreamcache exchange getin
+}
+}
+protected object dogetdocument exchange exchange  object body  throws exception
+if  body    null
+return null
+}
+object answer   null
+class<?> type   getdocumenttype
+exception cause   null
+if  type    null
+// try to get the body as the desired type
+try
+answer   exchange getcontext   gettypeconverter   convertto type  exchange  body
+catch  exception e
+// we want to store the caused exception, if we could not convert
+cause   e
+}
+}
+// okay we can try to remedy the failed conversion by some special types
+if  answer    null
+// let's try coercing some common types into something jaxp work with the best for special types
+if  body instanceof wrappedfile
+// special for files so we can work with them out of the box
+inputstream is   exchange getcontext   gettypeconverter   convertto inputstream class  body
+answer   new inputsource is
+else if  body instanceof beaninvocation
+// if its a null bean invocation then handle that specially
+beaninvocation bi   exchange getcontext   gettypeconverter   convertto beaninvocation class  body
+if  bi getargs      null    bi getargs   length    1    bi getargs      null
+// its a null argument from the bean invocation so use null as answer
+answer   null
+}
+else if  body instanceof string
+answer   new inputsource new stringreader  string  body
+}
+}
+if  type    null    answer    null
+// fallback to get the body as is
+answer   body
+else if  answer    null
+// there was a type, and we could not convert to it, then fail
+if  cause    null
+throw cause
+else
+throw new notypeconversionavailableexception body  type
+}
+}
+return answer
+}
+private messagevariableresolver getvariableresolver
+messagevariableresolver resolver   variableresolver get
+if  resolver    null
+resolver   new messagevariableresolver exchange
+variableresolver set resolver
+}
+return resolver
+}
+public void start   throws exception
+if  xpathfactory    null
+initdefaultxpathfactory
+}
+}
+public void stop   throws exception
+pool clear
+poollognamespaces clear
+}
+protected synchronized void initdefaultxpathfactory   throws xpathfactoryconfigurationexception
+if  defaultxpathfactory    null
+if  objectmodeluri    null
+defaultxpathfactory   xpathfactory newinstance objectmodeluri
+log info     objectmodeluri      defaultxpathfactory
+}
+if  defaultxpathfactory    null
+// read system property and see if there is a factory set
+properties properties   system getproperties
+for  map entry<object  object> prop   properties entryset
+string key    string  prop getkey
+if  key startswith xpathfactory default_property_name
+string uri   objecthelper after key
+if  uri    null
+defaultxpathfactory   xpathfactory newinstance uri
+log info    new object key  uri  defaultxpathfactory
+}
+}
+}
+}
+defaultxpathfactory   xpathfactory newinstance
+log info    defaultxpathfactory
+}
+}
+/**
+* on completion class which cleanup thread local resources
+*/
+private final class xpathbuilderoncompletion extends synchronizationadapter
+@override
+public void ondone exchange exchange
+// when the exchange is done, then cleanup thread locals if they are still
+// pointing to this exchange that was done
+if  exchange equals xpathbuilder this exchange get
+// cleanup thread locals after usage
+xpathbuilder this variableresolver remove
+xpathbuilder this exchange remove
+}
+}
+@override
+public boolean allowhandover
+// this completion should not be handed over, as we want to execute it
+// on current thread as the thread locals is bound the current thread
+return false
+}
+@override
+public string tostring() {
+return
+}
+}
+}

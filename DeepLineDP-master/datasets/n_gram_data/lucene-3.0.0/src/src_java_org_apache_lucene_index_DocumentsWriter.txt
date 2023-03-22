@@ -1,0 +1,1090 @@
+package org apache lucene index
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+import java io ioexception
+import java io printstream
+import java text numberformat
+import java util arraylist
+import java util collection
+import java util hashmap
+import java util hashset
+import java util list
+import java util map entry
+import org apache lucene analysis analyzer
+import org apache lucene document document
+import org apache lucene search indexsearcher
+import org apache lucene search query
+import org apache lucene search scorer
+import org apache lucene search similarity
+import org apache lucene search weight
+import org apache lucene store alreadyclosedexception
+import org apache lucene store directory
+import org apache lucene util arrayutil
+import org apache lucene util constants
+import org apache lucene util threadinterruptedexception
+/**
+* this class accepts multiple added documents and directly
+* writes a single segment file.  it does this more
+* efficiently than creating a single segment per document
+* (with documentwriter) and doing standard merges on those
+* segments.
+*
+* each added document is passed to the {@link docconsumer},
+* which in turn processes the document and interacts with
+* other consumers in the indexing chain.  certain
+* consumers, like {@link storedfieldswriter} and {@link
+* termvectorstermswriter}, digest a document and
+* immediately write bytes to the "doc store" files (ie,
+* they do not consume ram per document, except while they
+* are processing the document).
+*
+* other consumers, eg {@link freqproxtermswriter} and
+* {@link normswriter}, buffer bytes in ram and flush only
+* when a new segment is produced.
+* once we have used our allowed ram buffer, or the number
+* of added docs is large enough (in the case we are
+* flushing by doc count instead of ram usage), we create a
+* real segment and flush it to the directory.
+*
+* threads:
+*
+* multiple threads are allowed into adddocument at once.
+* there is an initial synchronized call to getthreadstate
+* which allocates a threadstate for this thread.  the same
+* thread will get the same threadstate over time (thread
+* affinity) so that if there are consistent patterns (for
+* example each thread is indexing a different content
+* source) then we make better use of ram.  then
+* processdocument is called on that threadstate without
+* synchronization (most of the "heavy lifting" is in this
+* call).  finally the synchronized "finishdocument" is
+* called to flush changes to the directory.
+*
+* when flush is called by indexwriter we forcefully idle
+* all threads and flush only once they are all idle.  this
+* means you can call flush with a given thread even while
+* other threads are actively adding/deleting documents.
+*
+*
+* exceptions:
+*
+* because this class directly updates in-memory posting
+* lists, and flushes stored fields and term vectors
+* directly to files in the directory, there are certain
+* limited times when an exception can corrupt this state.
+* for example, a disk full while flushing stored fields
+* leaves this file in a corrupt state.  or, an oom
+* exception while appending to the in-memory posting lists
+* can corrupt that posting list.  we call such exceptions
+* "aborting exceptions".  in these cases we must call
+* abort() to discard all docs added since the last flush.
+*
+* all other exceptions ("non-aborting exceptions") can
+* still partially update the index structures.  these
+* updates are consistent, but, they represent only a part
+* of the document seen up until the exception was hit.
+* when this happens, we immediately mark the document as
+* deleted so that the document is always atomically ("all
+* or none") added to the index.
+*/
+final class documentswriter
+indexwriter writer
+directory directory
+string segment                             current segment we are working on
+private string docstoresegment             current doc store segment we are writing
+private int docstoreoffset                         current starting doc store offset of current segment
+private int nextdocid                              next docid to be added
+private int numdocsinram                           # docs buffered in ram
+int numdocsinstore                         # docs written to doc stores
+// max # threadstate instances; if there are more threads
+// than this they share threadstates
+private final static int max_thread_state   5
+private documentswriterthreadstate threadstates   new documentswriterthreadstate
+private final hashmap<thread documentswriterthreadstate> threadbindings   new hashmap<thread documentswriterthreadstate>
+private int pausethreads                   non zero when we need all threads to
+// pause (eg to flush)
+boolean flushpending                       true when a thread has decided to flush
+boolean bufferisfull                       true when it's time to write segment
+private boolean aborting                   true if an abort is pending
+private docfieldprocessor docfieldprocessor
+printstream infostream
+int maxfieldlength   indexwriter default_max_field_length
+similarity similarity
+list<string> newfiles
+static class docstate
+documentswriter docwriter
+analyzer analyzer
+int maxfieldlength
+printstream infostream
+similarity similarity
+int docid
+document doc
+string maxtermprefix
+// only called by asserts
+public boolean testpoint string name
+return docwriter writer testpoint name
+/** consumer returns this on each doc.  this holds any
+*  state that must be flushed synchronized "in docid
+*  order".  we gather these and flush them in order. */
+abstract static class docwriter
+docwriter next
+int docid
+abstract void finish   throws ioexception
+abstract void abort
+abstract long sizeinbytes
+void setnext docwriter next
+this next   next
+/**
+* the indexingchain must define the {@link #getchain(documentswriter)} method
+* which returns the docconsumer that the documentswriter calls to process the
+* documents.
+*/
+abstract static class indexingchain
+abstract docconsumer getchain documentswriter documentswriter
+static final indexingchain defaultindexingchain   new indexingchain
+@override
+docconsumer getchain documentswriter documentswriter
+/*
+this is the current indexing chain:
+docconsumer / docconsumerperthread
+--> code: docfieldprocessor / docfieldprocessorperthread
+--> docfieldconsumer / docfieldconsumerperthread / docfieldconsumerperfield
+--> code: docfieldconsumers / docfieldconsumersperthread / docfieldconsumersperfield
+--> code: docinverter / docinverterperthread / docinverterperfield
+--> inverteddocconsumer / inverteddocconsumerperthread / inverteddocconsumerperfield
+--> code: termshash / termshashperthread / termshashperfield
+--> termshashconsumer / termshashconsumerperthread / termshashconsumerperfield
+--> code: freqproxtermswriter / freqproxtermswriterperthread / freqproxtermswriterperfield
+--> code: termvectorstermswriter / termvectorstermswriterperthread / termvectorstermswriterperfield
+--> inverteddocendconsumer / inverteddocconsumerperthread / inverteddocconsumerperfield
+--> code: normswriter / normswriterperthread / normswriterperfield
+--> code: storedfieldswriter / storedfieldswriterperthread / storedfieldswriterperfield
+*/
+// build up indexing chain:
+final termshashconsumer termvectorswriter   new termvectorstermswriter documentswriter
+final termshashconsumer freqproxwriter   new freqproxtermswriter
+final inverteddocconsumer  termshash   new termshash documentswriter  true  freqproxwriter
+new termshash documentswriter  false  termvectorswriter  null
+final normswriter normswriter   new normswriter
+final docinverter docinverter   new docinverter termshash  normswriter
+return new docfieldprocessor documentswriter  docinverter
+final docconsumer consumer
+// deletes done after the last flush; these are discarded
+// on abort
+private buffereddeletes deletesinram   new buffereddeletes
+// deletes done before the last flush; these are still
+// kept on abort
+private buffereddeletes deletesflushed   new buffereddeletes
+// the max number of delete terms that can be buffered before
+// they must be flushed to disk.
+private int maxbuffereddeleteterms   indexwriter default_max_buffered_delete_terms
+// how much ram we can use before flushing.  this is 0 if
+// we are flushing by doc count instead.
+private long rambuffersize    long   indexwriter default_ram_buffer_size_mb 1024 1024
+private long waitqueuepausebytes    long   rambuffersize 0 1
+private long waitqueueresumebytes    long   rambuffersize 0 05
+// if we've allocated 5% over our ram budget, we then
+// free down to 95%
+private long freetrigger    long   indexwriter default_ram_buffer_size_mb 1024 1024 1 05
+private long freelevel    long   indexwriter default_ram_buffer_size_mb 1024 1024 0 95
+// flush @ this number of docs.  if rambuffersize is
+// non-zero we will flush by ram usage instead.
+private int maxbuffereddocs   indexwriter default_max_buffered_docs
+private int flusheddoccount                          how many docs already flushed to index
+synchronized void updateflusheddoccount int n
+flusheddoccount    n
+synchronized int getflusheddoccount
+return flusheddoccount
+synchronized void setflusheddoccount int n
+flusheddoccount   n
+private boolean closed
+documentswriter directory directory  indexwriter writer  indexingchain indexingchain  throws ioexception
+this directory   directory
+this writer   writer
+this similarity   writer getsimilarity
+flusheddoccount   writer maxdoc
+consumer   indexingchain getchain this
+if  consumer instanceof docfieldprocessor
+docfieldprocessor    docfieldprocessor  consumer
+/** returns true if any of the fields in the current
+*  buffered docs have omittermfreqandpositions==false */
+boolean hasprox
+return  docfieldprocessor    null  ? docfieldprocessor fieldinfos hasprox
+true
+/** if non-null, various details of indexing are printed
+*  here. */
+synchronized void setinfostream printstream infostream
+this infostream   infostream
+for int i 0 i<threadstates length i
+threadstates docstate infostream   infostream
+synchronized void setmaxfieldlength int maxfieldlength
+this maxfieldlength   maxfieldlength
+for int i 0 i<threadstates length i
+threadstates docstate maxfieldlength   maxfieldlength
+synchronized void setsimilarity similarity similarity
+this similarity   similarity
+for int i 0 i<threadstates length i
+threadstates docstate similarity   similarity
+/** set how much ram we can use before flushing. */
+synchronized void setrambuffersizemb double mb
+if  mb    indexwriter disable_auto_flush
+rambuffersize   indexwriter disable_auto_flush
+waitqueuepausebytes   4 1024 1024
+waitqueueresumebytes   2 1024 1024
+else
+rambuffersize    long   mb 1024 1024
+waitqueuepausebytes    long   rambuffersize 0 1
+waitqueueresumebytes    long   rambuffersize 0 05
+freetrigger    long   1 05   rambuffersize
+freelevel    long   0 95   rambuffersize
+synchronized double getrambuffersizemb
+if  rambuffersize    indexwriter disable_auto_flush
+return rambuffersize
+else
+return rambuffersize 1024  1024
+/** set max buffered docs, which means we will flush by
+*  doc count instead of by ram usage. */
+void setmaxbuffereddocs int count
+maxbuffereddocs   count
+int getmaxbuffereddocs
+return maxbuffereddocs
+/** get current segment name we are writing. */
+string getsegment
+return segment
+/** returns how many docs are currently buffered in ram. */
+int getnumdocsinram
+return numdocsinram
+/** returns the current doc store segment we are writing
+*  to. */
+synchronized string getdocstoresegment
+return docstoresegment
+/** returns the doc offset into the shared doc store for
+*  the current buffered docs. */
+int getdocstoreoffset
+return docstoreoffset
+/** closes the current open doc stores an returns the doc
+*  store segment name.  this returns null if there are *
+*  no buffered documents. */
+synchronized string closedocstore   throws ioexception
+assert allthreadsidle
+if  infostream    null
+message     openfiles size         docstoresegment       numdocsinstore
+boolean success   false
+try
+initflushstate true
+closedfiles clear
+consumer closedocstore flushstate
+assert 0    openfiles size
+string s   docstoresegment
+docstoresegment   null
+docstoreoffset   0
+numdocsinstore   0
+success   true
+return s
+finally
+if   success
+abort
+private collection<string> abortedfiles                   list of files that were written before last abort
+private segmentwritestate flushstate
+collection<string> abortedfiles
+return abortedfiles
+void message string message
+if  infostream    null
+writer message     message
+final list<string> openfiles   new arraylist<string>
+final list<string> closedfiles   new arraylist<string>
+/* returns collection of files in use by this instance,
+* including any flushed segments. */
+@suppresswarnings
+synchronized list<string> openfiles
+return  list<string>    arraylist<string>  openfiles  clone
+@suppresswarnings
+synchronized list<string> closedfiles
+return  list<string>    arraylist<string>  closedfiles  clone
+synchronized void addopenfile string name
+assert  openfiles contains name
+openfiles add name
+synchronized void removeopenfile string name
+assert openfiles contains name
+openfiles remove name
+closedfiles add name
+synchronized void setaborting
+aborting   true
+/** called if we hit an exception at a bad time (when
+*  updating the index files) and must discard all
+*  currently buffered docs.  this resets our state,
+*  discarding any docs added since last flush. */
+synchronized void abort   throws ioexception
+try
+if  infostream    null
+message
+// forcefully remove waiting threadstates from line
+waitqueue abort
+// wait for all other threads to finish with
+// documentswriter:
+pauseallthreads
+try
+assert 0    waitqueue numwaiting
+waitqueue waitingbytes   0
+try
+abortedfiles   openfiles
+catch  throwable t
+abortedfiles   null
+deletesinram clear
+openfiles clear
+for int i 0 i<threadstates length i
+try
+threadstates consumer abort
+catch  throwable t
+try
+consumer abort
+catch  throwable t
+docstoresegment   null
+numdocsinstore   0
+docstoreoffset   0
+// reset all postings data
+doafterflush
+finally
+resumeallthreads
+finally
+aborting   false
+notifyall
+if  infostream    null
+message
+/** reset after a flush */
+private void doafterflush   throws ioexception
+// all threadstates should be idle when we are called
+assert allthreadsidle
+threadbindings clear
+waitqueue reset
+segment   null
+numdocsinram   0
+nextdocid   0
+bufferisfull   false
+flushpending   false
+for int i 0 i<threadstates length i
+threadstates doafterflush
+numbytesused   0
+// returns true if an abort is in progress
+synchronized boolean pauseallthreads
+pausethreads
+while  allthreadsidle
+try
+wait
+catch  interruptedexception ie
+throw new threadinterruptedexception ie
+return aborting
+synchronized void resumeallthreads
+pausethreads
+assert pausethreads >  0
+if  0    pausethreads
+notifyall
+private synchronized boolean allthreadsidle
+for int i 0 i<threadstates length i
+if   threadstates isidle
+return false
+return true
+synchronized boolean anychanges
+return numdocsinram    0
+deletesinram numterms    0
+deletesinram docids size      0
+deletesinram queries size      0
+synchronized private void initflushstate boolean onlydocstore
+initsegmentname onlydocstore
+flushstate   new segmentwritestate this  directory  segment  docstoresegment  numdocsinram  numdocsinstore  writer gettermindexinterval
+/** flush all pending docs to a new segment */
+synchronized int flush boolean closedocstore  throws ioexception
+assert allthreadsidle
+assert numdocsinram > 0
+assert nextdocid    numdocsinram
+assert waitqueue numwaiting    0
+assert waitqueue waitingbytes    0
+initflushstate false
+docstoreoffset   numdocsinstore
+if  infostream    null
+message     flushstate segmentname       numdocsinram
+boolean success   false
+try
+if  closedocstore
+assert flushstate docstoresegmentname    null
+assert flushstate docstoresegmentname equals flushstate segmentname
+closedocstore
+flushstate numdocsinstore   0
+collection<docconsumerperthread> threads   new hashset<docconsumerperthread>
+for int i 0 i<threadstates length i
+threads add threadstates consumer
+consumer flush threads  flushstate
+if  infostream    null
+segmentinfo si   new segmentinfo flushstate segmentname  flushstate numdocs  directory
+final long newsegmentsize   si sizeinbytes
+string message       numbytesused
+newsegmentsize
+nf format numdocsinram  newsegmentsize 1024  1024
+nf format 100 0 newsegmentsize numbytesused
+message message
+flusheddoccount    flushstate numdocs
+doafterflush
+success   true
+finally
+if   success
+abort
+assert waitqueue waitingbytes    0
+return flushstate numdocs
+/** build compound file for the segment we just flushed */
+void createcompoundfile string segment  throws ioexception
+compoundfilewriter cfswriter   new compoundfilewriter directory  segment       indexfilenames compound_file_extension
+for  final string flushedfile   flushstate flushedfiles
+cfswriter addfile flushedfile
+// perform the merge
+cfswriter close
+/** set flushpending if it is not already set and returns
+*  whether it was set. this is used by indexwriter to
+*  trigger a single flush even when multiple threads are
+*  trying to do so. */
+synchronized boolean setflushpending
+if  flushpending
+return false
+else
+flushpending   true
+return true
+synchronized void clearflushpending
+flushpending   false
+synchronized void pushdeletes
+deletesflushed update deletesinram
+synchronized void close
+closed   true
+notifyall
+synchronized void initsegmentname boolean onlydocstore
+if  segment    null      onlydocstore    docstoresegment    null
+segment   writer newsegmentname
+assert numdocsinram    0
+if  docstoresegment    null
+docstoresegment   segment
+assert numdocsinstore    0
+/** returns a free (idle) threadstate that may be used for
+* indexing this one document.  this call also pauses if a
+* flush is pending.  if delterm is non-null then we
+* buffer this deleted term after the thread state has
+* been acquired. */
+synchronized documentswriterthreadstate getthreadstate document doc  term delterm  throws ioexception
+// first, find a thread state.  if this thread already
+// has affinity to a specific threadstate, use that one
+// again.
+documentswriterthreadstate state   threadbindings get thread currentthread
+if  state    null
+// first time this thread has called us since last
+// flush.  find the least loaded thread state:
+documentswriterthreadstate minthreadstate   null
+for int i 0 i<threadstates length i
+documentswriterthreadstate ts   threadstates
+if  minthreadstate    null    ts numthreads < minthreadstate numthreads
+minthreadstate   ts
+if  minthreadstate    null     minthreadstate numthreads    0    threadstates length >  max_thread_state
+state   minthreadstate
+state numthreads
+else
+// just create a new "private" thread state
+documentswriterthreadstate newarray   new documentswriterthreadstate
+if  threadstates length > 0
+system arraycopy threadstates  0  newarray  0  threadstates length
+state   newarray   new documentswriterthreadstate this
+threadstates   newarray
+threadbindings put thread currentthread    state
+// next, wait until my thread state is idle (in case
+// it's shared with other threads) and for threads to
+// not be paused nor a flush pending:
+waitready state
+// allocate segment name if this is the first doc since
+// last flush:
+initsegmentname false
+state isidle   false
+boolean success   false
+try
+state docstate docid   nextdocid
+assert writer testpoint
+if  delterm    null
+adddeleteterm delterm  state docstate docid
+state doflushafter   timetoflushdeletes
+assert writer testpoint
+nextdocid
+numdocsinram
+// we must at this point commit to flushing to ensure we
+// always get n docs when we flush by doc count, even if
+// > 1 thread is adding documents:
+if   flushpending
+maxbuffereddocs    indexwriter disable_auto_flush
+numdocsinram >  maxbuffereddocs
+flushpending   true
+state doflushafter   true
+success   true
+finally
+if   success
+// forcefully idle this threadstate:
+state isidle   true
+notifyall
+if  state doflushafter
+state doflushafter   false
+flushpending   false
+return state
+/** returns true if the caller (indexwriter) should now
+* flush. */
+boolean adddocument document doc  analyzer analyzer
+throws corruptindexexception  ioexception
+return updatedocument doc  analyzer  null
+boolean updatedocument term t  document doc  analyzer analyzer
+throws corruptindexexception  ioexception
+return updatedocument doc  analyzer  t
+boolean updatedocument document doc  analyzer analyzer  term delterm
+throws corruptindexexception  ioexception
+// this call is synchronized but fast
+final documentswriterthreadstate state   getthreadstate doc  delterm
+final docstate docstate   state docstate
+docstate doc   doc
+docstate analyzer   analyzer
+boolean success   false
+try
+// this call is not synchronized and does all the
+// work
+final docwriter perdoc   state consumer processdocument
+// this call is synchronized but fast
+finishdocument state  perdoc
+success   true
+finally
+if   success
+synchronized this
+if  aborting
+state isidle   true
+notifyall
+abort
+else
+skipdocwriter docid   docstate docid
+boolean success2   false
+try
+waitqueue add skipdocwriter
+success2   true
+finally
+if   success2
+state isidle   true
+notifyall
+abort
+return false
+state isidle   true
+notifyall
+// if this thread state had decided to flush, we
+// must clear it so another thread can flush
+if  state doflushafter
+state doflushafter   false
+flushpending   false
+notifyall
+// immediately mark this document as deleted
+// since likely it was partially added.  this
+// keeps indexing as "all or none" (atomic) when
+// adding a document:
+adddeletedocid state docstate docid
+return state doflushafter    timetoflushdeletes
+// for testing
+synchronized int getnumbuffereddeleteterms
+return deletesinram numterms
+// for testing
+synchronized hashmap<term buffereddeletes num> getbuffereddeleteterms
+return deletesinram terms
+/** called whenever a merge has completed and the merged segments had deletions */
+synchronized void remapdeletes segmentinfos infos  int docmaps  int delcounts  mergepolicy onemerge merge  int mergedoccount
+if  docmaps    null
+// the merged segments had no deletes so docids did not change and we have nothing to do
+return
+mergedocidremapper mapper   new mergedocidremapper infos  docmaps  delcounts  merge  mergedoccount
+deletesinram remap mapper  infos  docmaps  delcounts  merge  mergedoccount
+deletesflushed remap mapper  infos  docmaps  delcounts  merge  mergedoccount
+flusheddoccount    mapper docshift
+synchronized private void waitready documentswriterthreadstate state
+while   closed      state    null     state isidle     pausethreads    0    flushpending    aborting
+try
+wait
+catch  interruptedexception ie
+throw new threadinterruptedexception ie
+if  closed
+throw new alreadyclosedexception
+synchronized boolean bufferdeleteterms term terms  throws ioexception
+waitready null
+for  int i   0  i < terms length  i
+adddeleteterm terms  numdocsinram
+return timetoflushdeletes
+synchronized boolean bufferdeleteterm term term  throws ioexception
+waitready null
+adddeleteterm term  numdocsinram
+return timetoflushdeletes
+synchronized boolean bufferdeletequeries query queries  throws ioexception
+waitready null
+for  int i   0  i < queries length  i
+adddeletequery queries  numdocsinram
+return timetoflushdeletes
+synchronized boolean bufferdeletequery query query  throws ioexception
+waitready null
+adddeletequery query  numdocsinram
+return timetoflushdeletes
+synchronized boolean deletesfull
+return  rambuffersize    indexwriter disable_auto_flush
+deletesinram bytesused   deletesflushed bytesused   numbytesused  >  rambuffersize
+maxbuffereddeleteterms    indexwriter disable_auto_flush
+deletesinram size     deletesflushed size    >  maxbuffereddeleteterms
+synchronized boolean doapplydeletes
+// very similar to deletesfull(), except we don't count
+// numbytesalloc, because we are checking whether
+// deletes (alone) are consuming too many resources now
+// and thus should be applied.  we apply deletes if ram
+// usage is > 1/2 of our allowed ram buffer, to prevent
+// too-frequent flushing of a long tail of tiny segments
+// when merges (which always apply deletes) are
+// infrequent.
+return  rambuffersize    indexwriter disable_auto_flush
+deletesinram bytesused   deletesflushed bytesused  >  rambuffersize 2
+maxbuffereddeleteterms    indexwriter disable_auto_flush
+deletesinram size     deletesflushed size    >  maxbuffereddeleteterms
+synchronized private boolean timetoflushdeletes
+return  bufferisfull    deletesfull       setflushpending
+void setmaxbuffereddeleteterms int maxbuffereddeleteterms
+this maxbuffereddeleteterms   maxbuffereddeleteterms
+int getmaxbuffereddeleteterms
+return maxbuffereddeleteterms
+synchronized boolean hasdeletes
+return deletesflushed any
+synchronized boolean applydeletes segmentinfos infos  throws ioexception
+if   hasdeletes
+return false
+if  infostream    null
+message     deletesflushed numterms
+deletesflushed docids size
+deletesflushed queries size
+infos size
+final int infosend   infos size
+int docstart   0
+boolean any   false
+for  int i   0  i < infosend  i
+// make sure we never attempt to apply deletes to
+// segment in external dir
+assert infos info i  dir    directory
+segmentreader reader   writer readerpool get infos info i   false
+try
+any    applydeletes reader  docstart
+docstart    reader maxdoc
+finally
+writer readerpool release reader
+deletesflushed clear
+return any
+// apply buffered delete terms, queries and docids to the
+// provided reader
+private final synchronized boolean applydeletes indexreader reader  int docidstart
+throws corruptindexexception  ioexception
+final int docend   docidstart   reader maxdoc
+boolean any   false
+// delete by term
+termdocs docs   reader termdocs
+try
+for  entry<term  buffereddeletes num> entry  deletesflushed terms entryset
+term term   entry getkey
+docs seek term
+int limit   entry getvalue   getnum
+while  docs next
+int docid   docs doc
+if  docidstart docid >  limit
+break
+reader deletedocument docid
+any   true
+finally
+docs close
+// delete by docid
+for  integer docidint   deletesflushed docids
+int docid   docidint intvalue
+if  docid >  docidstart    docid < docend
+reader deletedocument docid docidstart
+any   true
+// delete by query
+indexsearcher searcher   new indexsearcher reader
+for  entry<query  integer> entry   deletesflushed queries entryset
+query query   entry getkey
+int limit   entry getvalue   intvalue
+weight weight   query weight searcher
+scorer scorer   weight scorer reader  true  false
+if  scorer    null
+while true
+int doc   scorer nextdoc
+if    long  docidstart    doc >  limit
+break
+reader deletedocument doc
+any   true
+searcher close
+return any
+// buffer a term in buffereddeleteterms, which records the
+// current number of documents buffered in ram so that the
+// delete term will be applied to those documents as well
+// as the disk segments.
+synchronized private void adddeleteterm term term  int doccount
+buffereddeletes num num   deletesinram terms get term
+final int docidupto   flusheddoccount   doccount
+if  num    null
+deletesinram terms put term  new buffereddeletes num docidupto
+else
+num setnum docidupto
+deletesinram numterms
+deletesinram addbytesused bytes_per_del_term   term text length   char_num_byte
+// buffer a specific docid for deletion.  currently only
+// used when we hit a exception when adding a document
+synchronized private void adddeletedocid int docid
+deletesinram docids add integer valueof flusheddoccount docid
+deletesinram addbytesused bytes_per_del_docid
+synchronized private void adddeletequery query query  int docid
+deletesinram queries put query  integer valueof flusheddoccount   docid
+deletesinram addbytesused bytes_per_del_query
+synchronized boolean dobalanceram
+return rambuffersize    indexwriter disable_auto_flush     bufferisfull     numbytesused deletesinram bytesused deletesflushed bytesused >  rambuffersize    numbytesalloc >  freetrigger
+/** does the synchronized work to finish/flush the
+*  inverted document. */
+private void finishdocument documentswriterthreadstate perthread  docwriter docwriter  throws ioexception
+if  dobalanceram
+// must call this w/o holding synchronized(this) else
+// we'll hit deadlock:
+balanceram
+synchronized this
+assert docwriter    null    docwriter docid    perthread docstate docid
+if  aborting
+// we are currently aborting, and another thread is
+// waiting for me to become idle.  we just forcefully
+// idle this threadstate; it will be fully reset by
+// abort()
+if  docwriter    null
+try
+docwriter abort
+catch  throwable t
+perthread isidle   true
+notifyall
+return
+final boolean dopause
+if  docwriter    null
+dopause   waitqueue add docwriter
+else
+skipdocwriter docid   perthread docstate docid
+dopause   waitqueue add skipdocwriter
+if  dopause
+waitforwaitqueue
+if  bufferisfull     flushpending
+flushpending   true
+perthread doflushafter   true
+perthread isidle   true
+notifyall
+synchronized void waitforwaitqueue
+do
+try
+wait
+catch  interruptedexception ie
+throw new threadinterruptedexception ie
+while   waitqueue doresume
+private static class skipdocwriter extends docwriter
+@override
+void finish
+@override
+void abort
+@override
+long sizeinbytes
+return 0
+final skipdocwriter skipdocwriter   new skipdocwriter
+long getramused
+return numbytesused   deletesinram bytesused   deletesflushed bytesused
+long numbytesalloc
+long numbytesused
+numberformat nf   numberformat getinstance
+// coarse estimates used to measure ram usage of buffered deletes
+final static int object_header_bytes   8
+final static int pointer_num_byte   constants jre_is_64bit ? 8   4
+final static int int_num_byte   4
+final static int char_num_byte   2
+/* rough logic: hashmap has an array[entry] w/ varying
+load factor (say 2 * pointer).  entry is object w/ term
+key, buffereddeletes.num val, int hash, entry next
+(obj_header + 3*pointer + int).  term is object w/
+string field and string text (obj_header + 2*pointer).
+we don't count term's field since it's interned.
+term's text is string (obj_header + 4*int + pointer +
+obj_header + string.length*char).  buffereddeletes.num is
+obj_header + int. */
+final static int bytes_per_del_term   8 pointer_num_byte   5 object_header_bytes   6 int_num_byte
+/* rough logic: del docids are list<integer>.  say list
+allocates ~2x size (2*pointer).  integer is obj_header
++ int */
+final static int bytes_per_del_docid   2 pointer_num_byte   object_header_bytes   int_num_byte
+/* rough logic: hashmap has an array[entry] w/ varying
+load factor (say 2 * pointer).  entry is object w/
+query key, integer val, int hash, entry next
+(obj_header + 3*pointer + int).  query we often
+undercount (say 24 bytes).  integer is obj_header + int. */
+final static int bytes_per_del_query   5 pointer_num_byte   2 object_header_bytes   2 int_num_byte   24
+/* initial chunks size of the shared byte[] blocks used to
+store postings data */
+final static int byte_block_shift   15
+final static int byte_block_size   1 << byte_block_shift
+final static int byte_block_mask   byte_block_size   1
+final static int byte_block_not_mask   ~byte_block_mask
+private class byteblockallocator extends byteblockpool allocator
+arraylist<byte> freebyteblocks   new arraylist<byte>
+/* allocate another byte[] from the shared pool */
+@override
+byte getbyteblock boolean trackallocations
+synchronized documentswriter this
+final int size   freebyteblocks size
+final byte b
+if  0    size
+// always record a block allocated, even if
+// trackallocations is false.  this is necessary
+// because this block will be shared between
+// things that don't track allocations (term
+// vectors) and things that do (freq/prox
+// postings).
+numbytesalloc    byte_block_size
+b   new byte
+else
+b   freebyteblocks remove size 1
+if  trackallocations
+numbytesused    byte_block_size
+assert numbytesused <  numbytesalloc
+return b
+/* return byte[]'s to the pool */
+@override
+void recyclebyteblocks byte blocks  int start  int end
+synchronized documentswriter this
+for int i start i<end i
+freebyteblocks add blocks
+/* initial chunks size of the shared int[] blocks used to
+store postings data */
+final static int int_block_shift   13
+final static int int_block_size   1 << int_block_shift
+final static int int_block_mask   int_block_size   1
+private arraylist<int> freeintblocks   new arraylist<int>
+/* allocate another int[] from the shared pool */
+synchronized int getintblock boolean trackallocations
+final int size   freeintblocks size
+final int b
+if  0    size
+// always record a block allocated, even if
+// trackallocations is false.  this is necessary
+// because this block will be shared between
+// things that don't track allocations (term
+// vectors) and things that do (freq/prox
+// postings).
+numbytesalloc    int_block_size int_num_byte
+b   new int
+else
+b   freeintblocks remove size 1
+if  trackallocations
+numbytesused    int_block_size int_num_byte
+assert numbytesused <  numbytesalloc
+return b
+synchronized void bytesallocated long numbytes
+numbytesalloc    numbytes
+assert numbytesused <  numbytesalloc
+synchronized void bytesused long numbytes
+numbytesused    numbytes
+assert numbytesused <  numbytesalloc
+/* return int[]s to the pool */
+synchronized void recycleintblocks int blocks  int start  int end
+for int i start i<end i
+freeintblocks add blocks
+byteblockallocator byteblockallocator   new byteblockallocator
+/* initial chunk size of the shared char[] blocks used to
+store term text */
+final static int char_block_shift   14
+final static int char_block_size   1 << char_block_shift
+final static int char_block_mask   char_block_size   1
+final static int max_term_length   char_block_size 1
+private arraylist  freecharblocks   new arraylist
+/* allocate another char[] from the shared pool */
+synchronized char getcharblock
+final int size   freecharblocks size
+final char c
+if  0    size
+numbytesalloc    char_block_size   char_num_byte
+c   new char
+else
+c   freecharblocks remove size 1
+// we always track allocations of char blocks, for now,
+// because nothing that skips allocation tracking
+// (currently only term vectors) uses its own char
+// blocks.
+numbytesused    char_block_size   char_num_byte
+assert numbytesused <  numbytesalloc
+return c
+/* return char[]s to the pool */
+synchronized void recyclecharblocks char blocks  int numblocks
+for int i 0 i<numblocks i
+freecharblocks add blocks
+string tomb long v
+return nf format v 1024  1024
+/* we have three pools of ram: postings, byte blocks
+* (holds freq/prox posting data) and char blocks (holds
+* characters in the term).  different docs require
+* varying amount of storage from these three classes.
+* for example, docs with many unique single-occurrence
+* short terms will use up the postings ram and hardly any
+* of the other two.  whereas docs with very large terms
+* will use alot of char blocks ram and relatively less of
+* the other two.  this method just frees allocations from
+* the pools once we are over-budget, which balances the
+* pools to match the current docs. */
+void balanceram
+// we flush when we've used our target usage
+final long flushtrigger   rambuffersize
+final long deletesramused   deletesinram bytesused deletesflushed bytesused
+if  numbytesalloc deletesramused > freetrigger
+if  infostream    null
+message     tomb numbytesused
+tomb flushtrigger
+tomb numbytesalloc
+tomb deletesramused
+tomb freetrigger
+tomb byteblockallocator freebyteblocks size   byte_block_size
+tomb freecharblocks size   char_block_size char_num_byte
+final long startbytesalloc   numbytesalloc   deletesramused
+int iter   0
+// we free equally from each pool in 32 kb
+// chunks until we are below our threshold
+// (freelevel)
+boolean any   true
+while numbytesalloc deletesramused > freelevel
+synchronized this
+if  0    byteblockallocator freebyteblocks size      0    freecharblocks size      0    freeintblocks size       any
+// nothing else to free -- must flush now.
+bufferisfull   numbytesused deletesramused > flushtrigger
+if  infostream    null
+if  numbytesused > flushtrigger
+message
+else
+message
+assert numbytesused <  numbytesalloc
+break
+if   0    iter % 4     byteblockallocator freebyteblocks size   > 0
+byteblockallocator freebyteblocks remove byteblockallocator freebyteblocks size   1
+numbytesalloc    byte_block_size
+if   1    iter % 4     freecharblocks size   > 0
+freecharblocks remove freecharblocks size   1
+numbytesalloc    char_block_size   char_num_byte
+if   2    iter % 4     freeintblocks size   > 0
+freeintblocks remove freeintblocks size   1
+numbytesalloc    int_block_size   int_num_byte
+if   3    iter % 4     any
+// ask consumer to free any recycled state
+any   consumer freeram
+iter
+if  infostream    null
+message     nf format  startbytesalloc numbytesalloc deletesramused  1024  1024         nf format  numbytesused deletesramused  1024  1024         nf format numbytesalloc 1024  1024
+else
+// if we have not crossed the 100% mark, but have
+// crossed the 95% mark of ram we are actually
+// using, go ahead and flush.  this prevents
+// over-allocating and then freeing, with every
+// flush.
+synchronized this
+if  numbytesused deletesramused > flushtrigger
+if  infostream    null
+message     nf format numbytesused 1024  1024
+nf format numbytesalloc 1024  1024
+nf format deletesramused 1024  1024
+nf format flushtrigger 1024  1024
+bufferisfull   true
+final waitqueue waitqueue   new waitqueue
+private class waitqueue
+docwriter waiting
+int nextwritedocid
+int nextwriteloc
+int numwaiting
+long waitingbytes
+public waitqueue
+waiting   new docwriter
+synchronized void reset
+// note: nextwriteloc doesn't need to be reset
+assert numwaiting    0
+assert waitingbytes    0
+nextwritedocid   0
+synchronized boolean doresume
+return waitingbytes <  waitqueueresumebytes
+synchronized boolean dopause
+return waitingbytes > waitqueuepausebytes
+synchronized void abort
+int count   0
+for int i 0 i<waiting length i
+final docwriter doc   waiting
+if  doc    null
+doc abort
+waiting   null
+count
+waitingbytes   0
+assert count    numwaiting
+numwaiting   0
+private void writedocument docwriter doc  throws ioexception
+assert doc    skipdocwriter    nextwritedocid    doc docid
+boolean success   false
+try
+doc finish
+nextwritedocid
+numdocsinstore
+nextwriteloc
+assert nextwriteloc <  waiting length
+if  nextwriteloc    waiting length
+nextwriteloc   0
+success   true
+finally
+if   success
+setaborting
+synchronized public boolean add docwriter doc  throws ioexception
+assert doc docid >  nextwritedocid
+if  doc docid    nextwritedocid
+writedocument doc
+while true
+doc   waiting
+if  doc    null
+numwaiting
+waiting   null
+waitingbytes    doc sizeinbytes
+writedocument doc
+else
+break
+else
+// i finished before documents that were added
+// before me.  this can easily happen when i am a
+// small doc and the docs before me were large, or,
+// just due to luck in the thread scheduling.  just
+// add myself to the queue and when that large doc
+// finishes, it will flush me:
+int gap   doc docid   nextwritedocid
+if  gap >  waiting length
+// grow queue
+docwriter newarray   new docwriter
+assert nextwriteloc >  0
+system arraycopy waiting  nextwriteloc  newarray  0  waiting length nextwriteloc
+system arraycopy waiting  0  newarray  waiting length nextwriteloc  nextwriteloc
+nextwriteloc   0
+waiting   newarray
+gap   doc docid   nextwritedocid
+int loc   nextwriteloc   gap
+if  loc >  waiting length
+loc    waiting length
+// we should only wrap one time
+assert loc < waiting length
+// nobody should be in my spot!
+assert waiting    null
+waiting   doc
+numwaiting
+waitingbytes    doc sizeinbytes
+return dopause

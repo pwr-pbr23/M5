@@ -1,0 +1,914 @@
+/**
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase
+import com google protobuf bytestring
+import com google protobuf invalidprotocolbufferexception
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop classification interfacestability
+import org apache hadoop hbase keyvalue kvcomparator
+import org apache hadoop hbase client result
+import org apache hadoop hbase exceptions deserializationexception
+import org apache hadoop hbase protobuf protobufutil
+import org apache hadoop hbase protobuf generated hbaseprotos
+import org apache hadoop hbase protobuf generated hbaseprotos regioninfo
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util jenkinshash
+import org apache hadoop hbase util md5hash
+import org apache hadoop hbase util pair
+import org apache hadoop hbase util pairofsametype
+import org apache hadoop io datainputbuffer
+import java io bytearrayinputstream
+import java io datainput
+import java io datainputstream
+import java io dataoutput
+import java io eofexception
+import java io ioexception
+import java io sequenceinputstream
+import java util arraylist
+import java util arrays
+import java util list
+/**
+* hregion information.
+* contains hregion id, start and end keys, a reference to this hregions' table descriptor, etc.
+*/
+@interfaceaudience public
+@interfacestability evolving
+public class hregioninfo implements comparable<hregioninfo>
+/*
+* there are two versions associated with hregioninfo: hregioninfo.version and
+* hconstants.meta_version. hregioninfo.version indicates the data structure's versioning
+* while hconstants.meta_version indicates the versioning of the serialized hris stored in
+* the meta table.
+*
+* pre-0.92:
+*   hri.version == 0 and hconstants.meta_version does not exist (is not stored at meta table)
+*   hregioninfo had an htabledescriptor reference inside it.
+*   hregioninfo is serialized as writable to meta table.
+* for 0.92.x and 0.94.x:
+*   hri.version == 1 and hconstants.meta_version == 0
+*   hri no longer has htabledescriptor in it.
+*   hri is serialized as writable to meta table.
+* for 0.96.x:
+*   hri.version == 1 and hconstants.meta_version == 1
+*   hri data structure is the same as 0.92 and 0.94
+*   hri is serialized as pb to meta table.
+*
+* versioning of hregioninfo is deprecated. hregioninfo does protobuf
+* serialization using regioninfo class, which has it's own versioning.
+*/
+@deprecated
+public static final byte version   1
+private static final log log   logfactory getlog hregioninfo class
+/**
+* the new format for a region name contains its encodedname at the end.
+* the encoded name also serves as the directory name for the region
+* in the filesystem.
+*
+* new region name format:
+*    &lt;tablename>,,&lt;startkey>,&lt;regionidtimestamp>.&lt;encodedname>.
+* where,
+*    &lt;encodedname> is a hex version of the md5 hash of
+*    &lt;tablename>,&lt;startkey>,&lt;regionidtimestamp>
+*
+* the old region name format:
+*    &lt;tablename>,&lt;startkey>,&lt;regionidtimestamp>
+* for region names in the old format, the encoded name is a 32-bit
+* jenkinshash integer value (in its decimal notation, string form).
+*<p>
+* **note**
+*
+* the first meta region, and regions created by an older
+* version of hbase (0.20 or prior) will continue to use the
+* old region name format.
+*/
+/** separator used to demarcate the encodedname in a region name
+* in the new format. see description on new format above.
+*/
+private static final int enc_separator
+public  static final int md5_hex_length     32
+/** a non-capture group so that this can be embedded. */
+public static final string encoded_region_name_regex
+/**
+* does region name contain its encoded name?
+* @param regionname region name
+* @return boolean indicating if this a new format region
+*         name which contains its encoded name.
+*/
+private static boolean hasencodedname final byte regionname
+// check if region name ends in enc_separator
+if   regionname length >  1
+regionname    enc_separator
+// region name is new format. it contains the encoded name.
+return true
+return false
+/**
+* @param regionname
+* @return the encodedname
+*/
+public static string encoderegionname final byte  regionname
+string encodedname
+if  hasencodedname regionname
+// region is in new format:
+// <tablename>,<startkey>,<regionidtimestamp>/encodedname/
+encodedname   bytes tostring regionname
+regionname length   md5_hex_length   1
+md5_hex_length
+else
+// old format region name. first meta region also
+// use this format.encodedname is the jenkinshash value.
+int hashval   math abs jenkinshash getinstance   hash regionname
+regionname length  0
+encodedname   string valueof hashval
+return encodedname
+/**
+* use logging.
+* @param encodedregionname the encoded regionname.
+* @return <code>.meta.</code> if passed </code>1028785192</code> else returns
+* <code>encodedregionname</code>
+*/
+public static string prettyprint final string encodedregionname
+if  encodedregionname equals
+return encodedregionname
+return encodedregionname
+private byte  endkey   hconstants empty_byte_array
+// this flag is in the parent of a split while the parent is still referenced
+// by daughter regions.  we used to set this flag when we disabled a table
+// but now table state is kept up in zookeeper as of 0.90.0 hbase.
+private boolean offline   false
+private long regionid    1
+private transient byte  regionname   hconstants empty_byte_array
+private string regionnamestr
+private boolean split   false
+private byte  startkey   hconstants empty_byte_array
+private int hashcode    1
+//todo: move no_hash to hstorefile which is really the only place it is used.
+public static final string no_hash   null
+private volatile string encodedname   no_hash
+private byte  encodednameasbytes   null
+// current tablename
+private byte tablename   null
+/** hregioninfo for root region */
+public static final hregioninfo root_regioninfo
+new hregioninfo 0l  bytes tobytes
+/** hregioninfo for first meta region */
+public static final hregioninfo first_meta_regioninfo
+new hregioninfo 1l  bytes tobytes
+private void sethashcode
+int result   arrays hashcode this regionname
+result ^  this regionid
+result ^  arrays hashcode this startkey
+result ^  arrays hashcode this endkey
+result ^  boolean valueof this offline  hashcode
+result ^  arrays hashcode this tablename
+this hashcode   result
+/**
+* private constructor used constructing hregioninfo for the
+* first meta regions
+*/
+private hregioninfo long regionid  byte tablename
+super
+this regionid   regionid
+this tablename   tablename clone
+// note: first meta regions names are still in old format
+this regionname   createregionname tablename  null
+regionid  false
+this regionnamestr   bytes tostringbinary this regionname
+sethashcode
+/** default constructor - creates empty object
+* @deprecated used by writables and writables are going away.
+*/
+@deprecated
+public hregioninfo
+super
+public hregioninfo final byte tablename
+this tablename  null  null
+/**
+* construct hregioninfo with explicit parameters
+*
+* @param tablename the table name
+* @param startkey first key in region
+* @param endkey end of key range
+* @throws illegalargumentexception
+*/
+public hregioninfo final byte tablename  final byte startkey  final byte endkey
+throws illegalargumentexception
+this tablename  startkey  endkey  false
+/**
+* construct hregioninfo with explicit parameters
+*
+* @param tablename the table descriptor
+* @param startkey first key in region
+* @param endkey end of key range
+* @param split true if this region has split and we have daughter regions
+* regions that may or may not hold references to this region.
+* @throws illegalargumentexception
+*/
+public hregioninfo final byte tablename  final byte startkey  final byte endkey
+final boolean split
+throws illegalargumentexception
+this tablename  startkey  endkey  split  system currenttimemillis
+/**
+* construct hregioninfo with explicit parameters
+*
+* @param tablename the table descriptor
+* @param startkey first key in region
+* @param endkey end of key range
+* @param split true if this region has split and we have daughter regions
+* regions that may or may not hold references to this region.
+* @param regionid region id to use.
+* @throws illegalargumentexception
+*/
+public hregioninfo final byte tablename  final byte startkey
+final byte endkey  final boolean split  final long regionid
+throws illegalargumentexception
+super
+if  tablename    null
+throw new illegalargumentexception
+this tablename   tablename clone
+this offline   false
+this regionid   regionid
+this regionname   createregionname this tablename  startkey  regionid  true
+this regionnamestr   bytes tostringbinary this regionname
+this split   split
+this endkey   endkey    null? hconstants empty_end_row  endkey clone
+this startkey   startkey    null?
+hconstants empty_start_row  startkey clone
+this tablename   tablename clone
+sethashcode
+/**
+* costruct a copy of another hregioninfo
+*
+* @param other
+*/
+public hregioninfo hregioninfo other
+super
+this endkey   other getendkey
+this offline   other isoffline
+this regionid   other getregionid
+this regionname   other getregionname
+this regionnamestr   bytes tostringbinary this regionname
+this split   other issplit
+this startkey   other getstartkey
+this hashcode   other hashcode
+this encodedname   other getencodedname
+this tablename   other tablename
+/**
+* make a region name of passed parameters.
+* @param tablename
+* @param startkey can be null
+* @param regionid region id (usually timestamp from when region was created).
+* @param newformat should we create the region name in the new format
+*                  (such that it contains its encoded name?).
+* @return region name made of passed tablename, startkey and id
+*/
+public static byte  createregionname final byte  tablename
+final byte  startkey  final long regionid  boolean newformat
+return createregionname tablename  startkey  long tostring regionid   newformat
+/**
+* make a region name of passed parameters.
+* @param tablename
+* @param startkey can be null
+* @param id region id (usually timestamp from when region was created).
+* @param newformat should we create the region name in the new format
+*                  (such that it contains its encoded name?).
+* @return region name made of passed tablename, startkey and id
+*/
+public static byte  createregionname final byte  tablename
+final byte  startkey  final string id  boolean newformat
+return createregionname tablename  startkey  bytes tobytes id   newformat
+/**
+* make a region name of passed parameters.
+* @param tablename
+* @param startkey can be null
+* @param id region id (usually timestamp from when region was created).
+* @param newformat should we create the region name in the new format
+*                  (such that it contains its encoded name?).
+* @return region name made of passed tablename, startkey and id
+*/
+public static byte  createregionname final byte  tablename
+final byte  startkey  final byte  id  boolean newformat
+byte  b   new byte [tablename length   2   id length
+startkey    null? 0  startkey length
+newformat ?  md5_hex_length   2    0 ]
+int offset   tablename length
+system arraycopy tablename  0  b  0  offset
+b   hconstants delimiter
+if  startkey    null    startkey length > 0
+system arraycopy startkey  0  b  offset  startkey length
+offset    startkey length
+b   hconstants delimiter
+system arraycopy id  0  b  offset  id length
+offset    id length
+if  newformat
+//
+// encoded name should be built into the region name.
+//
+// use the region name thus far (namely, <tablename>,<startkey>,<id>)
+// to compute a md5 hash to be used as the encoded name, and append
+// it to the byte buffer.
+//
+string md5hash   md5hash getmd5ashex b  0  offset
+byte  md5hashbytes   bytes tobytes md5hash
+if  md5hashbytes length    md5_hex_length
+log error     md5_hex_length
+md5hashbytes length
+// now append the bytes '.<encodedname>.' to the end
+b   enc_separator
+system arraycopy md5hashbytes  0  b  offset  md5_hex_length
+offset    md5_hex_length
+b   enc_separator
+return b
+/**
+* gets the table name from the specified region name.
+* @param regionname
+* @return table name.
+*/
+public static byte  gettablename byte  regionname
+int offset    1
+for  int i   0  i < regionname length  i
+if  regionname    hconstants delimiter
+offset   i
+break
+byte  tablename   new byte
+system arraycopy regionname  0  tablename  0  offset
+return tablename
+/**
+* gets the start key from the specified region name.
+* @param regionname
+* @return start key.
+*/
+public static byte getstartkey final byte regionname  throws ioexception
+return parseregionname regionname
+/**
+* separate elements of a regionname.
+* @param regionname
+* @return array of byte[] containing tablename, startkey and id
+* @throws ioexception
+*/
+public static byte  parseregionname final byte  regionname
+throws ioexception
+int offset    1
+for  int i   0  i < regionname length  i
+if  regionname    hconstants delimiter
+offset   i
+break
+if offset     1  throw new ioexception
+byte  tablename   new byte
+system arraycopy regionname  0  tablename  0  offset
+offset    1
+for  int i   regionname length   1  i > 0  i
+if regionname    hconstants delimiter
+offset   i
+break
+if offset     1  throw new ioexception
+byte  startkey   hconstants empty_byte_array
+if offset    tablename length   1
+startkey   new byte
+system arraycopy regionname  tablename length   1  startkey  0
+offset   tablename length   1
+byte  id   new byte
+system arraycopy regionname  offset   1  id  0
+regionname length   offset   1
+byte  elements   new byte
+elements   tablename
+elements   startkey
+elements   id
+return elements
+/** @return the regionid */
+public long getregionid
+return regionid
+/**
+* @return the regionname as an array of bytes.
+* @see #getregionnameasstring()
+*/
+public byte  getregionname
+return regionname
+/**
+* @return region name as a string for use in logging, etc.
+*/
+public string getregionnameasstring
+if  hasencodedname this regionname
+// new format region names already have their encoded name.
+return this regionnamestr
+// old format. regionnamestr doesn't have the region name.
+//
+//
+return this regionnamestr       this getencodedname
+/** @return the encoded region name */
+public synchronized string getencodedname
+if  this encodedname    no_hash
+this encodedname   encoderegionname this regionname
+return this encodedname
+public synchronized byte  getencodednameasbytes
+if  this encodednameasbytes    null
+this encodednameasbytes   bytes tobytes getencodedname
+return this encodednameasbytes
+/** @return the startkey */
+public byte  getstartkey
+return startkey
+/** @return the endkey */
+public byte  getendkey
+return endkey
+/**
+* get current table name of the region
+* @return byte array of table name
+*/
+public byte gettablename
+if  tablename    null    tablename length    0
+tablename   gettablename getregionname
+return tablename
+/**
+* get current table name as string
+* @return string representation of current table
+*/
+public string gettablenameasstring
+return bytes tostring tablename
+/**
+* returns true if the given inclusive range of rows is fully contained
+* by this region. for example, if the region is foo,a,g and this is
+* passed ["b","c"] or ["a","c"] it will return true, but if this is passed
+* ["b","z"] it will return false.
+* @throws illegalargumentexception if the range passed is invalid (ie end < start)
+*/
+public boolean containsrange byte rangestartkey  byte rangeendkey
+if  bytes compareto rangestartkey  rangeendkey  > 0
+throw new illegalargumentexception
+bytes tostringbinary rangestartkey
+bytes tostringbinary rangeendkey
+boolean firstkeyinrange   bytes compareto rangestartkey  startkey  >  0
+boolean lastkeyinrange
+bytes compareto rangeendkey  endkey  < 0
+bytes equals endkey  hconstants empty_byte_array
+return firstkeyinrange    lastkeyinrange
+/**
+* return true if the given row falls in this region.
+*/
+public boolean containsrow byte row
+return bytes compareto row  startkey  >  0
+bytes compareto row  endkey  < 0
+bytes equals endkey  hconstants empty_byte_array
+/**
+* @return true if this region is from .meta.
+*/
+public boolean ismetatable
+return ismetaregion
+/** @return true if this region is a meta region */
+public boolean ismetaregion
+return bytes equals tablename  hregioninfo first_meta_regioninfo gettablename
+/**
+* @return true if has been split and has daughters.
+*/
+public boolean issplit
+return this split
+/**
+* @param split set split status
+*/
+public void setsplit boolean split
+this split   split
+/**
+* @return true if this region is offline.
+*/
+public boolean isoffline
+return this offline
+/**
+* the parent of a region split is offline while split daughters hold
+* references to the parent. offlined regions are closed.
+* @param offline set online/offline status.
+*/
+public void setoffline boolean offline
+this offline   offline
+/**
+* @return true if this is a split parent region.
+*/
+public boolean issplitparent
+if   issplit    return false
+if   isoffline
+log warn     getregionnameasstring
+return true
+/**
+* @see java.lang.object#tostring()
+*/
+@override
+public string tostring
+return     hconstants name
+this regionnamestr
+bytes tostringbinary this startkey
+bytes tostringbinary this endkey
+getencodedname
+isoffline  ?
+issplit  ?
+/**
+* @see java.lang.object#equals(java.lang.object)
+*/
+@override
+public boolean equals object o
+if  this    o
+return true
+if  o    null
+return false
+if    o instanceof hregioninfo
+return false
+return this compareto  hregioninfo o     0
+/**
+* @see java.lang.object#hashcode()
+*/
+@override
+public int hashcode
+return this hashcode
+/** @return the object version number
+* @deprecated hri is no longer a versionedwritable */
+@deprecated
+public byte getversion
+return version
+/**
+* @deprecated use protobuf serialization instead.  see {@link #tobytearray()} and
+* {@link #todelimitedbytearray()}
+*/
+@deprecated
+public void write dataoutput out  throws ioexception
+out writebyte getversion
+bytes writebytearray out  endkey
+out writeboolean offline
+out writelong regionid
+bytes writebytearray out  regionname
+out writeboolean split
+bytes writebytearray out  startkey
+bytes writebytearray out  tablename
+out writeint hashcode
+/**
+* @deprecated use protobuf deserialization instead.
+* @see #parsefrom(byte[])
+*/
+@deprecated
+public void readfields datainput in  throws ioexception
+// read the single version byte.  we don't ask the super class do it
+// because freaks out if its not the current classes' version.  this method
+// can deserialize version 0 and version 1 of hri.
+byte version   in readbyte
+if  version    0
+// this is the old hri that carried an htd.  migrate it.  the below
+// was copied from the old 0.90 hri readfields.
+this endkey   bytes readbytearray in
+this offline   in readboolean
+this regionid   in readlong
+this regionname   bytes readbytearray in
+this regionnamestr   bytes tostringbinary this regionname
+this split   in readboolean
+this startkey   bytes readbytearray in
+try
+htabledescriptor htd   new htabledescriptor
+htd readfields in
+this tablename   htd getname
+catch eofexception eofe
+throw new ioexception    eofe
+this hashcode   in readint
+else if  getversion      version
+this endkey   bytes readbytearray in
+this offline   in readboolean
+this regionid   in readlong
+this regionname   bytes readbytearray in
+this regionnamestr   bytes tostringbinary this regionname
+this split   in readboolean
+this startkey   bytes readbytearray in
+this tablename   bytes readbytearray in
+this hashcode   in readint
+else
+throw new ioexception     getversion
+@deprecated
+private void readfields byte bytes  throws ioexception
+if  bytes    null    bytes length <  0
+throw new illegalargumentexception
+datainputbuffer in   new datainputbuffer
+try
+in reset bytes  0  bytes length
+this readfields in
+finally
+in close
+//
+// comparable
+//
+public int compareto hregioninfo o
+if  o    null
+return 1
+// are regions of same table?
+int result   bytes compareto this tablename  o tablename
+if  result    0
+return result
+// compare start keys.
+result   bytes compareto this startkey  o startkey
+if  result    0
+return result
+// compare end keys.
+result   bytes compareto this endkey  o endkey
+if  result    0
+if  this getstartkey   length    0
+this getendkey   length    0
+return 1     this is last region
+if  o getstartkey   length    0
+o getendkey   length    0
+return  1     o is the last region
+return result
+// regionid is usually milli timestamp -- this defines older stamps
+// to be "smaller" than newer stamps in sort order.
+if  this regionid > o regionid
+return 1
+else if  this regionid < o regionid
+return  1
+if  this offline    o offline
+return 0
+if  this offline    true  return  1
+return 1
+/**
+* @return comparator to use comparing {@link keyvalue}s.
+*/
+public kvcomparator getcomparator
+return ismetaregion  ?
+keyvalue meta_comparator  keyvalue comparator
+/**
+* convert a hregioninfo to a regioninfo
+*
+* @return the converted regioninfo
+*/
+regioninfo convert
+return convert this
+/**
+* convert a hregioninfo to a regioninfo
+*
+* @param info the hregioninfo to convert
+* @return the converted regioninfo
+*/
+public static regioninfo convert final hregioninfo info
+if  info    null  return null
+regioninfo builder builder   regioninfo newbuilder
+builder settablename bytestring copyfrom info gettablename
+builder setregionid info getregionid
+if  info getstartkey      null
+builder setstartkey bytestring copyfrom info getstartkey
+if  info getendkey      null
+builder setendkey bytestring copyfrom info getendkey
+builder setoffline info isoffline
+builder setsplit info issplit
+return builder build
+/**
+* convert a regioninfo to a hregioninfo
+*
+* @param proto the regioninfo to convert
+* @return the converted hregioninfo
+*/
+public static hregioninfo convert final regioninfo proto
+if  proto    null  return null
+byte  tablename   proto gettablename   tobytearray
+if  bytes equals tablename  hconstants meta_table_name
+return first_meta_regioninfo
+long regionid   proto getregionid
+byte startkey   null
+byte endkey   null
+if  proto hasstartkey
+startkey   proto getstartkey   tobytearray
+if  proto hasendkey
+endkey   proto getendkey   tobytearray
+boolean split   false
+if  proto hassplit
+split   proto getsplit
+hregioninfo hri   new hregioninfo tablename  startkey  endkey  split  regionid
+if  proto hasoffline
+hri setoffline proto getoffline
+return hri
+/**
+* @return this instance serialized as protobuf w/ a magic pb prefix.
+* @see #parsefrom(byte[])
+*/
+public byte  tobytearray
+byte  bytes   convert   tobytearray
+return protobufutil prependpbmagic bytes
+/**
+* @param bytes
+* @return a deserialized {@link hregioninfo} or null if we failed deserialize or passed bytes null
+* @see #tobytearray()
+*/
+public static hregioninfo parsefromornull final byte  bytes
+if  bytes    null    bytes length <  0  return null
+try
+return parsefrom bytes
+catch  deserializationexception e
+return null
+/**
+* @param bytes a pb regioninfo serialized with a pb magic prefix.
+* @return a deserialized {@link hregioninfo}
+* @throws deserializationexception
+* @see #tobytearray()
+*/
+public static hregioninfo parsefrom final byte  bytes  throws deserializationexception
+if  protobufutil ispbmagicprefix bytes
+int pblen   protobufutil lengthofpbmagic
+try
+hbaseprotos regioninfo ri
+hbaseprotos regioninfo newbuilder   mergefrom bytes  pblen  bytes length   pblen  build
+return convert ri
+catch  invalidprotocolbufferexception e
+throw new deserializationexception e
+else
+try
+hregioninfo hri   new hregioninfo
+hri readfields bytes
+return hri
+catch  ioexception e
+throw new deserializationexception e
+/**
+* use this instead of {@link #tobytearray()} when writing to a stream and you want to use
+* the pb mergedelimitedfrom (w/o the delimiter, pb reads to eof which may not be what you want).
+* @return this instance serialized as a delimited protobuf w/ a magic pb prefix.
+* @throws ioexception
+* @see #tobytearray()
+*/
+public byte  todelimitedbytearray   throws ioexception
+return protobufutil todelimitedbytearray convert
+/**
+* extract a hregioninfo and servername from catalog table {@link result}.
+* @param r result to pull from
+* @return a pair of the {@link hregioninfo} and the {@link servername}
+* (or null for server address if no address set in .meta.).
+* @throws ioexception
+*/
+public static pair<hregioninfo  servername> gethregioninfoandservername final result r
+hregioninfo info
+gethregioninfo r  hconstants regioninfo_qualifier
+servername sn   getservername r
+return new pair<hregioninfo  servername> info  sn
+/**
+* returns hregioninfo object from the column
+* hconstants.catalog_family:hconstants.regioninfo_qualifier of the catalog
+* table result.
+* @param data a result object from the catalog table scan
+* @return hregioninfo or null
+*/
+public static hregioninfo gethregioninfo result data
+byte  bytes
+data getvalue hconstants catalog_family  hconstants regioninfo_qualifier
+if  bytes    null  return null
+hregioninfo info   parsefromornull bytes
+if  log isdebugenabled
+log debug     info
+return info
+/**
+* returns the daughter regions by reading the corresponding columns of the catalog table
+* result.
+* @param data a result object from the catalog table scan
+* @return a pair of hregioninfo or pairofsametype(null, null) if the region is not a split
+* parent
+*/
+public static pairofsametype<hregioninfo> getdaughterregions result data  throws ioexception
+hregioninfo splita   gethregioninfo data  hconstants splita_qualifier
+hregioninfo splitb   gethregioninfo data  hconstants splitb_qualifier
+return new pairofsametype<hregioninfo> splita  splitb
+/**
+* returns the hregioninfo object from the column {@link hconstants#catalog_family} and
+* <code>qualifier</code> of the catalog table result.
+* @param r a result object from the catalog table scan
+* @param qualifier column family qualifier -- either
+* {@link hconstants#splita_qualifier}, {@link hconstants#splitb_qualifier} or
+* {@link hconstants#regioninfo_qualifier}.
+* @return an hregioninfo instance or null.
+* @throws ioexception
+*/
+public static hregioninfo gethregioninfo final result r  byte  qualifier
+byte  bytes   r getvalue hconstants catalog_family  qualifier
+if  bytes    null    bytes length <  0  return null
+return parsefromornull bytes
+/**
+* returns a {@link servername} from catalog table {@link result}.
+* @param r result to pull from
+* @return a servername instance or null if necessary fields not found or empty.
+*/
+public static servername getservername final result r
+byte value   r getvalue hconstants catalog_family
+hconstants server_qualifier
+if  value    null    value length    0  return null
+string hostandport   bytes tostring value
+value   r getvalue hconstants catalog_family
+hconstants startcode_qualifier
+if  value    null    value length    0  return null
+return new servername hostandport  bytes tolong value
+/**
+* the latest seqnum that the server writing to meta observed when opening the region.
+* e.g. the seqnum when the result of {@link #getservername(result)} was written.
+* @param r result to pull the seqnum from
+* @return seqnum, or hconstants.no_seqnum if there's no value written.
+*/
+public static long getseqnumduringopen final result r
+byte value   r getvalue hconstants catalog_family  hconstants seqnum_qualifier
+if  value    null    value length    0  return hconstants no_seqnum
+long result   bytes tolong value
+if  result    null  return hconstants no_seqnum
+return result longvalue
+/**
+* parses an hregioninfo instance from the passed in stream.  presumes the hregioninfo was
+* serialized to the stream with {@link #todelimitedbytearray()}
+* @param in
+* @return an instance of hregioninfo.
+* @throws ioexception
+*/
+public static hregioninfo parsefrom final datainputstream in  throws ioexception
+// i need to be able to move back in the stream if this is not a pb serialization so i can
+// do the writable decoding instead.
+int pblen   protobufutil lengthofpbmagic
+byte  pbuf   new byte
+if  in marksupported        read it with mark
+in mark pblen
+int read   in read pbuf     assumption  if writable serialization  it should be longer than pblen
+if  read    pblen  throw new ioexception     read       pblen
+if  protobufutil ispbmagicprefix pbuf
+return convert hbaseprotos regioninfo parsedelimitedfrom in
+else
+// presume writables.  need to reset the stream since it didn't start w/ pb.
+if  in marksupported
+in reset
+hregioninfo hri   new hregioninfo
+hri readfields in
+return hri
+else
+//we cannot use bufferedinputstream, it consumes more than we read from the underlying is
+bytearrayinputstream bais   new bytearrayinputstream pbuf
+sequenceinputstream sis   new sequenceinputstream bais  in     concatenate input streams
+hregioninfo hri   new hregioninfo
+hri readfields new datainputstream sis
+return hri
+/**
+* serializes given hregioninfo's as a byte array. use this instead of {@link #tobytearray()} when
+* writing to a stream and you want to use the pb mergedelimitedfrom (w/o the delimiter, pb reads
+* to eof which may not be what you want). {@link #parsedelimitedfrom(byte[], int, int)} can
+* be used to read back the instances.
+* @param infos hregioninfo objects to serialize
+* @return this instance serialized as a delimited protobuf w/ a magic pb prefix.
+* @throws ioexception
+* @see #tobytearray()
+*/
+public static byte todelimitedbytearray hregioninfo    infos  throws ioexception
+byte bytes   new byte
+int size   0
+for  int i   0  i < infos length  i
+bytes   infos todelimitedbytearray
+size    bytes length
+byte result   new byte
+int offset   0
+for  byte b   bytes
+system arraycopy b  0  result  offset  b length
+offset    b length
+return result
+/**
+* parses all the hregioninfo instances from the passed in stream until eof. presumes the
+* hregioninfo's were serialized to the stream with {@link #todelimitedbytearray()}
+* @param bytes serialized bytes
+* @param offset the start offset into the byte[] buffer
+* @param length how far we should read into the byte[] buffer
+* @return all the hregioninfos that are in the byte array. keeps reading till we hit the end.
+*/
+public static list<hregioninfo> parsedelimitedfrom final byte bytes  final int offset
+final int length  throws ioexception
+if  bytes    null
+throw new illegalargumentexception
+datainputbuffer in   new datainputbuffer
+list<hregioninfo> hris   new arraylist<hregioninfo>
+try
+in reset bytes  offset  length
+while  in available   > 0
+hregioninfo hri   parsefrom in
+hris add hri
+finally
+in close
+return hris
+/**
+* check whether two regions are adjacent
+* @param regiona
+* @param regionb
+* @return true if two regions are adjacent
+*/
+public static boolean areadjacent hregioninfo regiona  hregioninfo regionb
+if  regiona    null    regionb    null
+throw new illegalargumentexception
+hregioninfo a   regiona
+hregioninfo b   regionb
+if  bytes compareto a getstartkey    b getstartkey    > 0
+a   regionb
+b   regiona
+if  bytes compareto a getendkey    b getstartkey       0
+return true
+return false

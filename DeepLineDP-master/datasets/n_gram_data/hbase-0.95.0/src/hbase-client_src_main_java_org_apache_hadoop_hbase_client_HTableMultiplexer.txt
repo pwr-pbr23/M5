@@ -1,0 +1,425 @@
+/**
+* copyright the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase client
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop classification interfacestability
+import org apache hadoop conf configuration
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase hregionlocation
+import org apache hadoop hbase exceptions zookeeperconnectionexception
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util environmentedgemanager
+import java io ioexception
+import java util abstractmap simpleentry
+import java util arraylist
+import java util hashmap
+import java util hashset
+import java util list
+import java util map
+import java util set
+import java util concurrent concurrenthashmap
+import java util concurrent concurrentskiplistmap
+import java util concurrent linkedblockingqueue
+import java util concurrent atomic atomicinteger
+import java util concurrent atomic atomiclong
+/**
+* htablemultiplexer provides a thread-safe non blocking put api across all the tables.
+* each put will be sharded into different buffer queues based on its destination region server.
+* so each region server buffer queue will only have the puts which share the same destination.
+* and each queue will have a flush worker thread to flush the puts request to the region server.
+* if any queue is full, the htablemultiplexer starts to drop the put requests for that
+* particular queue.
+*
+* also all the puts will be retried as a configuration number before dropping.
+* and the htablemultiplexer can report the number of buffered requests and the number of the
+* failed (dropped) requests in total or on per region server basis.
+*
+* this class is thread safe.
+*/
+@interfaceaudience public
+@interfacestability evolving
+public class htablemultiplexer
+private static final log log   logfactory getlog htablemultiplexer class getname
+private static int poolid   0
+static final string table_multiplexer_flush_freq_ms
+private map<byte  htable> tablenametohtablemap
+/** the map between each region server to its corresponding buffer queue */
+private map<hregionlocation  linkedblockingqueue<putstatus>>
+servertobufferqueuemap
+/** the map between each region server to its flush worker */
+private map<hregionlocation  htableflushworker> servertoflushworkermap
+private configuration conf
+private int retrynum
+private int perregionserverbufferqueuesize
+/**
+*
+* @param conf the hbaseconfiguration
+* @param perregionserverbufferqueuesize determines the max number of the buffered put ops
+*         for each region server before dropping the request.
+*/
+public htablemultiplexer configuration conf
+int perregionserverbufferqueuesize  throws zookeeperconnectionexception
+this conf   conf
+this servertobufferqueuemap   new concurrenthashmap<hregionlocation
+linkedblockingqueue<putstatus>>
+this servertoflushworkermap   new concurrenthashmap<hregionlocation  htableflushworker>
+this tablenametohtablemap   new concurrentskiplistmap<byte  htable> bytes bytes_comparator
+this retrynum   conf getint    10
+this perregionserverbufferqueuesize   perregionserverbufferqueuesize
+/**
+* the put request will be buffered by its corresponding buffer queue. return false if the queue
+* is already full.
+* @param table
+* @param put
+* @return true if the request can be accepted by its corresponding buffer queue.
+* @throws ioexception
+*/
+public boolean put final byte table  final put put  throws ioexception
+return put table  put  this retrynum
+/**
+* the puts request will be buffered by their corresponding buffer queue.
+* return the list of puts which could not be queued.
+* @param table
+* @param puts
+* @return the list of puts which could not be queued
+* @throws ioexception
+*/
+public list<put> put final byte table  final list<put> puts
+throws ioexception
+if  puts    null
+return null
+list <put> failedputs   null
+boolean result
+for  put put   puts
+result   put table  put  this retrynum
+if  result    false
+// create the failed puts list if necessary
+if  failedputs    null
+failedputs   new arraylist<put>
+// add the put to the failed puts list
+failedputs add put
+return failedputs
+/**
+* the put request will be buffered by its corresponding buffer queue. and the put request will be
+* retried before dropping the request.
+* return false if the queue is already full.
+* @param table
+* @param put
+* @param retry
+* @return true if the request can be accepted by its corresponding buffer queue.
+* @throws ioexception
+*/
+public boolean put final byte table  final put put  int retry
+throws ioexception
+if  retry <  0
+return false
+linkedblockingqueue<putstatus> queue
+htable htable   gethtable table
+try
+htable validateput put
+hregionlocation loc   htable getregionlocation put getrow    false
+if  loc    null
+// add the put pair into its corresponding queue.
+queue   addnewregionserver loc  htable
+// generate a multiputstatus obj and offer it into the queue
+putstatus s   new putstatus loc getregioninfo    put  retry
+return queue offer s
+catch  exception e
+log debug     put       e
+return false
+/**
+* @return the current htablemultiplexerstatus
+*/
+public htablemultiplexerstatus gethtablemultiplexerstatus
+return new htablemultiplexerstatus servertoflushworkermap
+private htable gethtable final byte table  throws ioexception
+htable htable   this tablenametohtablemap get table
+if  htable    null
+synchronized  this tablenametohtablemap
+htable   this tablenametohtablemap get table
+if  htable    null
+htable   new htable conf  table
+this tablenametohtablemap put table  htable
+return htable
+private synchronized linkedblockingqueue<putstatus> addnewregionserver
+hregionlocation addr  htable htable
+linkedblockingqueue<putstatus> queue
+servertobufferqueuemap get addr
+if  queue    null
+// create a queue for the new region server
+queue   new linkedblockingqueue<putstatus> perregionserverbufferqueuesize
+servertobufferqueuemap put addr  queue
+// create the flush worker
+htableflushworker worker   new htableflushworker conf  addr
+this  queue  htable
+this servertoflushworkermap put addr  worker
+// launch a daemon thread to flush the puts
+// from the queue to its corresponding region server.
+string name       addr gethostnameport
+poolid
+thread t   new thread worker  name
+t setdaemon true
+t start
+return queue
+/**
+* htablemultiplexerstatus keeps track of the current status of the htablemultiplexer.
+* report the number of buffered requests and the number of the failed (dropped) requests
+* in total or on per region server basis.
+*/
+static class htablemultiplexerstatus
+private long totalfailedputcounter
+private long totalbufferedputcounter
+private long maxlatency
+private long overallaveragelatency
+private map<string  long> servertofailedcountermap
+private map<string  long> servertobufferedcountermap
+private map<string  long> servertoaveragelatencymap
+private map<string  long> servertomaxlatencymap
+public htablemultiplexerstatus
+map<hregionlocation  htableflushworker> servertoflushworkermap
+this totalbufferedputcounter   0
+this totalfailedputcounter   0
+this maxlatency   0
+this overallaveragelatency   0
+this servertobufferedcountermap   new hashmap<string  long>
+this servertofailedcountermap   new hashmap<string  long>
+this servertoaveragelatencymap   new hashmap<string  long>
+this servertomaxlatencymap   new hashmap<string  long>
+this initialize servertoflushworkermap
+private void initialize
+map<hregionlocation  htableflushworker> servertoflushworkermap
+if  servertoflushworkermap    null
+return
+long averagecalcsum   0
+int averagecalccount   0
+for  map entry<hregionlocation  htableflushworker> entry   servertoflushworkermap
+entryset
+hregionlocation addr   entry getkey
+htableflushworker worker   entry getvalue
+long bufferedcounter   worker gettotalbufferedcount
+long failedcounter   worker gettotalfailedcount
+long servermaxlatency   worker getmaxlatency
+atomicaveragecounter averagecounter   worker getaveragelatencycounter
+// get sum and count pieces separately to compute overall average
+simpleentry<long  integer> averagecomponents   averagecounter
+getcomponents
+long serveravglatency   averagecounter getandreset
+this totalbufferedputcounter    bufferedcounter
+this totalfailedputcounter    failedcounter
+if  servermaxlatency > this maxlatency
+this maxlatency   servermaxlatency
+averagecalcsum    averagecomponents getkey
+averagecalccount    averagecomponents getvalue
+this servertobufferedcountermap put addr gethostnameport
+bufferedcounter
+this servertofailedcountermap
+put addr gethostnameport
+failedcounter
+this servertoaveragelatencymap put addr gethostnameport
+serveravglatency
+this servertomaxlatencymap
+put addr gethostnameport
+servermaxlatency
+this overallaveragelatency   averagecalccount    0 ? averagecalcsum
+averagecalccount   0
+public long gettotalbufferedcounter
+return this totalbufferedputcounter
+public long gettotalfailedcounter
+return this totalfailedputcounter
+public long getmaxlatency
+return this maxlatency
+public long getoverallaveragelatency
+return this overallaveragelatency
+public map<string  long> getbufferedcounterforeachregionserver
+return this servertobufferedcountermap
+public map<string  long> getfailedcounterforeachregionserver
+return this servertofailedcountermap
+public map<string  long> getmaxlatencyforeachregionserver
+return this servertomaxlatencymap
+public map<string  long> getaveragelatencyforeachregionserver
+return this servertoaveragelatencymap
+private static class putstatus
+private final hregioninfo regioninfo
+private final put put
+private final int retrycount
+public putstatus final hregioninfo regioninfo  final put put
+final int retrycount
+this regioninfo   regioninfo
+this put   put
+this retrycount   retrycount
+public hregioninfo getregioninfo
+return regioninfo
+public put getput
+return put
+public int getretrycount
+return retrycount
+/**
+* helper to count the average over an interval until reset.
+*/
+private static class atomicaveragecounter
+private long sum
+private int count
+public atomicaveragecounter
+this sum   0l
+this count   0
+public synchronized long getandreset
+long result   this get
+this reset
+return result
+public synchronized long get
+if  this count    0
+return 0
+return this sum   this count
+public synchronized simpleentry<long  integer> getcomponents
+return new simpleentry<long  integer> sum  count
+public synchronized void reset
+this sum   0l
+this count   0
+public synchronized void add long value
+this sum    value
+this count
+private static class htableflushworker implements runnable
+private hregionlocation addr
+private configuration conf
+private linkedblockingqueue<putstatus> queue
+private htablemultiplexer htablemultiplexer
+private atomiclong totalfailedputcount
+private atomicinteger currentprocessingputcount
+private atomicaveragecounter averagelatency
+private atomiclong maxlatency
+private htable htable     for multi
+public htableflushworker configuration conf  hregionlocation addr
+htablemultiplexer htablemultiplexer
+linkedblockingqueue<putstatus> queue  htable htable
+this addr   addr
+this conf   conf
+this htablemultiplexer   htablemultiplexer
+this queue   queue
+this totalfailedputcount   new atomiclong 0
+this currentprocessingputcount   new atomicinteger 0
+this averagelatency   new atomicaveragecounter
+this maxlatency   new atomiclong 0
+this htable   htable
+public long gettotalfailedcount
+return totalfailedputcount get
+public long gettotalbufferedcount
+return queue size     currentprocessingputcount get
+public atomicaveragecounter getaveragelatencycounter
+return this averagelatency
+public long getmaxlatency
+return this maxlatency getandset 0
+private boolean resubmitfailedput putstatus failedputstatus
+hregionlocation oldloc  throws ioexception
+put failedput   failedputstatus getput
+// the currentput is failed. so get the table name for the currentput.
+byte tablename   failedputstatus getregioninfo   gettablename
+// decrease the retry count
+int retrycount   failedputstatus getretrycount     1
+if  retrycount <  0
+// update the failed counter and no retry any more.
+return false
+else
+// retry one more time
+return this htablemultiplexer put tablename  failedput  retrycount
+@override
+public void run
+list<putstatus> processinglist   new arraylist<putstatus>
+/**
+* the frequency in milliseconds for the current thread to process the corresponding
+* buffer queue.
+**/
+long frequency   conf getlong table_multiplexer_flush_freq_ms  100
+// initial delay
+try
+thread sleep frequency
+catch  interruptedexception e
+ignore
+long start  elapsed
+int failedcount   0
+while  true
+try
+start   elapsed   environmentedgemanager currenttimemillis
+// clear the processinglist, puttostatusmap and failedcount
+processinglist clear
+failedcount   0
+// drain all the queued puts into the tmp list
+queue drainto processinglist
+currentprocessingputcount set processinglist size
+if  processinglist size   > 0
+arraylist<put> list   new arraylist<put> processinglist size
+for  putstatus putstatus  processinglist
+list add putstatus getput
+// process this multiput request
+list<put> failed   null
+object results   new object
+try
+htable batch list  results
+catch  ioexception e
+log debug     e
+addr gethostnameport
+finally
+// mutate list so that it is empty for complete success, or
+// contains only failed records
+// results are returned in the same order as the requests in list
+// walk the list backwards, so we can remove from list without
+// impacting the indexes of earlier members
+for  int i   results length   1  i >  0  i
+if  results instanceof result
+// successful puts are removed from the list here.
+list remove i
+failed   list
+if  failed    null
+if  failed size      processinglist size
+// all the puts for this region server are failed. going to retry it later
+for  putstatus putstatus  processinglist
+if   resubmitfailedput putstatus  this addr
+failedcount
+else
+set<put> failedputset   new hashset<put> failed
+for  putstatus putstatus  processinglist
+if  failedputset contains putstatus getput
+resubmitfailedput putstatus  this addr
+failedcount
+// update the totalfailedcount
+this totalfailedputcount addandget failedcount
+elapsed   environmentedgemanager currenttimemillis     start
+// update latency counters
+averagelatency add elapsed
+if  elapsed > maxlatency get
+maxlatency set elapsed
+// log some basic info
+if  log isdebugenabled
+log debug     currentprocessingputcount
+addr gethostnameport
+failedcount
+elapsed
+// reset the current processing put count
+currentprocessingputcount set 0
+// sleep for a while
+if  elapsed    start
+elapsed   environmentedgemanager currenttimemillis     start
+if  elapsed < frequency
+thread sleep frequency   elapsed
+catch  exception e
+// log all the exceptions and move on
+log debug     e
+addr gethostnameport

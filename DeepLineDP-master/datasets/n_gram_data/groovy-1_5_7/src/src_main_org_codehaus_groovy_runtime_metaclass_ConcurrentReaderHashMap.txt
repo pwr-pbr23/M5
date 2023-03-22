@@ -1,0 +1,1002 @@
+/*
+file: concurrentreaderhashmap
+written by doug lea. adapted and released, under explicit
+permission, from jdk1.2 hashmap.java and hashtable.java which
+carries the following copyright:
+* copyright 1997 by sun microsystems, inc.,
+* 901 san antonio road, palo alto, california, 94303, u.s.a.
+* all rights reserved.
+*
+* this software is the confidential and proprietary information
+* of sun microsystems, inc. ("confidential information").  you
+* shall not disclose such confidential information and shall use
+* it only in accordance with the terms of the license agreement
+* you entered into with sun.
+history:
+date       who                what
+28oct1999  dl               created
+14dec1999  dl               jmm snapshot
+19apr2000  dl               use barrierlock
+12jan2001  dl               public release
+17nov2001  dl               minor tunings
+20may2002  dl               barrierlock can now be serialized.
+09dec2002  dl               fix interference checks.
+23jun2004  dl               avoid bad array sizings in view toarray methods
+02jul2007  blackdrag        adaption of package name to groovy project
+*/
+package org codehaus groovy runtime metaclass
+import java util map
+import java util abstractmap
+import java util abstractset
+import java util abstractcollection
+import java util collection
+import java util set
+import java util arraylist
+import java util iterator
+import java util enumeration
+import java util nosuchelementexception
+import java io serializable
+import java io ioexception
+/**
+* a version of hashtable that supports mostly-concurrent reading, but
+* exclusive writing.  because reads are not limited to periods
+* without writes, a concurrent reader policy is weaker than a classic
+* reader/writer policy, but is generally faster and allows more
+* concurrency. this class is a good choice especially for tables that
+* are mainly created by one thread during the start-up phase of a
+* program, and from then on, are mainly read (with perhaps occasional
+* additions or removals) in many threads.  if you also need concurrency
+* among writes, consider instead using concurrenthashmap.
+* <p>
+*
+* successful retrievals using get(key) and containskey(key) usually
+* run without locking. unsuccessful ones (i.e., when the key is not
+* present) do involve brief synchronization (locking).  also, the
+* size and isempty methods are always synchronized.
+*
+* <p> because retrieval operations can ordinarily overlap with
+* writing operations (i.e., put, remove, and their derivatives),
+* retrievals can only be guaranteed to return the results of the most
+* recently <em>completed</em> operations holding upon their
+* onset. retrieval operations may or may not return results
+* reflecting in-progress writing operations.  however, the retrieval
+* operations do always return consistent results -- either those
+* holding before any single modification or after it, but never a
+* nonsense result.  for aggregate operations such as putall and
+* clear, concurrent reads may reflect insertion or removal of only
+* some entries. in those rare contexts in which you use a hash table
+* to synchronize operations across threads (for example, to prevent
+* reads until after clears), you should either encase operations
+* in synchronized blocks, or instead use java.util.hashtable.
+*
+* <p>
+*
+* this class also supports optional guaranteed
+* exclusive reads, simply by surrounding a call within a synchronized
+* block, as in <br>
+* <code>concurrentreaderhashmap t; ... object v; <br>
+* synchronized(t) { v = t.get(k); } </code> <br>
+*
+* but this is not usually necessary in practice. for
+* example, it is generally inefficient to write:
+*
+* <pre>
+*   concurrentreaderhashmap t; ...            // inefficient version
+*   object key; ...
+*   object value; ...
+*   synchronized(t) {
+*     if (!t.containskey(key))
+*       t.put(key, value);
+*       // other code if not previously present
+*     }
+*     else {
+*       // other code if it was previously present
+*     }
+*   }
+*</pre>
+* instead, if the values are intended to be the same in each case, just take advantage of the fact that put returns
+* null if the key was not previously present:
+* <pre>
+*   concurrentreaderhashmap t; ...                // use this instead
+*   object key; ...
+*   object value; ...
+*   object oldvalue = t.put(key, value);
+*   if (oldvalue == null) {
+*     // other code if not previously present
+*   }
+*   else {
+*     // other code if it was previously present
+*   }
+*</pre>
+* <p>
+*
+* iterators and enumerations (i.e., those returned by
+* keyset().iterator(), entryset().iterator(), values().iterator(),
+* keys(), and elements()) return elements reflecting the state of the
+* hash table at some point at or since the creation of the
+* iterator/enumeration.  they will return at most one instance of
+* each element (via next()/nextelement()), but might or might not
+* reflect puts and removes that have been processed since they were
+* created.  they do <em>not</em> throw concurrentmodificationexception.
+* however, these iterators are designed to be used by only one
+* thread at a time. sharing an iterator across multiple threads may
+* lead to unpredictable results if the table is being concurrently
+* modified.  again, you can ensure interference-free iteration by
+* enclosing the iteration in a synchronized block.  <p>
+*
+* this class may be used as a direct replacement for any use of
+* java.util.hashtable that does not depend on readers being blocked
+* during updates. like hashtable but unlike java.util.hashmap,
+* this class does not allow <tt>null</tt> to be used as a key or
+* value.  this class is also typically faster than concurrenthashmap
+* when there is usually only one thread updating the table, but
+* possibly many retrieving values from it.
+* <p>
+*
+* implementation note: a slightly faster implementation of
+* this class will be possible once planned java memory model
+* revisions are in place.
+*
+* <p>[<a href="http://gee.cs.oswego.edu/dl/classes/edu/oswego/cs/dl/util/concurrent/intro.html"> introduction to this package. </a>]
+**/
+public class concurrentreaderhashmap
+extends abstractmap
+implements map  cloneable  serializable
+/*
+the basic strategy is an optimistic-style scheme based on
+the guarantee that the hash table and its lists are always
+kept in a consistent enough state to be read without locking:
+* read operations first proceed without locking, by traversing the
+apparently correct list of the apparently correct bin. if an
+entry is found, but not invalidated (value field null), it is
+returned. if not found, operations must recheck (after a memory
+barrier) to make sure they are using both the right list and
+the right table (which can change under resizes). if
+invalidated, reads must acquire main update lock to wait out
+the update, and then re-traverse.
+* all list additions are at the front of each bin, making it easy
+to check changes, and also fast to traverse.  entry next
+pointers are never assigned. remove() builds new nodes when
+necessary to preserve this.
+* remove() (also clear()) invalidates removed nodes to alert read
+operations that they must wait out the full modifications.
+*/
+/** a serializable class for barrier lock **/
+protected static class barrierlock implements java io serializable
+/**
+* lock used only for its memory effects.
+**/
+protected final barrierlock barrierlock   new barrierlock
+/**
+* field written to only to guarantee lock ordering.
+**/
+protected transient object lastwrite
+/**
+* force a memory synchronization that will cause
+* all readers to see table. call only when already
+* holding main synch lock.
+**/
+protected final void recordmodification object x
+synchronized barrierlock
+lastwrite   x
+/**
+* get ref to table; the reference and the cells it
+* accesses will be at least as fresh as from last
+* use of barrierlock
+**/
+protected final entry gettableforreading
+synchronized barrierlock
+return table
+/**
+* the default initial number of table slots for this table (32).
+* used when not otherwise specified in constructor.
+**/
+public static final int default_initial_capacity   32
+/**
+* the minimum capacity, used if a lower value is implicitly specified
+* by either of the constructors with arguments.
+* must be a power of two.
+*/
+private static final int minimum_capacity   4
+/**
+* the maximum capacity, used if a higher value is implicitly specified
+* by either of the constructors with arguments.
+* must be a power of two <= 1<<30.
+*/
+private static final int maximum_capacity   1 << 30
+/**
+* the default load factor for this table (1.0).
+* used when not otherwise specified in constructor.
+**/
+public static final float default_load_factor   0 75f
+/**
+* the hash table data.
+*/
+protected transient entry table
+/**
+* the total number of mappings in the hash table.
+*/
+protected transient int count
+/**
+* the table is rehashed when its size exceeds this threshold.  (the
+* value of this field is always (int)(capacity * loadfactor).)
+*
+* @serial
+*/
+protected int threshold
+/**
+* the load factor for the hash table.
+*
+* @serial
+*/
+protected float loadfactor
+/**
+* returns the appropriate capacity (power of two) for the specified
+* initial capacity argument.
+*/
+private int p2capacity int initialcapacity
+int cap   initialcapacity
+// compute the appropriate capacity
+int result
+if  cap > maximum_capacity    cap < 0
+result   maximum_capacity
+else
+result   minimum_capacity
+while  result < cap
+result <<  1
+return result
+/**
+* return hash code for object x. since we are using power-of-two
+* tables, it is worth the effort to improve hashcode via
+* the same multiplicative scheme as used in identityhashmap.
+*/
+private static int hash object x
+int h   x hashcode
+// multiply by 127 (quickly, via shifts), and mix in some high
+// bits to help guard against bunching of codes that are
+// consecutive or equally spaced.
+return   h << 7    h    h >>> 9     h >>> 17
+/**
+* check for equality of non-null references x and y.
+**/
+protected boolean eq object x  object y
+return x    y    x equals y
+/**
+* constructs a new, empty map with the specified initial
+* capacity and the specified load factor.
+*
+* @param initialcapacity the initial capacity
+*  the actual initial capacity is rounded to the nearest power of two.
+* @param loadfactor  the load factor of the concurrentreaderhashmap
+* @throws illegalargumentexception  if the initial maximum number
+*               of elements is less
+*               than zero, or if the load factor is nonpositive.
+*/
+public concurrentreaderhashmap int initialcapacity  float loadfactor
+if  loadfactor <  0
+throw new illegalargumentexception
+loadfactor
+this loadfactor   loadfactor
+int cap   p2capacity initialcapacity
+table   new entry
+threshold    int  cap   loadfactor
+/**
+* constructs a new, empty map with the specified initial
+* capacity and default load factor.
+*
+* @param   initialcapacity   the initial capacity of the
+*                            concurrentreaderhashmap.
+* @throws    illegalargumentexception if the initial maximum number
+*              of elements is less
+*              than zero.
+*/
+public concurrentreaderhashmap int initialcapacity
+this initialcapacity  default_load_factor
+/**
+* constructs a new, empty map with a default initial capacity
+* and load factor.
+*/
+public concurrentreaderhashmap
+this default_initial_capacity  default_load_factor
+/**
+* constructs a new map with the same mappings as the given map.  the
+* map is created with a capacity of twice the number of mappings in
+* the given map or 16 (whichever is greater), and a default load factor.
+*/
+public concurrentreaderhashmap map t
+this math max  int   t size     default_load_factor    1  16
+default_load_factor
+putall t
+/**
+* returns the number of key-value mappings in this map.
+*
+* @return the number of key-value mappings in this map.
+*/
+public synchronized int size
+return count
+/**
+* returns <tt>true</tt> if this map contains no key-value mappings.
+*
+* @return <tt>true</tt> if this map contains no key-value mappings.
+*/
+public synchronized boolean isempty
+return count    0
+/**
+* returns the value to which the specified key is mapped in this table.
+*
+* @param   key   a key in the table.
+* @return  the value to which the key is mapped in this table;
+*          <code>null</code> if the key is not mapped to any value in
+*          this table.
+* @exception  nullpointerexception  if the key is
+*               <code>null</code>.
+* @see     #put(object, object)
+*/
+public object get object key
+// throw null pointer exception if key null
+int hash   hash key
+/*
+start off at the apparently correct bin.  if entry is found, we
+need to check after a barrier anyway.  if not found, we need a
+barrier to check if we are actually in right bin. so either
+way, we encounter only one barrier unless we need to retry.
+and we only need to fully synchronize if there have been
+concurrent modifications.
+*/
+entry tab   table
+int index   hash    tab length   1
+entry first   tab
+entry e   first
+for
+if  e    null
+// if key apparently not there, check to
+// make sure this was a valid read
+entry reread   gettableforreading
+if  tab    reread    first    tab
+return null
+else
+// wrong list -- must restart traversal at new first
+tab   reread
+e   first   tab
+else if  e hash    hash    eq key  e key
+object value   e value
+if  value    null
+return value
+// entry was invalidated during deletion. but it could
+// have been re-inserted, so we must retraverse.
+// to avoid useless contention, get lock to wait out modifications
+// before retraversing.
+synchronized this
+tab   table
+e   first   tab
+else
+e   e next
+/**
+* tests if the specified object is a key in this table.
+*
+* @param   key   possible key.
+* @return  <code>true</code> if and only if the specified object
+*          is a key in this table, as determined by the
+*          <tt>equals</tt> method; <code>false</code> otherwise.
+* @exception  nullpointerexception  if the key is
+*               <code>null</code>.
+* @see     #contains(object)
+*/
+public boolean containskey object key
+return get key     null
+/**
+* maps the specified <code>key</code> to the specified
+* <code>value</code> in this table. neither the key nor the
+* value can be <code>null</code>. <p>
+*
+* the value can be retrieved by calling the <code>get</code> method
+* with a key that is equal to the original key.
+*
+* @param      key     the table key.
+* @param      value   the value.
+* @return     the previous value of the specified key in this table,
+*             or <code>null</code> if it did not have one.
+* @exception  nullpointerexception  if the key or value is
+*               <code>null</code>.
+* @see     object#equals(object)
+* @see     #get(object)
+*/
+public object put object key  object value
+if  value    null
+throw new nullpointerexception
+int hash   hash key
+entry tab   table
+int index   hash    tab length 1
+entry first   tab
+entry e
+for  e   first  e    null  e   e next
+if  e hash    hash    eq key  e key
+break
+synchronized this
+if  tab    table
+if  e    null
+//  make sure we are adding to correct list
+if  first    tab
+//  add to front of list
+entry newentry   new entry hash  key  value  first
+tab   newentry
+if    count >  threshold  rehash
+else recordmodification newentry
+return null
+else
+object oldvalue   e value
+if  first    tab    oldvalue    null
+e value   value
+return oldvalue
+// retry if wrong list or lost race against concurrent remove
+return sput key  value  hash
+/**
+* continuation of put(), called only when synch lock is
+* held and interference has been detected.
+**/
+protected object sput object key  object value  int hash
+entry tab   table
+int index   hash    tab length 1
+entry first   tab
+entry e   first
+for
+if  e    null
+entry newentry   new entry hash  key  value  first
+tab   newentry
+if    count >  threshold  rehash
+else recordmodification newentry
+return null
+else if  e hash    hash    eq key  e key
+object oldvalue   e value
+e value   value
+return oldvalue
+else
+e   e next
+/**
+* rehashes the contents of this map into a new table
+* with a larger capacity. this method is called automatically when the
+* number of keys in this map exceeds its capacity and load factor.
+*/
+protected void rehash
+entry oldtable   table
+int oldcapacity   oldtable length
+if  oldcapacity >  maximum_capacity
+threshold   integer max_value     avoid retriggering
+return
+int newcapacity   oldcapacity << 1
+int mask   newcapacity   1
+threshold    int  newcapacity   loadfactor
+entry newtable   new entry
+/*
+* reclassify nodes in each list to new map.  because we are
+* using power-of-two expansion, the elements from each bin
+* must either stay at same index, or move to
+* oldcapacity+index. we also eliminate unnecessary node
+* creation by catching cases where old nodes can be reused
+* because their next fields won't change. statistically, at
+* the default threshhold, only about one-sixth of them need
+* cloning. (the nodes they replace will be garbage
+* collectable as soon as they are no longer referenced by any
+* reader thread that may be in the midst of traversing table
+* right now.)
+*/
+for  int i   0  i < oldcapacity   i
+// we need to guarantee that any existing reads of old map can
+//  proceed. so we cannot yet null out each bin.
+entry e   oldtable
+if  e    null
+int idx   e hash   mask
+entry next   e next
+//  single node on list
+if  next    null
+newtable   e
+else
+// reuse trailing consecutive sequence of all same bit
+entry lastrun   e
+int lastidx   idx
+for  entry last   next  last    null  last   last next
+int k   last hash   mask
+if  k    lastidx
+lastidx   k
+lastrun   last
+newtable   lastrun
+// clone all remaining nodes
+for  entry p   e  p    lastrun  p   p next
+int k   p hash   mask
+newtable   new entry p hash  p key
+p value  newtable
+table   newtable
+recordmodification newtable
+/**
+* removes the key (and its corresponding value) from this
+* table. this method does nothing if the key is not in the table.
+*
+* @param   key   the key that needs to be removed.
+* @return  the value to which the key had been mapped in this table,
+*          or <code>null</code> if the key did not have a mapping.
+* @exception  nullpointerexception  if the key is
+*               <code>null</code>.
+*/
+public object remove object key
+/*
+find the entry, then
+1. set value field to null, to force get() to retry
+2. rebuild the list without this entry.
+all entries following removed node can stay in list, but
+all preceeding ones need to be cloned.  traversals rely
+on this strategy to ensure that elements will not be
+repeated during iteration.
+*/
+int hash   hash key
+entry tab   table
+int index   hash    tab length 1
+entry first   tab
+entry e   first
+for  e   first  e    null  e   e next
+if  e hash    hash    eq key  e key
+break
+synchronized this
+if  tab    table
+if  e    null
+if  first    tab
+return null
+else
+object oldvalue   e value
+if  first    tab    oldvalue    null
+e value   null
+count
+entry head   e next
+for  entry p   first  p    e  p   p next
+head   new entry p hash  p key  p value  head
+tab   head
+recordmodification head
+return oldvalue
+// wrong list or interference
+return sremove key  hash
+/**
+* continuation of remove(), called only when synch lock is
+* held and interference has been detected.
+**/
+protected object sremove object key  int hash
+entry tab   table
+int index   hash    tab length 1
+entry first   tab
+for  entry e   first  e    null  e   e next
+if  e hash    hash    eq key  e key
+object oldvalue   e value
+e value   null
+count
+entry head   e next
+for  entry p   first  p    e  p   p next
+head   new entry p hash  p key  p value  head
+tab   head
+recordmodification head
+return oldvalue
+return null
+/**
+* returns <tt>true</tt> if this map maps one or more keys to the
+* specified value. note: this method requires a full internal
+* traversal of the hash table, and so is much slower than
+* method <tt>containskey</tt>.
+*
+* @param value value whose presence in this map is to be tested.
+* @return <tt>true</tt> if this map maps one or more keys to the
+* specified value.
+* @exception  nullpointerexception  if the value is <code>null</code>.
+*/
+public boolean containsvalue object value
+if  value    null  throw new nullpointerexception
+entry tab   gettableforreading
+for  int i   0   i < tab length    i
+for  entry e   tab   e    null   e   e next
+if  value equals e value
+return true
+return false
+/**
+* tests if some key maps into the specified value in this table.
+* this operation is more expensive than the <code>containskey</code>
+* method.<p>
+*
+* note that this method is identical in functionality to containsvalue,
+* (which is part of the map interface in the collections framework).
+*
+* @param      value   a value to search for.
+* @return     <code>true</code> if and only if some key maps to the
+*             <code>value</code> argument in this table as
+*             determined by the <tt>equals</tt> method;
+*             <code>false</code> otherwise.
+* @exception  nullpointerexception  if the value is <code>null</code>.
+* @see        #containskey(object)
+* @see        #containsvalue(object)
+* @see      map
+*/
+public boolean contains object value
+return containsvalue value
+/**
+* copies all of the mappings from the specified map to this one.
+*
+* these mappings replace any mappings that this map had for any of the
+* keys currently in the specified map.
+*
+* @param t mappings to be stored in this map.
+*/
+public synchronized void putall map t
+int n   t size
+if  n    0
+return
+// expand enough to hold at least n elements without resizing.
+// we can only resize table by factor of two at a time.
+// it is faster to rehash with fewer elements, so do it now.
+while  n >  threshold
+rehash
+for  iterator it   t entryset   iterator    it hasnext
+map entry entry    map entry  it next
+object key   entry getkey
+object value   entry getvalue
+put key  value
+/**
+* removes all mappings from this map.
+*/
+public synchronized void clear
+entry tab   table
+for  int i   0  i < tab length     i
+// must invalidate all to force concurrent get's to wait and then retry
+for  entry e   tab  e    null  e   e next
+e value   null
+tab   null
+count   0
+recordmodification tab
+/**
+* returns a shallow copy of this
+* <tt>concurrentreaderhashmap</tt> instance: the keys and
+* values themselves are not cloned.
+*
+* @return a shallow copy of this map.
+*/
+public synchronized object clone
+try
+concurrentreaderhashmap t    concurrentreaderhashmap super clone
+t keyset   null
+t entryset   null
+t values   null
+entry tab   table
+t table   new entry
+entry ttab   t table
+for  int i   0  i < tab length    i
+entry first   null
+for  entry e   tab  e    null  e   e next
+first   new entry e hash  e key  e value  first
+ttab   first
+return t
+catch  clonenotsupportedexception e
+// this shouldn't happen, since we are cloneable
+throw new internalerror
+// views
+protected transient set keyset   null
+protected transient set entryset   null
+protected transient collection values   null
+/**
+* returns a set view of the keys contained in this map.  the set is
+* backed by the map, so changes to the map are reflected in the set, and
+* vice-versa.  the set supports element removal, which removes the
+* corresponding mapping from this map, via the <tt>iterator.remove</tt>,
+* <tt>set.remove</tt>, <tt>removeall</tt>, <tt>retainall</tt>, and
+* <tt>clear</tt> operations.  it does not support the <tt>add</tt> or
+* <tt>addall</tt> operations.
+*
+* @return a set view of the keys contained in this map.
+*/
+public set keyset
+set ks   keyset
+return  ks    null ? ks    keyset   new keyset
+private class keyset extends abstractset
+public iterator iterator
+return new keyiterator
+public int size
+return concurrentreaderhashmap this size
+public boolean contains object o
+return concurrentreaderhashmap this containskey o
+public boolean remove object o
+return concurrentreaderhashmap this remove o     null
+public void clear
+concurrentreaderhashmap this clear
+public object toarray
+collection c   new arraylist
+for  iterator i   iterator    i hasnext
+c add i next
+return c toarray
+public object toarray object a
+collection c   new arraylist
+for  iterator i   iterator    i hasnext
+c add i next
+return c toarray a
+/**
+* returns a collection view of the values contained in this map.  the
+* collection is backed by the map, so changes to the map are reflected in
+* the collection, and vice-versa.  the collection supports element
+* removal, which removes the corresponding mapping from this map, via the
+* <tt>iterator.remove</tt>, <tt>collection.remove</tt>,
+* <tt>removeall</tt>, <tt>retainall</tt>, and <tt>clear</tt> operations.
+* it does not support the <tt>add</tt> or <tt>addall</tt> operations.
+*
+* @return a collection view of the values contained in this map.
+*/
+public collection values
+collection vs   values
+return  vs    null ? vs    values   new values
+private class values extends abstractcollection
+public iterator iterator
+return new valueiterator
+public int size
+return concurrentreaderhashmap this size
+public boolean contains object o
+return concurrentreaderhashmap this containsvalue o
+public void clear
+concurrentreaderhashmap this clear
+public object toarray
+collection c   new arraylist
+for  iterator i   iterator    i hasnext
+c add i next
+return c toarray
+public object toarray object a
+collection c   new arraylist
+for  iterator i   iterator    i hasnext
+c add i next
+return c toarray a
+/**
+* returns a collection view of the mappings contained in this map.  each
+* element in the returned collection is a <tt>map.entry</tt>.  the
+* collection is backed by the map, so changes to the map are reflected in
+* the collection, and vice-versa.  the collection supports element
+* removal, which removes the corresponding mapping from the map, via the
+* <tt>iterator.remove</tt>, <tt>collection.remove</tt>,
+* <tt>removeall</tt>, <tt>retainall</tt>, and <tt>clear</tt> operations.
+* it does not support the <tt>add</tt> or <tt>addall</tt> operations.
+*
+* @return a collection view of the mappings contained in this map.
+*/
+public set entryset
+set es   entryset
+return  es    null  ? es    entryset   new entryset
+private class entryset extends abstractset
+public iterator iterator
+return new hashiterator
+public boolean contains object o
+if    o instanceof map entry
+return false
+map entry entry    map entry o
+object v   concurrentreaderhashmap this get entry getkey
+return v    null    v equals entry getvalue
+public boolean remove object o
+if    o instanceof map entry
+return false
+return concurrentreaderhashmap this findandremoveentry  map entry o
+public int size
+return concurrentreaderhashmap this size
+public void clear
+concurrentreaderhashmap this clear
+public object toarray
+collection c   new arraylist
+for  iterator i   iterator    i hasnext
+c add i next
+return c toarray
+public object toarray object a
+collection c   new arraylist
+for  iterator i   iterator    i hasnext
+c add i next
+return c toarray a
+/**
+* helper method for entryset.remove
+**/
+protected synchronized boolean findandremoveentry map entry entry
+object key   entry getkey
+object v   get key
+if  v    null    v equals entry getvalue
+remove key
+return true
+else
+return false
+/**
+* returns an enumeration of the keys in this table.
+*
+* @return  an enumeration of the keys in this table.
+* @see     enumeration
+* @see     #elements()
+* @see   #keyset()
+* @see   map
+*/
+public enumeration keys
+return new keyiterator
+/**
+* returns an enumeration of the values in this table.
+* use the enumeration methods on the returned object to fetch the elements
+* sequentially.
+*
+* @return  an enumeration of the values in this table.
+* @see     java.util.enumeration
+* @see     #keys()
+* @see   #values()
+* @see   map
+*/
+public enumeration elements
+return new valueiterator
+/**
+* concurrentreaderhashmap collision list entry.
+*/
+protected static class entry implements map entry
+/*
+the use of volatile for value field ensures that
+we can detect status changes without synchronization.
+the other fields are never changed, and are
+marked as final.
+*/
+protected final int hash
+protected final object key
+protected final entry next
+protected volatile object value
+entry int hash  object key  object value  entry next
+this hash   hash
+this key   key
+this next   next
+this value   value
+// map.entry ops
+public object getkey
+return key
+/**
+* get the value.  note: in an entryset or entryset.iterator,
+* unless the set or iterator is used under synchronization of the
+* table as a whole (or you can otherwise guarantee lack of
+* concurrent modification), <tt>getvalue</tt> <em>might</em>
+* return null, reflecting the fact that the entry has been
+* concurrently removed. however, there are no assurances that
+* concurrent removals will be reflected using this method.
+*
+* @return     the current value, or null if the entry has been
+* detectably removed.
+**/
+public object getvalue
+return value
+/**
+* set the value of this entry.  note: in an entryset or
+* entryset.iterator), unless the set or iterator is used under
+* synchronization of the table as a whole (or you can otherwise
+* guarantee lack of concurrent modification), <tt>setvalue</tt>
+* is not strictly guaranteed to actually replace the value field
+* obtained via the <tt>get</tt> operation of the underlying hash
+* table in multithreaded applications.  if iterator-wide
+* synchronization is not used, and any other concurrent
+* <tt>put</tt> or <tt>remove</tt> operations occur, sometimes
+* even to <em>other</em> entries, then this change is not
+* guaranteed to be reflected in the hash table. (it might, or it
+* might not. there are no assurances either way.)
+*
+* @param      value   the new value.
+* @return     the previous value, or null if entry has been detectably
+* removed.
+* @exception  nullpointerexception  if the value is <code>null</code>.
+*
+**/
+public object setvalue object value
+if  value    null
+throw new nullpointerexception
+object oldvalue   this value
+this value   value
+return oldvalue
+public boolean equals object o
+if    o instanceof map entry
+return false
+map entry e    map entry o
+return  key equals e getkey       value equals e getvalue
+public int hashcode
+return  key hashcode   ^ value hashcode
+public string tostring
+return key       value
+protected class hashiterator implements iterator  enumeration
+protected final entry tab               snapshot of table
+protected int index                       current slot
+protected entry entry   null              current node of slot
+protected object currentkey               key for current node
+protected object currentvalue             value for current node
+protected entry lastreturned   null       last node returned by next
+protected hashiterator
+tab   concurrentreaderhashmap this gettableforreading
+index   tab length   1
+public boolean hasmoreelements     return hasnext
+public object nextelement     return next
+public boolean hasnext
+/*
+currentkey and currentvalue are set here to ensure that next()
+returns normally if hasnext() returns true. this avoids
+surprises especially when final element is removed during
+traversal -- instead, we just ignore the removal during
+current traversal.
+*/
+for
+if  entry    null
+object v   entry value
+if  v    null
+currentkey   entry key
+currentvalue   v
+return true
+else
+entry   entry next
+while  entry    null    index >  0
+entry   tab
+if  entry    null
+currentkey   currentvalue   null
+return false
+protected object returnvalueofnext     return entry
+public object next
+if  currentkey    null     hasnext
+throw new nosuchelementexception
+object result   returnvalueofnext
+lastreturned   entry
+currentkey   currentvalue   null
+entry   entry next
+return result
+public void remove
+if  lastreturned    null
+throw new illegalstateexception
+concurrentreaderhashmap this remove lastreturned key
+lastreturned   null
+protected class keyiterator extends hashiterator
+protected object returnvalueofnext     return currentkey
+protected class valueiterator extends hashiterator
+protected object returnvalueofnext     return currentvalue
+/**
+* save the state of the <tt>concurrentreaderhashmap</tt>
+* instance to a stream (i.e.,
+* serialize it).
+*
+* @serialdata the <i>capacity</i> of the
+* concurrentreaderhashmap (the length of the
+* bucket array) is emitted (int), followed  by the
+* <i>size</i> of the concurrentreaderhashmap (the number of key-value
+* mappings), followed by the key (object) and value (object)
+* for each key-value mapping represented by the concurrentreaderhashmap
+* the key-value mappings are emitted in no particular order.
+*/
+private synchronized void writeobject java io objectoutputstream s
+throws ioexception
+// write out the threshold, loadfactor, and any hidden stuff
+s defaultwriteobject
+// write out number of buckets
+s writeint table length
+// write out size (number of mappings)
+s writeint count
+// write out keys and values (alternating)
+for  int index   table length 1  index >  0  index
+entry entry   table
+while  entry    null
+s writeobject entry key
+s writeobject entry value
+entry   entry next
+/**
+* reconstitute the <tt>concurrentreaderhashmap</tt>
+* instance from a stream (i.e.,
+* deserialize it).
+*/
+private synchronized void readobject java io objectinputstream s
+throws ioexception  classnotfoundexception
+// read in the threshold, loadfactor, and any hidden stuff
+s defaultreadobject
+// read in number of buckets and allocate the bucket array;
+int numbuckets   s readint
+table   new entry
+// read in size (number of mappings)
+int size   s readint
+// read the keys and values, and put the mappings in the table
+for  int i 0  i<size  i
+object key   s readobject
+object value   s readobject
+put key  value
+/**
+* return the number of slots in this table
+**/
+public synchronized int capacity
+return table length
+/**
+* return the load factor
+**/
+public float loadfactor
+return loadfactor

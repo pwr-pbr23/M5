@@ -1,0 +1,344 @@
+/*
+derby - class org.apache.derby.impl.sql.compile.orderbycolumn
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package	org apache derby impl sql compile
+import org apache derby iapi types typeid
+import org apache derby iapi error standardexception
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi sql compile nodefactory
+import org apache derby iapi sql compile c_nodetypes
+import org apache derby iapi util reusefactory
+/**
+* an orderbycolumn is a column in the order by clause.  an orderbycolumn
+* can be ordered ascending or descending.
+*
+* we need to make sure that the named columns are
+* columns in that query, and that positions are within range.
+*
+*/
+public class orderbycolumn extends orderedcolumn
+private resultcolumn	resultcol
+private boolean			ascending   true
+private boolean			nullsorderedlow   false
+private valuenode expression
+private orderbylist     list
+/**
+* if this sort key is added to the result column list then it is at result column position
+* 1 + resultcolumnlist.size() - resultcolumnlist.getorderbyselect() + addedcolumnoffset
+* if the sort key is already in the result column list then addedcolumnoffset < 0.
+*/
+private int addedcolumnoffset    1
+/**
+* initializer.
+*
+* @param expression            expression of this column
+*/
+public void init object expression
+this expression    valuenode expression
+/**
+* convert this object to a string.  see comments in querytreenode.java
+* for how this should be done for tree printing.
+*
+* @return	this object as a string
+*/
+public string tostring
+if  sanitymanager debug
+return expression tostring
+else
+return
+/**
+* mark the column as descending order
+*/
+public void setdescending
+ascending   false
+/**
+* get the column order.  overrides
+* orderedcolumn.isascending.
+*
+* @return true if ascending, false if descending
+*/
+public boolean isascending
+return ascending
+/**
+* mark the column as ordered null values lower than non-null values.
+*/
+public void setnullsorderedlow
+nullsorderedlow   true
+/**
+* get the column null ordering. overrides
+* orderedcolumn.getisnullsorderedlow.
+*
+* @return true if nulls ordered low, false if nulls ordered high
+*/
+public boolean isnullsorderedlow
+return nullsorderedlow
+/**
+* get the underlying resultcolumn.
+*
+* @return the underlying resultcolumn.
+*/
+resultcolumn getresultcolumn
+return resultcol
+/**
+* get the underlying expression, skipping over resultcolumns that
+* are marked redundant.
+*/
+valuenode getnonredundantexpression
+resultcolumn	rc
+valuenode		value
+columnreference	colref   null
+for  rc   resultcol  rc isredundant    rc   colref getsource
+value   rc getexpression
+if  value instanceof columnreference
+colref    columnreference  value
+else
+if  sanitymanager debug
+sanitymanager throwassert
+value getclass   getname
+return rc getexpression
+/**
+* bind this column.
+*
+* during binding, we may discover that this order by column was pulled
+* up into the result column list, but is now a duplicate, because the
+* actual result column was expanded into the result column list when "*"
+* expressions were replaced with the list of the table's columns. in such
+* a situation, we will end up calling back to the orderbylist to
+* adjust the addedcolumnoffset values of the columns; the "oblist"
+* parameter exists to allow that callback to be performed.
+*
+* @param target	the result set being selected from
+* @param oblist    orderbylist which contains this column
+*
+* @exception standardexception		thrown on error
+* @exception standardexception		thrown when column not found
+*/
+public void bindorderbycolumn resultsetnode target  orderbylist oblist
+throws standardexception
+this list   oblist
+if expression instanceof columnreference
+columnreference cr    columnreference  expression
+resultcol   resolvecolumnreference target
+cr
+columnposition   resultcol getcolumnposition
+if  addedcolumnoffset >  0
+target instanceof selectnode
+selectnode target   hasdistinct
+throw standardexception newexception sqlstate lang_distinct_order_by  cr columnname
+else if isreferedcolbynum expression
+resultcolumnlist targetcols   target getresultcolumns
+columnposition     integer expression getconstantvalueasobject    intvalue
+resultcol   targetcols getorderbycolumn columnposition
+/* column is out of range if either a) resultcol is null, or
+* b) resultcol points to a column that is not visible to the
+* user (i.e. it was generated internally).
+*/
+if   resultcol    null
+resultcol getcolumnposition   > targetcols visiblesize
+throw standardexception newexception sqlstate lang_column_out_of_range
+string valueof columnposition
+else
+if  sanitymanager debug
+sanitymanager assert  addedcolumnoffset >  0
+resolveaddedcolumn target
+if  resultcol    null
+throw standardexception newexception sqlstate lang_union_order_by
+// verify that the column is orderable
+resultcol verifyorderable
+/**
+* assuming this orderbycolumn was "pulled" into the received target's
+* resultcolumnlist (because it wasn't there to begin with), use
+* this.addedcolumnoffset to figure out which of the target's result
+* columns is the one corresponding to "this".
+*
+* the desired position is w.r.t. the original, user-specified result
+* column list--which is what "visiblesize()" gives us.  i.e. to get
+* this orderbycolumn's position in target's rcl, first subtract out
+* all columns which were "pulled" into the rcl for group by or order
+* by, then add "this.addedcolumnoffset". as an example, if the query
+* was:
+*
+*   select sum(j) as s from t1 group by i, k order by k, sum(k)
+*
+* then we will internally add columns "k" and "sum(k)" to the rcl for
+* order by, *and* we will add a generated column "i" to the rcl for
+* group by.  thus we end up with four result columns:
+*
+*          (1)        (2)  (3)   (4)
+*  select sum(j) as s, k, sum(k), i from t1 ...
+*
+* so when we get here and we want to find out which column "this"
+* corresponds to, we begin by taking the total number of visible
+* columns, which is 1 (i.e. 4 total columns minus 1 group by column
+* minus 2 order by columns).  then we add this.addedcolumnoffset in
+* order to find the target column position.  since addedcolumnoffset
+* is 0-based, an addedcolumnoffset value of "0" means we want the
+* the first order by column added to target's rcl, "1" means we want
+* the second order by column added, etc.  so if we assume that
+* this.addedcolumnoffset is "1" in this example then we add that
+* to the rcl's "visible size". and finally, we add 1 more to account
+* for fact that addedcolumnoffset is 0-based while column positions
+* are 1-based. this gives:
+*
+*  position = 1 + 1 + 1 = 3
+*
+* which points to sum(k) in the rcl.  thus an addedcolumnoffset
+* value of "1" resolves to column sum(k) in target's rcl; similarly,
+* an addedcolumnoffset value of "0" resolves to "k". derby-3303.
+*/
+private void resolveaddedcolumn resultsetnode target
+resultcolumnlist targetcols   target getresultcolumns
+columnposition   targetcols visiblesize     addedcolumnoffset   1
+resultcol   targetcols getresultcolumn  columnposition
+/**
+* pull up this orderby column if it doesn't appear in the resultset
+*
+* @param target	the result set being selected from
+*
+*/
+public void pulluporderbycolumn resultsetnode target
+throws standardexception
+resultcolumnlist targetcols   target getresultcolumns
+if expression instanceof columnreference
+columnreference cr    columnreference  expression
+resultcol   targetcols findresultcolumnfororderby
+cr getcolumnname    cr gettablenamenode
+if resultcol    null
+resultcol    resultcolumn  getnodefactory   getnode c_nodetypes result_column
+cr getcolumnname
+cr
+getcontextmanager
+targetcols addresultcolumn resultcol
+addedcolumnoffset   targetcols getorderbyselect
+targetcols incorderbyselect
+else if  isreferedcolbynum expression
+resultcol    resultcolumn  getnodefactory   getnode c_nodetypes result_column
+
+expression
+getcontextmanager
+targetcols addresultcolumn resultcol
+addedcolumnoffset   targetcols getorderbyselect
+targetcols incorderbyselect
+/**
+* order by columns now point to the prn above the node of interest.
+* we need them to point to the rcl under that one.  this is useful
+* when combining sorts where we need to reorder the sorting
+* columns.
+*/
+void resettosourcerc
+if  sanitymanager debug
+if     resultcol getexpression   instanceof virtualcolumnnode
+sanitymanager throwassert
+resultcol getexpression   getclass   getname
+resultcol   resultcol getexpression   getsourceresultcolumn
+/**
+* is this orderbycolumn constant, according to the given predicate list?
+* a constant column is one where all the column references it uses are
+* compared equal to constants.
+*/
+boolean constantcolumn predicatelist whereclause
+valuenode sourceexpr   resultcol getexpression
+return sourceexpr constantexpression whereclause
+/**
+* remap all the column references under this orderbycolumn to their
+* expressions.
+*
+* @exception standardexception		thrown on error
+*/
+void remapcolumnreferencestoexpressions   throws standardexception
+resultcol setexpression
+resultcol getexpression   remapcolumnreferencestoexpressions
+private static boolean isreferedcolbynum valuenode expression
+throws standardexception
+if  expression isconstantexpression
+return false
+return expression getconstantvalueasobject   instanceof integer
+private resultcolumn resolvecolumnreference resultsetnode target
+columnreference cr
+throws standardexception
+resultcolumn resultcol   null
+int					sourcetablenumber    1
+//bug 5716 - for db2 compatibility - no qualified names allowed in order by clause when union/union all operator is used
+if  target instanceof setoperatornode    cr gettablename      null
+string fullname   cr getsqlcolumnname
+throw standardexception newexception sqlstate lang_qualified_column_name_not_allowed  fullname
+if cr gettablenamenode      null
+tablename tablenamenode   cr gettablenamenode
+fromtable fromtable   target getfromtablebyname tablenamenode gettablename
+tablenamenode hasschema   ?
+tablenamenode getschemaname   null
+true
+if fromtable    null
+fromtable   target getfromtablebyname tablenamenode gettablename
+tablenamenode hasschema   ?
+tablenamenode getschemaname   null
+false
+if fromtable    null
+string fullname   cr gettablenamenode   tostring
+throw standardexception newexception sqlstate lang_exposed_name_not_found  fullname
+/* hack - if the target is a unionnode, then we have to
+* have special code to get the sourcetablenumber.  this is
+* because of the gyrations we go to with building the rcls
+* for a unionnode.
+*/
+if  target instanceof setoperatornode
+sourcetablenumber     fromtable  target  gettablenumber
+else
+sourcetablenumber   fromtable gettablenumber
+resultcolumnlist	targetcols   target getresultcolumns
+resultcol   targetcols getorderbycolumntobind cr getcolumnname
+cr gettablenamenode
+sourcetablenumber
+this
+/* search targetcols before using addedcolumnoffset because select list wildcards, '*',
+* are expanded after pulluporderbycolumn is called. a simple column reference in the
+* order by clause may be found in the user specified select list now even though it was
+* not found when pulluporderbycolumn was called.
+*/
+if  resultcol    null    addedcolumnoffset >  0
+resolveaddedcolumn target
+if  resultcol    null    resultcol isnamegenerated
+string errstring   cr columnname
+throw standardexception newexception sqlstate lang_order_by_column_not_found  errstring
+return resultcol
+/**
+* reset addedcolumnoffset to indicate that column is no longer added
+*
+* an added column is one which was artificially added to the result
+* column list due to its presence in the order by clause, as opposed to
+* having been explicitly selected by the user. since * is not expanded
+* until after the order by columns have been pulled up, we may add a
+* column, then later decide it is a duplicate of an explicitly selected
+* column. in that case, this method is called, and it does the following:
+* - resets addedcolumnoffset to -1 to indicate this is not an added col
+* - calls back to the orderbylist to adjust any other added cols
+*/
+void clearaddedcolumnoffset
+list closegap addedcolumnoffset
+addedcolumnoffset    1
+/**
+* adjust addedcolumnoffset to reflect that a column has been removed
+*
+* this routine is called when a previously-added result column has been
+* removed due to being detected as a duplicate. if that added column had
+* a lower offset than our column, we decrement our offset to reflect that
+* we have just been moved down one slot in the result column list.
+*
+* @param gap   offset of the column which has just been removed from list
+*/
+void collapseaddedcolumngap int gap
+if  addedcolumnoffset > gap
+addedcolumnoffset

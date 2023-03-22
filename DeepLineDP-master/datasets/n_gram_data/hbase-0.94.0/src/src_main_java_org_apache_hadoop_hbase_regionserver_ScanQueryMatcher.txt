@@ -1,0 +1,413 @@
+/**
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver
+import java io ioexception
+import java util navigableset
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase client scan
+import org apache hadoop hbase filter filter
+import org apache hadoop hbase filter filter returncode
+import org apache hadoop hbase io timerange
+import org apache hadoop hbase regionserver deletetracker deleteresult
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util environmentedgemanager
+import org apache hadoop hbase regionserver storescanner scantype
+/**
+* a query matcher that is specifically designed for the scan case.
+*/
+public class scanquerymatcher
+// optimization so we can skip lots of compares when we decide to skip
+// to the next row.
+private boolean stickynextrow
+private final byte stoprow
+private final timerange tr
+private final filter filter
+/** keeps track of deletes */
+private final deletetracker deletes
+/*
+* the following three booleans define how we deal with deletes.
+* there are three different aspects:
+* 1. whether to keep delete markers. this is used in compactions.
+*    minor compactions always keep delete markers.
+* 2. whether to keep deleted rows. this is also used in compactions,
+*    if the store is set to keep deleted rows. this implies keeping
+*    the delete markers as well.
+*    in this case deleted rows are subject to the normal max version
+*    and ttl/min version rules just like "normal" rows.
+* 3. whether a scan can do time travel queries even before deleted
+*    marker to reach deleted rows.
+*/
+/** whether to retain delete markers */
+private final boolean retaindeletesinoutput
+/** whether to return deleted rows */
+private final boolean keepdeletedcells
+/** whether time range queries can see rows "behind" a delete */
+private final boolean seepastdeletemarkers
+/** keeps track of columns and versions */
+private final columntracker columns
+/** key to seek to in memstore and storefiles */
+private final keyvalue startkey
+/** row comparator for the region this query is for */
+private final keyvalue keycomparator rowcomparator
+/* row is not private for tests */
+/** row the query is on */
+byte  row
+/**
+* oldest put in any of the involved store files
+* used to decide whether it is ok to delete
+* family delete marker of this store keeps
+* deleted kvs.
+*/
+private final long earliestputts
+/** readpoint over which the kvs are unconditionally included */
+protected long maxreadpointtotrackversions
+/**
+* this variable shows whether there is an null column in the query. there
+* always exists a null column in the wildcard column query.
+* there maybe exists a null column in the explicit column query based on the
+* first column.
+* */
+private boolean hasnullcolumn   true
+// by default, when hbase.hstore.time.to.purge.deletes is 0ms, a delete
+// marker is always removed during a major compaction. if set to non-zero
+// value then major compaction will try to keep a delete marker around for
+// the given number of milliseconds. we want to keep the delete markers
+// around a bit longer because old puts might appear out-of-order. for
+// example, during log replication between two clusters.
+//
+// if the delete marker has lived longer than its column-family's ttl then
+// the delete marker will be removed even if time.to.purge.deletes has not
+// passed. this is because all the puts that this delete marker can influence
+// would have also expired. (removing of delete markers on col family ttl will
+// not happen if min-versions is set to non-zero)
+//
+// but, if time.to.purge.deletes has not expired then a delete
+// marker will not be removed just because there are no puts that it is
+// currently influencing. this is because puts, that this delete can
+// influence.  may appear out of order.
+private final long timetopurgedeletes
+private final boolean isuserscan
+/**
+* construct a querymatcher for a scan
+* @param scan
+* @param scaninfo the store's immutable scan info
+* @param columns
+* @param scantype type of the scan
+* @param earliestputts earliest put seen in any of the store files.
+* @param oldestunexpiredts the oldest timestamp we are interested in,
+*  based on ttl
+*/
+public scanquerymatcher scan scan  store scaninfo scaninfo
+navigableset<byte> columns  storescanner scantype scantype
+long readpointtouse  long earliestputts  long oldestunexpiredts
+this tr   scan gettimerange
+this rowcomparator   scaninfo getcomparator   getrawcomparator
+this deletes    new scandeletetracker
+this stoprow   scan getstoprow
+this startkey   keyvalue createfirstdeletefamilyonrow scan getstartrow
+scaninfo getfamily
+this filter   scan getfilter
+this earliestputts   earliestputts
+this maxreadpointtotrackversions   readpointtouse
+this timetopurgedeletes   scaninfo gettimetopurgedeletes
+/* how to deal with deletes */
+this isuserscan   scantype    scantype user_scan
+// keep deleted cells: if compaction or raw scan
+this keepdeletedcells    scaninfo getkeepdeletedcells       isuserscan     scan israw
+// retain deletes: if minor compaction or raw scan
+this retaindeletesinoutput   scantype    scantype minor_compact    scan israw
+// seepastdeletemarker: user initiated scans
+this seepastdeletemarkers   scaninfo getkeepdeletedcells      isuserscan
+int maxversions   math min scan getmaxversions    scaninfo getmaxversions
+// single branch to deal with two types of reads (columns vs all in family)
+if  columns    null    columns size      0
+// there is always a null column in the wildcard column query.
+hasnullcolumn   true
+// use a specialized scan for wildcard column tracker.
+this columns   new scanwildcardcolumntracker
+scaninfo getminversions    maxversions  oldestunexpiredts
+else
+// whether there is null column in the explicit column query
+hasnullcolumn    columns first   length    0
+// we can share the explicitcolumntracker, diff is we reset
+// between rows, not between storefiles.
+this columns   new explicitcolumntracker columns
+scaninfo getminversions    maxversions  oldestunexpiredts
+/*
+* constructor for tests
+*/
+scanquerymatcher scan scan  store scaninfo scaninfo
+navigableset<byte> columns  long oldestunexpiredts
+this scan  scaninfo  columns  storescanner scantype user_scan
+long max_value     max readpoint to track versions
+hconstants latest_timestamp  oldestunexpiredts
+/**
+*
+* @return  whether there is an null column in the query
+*/
+public boolean hasnullcolumninquery
+return hasnullcolumn
+/**
+* determines if the caller should do one of several things:
+* - seek/skip to the next row (matchcode.seek_next_row)
+* - seek/skip to the next column (matchcode.seek_next_col)
+* - include the current keyvalue (matchcode.include)
+* - ignore the current keyvalue (matchcode.skip)
+* - got to the next row (matchcode.done)
+*
+* @param kv keyvalue to check
+* @return the match code instance.
+* @throws ioexception in case there is an internal consistency problem
+*      caused by a data corruption.
+*/
+public matchcode match keyvalue kv  throws ioexception
+if  filter    null    filter filterallremaining
+return matchcode done_scan
+byte  bytes   kv getbuffer
+int offset   kv getoffset
+int initialoffset   offset
+int keylength   bytes toint bytes  offset  bytes sizeof_int
+offset    keyvalue row_offset
+short rowlength   bytes toshort bytes  offset  bytes sizeof_short
+offset    bytes sizeof_short
+int ret   this rowcomparator comparerows row  0  row length
+bytes  offset  rowlength
+if  ret <   1
+return matchcode done
+else if  ret >  1
+// could optimize this, if necessary?
+// could also be called seek_to_current_row, but this
+// should be rare/never happens.
+return matchcode seek_next_row
+// optimize case.
+if  this stickynextrow
+return matchcode seek_next_row
+if  this columns done
+stickynextrow   true
+return matchcode seek_next_row
+//passing rowlength
+offset    rowlength
+//skipping family
+byte familylength   bytes
+offset    familylength   1
+int quallength   keylength   keyvalue row_offset
+offset   initialoffset    keyvalue timestamp_type_size
+long timestamp   kv gettimestamp
+// check for early out based on timestamp alone
+if  columns isdone timestamp
+return columns getnextrowornextcolumn bytes  offset  quallength
+/*
+* the delete logic is pretty complicated now.
+* this is corroborated by the following:
+* 1. the store might be instructed to keep deleted rows around.
+* 2. a scan can optionally see past a delete marker now.
+* 3. if deleted rows are kept, we have to find out when we can
+*    remove the delete markers.
+* 4. family delete markers are always first (regardless of their ts)
+* 5. delete markers should not be counted as version
+* 6. delete markers affect puts of the *same* ts
+* 7. delete marker need to be version counted together with puts
+*    they affect
+*/
+byte type   kv gettype
+if  kv isdelete
+if   keepdeletedcells
+// first ignore delete markers if the scanner can do so, and the
+// range does not include the marker
+//
+// during flushes and compactions also ignore delete markers newer
+// than the readpoint of any open scanner, this prevents deleted
+// rows that could still be seen by a scanner from being collected
+boolean includedeletemarker   seepastdeletemarkers ?
+tr withintimerange timestamp
+tr withinoraftertimerange timestamp
+if  includedeletemarker
+kv getmemstorets   <  maxreadpointtotrackversions
+this deletes add bytes  offset  quallength  timestamp  type
+// can't early out now, because delfam come before any other keys
+if  retaindeletesinoutput
+isuserscan
+environmentedgemanager currenttimemillis     timestamp  <
+timetopurgedeletes
+// always include or it is not time yet to check whether it is ok
+// to purge deltes or not
+return matchcode include
+else if  keepdeletedcells
+if  timestamp < earliestputts
+// keeping delete rows, but there are no puts older than
+// this delete in the store files.
+return columns getnextrowornextcolumn bytes  offset  quallength
+// else: fall through and do version counting on the
+// delete markers
+else
+return matchcode skip
+// note the following next else if...
+// delete marker are not subject to other delete markers
+else if   this deletes isempty
+deleteresult deleteresult   deletes isdeleted bytes  offset  quallength
+timestamp
+switch  deleteresult
+case family_deleted
+case column_deleted
+return columns getnextrowornextcolumn bytes  offset  quallength
+case version_deleted
+return matchcode skip
+case not_deleted
+break
+default
+throw new runtimeexception
+int timestampcomparison   tr compare timestamp
+if  timestampcomparison >  1
+return matchcode skip
+else if  timestampcomparison <   1
+return columns getnextrowornextcolumn bytes  offset  quallength
+/**
+* filters should be checked before checking column trackers. if we do
+* otherwise, as was previously being done, columntracker may increment its
+* counter for even that kv which may be discarded later on by filter. this
+* would lead to incorrect results in certain cases.
+*/
+if  filter    null
+returncode filterresponse   filter filterkeyvalue kv
+if  filterresponse    returncode skip
+return matchcode skip
+else if  filterresponse    returncode next_col
+return columns getnextrowornextcolumn bytes  offset  quallength
+else if  filterresponse    returncode next_row
+stickynextrow   true
+return matchcode seek_next_row
+else if  filterresponse    returncode seek_next_using_hint
+return matchcode seek_next_using_hint
+matchcode colchecker   columns checkcolumn bytes  offset  quallength
+timestamp  type  kv getmemstorets   > maxreadpointtotrackversions
+/*
+* according to current implementation, colchecker can only be
+* seek_next_col, seek_next_row, skip or include. therefore, always return
+* the matchcode. if it is seek_next_row, also set stickynextrow.
+*/
+if  colchecker    matchcode seek_next_row
+stickynextrow   true
+return colchecker
+public boolean morerowsmayexistafter keyvalue kv
+if   bytes equals stoprow   hconstants empty_end_row
+rowcomparator comparerows kv getbuffer   kv getrowoffset
+kv getrowlength    stoprow  0  stoprow length  >  0
+// kv >= stoprow
+// then no there is nothing left.
+return false
+else
+return true
+/**
+* set current row
+* @param row
+*/
+public void setrow byte  row
+this row   row
+reset
+public void reset
+this deletes reset
+this columns reset
+stickynextrow   false
+/**
+*
+* @return the start key
+*/
+public keyvalue getstartkey
+return this startkey
+/**
+*
+* @return the filter
+*/
+filter getfilter
+return this filter
+public keyvalue getnextkeyhint keyvalue kv
+if  filter    null
+return null
+else
+return filter getnextkeyhint kv
+public keyvalue getkeyfornextcolumn keyvalue kv
+columncount nextcolumn   columns getcolumnhint
+if  nextcolumn    null
+return keyvalue createlastonrow
+kv getbuffer    kv getrowoffset    kv getrowlength
+kv getbuffer    kv getfamilyoffset    kv getfamilylength
+kv getbuffer    kv getqualifieroffset    kv getqualifierlength
+else
+return keyvalue createfirstonrow
+kv getbuffer    kv getrowoffset    kv getrowlength
+kv getbuffer    kv getfamilyoffset    kv getfamilylength
+nextcolumn getbuffer    nextcolumn getoffset    nextcolumn getlength
+public keyvalue getkeyfornextrow keyvalue kv
+return keyvalue createlastonrow
+kv getbuffer    kv getrowoffset    kv getrowlength
+null  0  0
+null  0  0
+/**
+* {@link #match} return codes.  these instruct the scanner moving through
+* memstores and storefiles what to do with the current keyvalue.
+* <p>
+* additionally, this contains "early-out" language to tell the scanner to
+* move on to the next file (memstore or storefile), or to return immediately.
+*/
+public static enum matchcode
+/**
+* include keyvalue in the returned result
+*/
+include
+/**
+* do not include keyvalue in the returned result
+*/
+skip
+/**
+* do not include, jump to next storefile or memstore (in time order)
+*/
+next
+/**
+* do not include, return current result
+*/
+done
+/**
+* these codes are used by the scanquerymatcher
+*/
+/**
+* done with the row, seek there.
+*/
+seek_next_row
+/**
+* done with column, seek to next.
+*/
+seek_next_col
+/**
+* done with scan, thanks to the row filter.
+*/
+done_scan
+/*
+* seek to next key which is given as hint.
+*/
+seek_next_using_hint
+/**
+* include keyvalue and done with column, seek to next.
+*/
+include_and_seek_next_col
+/**
+* include keyvalue and done with row, seek to next.
+*/
+include_and_seek_next_row

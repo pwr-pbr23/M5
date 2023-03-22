@@ -1,0 +1,1749 @@
+/*
+derby - class org.apache.derby.impl.sql.compile.subquerynode
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package	org apache derby impl sql compile
+import org apache derby iapi error standardexception
+import org apache derby iapi sql compile compilercontext
+import org apache derby iapi sql compile costestimate
+import org apache derby iapi sql compile visitable
+import org apache derby iapi sql compile visitor
+import org apache derby iapi sql compile c_nodetypes
+import org apache derby iapi sql dictionary datadictionary
+import org apache derby iapi reference sqlstate
+import org apache derby iapi reference classname
+import org apache derby iapi types datatypedescriptor
+import org apache derby iapi services compiler methodbuilder
+import org apache derby iapi services compiler localfield
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi store access qualifier
+import java lang reflect modifier
+import org apache derby impl sql compile expressionclassbuilder
+import org apache derby impl sql compile activationclassbuilder
+import org apache derby impl sql execute onceresultset
+import org apache derby iapi util jbitset
+import org apache derby iapi services classfile vmopcode
+import java util vector
+/**
+* a subquerynode represents a subquery.  subqueries return values to their
+* outer queries. an quantified subquery is one that appears under a quantified
+* operator (like in or exists) - quantified subqueries can return more than
+* one value per invocation. an expression subquery is one that is not directly
+* under a quantified operator - expression subqueries are allowed to return
+* at most one value per invocation (returning no value is considered to be
+* equivalent to returning null).
+*
+* there are a large number of subquery types.  because of the large number of
+* types, and the large amount of shared code, we have decided to have 1 subquerynode
+* without any subclasses.  the subquery type (and operator) is encoded in the
+* subquerytype field.
+*
+* the query optimizer is responsible for optimizing subqueries, and also for
+* transforming them so that code can be generated for them. the optimizer may
+* eliminate some subqueries by transforming them into joins, or it may
+* change the internal form of a subquery (for example, transforming
+* 'where x in (select y from z where ...)' into
+* 'where (select true from z where x = y and ...)').
+*
+* note that aggregates present some additional issues.  a transformation
+* such as:
+*	<ul> where x in (select <i>expression</i> from z) </ul>
+* has to be treated specially if <i>expression</i> has an aggregate.
+* we change it to:
+*	<ul> where x = (select true from (select max(x) from z) where sqlcol1 = y) </ul>
+*
+*/
+public class subquerynode extends valuenode
+/*
+** this must be a single-column result set.  if the subquery is
+** not quantified, it must also be a single-row result set - that is,
+** expression subqueries are allowed to return only a single value
+** per invocation.
+** note: subquerynodes are used as an intermediate step within the parser
+** for building a derived table.  derived tables can be multi-column and
+** multi-table.
+*/
+resultsetnode	resultset
+/* type of this subquery */
+int				subquerytype
+/* whether or not this subquery is immediately under a top level andnode.
+* (important for subquery flattening.)
+*/
+boolean			undertopandnode
+/* whether or not we've been preprocessed. (only do the work once.) */
+boolean			preprocessed
+/* whether or not this subquery began life as a distinct expression subquery */
+boolean			distinctexpression
+/* since we do not have separate subquery operator nodes, the
+* type of the subquery is stored in the subquerytype field.  most subquery
+* types take a left operand (except for expression and exists).  we could
+* either add a leftoperand field here or subclass subquerynode for those
+* types that take a left operand.  we have decided to add the left operand
+* here for now.
+*/
+valuenode		leftoperand
+boolean			pushednewpredicate
+/* expression subqueries on the right side of a binarycomparisonoperatornode
+* will get passed a pointer to that node prior to preprocess().  this
+* allows us to replace the entire comparison, if we want to, when
+* flattening.
+*/
+binarycomparisonoperatornode parentcomparisonoperator
+/* private fields (all references via private methods) -
+* we reuse true booleanconstantnodes within
+* this class, creating them on the first reference.
+*/
+private booleanconstantnode truenode
+/* reuse generated code where possible */
+//private expression genresult;
+/* subquery # for this subquery */
+private int subquerynumber    1
+/* resultset # for the point of attachment for this subquery */
+private int pointofattachment    1
+/*
+** indicate whether we found a correlation or not.
+** and track whether we have checked yet.
+*/
+private boolean foundcorrelation
+private boolean donecorrelationcheck
+/*
+** indicate whether we found an invariant node
+** below us or not. and track whether we have
+** checked yet.
+*/
+private boolean foundvariant
+private boolean doneinvariantcheck
+/* subquery types.
+* note: from_subquery only exists for a brief second in the parser.  it
+* should never appear in a query tree.
+* note: not exists and not in subquery types do not exist prior to not
+* elimination during preprocessing.  prior to that, there is a separate
+* notnode above the subquerynode in the tree.
+*
+*/
+public final static int notimplemented_subquery		   1
+public final static int from_subquery	      0
+public final static int in_subquery			  1
+public final static int not_in_subquery		  2
+public final static int eq_any_subquery		  3
+public final static int eq_all_subquery		  4
+public final static int ne_any_subquery		  5
+public final static int ne_all_subquery		  6
+public final static int gt_any_subquery		  7
+public final static int gt_all_subquery		  8
+public final static int ge_any_subquery		  9
+public final static int ge_all_subquery		  10
+public final static int lt_any_subquery		  11
+public final static int lt_all_subquery		  12
+public final static int le_any_subquery		  13
+public final static int le_all_subquery		  14
+public final static int exists_subquery		  15
+public final static int not_exists_subquery	  16
+public final static int expression_subquery   17
+/**
+* initializer.
+*
+* @param resultset		the resultsetnode for the subquery
+* @param subquerytype	the type of the subquery
+* @param leftoperand	the left operand, if any, of the subquery
+*/
+public void init
+object resultset
+object subquerytype
+object leftoperand
+this resultset    resultsetnode  resultset
+this subquerytype     integer  subquerytype  intvalue
+/* subqueries are presumed not to be under a top level andnode by
+* default.  this is because expression normalization only recurses
+* under ands and ors, not under comparison operators, method calls,
+* built-in functions, etc.
+*/
+undertopandnode   false
+this leftoperand    valuenode  leftoperand
+/**
+* convert this object to a string.  see comments in querytreenode.java
+* for how this should be done for tree printing.
+*
+* @return	this object as a string
+*/
+public string tostring
+if  sanitymanager debug
+return     subquerytype
+undertopandnode
+subquerynumber
+pointofattachment
+preprocessed
+distinctexpression
+super tostring
+else
+return
+/**
+* prints the sub-nodes of this object.  see querytreenode.java for
+* how tree printing is supposed to work.
+*
+* @param depth		the depth of this node in the tree
+*/
+public void printsubnodes int depth
+if  sanitymanager debug
+super printsubnodes depth
+if  resultset    null
+printlabel depth
+resultset treeprint depth   1
+if  leftoperand    null
+printlabel depth
+leftoperand treeprint depth   1
+/**
+* return the resultset for this subquerynode.
+*
+* @return resultsetnode underlying this subquerynode.
+*/
+public resultsetnode getresultset
+return resultset
+/**
+* return the type of this subquery.
+*
+* @return int	type of this subquery.
+*/
+public int getsubquerytype
+return subquerytype
+/**
+* set the type of this subquery.
+*
+* @param subquerytype of this subquery.
+*/
+public void setsubquerytype int subquerytype
+this subquerytype   subquerytype
+/**
+* set the point of attachment of this subquery.
+*
+* @param pointofattachment	the point of attachment of this subquery.
+*
+* @exception standardexception			thrown on error
+*/
+public void setpointofattachment int pointofattachment
+throws standardexception
+/* materialized subqueries always keep their point of
+* attachment as -1.
+*/
+if    ismaterializable
+this pointofattachment   pointofattachment
+/**
+* return whether or not this subquery is immediately under a top level
+* andnode.
+*
+* @return boolean	whether or not this subquery is immediately under a
+*					top level andnode.
+*/
+public boolean getundertopandnode
+return undertopandnode
+/**
+* get the resultset # for the point of attachment for this subquerynode.
+*
+* @return int		the resultset # for the point of attachment
+*/
+public int getpointofattachment
+if  sanitymanager debug
+sanitymanager assert pointofattachment >  0
+return pointofattachment
+/**
+* get whether or not this subquerynode has already been
+* preprocessed.
+*
+* @return	whether or not this subquerynode has already been
+*			preprocessed.
+*/
+boolean getpreprocessed
+return preprocessed
+/**
+* set the parent bcon.  useful when considering flattening
+* expression subqueries.
+*
+* @param parent	the parent bcon.
+*/
+void setparentcomparisonoperator binarycomparisonoperatornode parent
+parentcomparisonoperator   parent
+/**
+* remap all columnreferences in this tree to be clones of the
+* underlying expression.
+*
+* @return valuenode			the remapped expression tree.
+*
+* @exception standardexception			thrown on error
+*/
+public valuenode remapcolumnreferencestoexpressions
+throws standardexception
+/* we need to remap both the select and predicate lists
+* since there may be correlated columns in either of them.
+*/
+if  resultset instanceof selectnode
+resultcolumnlist selectrcl   resultset getresultcolumns
+selectnode		 select    selectnode  resultset
+predicatelist	 selectpl   select getwherepredicates
+if  sanitymanager debug
+sanitymanager assert selectpl    null
+selectrcl remapcolumnreferencestoexpressions
+selectpl remapcolumnreferencestoexpressions
+return this
+/**
+* bind this expression.  this means binding the sub-expressions,
+* as well as figuring out what the return type is for this expression.
+*
+* @param fromlist			the from list for the query this
+*							expression is in, for binding columns.
+*							note: fromlist will be null if the subquery appears
+*							in a values clause.
+* @param subquerylist		the subquery list being built as we find subquerynodes
+* @param aggregatevector	the aggregate vector being built as we find aggregatenodes
+*
+* @return	the new top of the expression tree.
+*
+* @exception standardexception		thrown on error
+*/
+public valuenode bindexpression fromlist fromlist  subquerylist subquerylist
+vector	aggregatevector
+throws standardexception
+resultcolumnlist	resultcolumns
+//check if subquery is allowed in expression tree
+checkreliability  compilercontext subquery_illegal  sqlstate lang_subquery
+resultcolumns   resultset getresultcolumns
+/* the parser does not enforce the fact that a subquery can only return
+* a single column, so we must check here.
+*/
+if  resultcolumns visiblesize      1
+throw standardexception newexception sqlstate lang_non_single_column_subquery
+/* verify the usage of "*" in the select list:
+*	o  only valid in exists subqueries
+*	o  if the allresultcolumn is qualified, then we have to verify
+*	   that the qualification is a valid exposed name.
+*	   note: the exposed name can come from an outer query block.
+*/
+resultset verifyselectstarsubquery fromlist  subquerytype
+/* for an exists subquery:
+*	o  if the select list is a "*", then we convert it to a true.
+*	   (we need to do the conversion since we don't want the "*" to
+*	   get expanded.)
+*  o  we then must bind the expression under the select list to
+*	   verify that it is a valid expression.  (we must do this as a
+*	   separate step because we need to validate the expression and
+*	   we need to handle exists (select * ... union all select 1 ...)
+*	   without getting a type compatability error.)
+*	o  finally, we convert the expression to a select true.
+*/
+if  subquerytype    exists_subquery
+/* transform the * into true (exists). */
+resultset   resultset setresulttobooleantruenode true
+/* we need to bind the tables before we can bind the target list
+* (for exists subqueries).  however, we need to wait until after
+* any *'s have been replaced, so that they don't get expanded.
+*/
+compilercontext cc   getcompilercontext
+resultset   resultset bindnonvtitables getdatadictionary    fromlist
+resultset   resultset bindvtitables fromlist
+/* set the subquery # for this subquerynode */
+if  subquerynumber     1
+subquerynumber   cc getnextsubquerynumber
+/* reject ? parameters in the select list of subqueries */
+resultset rejectparameters
+if  subquerytype    exists_subquery
+/* bind the expression in the select list */
+resultset bindtargetexpressions fromlist
+/*
+* reject any untyped nulls in the exists subquery before
+* select true transformation.
+*/
+resultset binduntypednullstoresultcolumns null
+/* transform the resultcolumn into true.
+* note: this may be a 2nd instance of the same transformation for
+* an exists (select * ...), since we had to transform the
+* allresultcolumn above, but we have to also handle
+* exists (select r from s ...)
+*/
+resultset   resultset setresulttobooleantruenode false
+/* bind the left operand, if there is one */
+if  leftoperand    null
+leftoperand   leftoperand bindexpression fromlist  subquerylist
+aggregatevector
+/* bind the expressions in the underlying subquery */
+resultset bindexpressions fromlist
+resultset bindresultcolumns fromlist
+/* reject any untyped nulls in the subquery */
+resultset binduntypednullstoresultcolumns null
+/* we need to reset resultcolumns since the underlying resultset may
+* be a union (and unionnode.bindresultcolumns() regens a new rcl).
+*/
+resultcolumns   resultset getresultcolumns
+/*
+* a ? parameter to the left of this subquery gets type of the
+* subquery's sole column.
+*/
+if  leftoperand    null    leftoperand requirestypefromcontext
+leftoperand settype
+resultcolumn  resultcolumns elementat 0   gettypeservices
+// set the datatypeservices
+setdatatypeservices resultcolumns
+/* add this subquery to the subquery list */
+subquerylist addsubquerynode this
+return this
+/**
+* preprocess an expression tree.  we do a number of transformations
+* here (including subqueries, in lists, like and between) plus
+* subquery flattening.
+* note: this is done before the outer resultsetnode is preprocessed.
+*
+* @param	numtables			number of tables in the dml statement
+* @param	outerfromlist		fromlist from outer query block
+* @param	outersubquerylist	subquerylist from outer query block
+* @param	outerpredicatelist	predicatelist from outer query block
+*
+* @return		the modified expression
+*
+* @exception standardexception		thrown on error
+*/
+public valuenode preprocess int numtables
+fromlist outerfromlist
+subquerylist outersubquerylist
+predicatelist outerpredicatelist
+throws standardexception
+/* only preprocess this node once.  we may get called multiple times
+* due to tree transformations.
+*/
+if  preprocessed
+return this
+preprocessed   true
+boolean		flattenable
+valuenode	topnode   this
+resultset   resultset preprocess numtables  null   fromlist  null
+// eliminate any unnecessary distincts
+if  resultset instanceof selectnode
+if    selectnode  resultset  hasdistinct
+selectnode  resultset  cleardistinct
+/* we need to remember to check for single unique value
+* at execution time for expression subqueries.
+*/
+if   subquerytype    expression_subquery
+distinctexpression   true
+/* lame transformation - for in/any subqueries, if
+* result set is guaranteed to return at most 1 row
+* and it is not correlated
+* then convert the subquery into the matching expression
+* subquery type.  for example:
+*	c1 in (select min(c1) from t2)
+* becomes:
+*	c1 = (select min(c1) from t2)
+* (this actually showed up in an app that a potential customer
+* was porting from sql server.)
+* the transformed query can then be flattened if appropriate.
+*/
+if   isin      isany
+resultset returnsatmostonerow
+if    hascorrelatedcrs
+changetocorrespondingexpressiontype
+/* note: flattening occurs before the pushing of
+* the predicate, since the pushing will add a node
+* above the subquerynode.
+*/
+/* values subquery is flattenable if:
+*  o it is not under an or.
+*  o it is an expression subquery on the right side
+*	  of a binarycomparisonoperatornode.
+*/
+flattenable    resultset instanceof rowresultsetnode
+undertopandnode
+parentcomparisonoperator instanceof binarycomparisonoperatornode
+if  flattenable
+/* if we got this far and we are an expression subquery
+* then we want to set leftoperand to be the left side
+* of the comparison in case we pull the comparison into
+* the flattened subquery.
+*/
+leftoperand   parentcomparisonoperator getleftoperand
+// flatten the subquery
+rowresultsetnode rrsn    rowresultsetnode  resultset
+fromlist   fl   new fromlist
+// remove ourselves from the outer subquery list
+outersubquerylist removeelement this
+/* we only need to add the table from the subquery into
+* the outer from list if the subquery itself contains
+* another subquery.  otherwise, it just becomes a constant.
+*/
+if  rrsn subquerys size      0
+fl addelement rrsn
+outerfromlist destructiveappend fl
+/* append the subquery's subquery list to the
+* outer subquery list.
+*/
+outersubquerylist destructiveappend rrsn subquerys
+/* return the new join condition
+* if we are flattening an exists then there is no new join
+* condition since there is no leftoperand.  simply return
+* true.
+*
+* note: the outer where clause, etc. has already been normalized,
+* so we simply return the binarycomparisonoperatornode above
+* the new join condition.
+*/
+valuenode rightoperand
+rightoperand     resultcolumn  rrsn getresultcolumns   elementat 0
+getexpression
+return getnewjoincondition leftoperand  rightoperand
+/* select subquery is flattenable if:
+*  o it is not under an or.
+*  o the subquery type is in, any or exists or
+*    an expression subquery on the right side
+*	  of a binarycomparisonoperatornode.
+*  o there are no aggregates in the select list
+*  o there is no group by clause or having clause.
+*  o there is a uniqueness condition that ensures
+*	  that the flattening of the subquery will not
+*	  introduce duplicates into the result set.
+*
+*	or,
+*  o the subquery is not exists, not in, all (beetle 5173).
+*/
+boolean flattenablenotexists    isnot_exists      canallbeflattened
+flattenable    resultset instanceof selectnode
+undertopandnode
+isin      isany      isexists      flattenablenotexists
+parentcomparisonoperator    null
+if  flattenable
+selectnode	select    selectnode  resultset
+if    select hasaggregatesinselectlist
+select havingclause    null
+valuenode origleftoperand   leftoperand
+/* check for uniqueness condition. */
+/* is the column being returned by the subquery
+* a candidate for an = condition?
+*/
+boolean additionaleq
+subquerytype    in_subquery
+subquerytype    eq_any_subquery
+additionaleq   additionaleq
+leftoperand instanceof constantnode
+leftoperand instanceof columnreference
+leftoperand requirestypefromcontext
+/* if we got this far and we are an expression subquery
+* then we want to set leftoperand to be the left side
+* of the comparison in case we pull the comparison into
+* the flattened subquery.
+*/
+if  parentcomparisonoperator instanceof binarycomparisonoperatornode
+leftoperand   parentcomparisonoperator getleftoperand
+/* never flatten to normal join for not exists.
+*/
+if     flattenablenotexists     select uniquesubquery additionaleq
+// flatten the subquery
+return flattentonormaljoin numtables
+outerfromlist  outersubquerylist
+outerpredicatelist
+/* we can flatten into an exists join if all of the above
+* conditions except for a uniqueness condition are true
+* and:
+*	o subquery only has a single entry in its from list
+*	  and that entry is a frombasetable
+*	o all predicates in the subquery's where clause are
+*	  pushable.
+*  o the leftoperand, if non-null, is pushable.
+* if the subquery meets these conditions then we will flatten
+* the fbt into an exists fbt, pushd the subquery's
+* predicates down to the prn above the ebt and
+* mark the predicates to say that they cannot be pulled
+* above the prn. (the only way that we can guarantee correctness
+* is if the predicates do not get pulled up.  if they get pulled
+* up then the single next logic for an exists join does not work
+* because that row may get disqualified at a higher level.)
+*/
+else if    isin      isany      isexists      flattenablenotexists
+leftoperand    null  ? true
+leftoperand categorize new jbitset numtables   false
+select getwherepredicates   allpushable
+singlefrombasetable select getfromlist
+return flattentoexistsjoin numtables
+outerfromlist  outersubquerylist
+outerpredicatelist  flattenablenotexists
+// restore leftoperand to its original value
+leftoperand   origleftoperand
+/* we transform the leftoperand and the select list for quantified
+* predicates that have a leftoperand into a new predicate and push it
+* down to the subquery after we preprocess the subquery's resultset.
+* we must do this after preprocessing the underlying subquery so that
+* we know where to attach the new predicate.
+* note - if we pushed the predicate before preprocessing the underlying
+* subquery, then the point of attachment would depend on the form of
+* that subquery.  (where clause?  having clause?)
+*/
+if  leftoperand    null
+topnode   pushnewpredicate numtables
+pushednewpredicate   true
+/* since not exists subquery is not flattened, now is good time to create
+* an is null node on top.  other cases are taken care of in pushnewpredicate.
+*/
+else if  subquerytype    not_exists_subquery
+topnode   genisnulltree
+subquerytype   exists_subquery
+/*
+** do invariant and correlated checks now.  we
+** aren't going to use the results here, but they
+** have been stashed away by isinvariant() and hascorrelatedcrs()
+*/
+isinvariant
+hascorrelatedcrs
+/* if parentcomparisonoperator is non-null then we are an
+* expression subquery that was considered to be a candidate
+* for flattening, but we didn't get flattened.  in that case
+* we are the rightoperand of the parent.  we need to update
+* the parent's rightoperand with the new topnode and return
+* the parent because the parent is letting us decide whether
+* or not to replace the entire comparison, which we can do
+* if we flatten.  otherwise we simply return the new top node.
+*/
+if  parentcomparisonoperator    null
+parentcomparisonoperator setrightoperand topnode
+return parentcomparisonoperator
+return topnode
+/**
+* does the from list from the subquery contain a
+* single entry which is a fbt or a prn/fbt.
+*
+* @param fromlist	the from list from the subquery
+*
+* @return whether or not the from list from the subquery contains a
+*			single entry which is a fbt or a prn/fbt.
+*/
+private boolean singlefrombasetable fromlist fromlist
+boolean retcode    fromlist size      1
+if  retcode
+fromtable ft    fromtable  fromlist elementat 0
+if    ft instanceof projectrestrictnode
+projectrestrictnode  ft  getchildresult   instanceof frombasetable
+ft instanceof frombasetable
+else
+retcode   false
+return retcode
+/**
+* can not in, all be falttened to not exists join?  we can't or the flattening doesn't
+* easily make sense if either side of the comparison is nullable. (beetle 5173)
+*
+* @return whether or not the not in or all subquery can be flattened.
+*/
+private boolean canallbeflattened    throws standardexception
+boolean result   false
+if  isnot_in      isall
+valuenode rightoperand     resultcolumn  resultset getresultcolumns   elementat 0
+getexpression
+result      leftoperand gettypeservices   isnullable
+rightoperand gettypeservices   isnullable
+return result
+/**
+* flatten this subquery into the outer query block.
+* at this point we are only flattening based on a uniqueness
+* condition and only flattening non-aggregate subqueries.
+* so, we promote the subquery's from list, as is, into
+* the outer from list.  for exists subquerys, we return a
+* true.  otherwise we return a new comparison between
+* the leftoperand and the expression in the subquery's
+* select list.
+* resolve - we will need to modify this logic to account
+* for exists joins and aggregates as we support flattening
+* for them.
+*
+* anyway, here's what we do:
+*	o we remove ourself from the outer subquery list.
+*	o we decrement the nesting level for all tables
+*	  in the subquery tree.
+*	o we append the subquery's from list to the outer
+*	  from list.
+*	o we add the subquery's predicate list to the outer
+*	  predicate list.  (the subquery has already been
+*	  preprocessed.)
+*  o we add the subquery's subquery list to the outer
+*	  subquery list.
+*	o for exists, we return a true.
+*	o otherwise, we return a new comparison between the
+*	  leftoperand and the expression in the inner select's
+*	  rcl.
+*
+* @param	numtables			number of tables in the dml statement
+* @param	outerfromlist		fromlist from outer query block
+* @param	outersubquerylist	subquerylist from outer query block
+* @param	outerpredicatelist	predicatelist from outer query block
+*
+* @return	the modified expression
+*
+* @exception standardexception		thrown on error
+*/
+private valuenode flattentonormaljoin int numtables
+fromlist outerfromlist
+subquerylist outersubquerylist
+predicatelist outerpredicatelist
+throws standardexception
+selectnode select    selectnode  resultset
+fromlist   fl   select getfromlist
+int tablenumbers   fl gettablenumbers
+// remove ourselves from the outer subquery list
+outersubquerylist removeelement this
+/* decrease the nesting level for all
+* tables in the subquey tree.
+*/
+select decrementlevel 1
+/* add the table(s) from the subquery into the outer from list */
+outerfromlist destructiveappend fl
+/* append the subquery's predicate list to the
+* outer predicate list.
+*/
+outerpredicatelist destructiveappend select getwherepredicates
+/* append the subquery's subquery list to the
+* outer subquery list.
+* note: we must propagate any subqueries from both the
+* select list and where clause of the subquery that's
+* getting flattened.
+*/
+outersubquerylist destructiveappend select getwheresubquerys
+outersubquerylist destructiveappend select getselectsubquerys
+/* return the new join condition
+* if we are flattening an exists then there is no new join
+* condition since there is no leftoperand.  simply return
+* true.
+*
+* note: the outer where clause, etc. has already been normalized,
+* so we simply return the binarycomparisonoperatornode above
+* the new join condition.
+*/
+if  leftoperand    null
+return  valuenode  getnodefactory   getnode
+c_nodetypes boolean_constant_node
+boolean true
+getcontextmanager
+else
+valuenode rightoperand
+rightoperand     resultcolumn  select getresultcolumns   elementat 0
+getexpression
+/* if the right operand is a cr, then we need to decrement
+* its source level as part of flattening so that
+* transitive closure will work correctly.
+*/
+if  rightoperand instanceof columnreference
+columnreference cr    columnreference  rightoperand
+int tablenumber   cr gettablenumber
+for  int index   0  index < tablenumbers length  index
+if  tablenumber    tablenumbers
+cr setsourcelevel
+cr getsourcelevel     1
+break
+return getnewjoincondition leftoperand  rightoperand
+/**
+* flatten this subquery into the outer query block
+* as an exists join.
+* at this point we are only flattening non-aggregate subqueries
+* with a single fbt in the from list.
+* so, we transform all fbts in the from list into existbasetables,
+* update the dependency lists for each of the tables and then
+* flatten the subquery.
+* resolve - we will need to modify this logic to account
+* for aggregates as we support flattening
+* for them.
+*
+* @param	numtables			number of tables in the dml statement
+* @param	outerfromlist		fromlist from outer query block
+* @param	outersubquerylist	subquerylist from outer query block
+* @param	outerpredicatelist	predicatelist from outer query block
+* @param	flattenablenotexists is it a flattening into a not exists join
+*
+* @return	the modified expression
+*
+* @exception standardexception		thrown on error
+*/
+private valuenode flattentoexistsjoin int numtables
+fromlist outerfromlist
+subquerylist outersubquerylist
+predicatelist outerpredicatelist
+boolean flattenablenotexists
+throws standardexception
+selectnode select    selectnode  resultset
+// replace the frombasetables in the from list with existbasetables
+select getfromlist   genexistsbasetables resultset getreferencedtablemap
+outerfromlist  flattenablenotexists
+/* note: because we are currently only flattening single table subqueries
+* whose predicates are all pushable, we simply follow the rest of the
+* flattening algorithm for unique subqueries.  should we decide to
+* loosen these restrictions then we need to do more work such as:
+*
+* mark all of the predicates from the subquery as non-pullable. they must
+* not be pulled so that we can guarantee correctness.  otherwise, we could
+* add or subtract rows from the result set.
+*
+* remap all of the non-correlated crs in the predicate list so that they
+* point to the correct source.  (we've chopped a level out of the rcl/vcn
+* chain.)  we then transfer those predicates to the prn in the subquery's
+* from list.
+*/
+return flattentonormaljoin numtables  outerfromlist
+outersubquerylist  outerpredicatelist
+/**
+* check to see if we have a variant value below us.
+* if so, return true.  caches the result so multiple
+* calls are ok.
+*
+* @return boolean whether we have
+*
+* @exception standardexception		thrown on error
+*/
+private boolean isinvariant   throws standardexception
+if  doneinvariantcheck
+return  foundvariant
+doneinvariantcheck   true
+hasvariantvaluenodevisitor visitor   new hasvariantvaluenodevisitor
+resultset accept visitor
+foundvariant   visitor hasvariant
+return  foundvariant
+/**
+* check to see if this subquery has correlated
+* column references.  only useful results if
+* called after binding (after crs have been bound).
+*
+* @return whether the subquery has correlated column
+*	references.
+* @exception standardexception		thrown on error
+*/
+public boolean hascorrelatedcrs   throws standardexception
+if  donecorrelationcheck
+return foundcorrelation
+donecorrelationcheck   true
+resultsetnode realsubquery   resultset
+resultcolumnlist oldrcl   null
+/* if we have pushed the new join predicate on top, we want to disregard it
+* to see if anything under the predicate is correlated.  if nothing correlated
+* under the new join predicate, we could then materialize the subquery.
+* see beetle 4373.
+*/
+if  pushednewpredicate
+if  sanitymanager debug
+sanitymanager assert resultset instanceof projectrestrictnode
+realsubquery     projectrestrictnode  resultset  getchildresult
+oldrcl   realsubquery getresultcolumns
+/* only first column matters.
+*/
+if  oldrcl size   > 1
+resultcolumnlist newrcl   new resultcolumnlist
+newrcl addresultcolumn oldrcl getresultcolumn 1
+realsubquery setresultcolumns newrcl
+hascorrelatedcrsvisitor visitor   new hascorrelatedcrsvisitor
+realsubquery accept visitor
+foundcorrelation   visitor hascorrelatedcrs
+if  pushednewpredicate     oldrcl size   > 1
+realsubquery setresultcolumns oldrcl
+return foundcorrelation
+/**
+* transform:
+*		expresion quantifiedoperator (select x from ...)
+* into
+*		(select true from .. where expression <binarycomparisonoperator> x ...)
+*		is [not] null
+*
+* or, if we have an aggregate:
+*		(select true from
+*			(select agg(x) from ...)
+*		where expression <binarycomparisonoperator> x ...)
+*		is [not] null
+*
+*
+* for any and in subqueries:
+*		o  we generate an is null above the subquerynode and return the top of
+*		   the new tree to the caller.
+*		o  the operator in the new predicate that is added to the subquery
+*		   will correspond to the operator that modifies the any.
+*		   (eg, = for = any, with = for in.)
+* for all and not in subqueries:
+*		o  we generate an is not null above the subquerynode and return the top of
+*		   the new tree to the caller.
+*		o  the operator in the new predicate that is added to the subquery
+*		   will be a binaryalloperatornode whose bconodetype corresponds to
+*		   the negation of the operator that modifies the all.
+*		   (eg, <> for = all, with <> for not in.)
+*
+* note: this method is called after the underlying subquery has been
+* preprocessed, so we build a new predicate, not just a new expression.
+*
+* @param numtables			number of tables in dml statement
+*
+* @return unarycomparisonoperatornode	an is [not] null above the
+*										transformed subquery.
+*
+* @exception standardexception		thrown on error
+*/
+private unarycomparisonoperatornode pushnewpredicate
+int numtables
+throws standardexception
+andnode						andnode
+binarycomparisonoperatornode bconode   null
+jbitset						tablemap
+predicate					predicate
+resultcolumn				firstrc
+resultcolumnlist			resultcolumns
+unarycomparisonoperatornode	uconode   null
+valuenode					oldwhereclause
+valuenode					rightoperand
+/* we have to ensure that the resultset immediately under us has
+* a predicatelist, otherwise we can't push the predicate down.
+*/
+resultset   resultset ensurepredicatelist numtables
+/* resolve - once we understand how correlated columns will work,
+* we probably want to mark leftoperand as a correlated column
+*/
+resultcolumns   resultset getresultcolumns
+/*
+** create a new pr node.  put it over the original subquery.  resulset
+** is now the new pr.  we give the chance that things under the pr node
+** can be materialized.  see beetle 4373.
+*/
+resultcolumnlist newrcl   resultcolumns copylistandobjects
+newrcl genvirtualcolumnnodes resultset  resultcolumns
+resultset    resultsetnode  getnodefactory   getnode
+c_nodetypes project_restrict_node
+resultset 	   child
+newrcl 			   result columns
+null 			   restriction
+null  			   restriction list
+null 			   project subqueries
+null 			   restrict subqueries
+
+getcontextmanager
+resultcolumns   newrcl
+firstrc    resultcolumn  resultcolumns elementat 0
+rightoperand   firstrc getexpression
+bconode   getnewjoincondition leftoperand  rightoperand
+valuenode andleft   bconode
+/* for not in or all, and if either side of the comparison is nullable, and the
+* subquery can not be flattened (because of that), we need to add is null node
+* on top of the nullables, such that the behavior is (beetle 5173):
+*
+*    (1) if we have nulls in right operand, no row is returned.
+*    (2) if subquery result is empty before applying join predicate, every
+*		  left row (including nulls) is returned.
+*	  (3) otherwise, return {all left row} - {nulls}
+*/
+if  isnot_in      isall
+boolean leftnullable   leftoperand gettypeservices   isnullable
+boolean rightnullable   rightoperand gettypeservices   isnullable
+if  leftnullable    rightnullable
+/* create a normalized structure.
+*/
+booleanconstantnode falsenode    booleanconstantnode  getnodefactory   getnode
+c_nodetypes boolean_constant_node
+boolean false
+getcontextmanager
+ornode newor    ornode  getnodefactory   getnode
+c_nodetypes or_node
+bconode
+falsenode
+getcontextmanager
+newor postbindfixup
+andleft   newor
+if  leftnullable
+unarycomparisonoperatornode leftisnull    unarycomparisonoperatornode
+getnodefactory   getnode
+c_nodetypes is_null_node
+leftoperand
+getcontextmanager
+leftisnull bindcomparisonoperator
+newor    ornode  getnodefactory   getnode
+c_nodetypes or_node
+leftisnull
+andleft
+getcontextmanager
+newor postbindfixup
+andleft   newor
+if  rightnullable
+unarycomparisonoperatornode rightisnull    unarycomparisonoperatornode
+getnodefactory   getnode
+c_nodetypes is_null_node
+rightoperand
+getcontextmanager
+rightisnull bindcomparisonoperator
+newor    ornode  getnodefactory   getnode
+c_nodetypes or_node
+rightisnull
+andleft
+getcontextmanager
+newor postbindfixup
+andleft   newor
+/* place an andnode above the <binarycomparisonoperator> */
+andnode    andnode  getnodefactory   getnode
+c_nodetypes and_node
+andleft
+gettruenode
+getcontextmanager
+/* build the referenced table map for the new predicate */
+tablemap   new jbitset numtables
+andnode postbindfixup
+/* put the andnode under a predicate */
+predicate    predicate  getnodefactory   getnode
+c_nodetypes predicate
+andnode
+tablemap
+getcontextmanager
+predicate categorize
+/* push the new predicate to the subquery's list */
+resultset   resultset addnewpredicate predicate
+/* clean up the leftoperand and subquery resultcolumn */
+leftoperand   null
+firstrc settype gettypeservices
+firstrc setexpression gettruenode
+/* add the is [not] null above the subquerynode */
+switch  subquerytype
+case in_subquery
+case eq_any_subquery
+case ne_any_subquery
+case le_any_subquery
+case lt_any_subquery
+case ge_any_subquery
+case gt_any_subquery
+uconode    unarycomparisonoperatornode
+getnodefactory   getnode
+c_nodetypes is_not_null_node
+this
+getcontextmanager
+break
+case not_in_subquery
+case eq_all_subquery
+case ne_all_subquery
+case le_all_subquery
+case lt_all_subquery
+case ge_all_subquery
+case gt_all_subquery
+uconode    unarycomparisonoperatornode
+getnodefactory   getnode
+c_nodetypes is_null_node
+this
+getcontextmanager
+break
+uconode bindcomparisonoperator
+return uconode
+/**
+* build a new join condition between the leftoperand
+* and the rightoperand.  the comparison operator
+* is dependent on the subquery type.
+*
+* @param leftoperand	the left operand for the new condition.
+* @param rightoperand	the right operand for the new condition.
+*
+* @exception standardexception		thrown on error
+*/
+private binarycomparisonoperatornode getnewjoincondition
+valuenode leftoperand
+valuenode rightoperand
+throws standardexception
+binarycomparisonoperatornode bconode   null
+/* note: if we are an expression subquery that's getting
+* flattened then our subquerytype is expression_subquery.
+* however, we can get the comparison type from the
+* parentcomparisonoperator.  in that case we dovetail on
+* the any subquery types.
+*/
+int operatortype   subquerytype
+if  subquerytype    expression_subquery
+if  sanitymanager debug
+sanitymanager assert parentcomparisonoperator    null
+int parentoperator    1
+if  parentcomparisonoperator isrelationaloperator
+relationaloperator ro    relationaloperator parentcomparisonoperator
+parentoperator   ro getoperator
+if  parentoperator    relationaloperator equals_relop
+operatortype   eq_any_subquery
+else if  parentoperator    relationaloperator not_equals_relop
+operatortype   ne_any_subquery
+else if  parentoperator    relationaloperator less_equals_relop
+operatortype   le_any_subquery
+else if  parentoperator    relationaloperator less_than_relop
+operatortype   lt_any_subquery
+else if  parentoperator    relationaloperator greater_equals_relop
+operatortype   ge_any_subquery
+else if  parentoperator    relationaloperator greater_than_relop
+operatortype   gt_any_subquery
+int bcotype   0
+int nodetype   0
+/* build the <binarycomparisonoperator> */
+switch  operatortype
+case in_subquery
+case eq_any_subquery
+case not_in_subquery
+case ne_all_subquery
+nodetype   c_nodetypes binary_equals_operator_node
+break
+case ne_any_subquery
+case eq_all_subquery
+nodetype   c_nodetypes binary_not_equals_operator_node
+break
+case le_any_subquery
+case gt_all_subquery
+nodetype   c_nodetypes binary_less_equals_operator_node
+break
+case lt_any_subquery
+case ge_all_subquery
+nodetype   c_nodetypes binary_less_than_operator_node
+break
+case ge_any_subquery
+case lt_all_subquery
+nodetype   c_nodetypes binary_greater_equals_operator_node
+break
+case gt_any_subquery
+case le_all_subquery
+nodetype   c_nodetypes binary_greater_than_operator_node
+break
+default
+if  sanitymanager debug
+sanitymanager assert false
+subquerytype
+bconode     binarycomparisonoperatornode
+getnodefactory   getnode
+nodetype
+leftoperand
+rightoperand
+getcontextmanager
+bconode bindcomparisonoperator
+return bconode
+/**
+* eliminate notnodes in the current query block.  we traverse the tree,
+* inverting ands and ors and eliminating nots as we go.  we stop at
+* comparisonoperators and boolean expressions.  we invert
+* comparisonoperators and replace boolean expressions with
+* boolean expression = false.
+* note: since we do not recurse under comparisonoperators, there
+* still could be notnodes left in the tree.
+*
+* @param	undernotnode		whether or not we are under a notnode.
+*
+*
+* @return		the modified expression
+*
+* @exception standardexception		thrown on error
+*/
+valuenode eliminatenots boolean undernotnode
+throws standardexception
+valuenode result   this
+if  undernotnode
+/* negate the subquerytype. for expression subqueries
+* we simply return subquery = false
+*/
+/* resolve - this code needs to get cleaned up once there are
+* more subquery types.  (consider using arrays.)
+*/
+switch  subquerytype
+case expression_subquery
+result   genequalsfalsetree
+break
+case exists_subquery
+subquerytype   not_exists_subquery
+break
+/* any subqueries */
+case in_subquery
+case eq_any_subquery
+subquerytype   not_in_subquery
+break
+case ne_any_subquery
+subquerytype   eq_all_subquery
+break
+case ge_any_subquery
+subquerytype   lt_all_subquery
+break
+case gt_any_subquery
+subquerytype   le_all_subquery
+break
+case le_any_subquery
+subquerytype   gt_all_subquery
+break
+case lt_any_subquery
+subquerytype   ge_all_subquery
+break
+/* all subqueries - no need for not not_in_subquery, since
+* not in only comes into existence here.
+*/
+case eq_all_subquery
+subquerytype   ne_any_subquery
+break
+case ne_all_subquery
+subquerytype   eq_any_subquery
+break
+case ge_all_subquery
+subquerytype   lt_any_subquery
+break
+case gt_all_subquery
+subquerytype   le_any_subquery
+break
+case le_all_subquery
+subquerytype   gt_any_subquery
+break
+case lt_all_subquery
+subquerytype   ge_any_subquery
+break
+default
+if  sanitymanager debug
+sanitymanager assert false
+/* halt recursion here, as each query block is preprocessed separately */
+return result
+/**
+* finish putting an expression into conjunctive normal
+* form.  an expression tree in conjunctive normal form meets
+* the following criteria:
+*		o  if the expression tree is not null,
+*		   the top level will be a chain of andnodes terminating
+*		   in a true booleanconstantnode.
+*		o  the left child of an andnode will never be an andnode.
+*		o  any right-linked chain that includes an andnode will
+*		   be entirely composed of andnodes terminated by a true booleanconstantnode.
+*		o  the left child of an ornode will never be an ornode.
+*		o  any right-linked chain that includes an ornode will
+*		   be entirely composed of ornodes terminated by a false booleanconstantnode.
+*		o  valuenodes other than andnodes and ornodes are considered
+*		   leaf nodes for purposes of expression normalization.
+*		   in other words, we won't do any normalization under
+*		   those nodes.
+*
+* in addition, we track whether or not we are under a top level andnode.
+* subquerynodes need to know this for subquery flattening.
+*
+* @param	undertopandnode		whether or not we are under a top level andnode.
+*
+*
+* @return		the modified expression
+*
+* @exception standardexception		thrown on error
+*/
+public valuenode changetocnf boolean undertopandnode
+throws standardexception
+/* remember whether or not we are immediately under a top leve
+* andnode.  this is important for subquery flattening.
+* (we can only flatten subqueries under a top level andnode.)
+*/
+this undertopandnode   undertopandnode
+/* halt recursion here, as each query block is preprocessed separately */
+return this
+/**
+* categorize this predicate.  initially, this means
+* building a bit map of the referenced tables for each predicate.
+* if the source of this columnreference (at the next underlying level)
+* is not a columnreference or a virtualcolumnnode then this predicate
+* will not be pushed down.
+*
+* for example, in:
+*		select * from (select 1 from s) a (x) where x = 1
+* we will not push down x = 1.
+* note: it would be easy to handle the case of a constant, but if the
+* inner select returns an arbitrary expression, then we would have to copy
+* that tree into the pushed predicate, and that tree could contain
+* subqueries and method calls.
+* resolve - revisit this issue once we have views.
+*
+* @param referencedtabs	jbitset with bit map of referenced fromtables
+* @return boolean		whether or not source.expression is a columnreference
+*						or a virtualcolumnnode.
+*
+* @exception standardexception		thrown on error
+*/
+public boolean categorize jbitset referencedtabs  boolean simplepredsonly
+throws standardexception
+/* we stop here when only considering simple predicates
+*  as we don't consider method calls when looking
+* for null invariant predicates.
+*/
+if  simplepredsonly
+return false
+/* resolve - we need to or in a bit map when there are correlation columns */
+/* we categorize a query block at a time, so stop the recursion here */
+/* predicates with subqueries are not pushable for now */
+/*
+** if we can materialize the subquery, then it is
+** both invariant and non-correlated.  and so it
+** is pushable.
+*/
+return ismaterializable
+/*
+** subquery is materializable if
+** it is an expression subquery that
+** has no correlations and is invariant.
+*/
+boolean ismaterializable   throws standardexception
+boolean retval    subquerytype    expression_subquery
+hascorrelatedcrs
+isinvariant
+/* if we can materialize the subquery, then we set
+* the level of all of the tables to 0 so that we can
+* consider bulk fetch for them.
+*/
+if  retval
+if  resultset instanceof selectnode
+selectnode select    selectnode  resultset
+fromlist fromlist   select getfromlist
+fromlist setlevel 0
+return retval
+/**
+* optimize this subquerynode.
+*
+* @param datadictionary	the datadictionary to use for optimization
+* @param outerrows			the optimizer's estimate of the number of
+*							times this subquery will be executed.
+*
+* @exception standardexception		thrown on error
+*/
+public void optimize datadictionary datadictionary  double outerrows
+throws standardexception
+/* resolve - is there anything else that we need to do for this
+* node.
+*/
+/* optimize the underlying result set */
+resultset   resultset optimize datadictionary  null  outerrows
+/**
+* make any changes to the access paths, as decided by the optimizer.
+*
+* @exception standardexception		thrown on error
+*/
+public void modifyaccesspaths   throws standardexception
+resultset   resultset modifyaccesspaths
+/**
+* return the variant type for the underlying expression.
+* the variant type can be:
+*		variant				- variant within a scan
+*							  (method calls and non-static field access)
+*		scan_invariant		- invariant within a scan
+*							  (column references from outer tables)
+*		query_invariant		- invariant within the life of a query
+*							  (constant expressions)
+*
+* @return	the variant type for the underlying expression.
+*
+* @exception standardexception		thrown on error
+*/
+protected int getorderablevarianttype   throws standardexception
+/*
+* if the subquery is variant, than return
+* variant.  otherwise, if we have an expression
+* subquery and no correlated crs we are going
+* to materialize it, so it is query_invariant.
+* otherwise, scan_invariant.
+*/
+if  isinvariant
+if   hascorrelatedcrs
+subquerytype    expression_subquery
+return qualifier query_invariant
+else
+return qualifier scan_invariant
+else
+return qualifier variant
+/**
+* do code generation for this subquery.
+*
+* @param expressionbuilder	the expressionclassbuilder for the class being built
+* @param mbex	the method the expression will go into
+*
+*
+* @exception standardexception		thrown on error
+*/
+public void generateexpression
+expressionclassbuilder expressionbuilder
+methodbuilder mbex
+throws standardexception
+compilercontext	cc   getcompilercontext
+string			resultsetstring
+///////////////////////////////////////////////////////////////////////////
+//
+//	subqueries should not appear in filter expressions. we should get here
+//	only if we're compiling a query. that means that our class builder
+//	is an activation builder. if we ever allow subqueries in filters, we'll
+//	have to revisit this code.
+//
+///////////////////////////////////////////////////////////////////////////
+if  sanitymanager debug
+sanitymanager assert expressionbuilder instanceof activationclassbuilder
+activationclassbuilder	acb    activationclassbuilder  expressionbuilder
+/* reuse generated code, where possible */
+/* generate the appropriate (any or once) resultset */
+if  subquerytype    expression_subquery
+resultsetstring
+else
+resultsetstring
+// get cost estimate for underlying subquery
+costestimate costestimate   resultset getfinalcostestimate
+/* generate a new method.  it's only used within the other
+* exprfuns, so it could be private. but since we don't
+* generate the right bytecodes to invoke private methods,
+* we just make it protected.  this generated class won't
+* have any subclasses, certainly! (nat 12/97)
+*/
+string subquerytypestring
+gettypecompiler   interfacename
+methodbuilder	mb   acb newgeneratedfun subquerytypestring  modifier protected
+/* declare the field to hold the suquery's resultset tree */
+localfield rsfieldlf   acb newfielddeclaration modifier private  classname noputresultset
+resultsetnode subnode   null
+if   ismaterializable
+methodbuilder executemb   acb getexecutemethod
+if  pushednewpredicate       hascorrelatedcrs
+/* we try to materialize the subquery if it can fit in the memory.  we
+* evaluate the subquery first.  if the result set fits in the memory,
+* we replace the resultset with in-memory unions of row result sets.
+* we do this trick by replacing the child result with a new node --
+* materializesubquerynode, which essentially generates the suitable
+* code to materialize the subquery if possible.  this may have big
+* performance improvement.  see beetle 4373.
+*/
+if  sanitymanager debug
+sanitymanager assert resultset instanceof projectrestrictnode
+subnode     projectrestrictnode  resultset  getchildresult
+localfield subrs   acb newfielddeclaration modifier private  classname noputresultset
+mb getfield subrs
+mb conditionalifnull
+resultsetnode materialsubnode   new materializesubquerynode subrs
+// propagate the resultset's cost estimate to the new node.
+materialsubnode costestimate   resultset getfinalcostestimate
+projectrestrictnode  resultset  setchildresult materialsubnode
+/* evaluate subquery resultset here first.  next time when we come to
+* this subquery it may be replaced by a bunch of unions of rows.
+*/
+subnode generate acb  mb
+mb startelsecode
+mb getfield subrs
+mb completeconditional
+mb setfield subrs
+executemb pushnull  classname noputresultset
+executemb setfield subrs
+executemb pushnull  classname noputresultset
+executemb setfield rsfieldlf
+// now we fill in the body of the conditional
+mb getfield rsfieldlf
+mb conditionalifnull
+acb pushgetresultsetfactoryexpression mb
+// start of args
+int nargs
+/* inside here is where subquery could already have been materialized. 4373
+*/
+resultset generate acb  mb
+/* get the next resultset #, so that we can number the subquery's
+* empty row resultcolumnlist and once/any resultset.
+*/
+int subqresultsetnumber   cc getnextresultsetnumber
+/* we will be reusing the rcl from the subquery's resultset for the
+* empty row function.  we need to reset the resultsetnumber in the
+* rcl, before we generate that function.  now that we've called
+* generate() on the subquery's resultset, we can reset that
+* resultsetnumber.
+*/
+resultset getresultcolumns   setresultsetnumber subqresultsetnumber
+/* generate code for empty row */
+resultset getresultcolumns   generatenulls acb  mb
+/*
+*	arg1: suqueryexpress - expression for subquery's
+*		  resultset
+*  arg2: activation
+*  arg3: method to generate row with null(s) if subquery
+*		  result set is empty
+*/
+if  subquerytype    expression_subquery
+int cardinalitycheck
+/* no need to do sort if subquery began life as a distinct expression subquery.
+* (we simply check for a single unique value at execution time.)
+* no need for cardinality check if we know that underlying
+* resultset can contain at most 1 row.
+* resolve - not necessary if we know we
+* are getting a single row because of a unique index.
+*/
+if  distinctexpression
+cardinalitycheck   onceresultset unique_cardinality_check
+else if  resultset returnsatmostonerow
+cardinalitycheck   onceresultset no_cardinality_check
+else
+cardinalitycheck   onceresultset do_cardinality_check
+/*  arg4: int - whether or not cardinality check is required
+*				do_cardinality_check - required
+*				no_cardinality_check - not required
+*				unique_cardinality_check - verify single
+*											unique value
+*/
+mb push cardinalitycheck
+nargs   8
+else
+nargs   7
+mb push subqresultsetnumber
+mb push subquerynumber
+mb push pointofattachment
+mb push costestimate rowcount
+mb push costestimate getestimatedcost
+mb callmethod vmopcode invokeinterface   string  null  resultsetstring  classname noputresultset  nargs
+/* fill in the body of the method
+* generates the following.
+* (note: the close() method only generated for
+* materialized subqueries.  all other subqueries
+* closed by top result set in the query.):
+*
+*	noputresultset	rsfieldx;
+*	{
+*		<datatype interface> col;
+*		execrow r;
+*		rsfieldx = (rsfieldx == null) ? outerrscall() : rsfieldx; // <== nonmaterialized specific
+*		rsfieldx.opencore();
+*		r = rsfieldx.getnextrowcore();
+*		col = (<datatype interface>) r.getcolumn(1);
+*		return col;
+*	}
+*
+* materialized:
+*	noputresultset	rsfieldx;
+*	{
+*		<datatype interface> col;
+*		execrow r;
+*		rsfieldx = outerrscall();
+*		rsfieldx.opencore();
+*		r = rsfieldx.getnextrowcore();
+*		col = (<datatype interface>) r.getcolumn(1);
+*		rsfieldx.close();								// <== materialized specific
+*		return col;
+*	}
+* and adds it to exprfun
+*/
+generate the declarations       pushcompile
+//variabledeclaration colvar = mb.addvariabledeclaration(subquerytypestring);
+//variabledeclaration rvar   = mb.addvariabledeclaration(classname.execrow);
+if   ismaterializable
+/* put it back
+*/
+if  pushednewpredicate       hascorrelatedcrs
+projectrestrictnode  resultset  setchildresult subnode
+// now we fill in the body of the conditional
+mb startelsecode
+mb getfield rsfieldlf
+mb completeconditional
+mb setfield rsfieldlf
+/* rs.opencore() */
+mb getfield rsfieldlf
+mb callmethod vmopcode invokeinterface   string  null        0
+/* r = rs.next() */
+mb getfield rsfieldlf
+mb callmethod vmopcode invokeinterface   string  null     classname execrow  0
+//mb.putvariable(rvar);
+//mb.endstatement();
+/* col = (<datatype interface>) r.getcolumn(1) */
+//mb.getvariable(rvar);
+mb push 1      both the row interface and columnid are 1 based
+mb callmethod vmopcode invokeinterface  classname row     classname datavaluedescriptor  1
+mb cast subquerytypestring
+//mb.putvariable(colvar);
+//mb.endstatement();
+/* only generate the close() method for materialized
+* subqueries.  all others will be closed when the
+* close() method is called on the top resultset.
+*/
+if  ismaterializable
+/* rs.close() */
+mb getfield rsfieldlf
+mb callmethod vmopcode invokeinterface  classname resultset        0
+/* return col */
+//mb.getvariable(colvar);
+mb methodreturn
+mb complete
+/*
+** if we have an expression subquery, then we
+** can materialize it if it has no correlated
+** column references and is invariant.
+*/
+if  ismaterializable
+localfield lf   generatematerialization acb  mb  subquerytypestring
+mbex getfield lf
+else
+/* generate the call to the new method */
+mbex pushthis
+mbex callmethod vmopcode invokevirtual   string  null  mb getname    subquerytypestring  0
+/*
+** materialize the subquery in question.  given the expression
+** that represents the subquery, this returns fieldx where
+** fieldx is set up as follows:
+**
+** private ... fieldx
+**
+** execute()
+** {
+**	fieldx = <subqueryexpression>
+**	...
+** }
+**
+** so we wind up evaluating the subquery when we start
+** execution.  obviously, it is absolutely necessary that
+** the subquery is invariant and has no correlations
+** for this to work.
+**
+** ideally we wouldn't evaluate the expression subquery
+** until we know we need to, but because we are marking
+** this expression subquery as pushable, we must evaluate
+** it up front because it might wind up as a qualification,
+** and we cannot execute a subquery in the store as a
+** qualification because the store executes qualifications
+** while holding a latch.
+**
+** @param acb
+** @param type
+** @param subqueryexpression
+*/
+private localfield generatematerialization
+activationclassbuilder	acb
+methodbuilder mbsq
+string 			type
+methodbuilder mb   acb getexecutemethod
+// declare field
+localfield field   acb newfielddeclaration modifier private  type
+/* generate the call to the new method */
+mb pushthis
+mb callmethod vmopcode invokevirtual   string  null  mbsq getname    type  0
+// generate: field = value (value is on stack)
+mb setfield field
+return field
+/* private methods on private variables */
+private booleanconstantnode gettruenode
+throws standardexception
+if  truenode    null
+truenode    booleanconstantnode  getnodefactory   getnode
+c_nodetypes boolean_constant_node
+boolean true
+getcontextmanager
+return truenode
+/**
+* accept a visitor, and call v.visit()
+* on child nodes as necessary.
+*
+* @param v the visitor
+*
+* @exception standardexception on error
+*/
+public visitable accept visitor v
+throws standardexception
+visitable returnnode   v visit this
+/* shortcut if we've already done it
+*/
+if   v instanceof hascorrelatedcrsvisitor     donecorrelationcheck
+hascorrelatedcrsvisitor  v  sethascorrelatedcrs foundcorrelation
+return returnnode
+if  v skipchildren this
+return returnnode
+if  resultset    null     v stoptraversal
+resultset    resultsetnode resultset accept v
+if  leftoperand    null     v stoptraversal
+leftoperand    valuenode leftoperand accept v
+return returnnode
+private boolean isin
+return subquerytype    in_subquery
+private boolean isnot_in
+return subquerytype    not_in_subquery
+private boolean isany
+switch  subquerytype
+case eq_any_subquery
+case ne_any_subquery
+case le_any_subquery
+case lt_any_subquery
+case ge_any_subquery
+case gt_any_subquery
+return true
+default
+return false
+private boolean isall
+switch  subquerytype
+case eq_all_subquery
+case ne_all_subquery
+case le_all_subquery
+case lt_all_subquery
+case ge_all_subquery
+case gt_all_subquery
+return true
+default
+return false
+private boolean isexists
+return subquerytype    exists_subquery
+private boolean isnot_exists
+return subquerytype    not_exists_subquery
+/**
+* convert this in/any subquery, which is known to return at most 1 row,
+* to an equivalent expression subquery.
+*
+* @exception standardexception		thrown on error
+*/
+private void changetocorrespondingexpressiontype
+throws standardexception
+binaryoperatornode bcon   null
+switch  subquerytype
+case eq_any_subquery
+case in_subquery
+bcon    binaryoperatornode  getnodefactory   getnode
+c_nodetypes binary_equals_operator_node
+leftoperand
+this
+getcontextmanager
+break
+case ne_any_subquery
+bcon    binaryoperatornode  getnodefactory   getnode
+c_nodetypes binary_not_equals_operator_node
+leftoperand
+this
+getcontextmanager
+break
+case le_any_subquery
+bcon    binaryoperatornode  getnodefactory   getnode
+c_nodetypes binary_less_equals_operator_node
+leftoperand
+this
+getcontextmanager
+break
+case lt_any_subquery
+bcon    binaryoperatornode  getnodefactory   getnode
+c_nodetypes binary_less_than_operator_node
+leftoperand
+this
+getcontextmanager
+break
+case ge_any_subquery
+bcon    binaryoperatornode  getnodefactory   getnode
+c_nodetypes binary_greater_equals_operator_node
+leftoperand
+this
+getcontextmanager
+break
+case gt_any_subquery
+bcon    binaryoperatornode  getnodefactory   getnode
+c_nodetypes binary_greater_than_operator_node
+leftoperand
+this
+getcontextmanager
+break
+// clean up the state of the tree to reflect a bound expression subquery
+subquerytype   expression_subquery
+setdatatypeservices resultset getresultcolumns
+parentcomparisonoperator    binarycomparisonoperatornode  bcon
+/* set type info for the operator node */
+parentcomparisonoperator bindcomparisonoperator
+leftoperand   null
+private void setdatatypeservices resultcolumnlist resultcolumns
+throws standardexception
+datatypedescriptor dts
+/* set the result type for this subquery (must be nullable).
+* quantified predicates will return boolean.
+* however, the return type of the subquery's result list will
+* probably not be boolean at this point, because we do not
+* transform the subquery (other than exists) into
+* (select true/false ...) until preprocess().  so, we force
+* the return type to boolean.
+*/
+if  subquerytype    expression_subquery
+dts     resultcolumn  resultcolumns elementat 0   gettypeservices
+else
+dts   gettruenode   gettypeservices
+settype dts getnullabilitytype true
+/**
+* {@inheritdoc}
+*/
+protected boolean isequivalent valuenode o
+return false

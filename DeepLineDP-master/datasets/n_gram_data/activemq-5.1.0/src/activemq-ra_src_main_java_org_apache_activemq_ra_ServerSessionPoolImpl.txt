@@ -1,0 +1,233 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq ra
+import java util arraylist
+import java util iterator
+import java util list
+import java util concurrent atomic atomicboolean
+import java util concurrent locks lock
+import java util concurrent locks reentrantlock
+import javax jms jmsexception
+import javax jms serversession
+import javax jms serversessionpool
+import javax jms session
+import javax resource spi unavailableexception
+import javax resource spi endpoint messageendpoint
+import org apache activemq activemqqueuesession
+import org apache activemq activemqsession
+import org apache activemq activemqtopicsession
+import org apache activemq command messagedispatch
+import org apache commons logging log
+import org apache commons logging logfactory
+/**
+* @version $revision$ $date$
+*/
+public class serversessionpoolimpl implements serversessionpool
+private static final log log   logfactory getlog serversessionpoolimpl class
+private final activemqendpointworker activemqasfendpointworker
+private final int maxsessions
+private final list<serversessionimpl> idlesessions   new arraylist<serversessionimpl>
+private final list<serversessionimpl> activesessions   new arraylist<serversessionimpl>
+private final lock sessionlock   new reentrantlock
+private final atomicboolean closing   new atomicboolean false
+public serversessionpoolimpl activemqendpointworker activemqasfendpointworker  int maxsessions
+this activemqasfendpointworker   activemqasfendpointworker
+this maxsessions   maxsessions
+private serversessionimpl createserversessionimpl   throws jmsexception
+messageactivationspec activationspec   activemqasfendpointworker endpointactivationkey getactivationspec
+int acknowledge    activemqasfendpointworker transacted  ? session session_transacted   activationspec getacknowledgemodeforsession
+final activemqsession session    activemqsession activemqasfendpointworker connection createsession activemqasfendpointworker transacted  acknowledge
+messageendpoint endpoint
+try
+int batchsize   0
+if  activationspec getenablebatchbooleanvalue
+batchsize   activationspec getmaxmessagesperbatchintvalue
+if  activationspec isuseramanagedtransactionenabled
+// the ra will manage the transaction commit.
+endpoint   createendpoint null
+return new serversessionimpl this   activemqsession session  activemqasfendpointworker workmanager  endpoint  true  batchsize
+else
+// give the container an object to manage to transaction with.
+endpoint   createendpoint new localandxatransaction session gettransactioncontext
+return new serversessionimpl this   activemqsession session  activemqasfendpointworker workmanager  endpoint  false  batchsize
+catch  unavailableexception e
+// the container could be limiting us on the number of endpoints
+// that are being created.
+if  log isdebugenabled
+log debug    e
+session close
+return null
+private messageendpoint createendpoint localandxatransaction txresourceproxy  throws unavailableexception
+messageendpoint endpoint
+endpoint   activemqasfendpointworker endpointfactory createendpoint txresourceproxy
+messageendpointproxy endpointproxy   new messageendpointproxy endpoint
+return endpointproxy
+/**
+*/
+public serversession getserversession   throws jmsexception
+if  log isdebugenabled
+log debug
+if  closing get
+throw new jmsexception
+serversessionimpl ss   null
+sessionlock lock
+try
+ss   getexistingserversession false
+finally
+sessionlock unlock
+if  ss    null
+return ss
+ss   createserversessionimpl
+sessionlock lock
+try
+// we may not be able to create a session due to the container
+// restricting us.
+if  ss    null
+if  activesessions isempty      idlesessions isempty
+throw new jmsexception
+ss   getexistingserversession true
+else
+activesessions add ss
+finally
+sessionlock unlock
+if  log isdebugenabled
+log debug     ss
+return ss
+/**
+* must be called with sessionlock held.
+* returns an idle session if one exists or an active session if no more
+* sessions can be created.  sessions can not be created if force is true
+* or activesessions >= maxsessions.
+* @param force do not check activesessions >= maxsessions, return an active connection anyway.
+* @return an already existing session.
+*/
+private serversessionimpl getexistingserversession boolean force
+serversessionimpl ss   null
+if  idlesessions size   > 0
+ss   idlesessions remove idlesessions size     1
+if  ss    null
+activesessions add ss
+if  log isdebugenabled
+log debug     ss
+else if  force    activesessions size   >  maxsessions
+// if we are at the upper limit
+// then reuse the already created sessions..
+// this is going to queue up messages into a session for
+// processing.
+ss   getexistingactiveserversession
+return ss
+/**
+* must be called with sessionlock held.
+* returns the first session from activesessions, shifting it to last.
+* @return session
+*/
+private serversessionimpl getexistingactiveserversession
+serversessionimpl ss   null
+if   activesessions isempty
+if  activesessions size   > 1
+// round robin
+ss   activesessions remove 0
+activesessions add ss
+else
+ss   activesessions get 0
+if  log isdebugenabled
+log debug     ss
+return ss
+public void returntopool serversessionimpl ss
+if  log isdebugenabled
+log debug     ss
+sessionlock lock
+try
+activesessions remove ss
+idlesessions add ss
+finally
+sessionlock unlock
+synchronized  closing
+closing notify
+public void removefrompool serversessionimpl ss
+sessionlock lock
+try
+activesessions remove ss
+finally
+sessionlock unlock
+try
+activemqsession session    activemqsession ss getsession
+list l   session getunconsumedmessages
+for  iterator i   l iterator    i hasnext
+dispatchtosession  messagedispatch i next
+catch  throwable t
+log error    t
+ss close
+synchronized  closing
+closing notify
+/**
+* @param messagedispatch
+*            the message to dispatch
+* @throws jmsexception
+*/
+private void dispatchtosession messagedispatch messagedispatch
+throws jmsexception
+serversession serversession   getserversession
+session s   serversession getsession
+activemqsession session   null
+if  s instanceof activemqsession
+session    activemqsession  s
+else if  s instanceof activemqqueuesession
+session    activemqsession  s
+else if  s instanceof activemqtopicsession
+session    activemqsession  s
+else
+activemqasfendpointworker connection
+onasyncexception new jmsexception
+s getclass
+session dispatch messagedispatch
+serversession start
+public void close
+closing set true
+int activecount   closeidlesessions
+// we may have to wait erroneously 250ms if an
+// active session is removed during our wait and we
+// are not notified
+while  activecount > 0
+if  log isdebugenabled
+log debug     activecount
+try
+synchronized  closing
+closing wait 250
+catch  interruptedexception e
+thread currentthread   interrupt
+return
+activecount   closeidlesessions
+private int closeidlesessions
+sessionlock lock
+try
+for  serversessionimpl ss   idlesessions
+ss close
+idlesessions clear
+return activesessions size
+finally
+sessionlock unlock
+/**
+* @return returns the closing.
+*/
+public boolean isclosing
+return closing get
+/**
+* @param closing the closing to set.
+*/
+public void setclosing boolean closing
+this closing set closing

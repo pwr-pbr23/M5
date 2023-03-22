@@ -1,0 +1,849 @@
+/*
+derby - class org.apache.derby.impl.sql.execute.scrollinsensitiveresultset
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl sql execute
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi sql execute cursorresultset
+import org apache derby iapi sql execute execrow
+import org apache derby iapi sql execute noputresultset
+import org apache derby iapi sql activation
+import org apache derby iapi types rowlocation
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi error standardexception
+import org apache derby iapi reference sqlstate
+import org apache derby iapi store access backingstorehashtable
+import org apache derby iapi types sqlboolean
+import org apache derby iapi types sqlinteger
+/**
+*
+* provide insensitive scrolling functionality for the underlying
+* result set.  we build a disk backed hash table of rows as the
+* user scrolls forward, with the position as the key.
+*
+* for read-only result sets the hash table will containg the
+* following columns:
+*<pre>
+*  +-------------------------------+
+*  | key                           |
+*  +-------------------------------+
+*  | row                           |
+*  +-------------------------------+
+*</pre>
+* where key is the position of the row in the result set and row is the data.
+*
+* and for updatable result sets it will contain:
+* <pre>
+*  +-------------------------------+
+*  | key                           | [0]
+*  +-------------------------------+
+*  | rowlocation                   | [pos_rowlocation]
+*  +-------------------------------+
+*  | deleted                       | [pos_rowdeleted]
+*  +-------------------------------+
+*  | updated                       | [pos_rowupdated]
+*  +-------------------------------+
+*  | row                           | [extracolumns ... n]
+*  +-------------------------------+
+*</pre>
+* where key is the position of the row in the result set, rowlocation is
+* the row location of that row in the heap, deleted indicates whether the
+* row has been deleted, updated indicates whether the row has been updated,
+* and row is the data.
+*
+*/
+public class scrollinsensitiveresultset extends noputresultsetimpl
+implements cursorresultset
+/*
+** set in constructor and not altered during life of object.
+*/
+public noputresultset	source
+private int							sourcerowwidth
+private	  backingstorehashtable		ht
+private	  execrow					resultrow
+// scroll tracking
+private int positioninsource
+private int currentposition
+private int lastposition
+private	boolean seenfirst
+private	boolean seenlast
+private	boolean beforefirst   true
+private	boolean afterlast
+public int numfromhashtable
+public int numtohashtable
+private int maxrows
+private boolean keepaftercommit
+/* the hash table will contain a different number of extra columns depending
+* on whether the result set is updatable or not.
+* extracolumns will contain the number of extra columns on the hash table,
+* 1 for read-only result sets and last_extra_column + 1 for updatable
+* result sets.
+*/
+private int extracolumns
+/* positioninhashtable is used for getting a row from the hash table. prior
+* to getting the row, positioninhashtable will be set to the desired key.
+*/
+private sqlinteger positioninhashtable
+/* reference to the target result set. target is used for updatable result
+* sets in order to keep the target result set on the same row as the
+* scrollinsensitiveresultset.
+*/
+private cursorresultset target
+/* if the last row was fetched from the hashtable, updatable result sets
+* need to be positioned in the last fetched row before resuming the
+* fetch from core.
+*/
+private boolean needsrepositioning
+/* position of the different fields in the hash table row for updatable
+* result sets
+*/
+private static final int pos_rowlocation   1
+private static final int pos_rowdeleted   2
+private static final int pos_rowupdated   3
+private static final int last_extra_column   3
+/**
+* constructor for a scrollinsensitiveresultset
+*
+* @param source					the noputresultset from which to get rows
+*									to scroll through
+* @param activation				the activation for this execution
+* @param resultsetnumber			the resultsetnumber
+* @param sourcerowwidth			# of columns in the source row
+*
+* @exception standardexception	on error
+*/
+public scrollinsensitiveresultset noputresultset source
+activation activation  int resultsetnumber
+int sourcerowwidth
+double optimizerestimatedrowcount
+double optimizerestimatedcost  throws standardexception
+super activation  resultsetnumber
+optimizerestimatedrowcount  optimizerestimatedcost
+this source   source
+this sourcerowwidth   sourcerowwidth
+keepaftercommit   activation getresultsetholdability
+maxrows   activation getmaxrows
+if  sanitymanager debug
+sanitymanager assert maxrows     1
+constructortime    getelapsedmillis begintime
+positioninhashtable   new sqlinteger
+needsrepositioning   false
+if  isforupdate
+target     cursoractivation activation  gettargetresultset
+extracolumns   last_extra_column   1
+else
+target   null
+extracolumns   1
+//
+// resultset interface (leftover from noputresultset)
+//
+/**
+* open a scan on the source. scan parameters are evaluated
+* at each open, so there is probably some way of altering
+* their values...
+*
+* @exception standardexception thrown on failure
+*/
+public void	opencore   throws standardexception
+begintime   getcurrenttimemillis
+if  sanitymanager debug
+sanitymanager assert    isopen
+source opencore
+isopen   true
+numopens
+/* create the hash table.  we pass
+* null in as the row source as we will
+* build the hash table on demand as
+* the user scrolls.
+* the 1st column, the position in the
+* scan, will be the key column.
+*/
+final int keycols   new int   0
+/* we don't use the optimizer row count for this because it could be
+* wildly pessimistic.  we only use hash tables when the optimizer row count
+* is within certain bounds.  we have no alternative for scrolling insensitive
+* cursors so we'll just trust that it will fit.
+* we need backingstorehashtable to actually go to disk when it doesn't fit.
+* this is a known limitation.
+*/
+ht   new backingstorehashtable gettransactioncontroller
+
+keycols
+false
+1     don't trust optimizer row count
+hashscanresultset default_max_capacity
+hashscanresultset default_initial_capacity
+hashscanresultset default_max_capacity
+false
+keepaftercommit
+// when re-using language result sets (derby-827) we need to
+// reset some member variables to the value they would have
+// had in a newly constructed object.
+lastposition   0
+needsrepositioning   false
+numfromhashtable   0
+numtohashtable   0
+positioninsource   0
+seenfirst   false
+seenlast   false
+opentime    getelapsedmillis begintime
+setbeforefirstrow
+/**
+* reopen a scan on the table. scan parameters are evaluated
+* at each open, so there is probably some way of altering
+* their values...
+*
+* @exception standardexception thrown if cursor finished.
+*/
+public void	reopencore   throws standardexception
+boolean constanteval   true
+begintime   getcurrenttimemillis
+if  sanitymanager debug
+sanitymanager assert isopen
+sanitymanager throwassert
+setbeforefirstrow
+/**
+* returns the row at the absolute position from the query,
+* and returns null when there is no such position.
+* (negative position means from the end of the result set.)
+* moving the cursor to an invalid position leaves the cursor
+* positioned either before the first row (negative position)
+* or after the last row (positive position).
+* note: an exception will be thrown on 0.
+*
+* @param row	the position.
+* @return	the row at the absolute position, or null if no such position.
+*
+* @exception standardexception		thrown on failure
+* @see org.apache.derby.iapi.sql.row
+*/
+public execrow	getabsoluterow int row  throws standardexception
+if     isopen
+throw standardexception newexception sqlstate lang_result_set_not_open
+attachstatementcontext
+if  sanitymanager debug
+if   istopresultset
+sanitymanager throwassert
+this
+// absolute 0 is defined to be before first!
+if  row    0
+setbeforefirstrow
+return null
+if  seenlast    row > lastposition
+return setafterlastrow
+if  row > 0
+// position is from the start of the result set
+if  row <  positioninsource
+// we've already seen the row before
+return getrowfromhashtable row
+/* we haven't seen the row yet, scan until we find
+* it or we get to the end.
+*/
+int diff   row   positioninsource
+execrow result   null
+while  diff > 0
+if   result   getnextrowfromsource       null
+diff
+else
+break
+if  result    null
+result   getrowfromhashtable row
+currentrow   result
+return result
+else if  row < 0
+// position is from the end of the result set
+// get the last row, if we haven't already
+if   seenlast
+getlastrow
+// note, for negative values position is from beyond the end
+// of the result set, e.g. absolute(-1) points to the last row
+int beyondresult   lastposition   1
+if  beyondresult   row > 0
+// valid row
+return getrowfromhashtable beyondresult   row
+else
+// position before the beginning of the result set
+return setbeforefirstrow
+currentrow   null
+return null
+/**
+* returns the row at the relative position from the current
+* cursor position, and returns null when there is no such position.
+* (negative position means toward the beginning of the result set.)
+* moving the cursor to an invalid position leaves the cursor
+* positioned either before the first row (negative position)
+* or after the last row (positive position).
+* note: 0 is valid.
+* note: an exception is thrown if the cursor is not currently
+* positioned on a row.
+*
+* @param row	the position.
+* @return	the row at the relative position, or null if no such position.
+*
+* @exception standardexception		thrown on failure
+* @see org.apache.derby.iapi.sql.row
+*/
+public execrow	getrelativerow int row  throws standardexception
+if     isopen
+throw standardexception newexception sqlstate lang_result_set_not_open
+attachstatementcontext
+if  sanitymanager debug
+if   istopresultset
+sanitymanager throwassert
+this
+// return the current row for 0
+if  row    0
+if  beforefirst    afterlast    currentposition  0
+return null
+else
+return getrowfromhashtable currentposition
+else if  row > 0
+return getabsoluterow currentposition   row
+else
+// row < 0
+if  currentposition   row < 0
+return setbeforefirstrow
+return getabsoluterow currentposition   row
+/**
+* sets the current position to before the first row and returns null
+* because there is no current row.
+*
+* @return	null.
+*
+* @see org.apache.derby.iapi.sql.row
+*/
+public execrow	setbeforefirstrow
+currentposition   0
+beforefirst   true
+afterlast   false
+currentrow   null
+return null
+/**
+* returns the first row from the query, and returns null when there
+* are no rows.
+*
+* @return	the first row, or null if no rows.
+*
+* @exception standardexception		thrown on failure
+* @see org.apache.derby.iapi.sql.row
+*/
+public execrow	getfirstrow
+throws standardexception
+if     isopen
+throw standardexception newexception sqlstate lang_result_set_not_open
+/* get the row from the hash table if
+* we have already seen it before.
+*/
+if  seenfirst
+return getrowfromhashtable 1
+attachstatementcontext
+if  sanitymanager debug
+if   istopresultset
+sanitymanager throwassert
+this
+return getnextrowcore
+/**
+*
+* @exception standardexception thrown on failure
+*/
+public execrow	getnextrowcore   throws standardexception
+execrow result   null
+begintime   getcurrenttimemillis
+if   isopen
+throw standardexception newexception sqlstate lang_result_set_not_open
+if  seenlast    currentposition    lastposition
+return setafterlastrow
+/* should we get the next row from the source or the hash table? */
+if  currentposition    positioninsource
+/* current position is same as position in source.
+* get row from the source.
+*/
+result   getnextrowfromsource
+if  result   null
+result   getrowfromhashtable currentposition
+else if  currentposition < positioninsource
+/* current position is before position in source.
+* get row from the hash table.
+*/
+result   getrowfromhashtable currentposition   1
+else
+result   null
+if  result    null
+rowsseen
+afterlast   false
+currentrow   result
+setcurrentrow currentrow
+beforefirst   false
+nexttime    getelapsedmillis begintime
+return result
+/**
+* returns the previous row from the query, and returns null when there
+* are no more previous rows.
+*
+* @return	the previous row, or null if no more previous rows.
+*
+* @exception standardexception		thrown on failure
+* @see org.apache.derby.iapi.sql.row
+*/
+public execrow	getpreviousrow
+throws standardexception
+if     isopen
+throw standardexception newexception sqlstate lang_result_set_not_open
+if  sanitymanager debug
+if   istopresultset
+sanitymanager throwassert
+this
+/* no row if we are positioned before the first row
+* or the result set is empty.
+*/
+if  beforefirst    currentposition    0
+currentrow   null
+return null
+// get the last row, if we are after it
+if  afterlast
+// special case for empty tables
+if  lastposition    0
+afterlast   false
+beforefirst   false
+currentrow   null
+return null
+else
+return getrowfromhashtable lastposition
+// move back 1
+currentposition
+if  currentposition    0
+setbeforefirstrow
+return null
+return getrowfromhashtable currentposition
+/**
+* returns the last row from the query, and returns null when there
+* are no rows.
+*
+* @return	the last row, or null if no rows.
+*
+* @exception standardexception		thrown on failure
+* @see org.apache.derby.iapi.sql.row
+*/
+public execrow	getlastrow
+throws standardexception
+if     isopen
+throw standardexception newexception sqlstate lang_result_set_not_open
+if   seenlast
+attachstatementcontext
+if  sanitymanager debug
+if   istopresultset
+sanitymanager throwassert
+this
+/* scroll to the end, filling the hash table as
+* we scroll, and return the last row that we find.
+*/
+execrow result   null
+while   result   getnextrowfromsource       null
+if  sanitymanager debug     seenlast
+sanitymanager throwassert this
+beforefirst   false
+afterlast   false
+// special case if table is empty
+if  lastposition    0
+currentrow   null
+return null
+else
+return getrowfromhashtable lastposition
+/**
+* sets the current position to after the last row and returns null
+* because there is no current row.
+*
+* @return	null.
+*
+* @exception standardexception		thrown on failure
+* @see org.apache.derby.iapi.sql.row
+*/
+public execrow	setafterlastrow
+throws standardexception
+if    seenlast
+getlastrow
+if  lastposition    0
+// empty rs special case
+currentposition   0
+afterlast   false
+else
+currentposition   lastposition   1
+afterlast   true
+beforefirst   false
+currentrow   null
+return null
+/**
+* determine if the cursor is before the first row in the result
+* set.
+*
+* @return true if before the first row, false otherwise. returns
+* false when the result set contains no rows.
+* @exception standardexception thrown on error.
+*/
+public boolean checkrowposition int istype  throws standardexception
+switch  istype
+case isbeforefirst
+if    beforefirst
+return false
+//  spec says to return false if result set is empty
+if  seenfirst
+return true
+else
+execrow firstrow   getfirstrow
+if  firstrow    null
+// resultset is empty
+return false
+else
+// resultset is not empty - reset position
+getpreviousrow
+return true
+case isfirst
+return  currentposition    1
+case islast
+if  beforefirst    afterlast    currentposition  0
+currentposition<positioninsource
+return false
+/* if we have seen the last row, we can tell if we are
+* on it by comparing currentposition with lastposition.
+* otherwise, we check if there is a next row.
+*/
+if  seenlast
+return  currentposition    lastposition
+else
+final int saveposition   currentposition
+final boolean retval    getnextrowfromsource      null
+getrowfromhashtable saveposition
+return retval
+case isafterlast
+return afterlast
+default
+return false
+/**
+* returns the row number of the current row.  row
+* numbers start from 1 and go to 'n'.  corresponds
+* to row numbering used to position current row
+* in the result set (as per jdbc).
+*
+* @return	the row number, or 0 if not on a row
+*
+*/
+public int getrownumber
+return currentrow    null ? 0   currentposition
+/* get the next row from the source resultset tree and insert into the hash table */
+private execrow getnextrowfromsource   throws standardexception
+execrow		sourcerow   null
+execrow		result   null
+/* don't give back more rows than requested */
+if  maxrows > 0    maxrows    positioninsource
+seenlast   true
+lastposition   positioninsource
+afterlast   true
+return null
+if  needsrepositioning
+positioninlastfetchedrow
+needsrepositioning   false
+sourcerow   source getnextrowcore
+if  sourcerow    null
+seenfirst   true
+beforefirst   false
+long begintctime   getcurrenttimemillis
+/* if this is the first row from the source then we create a new row
+* for use when fetching from the hash table.
+*/
+if  resultrow    null
+resultrow   activation getexecutionfactory   getvaluerow sourcerowwidth
+positioninsource
+currentposition   positioninsource
+rowlocation rowloc   null
+if  source isforupdate
+rowloc     cursorresultset source  getrowlocation
+addrowtohashtable sourcerow  currentposition  rowloc  false
+// remember whether or not we're past the end of the table
+else
+if    seenlast
+lastposition   positioninsource
+seenlast   true
+// special case for empty table (afterlast is never true)
+if  positioninsource    0
+afterlast   false
+else
+afterlast   true
+currentposition   positioninsource   1
+return sourcerow
+/**
+* if the result set has been opened,
+* close the open scan.
+*
+* @exception standardexception thrown on error
+*/
+public void	close   throws standardexception
+begintime   getcurrenttimemillis
+if   isopen
+currentrow   null
+source close
+if  ht    null
+ht close
+ht   null
+super close
+else
+if  sanitymanager debug
+sanitymanager debug
+setbeforefirstrow
+closetime    getelapsedmillis begintime
+public void	finish   throws standardexception
+source finish
+finishandrts
+/**
+* return the total amount of time spent in this resultset
+*
+* @param type	current_resultset_only - time spent only in this resultset
+*				entire_resultset_tree  - time spent in this resultset and below.
+*
+* @return long		the total amount of time spent (in milliseconds).
+*/
+public long gettimespent int type
+long tottime   constructortime   opentime   nexttime   closetime
+if  type    noputresultset current_resultset_only
+return	tottime   source gettimespent entire_resultset_tree
+else
+return tottime
+//
+// cursorresultset interface
+//
+/**
+* gets information from its source. we might want
+* to have this take a cursorresultset in its constructor some day,
+* instead of doing a cast here?
+*
+* @see cursorresultset
+*
+* @return the row location of the current cursor row.
+*
+* @exception standardexception thrown on failure
+*/
+public rowlocation getrowlocation   throws standardexception
+if  sanitymanager debug
+sanitymanager assert source instanceof cursorresultset
+return    cursorresultset source   getrowlocation
+/**
+* gets information from last getnextrow call.
+*
+* @see cursorresultset
+*
+* @return the last row returned.
+*/
+/* resolve - this should return activation.getcurrentrow(resultsetnumber),
+* once there is such a method.  (currentrow is redundant)
+*/
+public execrow getcurrentrow   throws standardexception
+if  isforupdate      isdeleted
+return null
+else
+return currentrow
+//
+// class implementation
+//
+/**
+* add a row to the backing hash table, keyed on position.
+* when a row gets updated when using scrollable insensitive updatable
+* result sets, the old entry for the row will be deleted from the hash
+* table and this method will be called to add the new values for the row
+* to the hash table, with the parameter rowupdated = true so as to mark
+* the row as updated. the latter is done in order to implement
+* detectability of own changes for result sets of this type.
+*
+* @param sourcerow	the row to add.
+* @param position the key
+* @param rowloc the rowlocation of the row to add.
+* @param rowupdated indicates whether the row has been updated.
+*
+*/
+private void addrowtohashtable execrow sourcerow  int position
+rowlocation rowloc  boolean rowupdated
+throws standardexception
+datavaluedescriptor hashrowarray   new
+datavaluedescriptor
+// 1st element is the key
+hashrowarray   new sqlinteger position
+if  isforupdate
+hashrowarray   rowloc getclone
+hashrowarray   new sqlboolean false
+hashrowarray   new sqlboolean rowupdated
+/* copy rest of elements from sourcerow.
+* note: we need to clone the source row
+* and we do our own cloning since the 1st column
+* is not a wrapper.
+*/
+datavaluedescriptor sourcerowarray   sourcerow getrowarray
+system arraycopy sourcerowarray  0  hashrowarray  extracolumns
+sourcerowarray length
+ht putrow true  hashrowarray
+numtohashtable
+/**
+* get the row at the specified position
+* from the hash table.
+*
+* @param position	the specified position.
+*
+* @return	the row at that position.
+*
+* @exception standardexception thrown on failure
+*/
+private execrow getrowfromhashtable int position
+throws standardexception
+// get the row from the hash table
+positioninhashtable setvalue position
+datavaluedescriptor hashrowarray    datavaluedescriptor
+ht get positioninhashtable
+if  sanitymanager debug
+sanitymanager assert hashrowarray    null
+// copy out the object[] without the position.
+datavaluedescriptor resultrowarray   new
+datavaluedescriptor
+system arraycopy hashrowarray  extracolumns  resultrowarray  0
+resultrowarray length
+resultrow setrowarray resultrowarray
+// reset the current position to the user position
+currentposition   position
+numfromhashtable
+if  resultrow    null
+beforefirst   false
+afterlast   false
+if  isforupdate
+rowlocation rowloc    rowlocation  hashrowarray
+// keep source and target with the same currentrow
+noputresultset target  setcurrentrow resultrow
+noputresultset target  positionscanatrowlocation rowloc
+needsrepositioning   true
+setcurrentrow resultrow
+return resultrow
+/**
+* get the row data at the specified position
+* from the hash table.
+*
+* @param position	the specified position.
+*
+* @return	the row data at that position.
+*
+* @exception standardexception thrown on failure
+*/
+private datavaluedescriptor getrowarrayfromhashtable int position
+throws standardexception
+positioninhashtable setvalue position
+final datavaluedescriptor hashrowarray    datavaluedescriptor
+ht get positioninhashtable
+// copy out the object[] without the position.
+final datavaluedescriptor resultrowarray   new
+datavaluedescriptor
+system arraycopy hashrowarray  extracolumns  resultrowarray  0
+resultrowarray length
+return resultrowarray
+/**
+* positions the cursor in the last fetched row. this is done before
+* navigating to a row that has not previously been fetched, so that
+* getnextrowcore() will re-start from where it stopped.
+*/
+private void positioninlastfetchedrow   throws standardexception
+if  positioninsource > 0
+positioninhashtable setvalue positioninsource
+datavaluedescriptor hashrowarray    datavaluedescriptor
+ht get positioninhashtable
+rowlocation rowloc    rowlocation  hashrowarray
+noputresultset target  positionscanatrowlocation rowloc
+currentposition   positioninsource
+/**
+* @see noputresultset#updaterow
+*
+* sets the updated column of the hash table to true and updates the row
+* in the hash table with the new values for the row.
+*/
+public void updaterow execrow row  throws standardexception
+execrow newrow   row
+boolean undoprojection   false
+if  source instanceof projectrestrictresultset
+newrow     projectrestrictresultset source
+dobaserowprojection row
+undoprojection   true
+positioninhashtable setvalue currentposition
+datavaluedescriptor hashrowarray    datavaluedescriptor
+ht get positioninhashtable
+rowlocation rowloc    rowlocation  hashrowarray
+ht remove new sqlinteger currentposition
+addrowtohashtable newrow  currentposition  rowloc  true
+// modify row to refer to data in the backingstorehashtable.
+// this allows reading of data which goes over multiple pages
+// when doing the actual update (lobs). putting columns of
+// type sqlbinary to disk, has destructive effect on the columns,
+// and they need to be re-read. that is the reason this is needed.
+if  undoprojection
+final datavaluedescriptor newrowdata   newrow getrowarray
+// array of original position in row
+final int origpos    projectrestrictresultset source
+getbaseprojectmapping
+// we want the row to contain data backed in backingstorehashtable
+final datavaluedescriptor backeddata
+getrowarrayfromhashtable currentposition
+for  int i 0  i<origpos length  i
+if  origpos> 0
+row setcolumn origpos  backeddata
+else
+row setrowarray getrowarrayfromhashtable currentposition
+/**
+* @see noputresultset#markrowasdeleted
+*
+* sets the deleted column of the hash table to true in the current row.
+*/
+public void markrowasdeleted   throws standardexception
+positioninhashtable setvalue currentposition
+datavaluedescriptor hashrowarray    datavaluedescriptor
+ht get positioninhashtable
+rowlocation rowloc    rowlocation  hashrowarray
+ht remove new sqlinteger currentposition
+sqlboolean hashrowarray  setvalue true
+// set all columns to null, the row is now a placeholder
+for  int i extracolumns  i<hashrowarray length  i
+hashrowarray settonull
+ht putrow true  hashrowarray
+/**
+* returns true if the row was been deleted within the transaction,
+* otherwise returns false
+*
+* @return true if the row has been deleted, otherwise false
+*
+* @exception standardexception on error
+*/
+public boolean isdeleted   throws standardexception
+if  currentposition <  positioninsource    currentposition > 0
+positioninhashtable setvalue currentposition
+datavaluedescriptor hashrowarray    datavaluedescriptor
+ht get positioninhashtable
+return hashrowarray getboolean
+return false
+/**
+* returns true if the row was been updated within the transaction,
+* otherwise returns false
+*
+* @return true if the row has been deleted, otherwise false
+*
+* @exception standardexception on error
+*/
+public boolean isupdated   throws standardexception
+if  currentposition <  positioninsource    currentposition > 0
+positioninhashtable setvalue currentposition
+datavaluedescriptor hashrowarray    datavaluedescriptor
+ht get positioninhashtable
+return hashrowarray getboolean
+return false
+public boolean isforupdate
+return source isforupdate

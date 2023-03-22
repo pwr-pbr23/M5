@@ -1,0 +1,1136 @@
+/**
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver wal
+import java io filenotfoundexception
+import java io ioexception
+import java io outputstream
+import java lang reflect invocationtargetexception
+import java lang reflect method
+import java net urlencoder
+import java util arraylist
+import java util arrays
+import java util collections
+import java util treemap
+import java util linkedlist
+import java util list
+import java util map
+import java util sortedmap
+import java util treemap
+import java util treeset
+import java util uuid
+import java util concurrent concurrentskiplistmap
+import java util concurrent copyonwritearraylist
+import java util concurrent atomic atomicboolean
+import java util concurrent atomic atomicinteger
+import java util concurrent atomic atomiclong
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop fs fsdataoutputstream
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop fs syncable
+import org apache hadoop hbase hbaseconfiguration
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase exceptions failedlogcloseexception
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util classsize
+import org apache hadoop hbase util drainbarrier
+import org apache hadoop hbase util environmentedgemanager
+import org apache hadoop hbase util fsutils
+import org apache hadoop hbase util hasthread
+import org apache hadoop hbase util threads
+import org apache hadoop util stringutils
+/**
+* hlog stores all the edits to the hstore.  its the hbase write-ahead-log
+* implementation.
+*
+* it performs logfile-rolling, so external callers are not aware that the
+* underlying file is being rolled.
+*
+* <p>
+* there is one hlog per regionserver.  all edits for all regions carried by
+* a particular regionserver are entered first in the hlog.
+*
+* <p>
+* each hregion is identified by a unique long <code>int</code>. hregions do
+* not need to declare themselves before using the hlog; they simply include
+* their hregion-id in the <code>append</code> or
+* <code>completecacheflush</code> calls.
+*
+* <p>
+* an hlog consists of multiple on-disk files, which have a chronological order.
+* as data is flushed to other (better) on-disk structures, the log becomes
+* obsolete. we can destroy all the log messages for a given hregion-id up to
+* the most-recent cacheflush message from that hregion.
+*
+* <p>
+* it's only practical to delete entire files. thus, we delete an entire on-disk
+* file f when all of the messages in f have a log-sequence-id that's older
+* (smaller) than the most-recent cacheflush message for every hregion that has
+* a message in f.
+*
+* <p>
+* synchronized methods can never execute in parallel. however, between the
+* start of a cache flush and the completion point, appends are allowed but log
+* rolling is not. to prevent log rolling taking place during this period, a
+* separate reentrant lock is used.
+*
+* <p>to read an hlog, call {@link hlogfactory#createreader(org.apache.hadoop.fs.filesystem,
+* org.apache.hadoop.fs.path, org.apache.hadoop.conf.configuration)}.
+*
+*/
+@interfaceaudience private
+class fshlog implements hlog  syncable
+static final log log   logfactory getlog fshlog class
+private final filesystem fs
+private final path rootdir
+private final path dir
+private final configuration conf
+// listeners that are called on wal events.
+private list<walactionslistener> listeners
+new copyonwritearraylist<walactionslistener>
+private final long optionalflushinterval
+private final long blocksize
+private final string prefix
+private final atomiclong unflushedentries   new atomiclong 0
+private volatile long syncedtillhere   0
+private long lastdeferredtxid
+private final path oldlogdir
+private volatile boolean logrollrunning
+private boolean failiflogdirexists
+private walcoprocessorhost coprocessorhost
+private fsdataoutputstream hdfs_out     fsdataoutputstream associated with the current sequencefile writer
+// minimum tolerable replicas, if the actual value is lower than it,
+// rollwriter will be triggered
+private int mintolerablereplication
+private method getnumcurrentreplicas     refers to dfsoutputstream getnumcurrentreplicas
+final static object  no_args   new object
+/** the barrier used to ensure that close() waits for all log rolls and flushes to finish. */
+private drainbarrier closebarrier   new drainbarrier
+/**
+* current log file.
+*/
+writer writer
+/**
+* map of all log files but the current one.
+*/
+final sortedmap<long  path> outputfiles
+collections synchronizedsortedmap new treemap<long  path>
+/**
+* this lock synchronizes all operations on oldestunflushedseqnums and oldestflushingseqnums,
+* with the exception of append's putifabsent into oldestunflushedseqnums.
+* we only use these to find out the low bound seqnum, or to find regions with old seqnums to
+* force flush them, so we don't care about these numbers messing with anything. */
+private final object oldestseqnumslock   new object
+/**
+* this lock makes sure only one log roll runs at the same time. should not be taken while
+* any other lock is held. we don't just use synchronized because that results in bogus and
+* tedious findbugs warning when it thinks synchronized controls writer thread safety */
+private final object rollwriterlock   new object
+/**
+* map of encoded region names to their most recent sequence/edit id in their memstore.
+*/
+private final concurrentskiplistmap<byte   long> oldestunflushedseqnums
+new concurrentskiplistmap<byte   long> bytes bytes_comparator
+/**
+* map of encoded region names to their most recent sequence/edit id in their memstore;
+* contains the regions that are currently flushing. that way we can store two numbers for
+* flushing and non-flushing (oldestunflushedseqnums) memstore for the same region.
+*/
+private final map<byte  long> oldestflushingseqnums
+new treemap<byte  long> bytes bytes_comparator
+private volatile boolean closed   false
+private final atomiclong logseqnum   new atomiclong 0
+private boolean formeta   false
+// the timestamp (in ms) when the log file was created.
+private volatile long filenum    1
+//number of transactions in the current hlog.
+private final atomicinteger numentries   new atomicinteger 0
+// if live datanode count is lower than the default replicas value,
+// rollwriter will be triggered in each sync(so the rollwriter will be
+// triggered one by one in a short time). using it as a workaround to slow
+// down the roll frequency triggered by checklowreplication().
+private atomicinteger consecutivelogrolls   new atomicinteger 0
+private final int lowreplicationrolllimit
+// if consecutivelogrolls is larger than lowreplicationrolllimit,
+// then disable the rolling in checklowreplication().
+// enable it if the replications recover.
+private volatile boolean lowreplicationrollenabled   true
+// if > than this size, roll the log. this is typically 0.95 times the size
+// of the default hdfs block size.
+private final long logrollsize
+// we synchronize on updatelock to prevent updates and to prevent a log roll
+// during an update
+// locked during appends
+private final object updatelock   new object
+private final object flushlock   new object
+private final boolean enabled
+/*
+* if more than this many logs, force flush of oldest region to oldest edit
+* goes to disk.  if too many and we crash, then will take forever replaying.
+* keep the number of logs tidy.
+*/
+private final int maxlogs
+/**
+* thread that handles optional sync'ing
+*/
+private final logsyncer logsyncer
+/** number of log close errors tolerated before we abort */
+private final int closeerrorstolerated
+private final atomicinteger closeerrorcount   new atomicinteger
+private final metricswal metrics
+/**
+* constructor.
+*
+* @param fs filesystem handle
+* @param root path for stored and archived hlogs
+* @param logdir dir where hlogs are stored
+* @param conf configuration to use
+* @throws ioexception
+*/
+public fshlog final filesystem fs  final path root  final string logdir
+final configuration conf
+throws ioexception
+this fs  root  logdir  hconstants hregion_oldlogdir_name
+conf  null  true  null  false
+/**
+* constructor.
+*
+* @param fs filesystem handle
+* @param root path for stored and archived hlogs
+* @param logdir dir where hlogs are stored
+* @param oldlogdir dir where hlogs are archived
+* @param conf configuration to use
+* @throws ioexception
+*/
+public fshlog final filesystem fs  final path root  final string logdir
+final string oldlogdir  final configuration conf
+throws ioexception
+this fs  root  logdir  oldlogdir
+conf  null  true  null  false
+/**
+* create an edit log at the given <code>dir</code> location.
+*
+* you should never have to load an existing log. if there is a log at
+* startup, it should have already been processed and deleted by the time the
+* hlog object is started up.
+*
+* @param fs filesystem handle
+* @param root path for stored and archived hlogs
+* @param logdir dir where hlogs are stored
+* @param conf configuration to use
+* @param listeners listeners on wal events. listeners passed here will
+* be registered before we do anything else; e.g. the
+* constructor {@link #rollwriter()}.
+* @param prefix should always be hostname and port in distributed env and
+*        it will be url encoded before being used.
+*        if prefix is null, "hlog" will be used
+* @throws ioexception
+*/
+public fshlog final filesystem fs  final path root  final string logdir
+final configuration conf  final list<walactionslistener> listeners
+final string prefix  throws ioexception
+this fs  root  logdir  hconstants hregion_oldlogdir_name
+conf  listeners  true  prefix  false
+/**
+* create an edit log at the given <code>dir</code> location.
+*
+* you should never have to load an existing log. if there is a log at
+* startup, it should have already been processed and deleted by the time the
+* hlog object is started up.
+*
+* @param fs filesystem handle
+* @param root path to where logs and oldlogs
+* @param logdir dir where hlogs are stored
+* @param oldlogdir dir where hlogs are archived
+* @param conf configuration to use
+* @param listeners listeners on wal events. listeners passed here will
+* be registered before we do anything else; e.g. the
+* constructor {@link #rollwriter()}.
+* @param failiflogdirexists if true ioexception will be thrown if dir already exists.
+* @param prefix should always be hostname and port in distributed env and
+*        it will be url encoded before being used.
+*        if prefix is null, "hlog" will be used
+* @param formeta if this hlog is meant for meta updates
+* @throws ioexception
+*/
+public fshlog final filesystem fs  final path root  final string logdir
+final string oldlogdir  final configuration conf
+final list<walactionslistener> listeners
+final boolean failiflogdirexists  final string prefix  boolean formeta
+throws ioexception
+super
+this fs   fs
+this rootdir   root
+this dir   new path this rootdir  logdir
+this oldlogdir   new path this rootdir  oldlogdir
+this formeta   formeta
+this conf   conf
+if  listeners    null
+for  walactionslistener i  listeners
+registerwalactionslistener i
+this failiflogdirexists   failiflogdirexists
+this blocksize   this conf getlong
+getdefaultblocksize
+// roll at 95% of block size.
+float multi   conf getfloat    0 95f
+this logrollsize    long  this blocksize   multi
+this optionalflushinterval
+conf getlong    1   1000
+this maxlogs   conf getint    32
+this mintolerablereplication   conf getint
+this fs getdefaultreplication
+this lowreplicationrolllimit   conf getint
+5
+this enabled   conf getboolean    true
+this closeerrorstolerated   conf getint
+0
+this logsyncer   new logsyncer this optionalflushinterval
+log info
+stringutils bytedesc this blocksize
+stringutils bytedesc this logrollsize
+this enabled
+this optionalflushinterval
+// if prefix is null||empty then just name it hlog
+this prefix   prefix    null    prefix isempty   ?
+urlencoder encode prefix
+boolean direxists   false
+if  failiflogdirexists     direxists   this fs exists dir
+throw new ioexception     dir
+if   direxists     fs mkdirs dir
+throw new ioexception     dir
+if   fs exists this oldlogdir
+if   fs mkdirs this oldlogdir
+throw new ioexception     this oldlogdir
+// rollwriter sets this.hdfs_out if it can.
+rollwriter
+// handle the reflection necessary to call getnumcurrentreplicas()
+this getnumcurrentreplicas   getgetnumcurrentreplicas this hdfs_out
+// when optionalflushinterval is set as 0, don't start a thread for deferred log sync.
+if  this optionalflushinterval > 0
+threads setdaemonthreadrunning logsyncer getthread    thread currentthread   getname
+else
+log info
+this optionalflushinterval
+coprocessorhost   new walcoprocessorhost this  conf
+this metrics   new metricswal
+// use reflection to search for getdefaultblocksize(path f)
+// if the method doesn't exist, fall back to using getdefaultblocksize()
+private long getdefaultblocksize   throws ioexception
+method m   null
+class<? extends filesystem> cls   this fs getclass
+try
+m   cls getmethod
+new class<?>   path class
+catch  nosuchmethodexception e
+log info
+catch  securityexception e
+log info
+e
+m   null     could happen on setaccessible
+if  null    m
+return this fs getdefaultblocksize
+else
+try
+object ret   m invoke this fs  this dir
+return   long ret  longvalue
+catch  exception e
+throw new ioexception e
+/**
+* find the 'getnumcurrentreplicas' on the passed <code>os</code> stream.
+* @return method or null.
+*/
+private method getgetnumcurrentreplicas final fsdataoutputstream os
+method m   null
+if  os    null
+class<? extends outputstream> wrappedstreamclass   os getwrappedstream
+getclass
+try
+m   wrappedstreamclass getdeclaredmethod
+new class<?>
+m setaccessible true
+catch  nosuchmethodexception e
+log info
+wrappedstreamclass getname
+catch  securityexception e
+log info
+wrappedstreamclass getname    e
+m   null     could happen on setaccessible
+if  m    null
+log info
+return m
+@override
+public void registerwalactionslistener final walactionslistener listener
+this listeners add listener
+@override
+public boolean unregisterwalactionslistener final walactionslistener listener
+return this listeners remove listener
+@override
+public long getfilenum
+return this filenum
+@override
+public void setsequencenumber final long newvalue
+for  long id   this logseqnum get    id < newvalue
+this logseqnum compareandset id  newvalue   id   this logseqnum get
+// this could spin on occasion but better the occasional spin than locking
+// every increment of sequence number.
+log debug     id       newvalue
+@override
+public long getsequencenumber
+return logseqnum get
+/**
+* method used internal to this class and for tests only.
+* @return the wrapped stream our writer is using; its not the
+* writer's 'out' fsdatooutputstream but the stream that this 'out' wraps
+* (in hdfs its an instance of dfsdataoutputstream).
+*
+* usage: see testlogrolling.java
+*/
+outputstream getoutputstream
+return this hdfs_out getwrappedstream
+@override
+public byte  rollwriter   throws failedlogcloseexception  ioexception
+return rollwriter false
+@override
+public byte  rollwriter boolean force
+throws failedlogcloseexception  ioexception
+synchronized  rollwriterlock
+// return if nothing to flush.
+if   force    this writer    null    this numentries get   <  0
+return null
+byte  regionstoflush   null
+try
+this logrollrunning   true
+boolean isclosed   closed
+if  isclosed     closebarrier beginop
+log debug      isclosed ?
+return regionstoflush
+// do all the preparation outside of the updatelock to block
+// as less as possible the incoming writes
+long currentfilenum   this filenum
+path oldpath   null
+if  currentfilenum > 0
+//computefilename  will take care of meta hlog filename
+oldpath   computefilename currentfilenum
+this filenum   system currenttimemillis
+path newpath   computefilename
+// tell our listeners that a new log is about to be created
+if   this listeners isempty
+for  walactionslistener i   this listeners
+i prelogroll oldpath  newpath
+fshlog writer nextwriter   this createwriterinstance fs  newpath  conf
+// can we get at the dfsclient outputstream?  if an instance of
+// sflw, it'll have done the necessary reflection to get at the
+// protected field name.
+fsdataoutputstream nexthdfsout   null
+if  nextwriter instanceof sequencefilelogwriter
+nexthdfsout     sequencefilelogwriter nextwriter  getwriterfsdataoutputstream
+path oldfile   null
+int oldnumentries   0
+synchronized  updatelock
+// clean up current writer.
+oldnumentries   this numentries get
+oldfile   cleanupcurrentwriter currentfilenum
+this writer   nextwriter
+this hdfs_out   nexthdfsout
+this numentries set 0
+log info      oldfile    null ?     fsutils getpath oldfile
+oldnumentries       this fs getfilestatus oldfile  getlen
+fsutils getpath newpath
+// tell our listeners that a new log was created
+if   this listeners isempty
+for  walactionslistener i   this listeners
+i postlogroll oldpath  newpath
+// can we delete any of the old log files?
+if  getnumlogfiles   > 0
+cleanoldlogs
+regionstoflush   getregionstoforceflush
+finally
+this logrollrunning   false
+closebarrier endop
+return regionstoflush
+/**
+* this method allows subclasses to inject different writers without having to
+* extend other methods like rollwriter().
+*
+* @param fs
+* @param path
+* @param conf
+* @return writer instance
+* @throws ioexception
+*/
+protected writer createwriterinstance final filesystem fs  final path path
+final configuration conf  throws ioexception
+if  formeta
+//todo: set a higher replication for the hlog files (hbase-6773)
+return hlogfactory createwriter fs  path  conf
+/*
+* clean up old commit logs.
+* @return if lots of logs, flush the returned region so next time through
+* we can clean logs. returns null if nothing to flush.  returns array of
+* encoded region names to flush.
+* @throws ioexception
+*/
+private void cleanoldlogs   throws ioexception
+long oldestoutstandingseqnum   long max_value
+synchronized  oldestseqnumslock
+long oldestflushing    oldestflushingseqnums size   > 0
+? collections min oldestflushingseqnums values      long max_value
+long oldestunflushed    oldestunflushedseqnums size   > 0
+? collections min oldestunflushedseqnums values      long max_value
+oldestoutstandingseqnum   math min oldestflushing  oldestunflushed
+// get the set of all log files whose last sequence number is smaller than
+// the oldest edit's sequence number.
+treeset<long> sequencenumbers   new treeset<long> this outputfiles headmap
+oldestoutstandingseqnum  keyset
+// now remove old log files (if any)
+if  log isdebugenabled
+if  sequencenumbers size   > 0
+log debug     sequencenumbers size
+this outputfiles size
+oldestoutstandingseqnum
+for  long seq   sequencenumbers
+archivelogfile this outputfiles remove seq   seq
+/**
+* return regions that have edits that are equal or less than a certain sequence number.
+* static due to some old unit test.
+* @param walseqnum the sequence number to compare with.
+* @param regionstoseqnums encoded region names to sequence ids
+* @return all regions whose seqnum <= walseqnum. null if no regions found.
+*/
+static byte findmemstoreswitheditsequalorolderthan
+final long walseqnum  final map<byte  long> regionstoseqnums
+list<byte> regions   null
+for  map entry<byte  long> e   regionstoseqnums entryset
+if  e getvalue   longvalue   <  walseqnum
+if  regions    null  regions   new arraylist<byte>
+regions add e getkey
+return regions    null ? null   regions
+toarray new byte   hconstants empty_byte_array
+private byte getregionstoforceflush   throws ioexception
+// if too many log files, figure which regions we need to flush.
+// array is an array of encoded region names.
+byte  regions   null
+int logcount   getnumlogfiles
+if  logcount > this maxlogs    logcount > 0
+// this is an array of encoded region names.
+synchronized  oldestseqnumslock
+regions   findmemstoreswitheditsequalorolderthan this outputfiles firstkey
+this oldestunflushedseqnums
+if  regions    null
+stringbuilder sb   new stringbuilder
+for  int i   0  i < regions length  i
+if  i > 0  sb append
+sb append bytes tostringbinary regions
+log info     logcount
+this maxlogs       regions length
+sb tostring
+return regions
+/*
+* cleans up current writer closing and adding to outputfiles.
+* presumes we're operating inside an updatelock scope.
+* @return path to current writer or null if none.
+* @throws ioexception
+*/
+path cleanupcurrentwriter final long currentfilenum  throws ioexception
+path oldfile   null
+if  this writer    null
+// close the current writer, get a new one.
+try
+// wait till all current transactions are written to the hlog.
+// no new transactions can occur because we have the updatelock.
+if  this unflushedentries get      this syncedtillhere
+log debug
+this unflushedentries get
+syncedtillhere
+sync
+this writer close
+this writer   null
+closeerrorcount set 0
+catch  ioexception e
+log error    e
+int errors   closeerrorcount incrementandget
+if  errors <  closeerrorstolerated     hasdeferredentries
+log warn   errors
+else
+if  hasdeferredentries
+log error
+// failed close of log file.  means we're losing edits.  for now,
+// shut ourselves down to minimize loss.  alternative is to try and
+// keep going.  see hbase-930.
+failedlogcloseexception flce
+new failedlogcloseexception     currentfilenum
+flce initcause e
+throw flce
+if  currentfilenum >  0
+oldfile   computefilename currentfilenum
+this outputfiles put long valueof this logseqnum get     oldfile
+return oldfile
+private void archivelogfile final path p  final long seqno  throws ioexception
+path newpath   gethlogarchivepath this oldlogdir  p
+log info     fsutils getpath p
+seqno
+fsutils getpath newpath
+// tell our listeners that a log is going to be archived.
+if   this listeners isempty
+for  walactionslistener i   this listeners
+i prelogarchive p  newpath
+if   this fs rename p  newpath
+throw new ioexception     p       newpath
+// tell our listeners that a log has been archived.
+if   this listeners isempty
+for  walactionslistener i   this listeners
+i postlogarchive p  newpath
+/**
+* this is a convenience method that computes a new filename with a given
+* using the current hlog file-number
+* @return path
+*/
+protected path computefilename
+return computefilename this filenum
+/**
+* this is a convenience method that computes a new filename with a given
+* file-number.
+* @param filenum to use
+* @return path
+*/
+protected path computefilename long filenum
+if  filenum < 0
+throw new runtimeexception
+string child   prefix       filenum
+if  formeta
+child    hlog meta_hlog_file_extn
+return new path dir  child
+@override
+public void closeanddelete   throws ioexception
+close
+if   fs exists this dir   return
+filestatus files   fs liststatus this dir
+for filestatus file   files
+path p   gethlogarchivepath this oldlogdir  file getpath
+// tell our listeners that a log is going to be archived.
+if   this listeners isempty
+for  walactionslistener i   this listeners
+i prelogarchive file getpath    p
+if   fs rename file getpath   p
+throw new ioexception     file getpath         p
+// tell our listeners that a log was archived.
+if   this listeners isempty
+for  walactionslistener i   this listeners
+i postlogarchive file getpath    p
+log debug     files length
+fsutils getpath this oldlogdir
+if   fs delete dir  true
+log info     dir
+@override
+public void close   throws ioexception
+if  this closed
+return
+// when optionalflushinterval is 0, the logsyncer is not started as a thread.
+if  this optionalflushinterval > 0
+try
+logsyncer close
+// make sure we synced everything
+logsyncer join this optionalflushinterval   2
+catch  interruptedexception e
+log error    e
+thread currentthread   interrupt
+try
+// prevent all further flushing and rolling.
+closebarrier stopanddrainops
+catch  interruptedexception e
+log error    e
+thread currentthread   interrupt
+// tell our listeners that the log is closing
+if   this listeners isempty
+for  walactionslistener i   this listeners
+i logcloserequested
+synchronized  updatelock
+this closed   true
+if  log isdebugenabled
+log debug     this dir tostring
+if  this writer    null
+this writer close
+this writer   null
+/**
+* @param now
+* @param regionname
+* @param tablename
+* @param clusterid
+* @return new log key.
+*/
+protected hlogkey makekey byte regionname  byte tablename  long seqnum
+long now  uuid clusterid
+return new hlogkey regionname  tablename  seqnum  now  clusterid
+@override
+public long append hregioninfo regioninfo  hlogkey logkey  waledit logedit
+htabledescriptor htd  boolean dosync
+throws ioexception
+if  this closed
+throw new ioexception
+long txid   0
+synchronized  updatelock
+long seqnum   obtainseqnum
+logkey setlogseqnum seqnum
+// the 'lastseqwritten' map holds the sequence number of the oldest
+// write for each region (i.e. the first edit added to the particular
+// memstore). when the cache is flushed, the entry for the
+// region being flushed is removed if the sequence number of the flush
+// is greater than or equal to the value in lastseqwritten.
+this oldestunflushedseqnums putifabsent regioninfo getencodednameasbytes
+long valueof seqnum
+dowrite regioninfo  logkey  logedit  htd
+txid   this unflushedentries incrementandget
+this numentries incrementandget
+if  htd isdeferredlogflush
+lastdeferredtxid   txid
+// sync if catalog region, and if not then check if that table supports
+// deferred log flushing
+if  dosync
+regioninfo ismetaregion
+htd isdeferredlogflush
+// sync txn to file system
+this sync txid
+return txid
+@override
+public void append hregioninfo info  byte  tablename  waledit edits
+final long now  htabledescriptor htd
+throws ioexception
+append info  tablename  edits  hconstants default_cluster_id  now  htd
+/**
+* append a set of edits to the log. log edits are keyed by (encoded)
+* regionname, rowname, and log-sequence-id.
+*
+* later, if we sort by these keys, we obtain all the relevant edits for a
+* given key-range of the hregion (todo). any edits that do not have a
+* matching complete_cacheflush message can be discarded.
+*
+* <p>
+* logs cannot be restarted once closed, or once the hlog process dies. each
+* time the hlog starts, it must create a new log. this means that other
+* systems should process the log appropriately upon each startup (and prior
+* to initializing hlog).
+*
+* synchronized prevents appends during the completion of a cache flush or for
+* the duration of a log roll.
+*
+* @param info
+* @param tablename
+* @param edits
+* @param clusterid the originating clusterid for this edit (for replication)
+* @param now
+* @param dosync shall we sync?
+* @return txid of this transaction
+* @throws ioexception
+*/
+private long append hregioninfo info  byte  tablename  waledit edits  uuid clusterid
+final long now  htabledescriptor htd  boolean dosync
+throws ioexception
+if  edits isempty    return this unflushedentries get
+if  this closed
+throw new ioexception
+long txid   0
+synchronized  this updatelock
+long seqnum   obtainseqnum
+// the 'lastseqwritten' map holds the sequence number of the oldest
+// write for each region (i.e. the first edit added to the particular
+// memstore). . when the cache is flushed, the entry for the
+// region being flushed is removed if the sequence number of the flush
+// is greater than or equal to the value in lastseqwritten.
+// use encoded name.  its shorter, guaranteed unique and a subset of
+// actual  name.
+byte  encodedregionname   info getencodednameasbytes
+this oldestunflushedseqnums putifabsent encodedregionname  seqnum
+hlogkey logkey   makekey encodedregionname  tablename  seqnum  now  clusterid
+dowrite info  logkey  edits  htd
+this numentries incrementandget
+txid   this unflushedentries incrementandget
+if  htd isdeferredlogflush
+lastdeferredtxid   txid
+// sync if catalog region, and if not then check if that table supports
+// deferred log flushing
+if  dosync
+info ismetaregion
+htd isdeferredlogflush
+// sync txn to file system
+this sync txid
+return txid
+@override
+public long appendnosync hregioninfo info  byte  tablename  waledit edits
+uuid clusterid  final long now  htabledescriptor htd
+throws ioexception
+return append info  tablename  edits  clusterid  now  htd  false
+@override
+public long append hregioninfo info  byte  tablename  waledit edits
+uuid clusterid  final long now  htabledescriptor htd
+throws ioexception
+return append info  tablename  edits  clusterid  now  htd  true
+/**
+* this class is responsible to hold the hlog's appended entry list
+* and to sync them according to a configurable interval.
+*
+* deferred log flushing works first by piggy backing on this process by
+* simply not sync'ing the appended entry. it can also be sync'd by other
+* non-deferred log flushed entries outside of this thread.
+*/
+class logsyncer extends hasthread
+private final long optionalflushinterval
+private final atomicboolean closelogsyncer   new atomicboolean false
+// list of pending writes to the hlog. there corresponds to transactions
+// that have not yet returned to the client. we keep them cached here
+// instead of writing them to hdfs piecemeal, because the hdfs write
+// method is pretty heavyweight as far as locking is concerned. the
+// goal is to increase the batchsize for writing-to-hdfs as well as
+// sync-to-hdfs, so that we can get better system throughput.
+private list<entry> pendingwrites   new linkedlist<entry>
+logsyncer long optionalflushinterval
+this optionalflushinterval   optionalflushinterval
+@override
+public void run
+try
+// awaiting with a timeout doesn't always
+// throw exceptions on interrupt
+while  this isinterrupted       closelogsyncer get
+try
+if  unflushedentries get   <  syncedtillhere
+synchronized  closelogsyncer
+closelogsyncer wait this optionalflushinterval
+// calling sync since we waited or had unflushed entries.
+// entries appended but not sync'd are taken care of here aka
+// deferred log flush
+sync
+catch  ioexception e
+log error    e
+requestlogroll
+catch  interruptedexception e
+log debug getname
+finally
+log info getname
+// appends new writes to the pendingwrites. it is better to keep it in
+// our own queue rather than writing it to the hdfs output stream because
+// hdfsoutputstream.writechunk is not lightweight at all.
+synchronized void append entry e  throws ioexception
+pendingwrites add e
+// returns all currently pending writes. new writes
+// will accumulate in a new list.
+synchronized list<entry> getpendingwrites
+list<entry> save   this pendingwrites
+this pendingwrites   new linkedlist<entry>
+return save
+// writes out pending entries to the hlog
+void hlogflush writer writer  list<entry> pending  throws ioexception
+if  pending    null  return
+// write out all accumulated entries to hdfs.
+for  entry e   pending
+writer append e
+void close
+synchronized  closelogsyncer
+closelogsyncer set true
+closelogsyncer notifyall
+// sync all known transactions
+private void syncer   throws ioexception
+syncer this unflushedentries get        sync all pending items
+// sync all transactions upto the specified txid
+private void syncer long txid  throws ioexception
+writer tempwriter
+synchronized  this updatelock
+if  this closed  return
+// guaranteed non-null.
+// note that parallel sync can close tempwriter.
+// the current method of dealing with this is to catch exceptions.
+// see hbase-4387, hbase-5623, hbase-7329.
+tempwriter   this writer
+// if the transaction that we are interested in is already
+// synced, then return immediately.
+if  txid <  this syncedtillhere
+return
+try
+long doneupto
+long now   environmentedgemanager currenttimemillis
+// first flush all the pending writes to hdfs. then
+// issue the sync to hdfs. if sync is successful, then update
+// syncedtillhere to indicate that transactions till this
+// number has been successfully synced.
+ioexception ioe   null
+list<entry> pending   null
+synchronized  flushlock
+if  txid <  this syncedtillhere
+return
+doneupto   this unflushedentries get
+pending   logsyncer getpendingwrites
+try
+logsyncer hlogflush tempwriter  pending
+catch ioexception io
+ioe   io
+log error     txid  ioe
+if  ioe    null    pending    null
+synchronized  this updatelock
+synchronized  flushlock
+// hbase-4387, hbase-5623, retry with updatelock held
+tempwriter   this writer
+logsyncer hlogflush tempwriter  pending
+// another thread might have sync'ed avoid double-sync'ing
+if  txid <  this syncedtillhere
+return
+try
+if  tempwriter    null  tempwriter sync
+catch ioexception ex
+synchronized  this updatelock
+// hbase-4387, hbase-5623, retry with updatelock held
+// todo: we don't actually need to do it for concurrent close - what is the point
+//       of syncing new unrelated writer? keep behavior for now.
+tempwriter   this writer
+if  tempwriter    null  tempwriter sync
+this syncedtillhere   math max this syncedtillhere  doneupto
+this metrics finishsync environmentedgemanager currenttimemillis     now
+// todo: preserving the old behavior for now, but this check is strange. it's not
+//       protected by any locks here, so for all we know rolling locks might start
+//       as soon as we enter the "if". is this best-effort optimization check?
+if   this logrollrunning
+checklowreplication
+try
+if  tempwriter getlength   > this logrollsize
+requestlogroll
+catch  ioexception x
+log debug
+catch  ioexception e
+log fatal    e
+requestlogroll
+throw e
+private void checklowreplication
+// if the number of replicas in hdfs has fallen below the configured
+// value, then roll logs.
+try
+int numcurrentreplicas   getlogreplication
+if  numcurrentreplicas    0
+numcurrentreplicas < this mintolerablereplication
+if  this lowreplicationrollenabled
+if  this consecutivelogrolls get   < this lowreplicationrolllimit
+log warn
+numcurrentreplicas
+this mintolerablereplication
+requestlogroll
+// if rollwriter is requested, increase consecutivelogrolls. once it
+// is larger than lowreplicationrolllimit, disable the
+// lowreplication-roller
+this consecutivelogrolls getandincrement
+else
+log warn
+this consecutivelogrolls set 0
+this lowreplicationrollenabled   false
+else if  numcurrentreplicas >  this mintolerablereplication
+if   this lowreplicationrollenabled
+// the new writer's log replicas is always the default value.
+// so we should not enable lowreplication-roller. if numentries
+// is lower than or equals 1, we consider it as a new writer.
+if  this numentries get   <  1
+return
+// once the live datanode number and the replicas return to normal,
+// enable the lowreplication-roller.
+this lowreplicationrollenabled   true
+log info
+catch  exception e
+log warn     e
+/**
+* this method gets the datanode replication count for the current hlog.
+*
+* if the pipeline isn't started yet or is empty, you will get the default
+* replication factor.  therefore, if this function returns 0, it means you
+* are not properly running with the hdfs-826 patch.
+* @throws invocationtargetexception
+* @throws illegalaccessexception
+* @throws illegalargumentexception
+*
+* @throws exception
+*/
+int getlogreplication
+throws illegalargumentexception  illegalaccessexception  invocationtargetexception
+if  this getnumcurrentreplicas    null    this hdfs_out    null
+object repl   this getnumcurrentreplicas invoke getoutputstream    no_args
+if  repl instanceof integer
+return   integer repl  intvalue
+return 0
+boolean cangetcurreplicas
+return this getnumcurrentreplicas    null
+public void hsync   throws ioexception
+syncer
+public void hflush   throws ioexception
+syncer
+public void sync   throws ioexception
+syncer
+public void sync long txid  throws ioexception
+syncer txid
+private void requestlogroll
+if   this listeners isempty
+for  walactionslistener i  this listeners
+i logrollrequested
+protected void dowrite hregioninfo info  hlogkey logkey  waledit logedit
+htabledescriptor htd
+throws ioexception
+if   this enabled
+return
+if   this listeners isempty
+for  walactionslistener i  this listeners
+i visitlogentrybeforewrite htd  logkey  logedit
+try
+long now   environmentedgemanager currenttimemillis
+// coprocessor hook:
+if   coprocessorhost prewalwrite info  logkey  logedit
+// write to our buffer for the hlog file.
+logsyncer append new fshlog entry logkey  logedit
+long took   environmentedgemanager currenttimemillis     now
+coprocessorhost postwalwrite info  logkey  logedit
+long len   0
+for  keyvalue kv   logedit getkeyvalues
+len    kv getlength
+this metrics finishappend took  len
+catch  ioexception e
+log fatal    e
+requestlogroll
+throw e
+/** @return how many items have been added to the log */
+int getnumentries
+return numentries get
+@override
+public long obtainseqnum
+return this logseqnum incrementandget
+/** @return the number of log files in use */
+int getnumlogfiles
+return outputfiles size
+@override
+public long startcacheflush final byte encodedregionname
+long oldregionseqnum   null
+if   closebarrier beginop
+return null
+synchronized  oldestseqnumslock
+oldregionseqnum   this oldestunflushedseqnums remove encodedregionname
+if  oldregionseqnum    null
+long oldvalue   this oldestflushingseqnums put encodedregionname  oldregionseqnum
+assert oldvalue    null
+bytes tostring encodedregionname
+if  oldregionseqnum    null
+// todo: if we have no oldregionseqnum, and wal is not disabled, presumably either
+//       the region is already flushing (which would make this call invalid), or there
+//       were no appends after last flush, so why are we starting flush? maybe we should
+//       assert not null, and switch to "long" everywhere. less rigorous, but safer,
+//       alternative is telling the caller to stop. for now preserve old logic.
+log warn
+bytes tostring encodedregionname
+return obtainseqnum
+@override
+public void completecacheflush final byte  encodedregionname
+synchronized  oldestseqnumslock
+this oldestflushingseqnums remove encodedregionname
+closebarrier endop
+@override
+public void abortcacheflush byte encodedregionname
+long currentseqnum   null  seqnumbeforeflushstarts   null
+synchronized  oldestseqnumslock
+seqnumbeforeflushstarts   this oldestflushingseqnums remove encodedregionname
+if  seqnumbeforeflushstarts    null
+currentseqnum
+this oldestunflushedseqnums put encodedregionname  seqnumbeforeflushstarts
+closebarrier endop
+if   currentseqnum    null
+currentseqnum longvalue   <  seqnumbeforeflushstarts longvalue
+string errorstr       bytes tostring encodedregionname
+currentseqnum
+seqnumbeforeflushstarts
+log error errorstr
+assert false   errorstr
+runtime getruntime   halt 1
+@override
+public boolean islowreplicationrollenabled
+return lowreplicationrollenabled
+/**
+* get the directory we are making logs in.
+*
+* @return dir
+*/
+protected path getdir
+return dir
+static path gethlogarchivepath path oldlogdir  path p
+return new path oldlogdir  p getname
+static string formatrecoverededitsfilename final long seqid
+return string format    seqid
+public static final long fixed_overhead   classsize align
+classsize object    5   classsize reference
+classsize atomic_integer   bytes sizeof_int    3   bytes sizeof_long
+private static void usage
+system err println
+system err println
+system err println
+system err println
+system err println
+system err println
+private static void split final configuration conf  final path p
+throws ioexception
+filesystem fs   filesystem get conf
+if   fs exists p
+throw new filenotfoundexception p tostring
+final path basedir   fsutils getrootdir conf
+final path oldlogdir   new path basedir  hconstants hregion_oldlogdir_name
+if   fs getfilestatus p  isdir
+throw new ioexception p
+hlogsplitter logsplitter   hlogsplitter createlogsplitter
+conf  basedir  p  oldlogdir  fs
+logsplitter splitlog
+@override
+public walcoprocessorhost getcoprocessorhost
+return coprocessorhost
+/** provide access to currently deferred sequence num for tests */
+boolean hasdeferredentries
+return lastdeferredtxid > syncedtillhere
+@override
+public long getearliestmemstoreseqnum byte encodedregionname
+long result   oldestunflushedseqnums get encodedregionname
+return result    null ? hconstants no_seqnum   result longvalue
+/**
+* pass one or more log file names and it will either dump out a text version
+* on <code>stdout</code> or split the specified log files.
+*
+* @param args
+* @throws ioexception
+*/
+public static void main string args  throws ioexception
+if  args length < 2
+usage
+system exit  1
+// either dump using the hlogprettyprinter or split, depending on args
+if  args compareto       0
+hlogprettyprinter run arrays copyofrange args  1  args length
+else if  args compareto       0
+configuration conf   hbaseconfiguration create
+for  int i   1  i < args length  i
+try
+path logpath   new path args
+fsutils setfsdefault conf  logpath
+split conf  logpath
+catch  throwable t
+t printstacktrace system err
+system exit  1
+else
+usage
+system exit  1

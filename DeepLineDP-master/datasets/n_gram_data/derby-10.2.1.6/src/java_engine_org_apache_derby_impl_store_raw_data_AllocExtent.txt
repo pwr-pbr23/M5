@@ -1,0 +1,712 @@
+/*
+derby - class org.apache.derby.impl.store.raw.data.allocextent
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store raw data
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby iapi store raw containerhandle
+import org apache derby iapi store raw xact rawtransaction
+import org apache derby iapi services io formatablebitset
+import java io externalizable
+import java io ioexception
+import java io objectoutput
+import java io objectinput
+/**
+an allocation extent row manages the page status of page in the extent.
+allocextent is externalizable and is written to the allocpage directly,
+without being converted to a row first.
+<p>
+<pre>
+@format_id	none, format implied by allocpage's format
+@purpose	manage page status of page in extent
+@upgrade
+@disk_layout
+extentoffset(long) the begin physical byte offset of the first page of this extent
+extentstart(long) the first logical page mananged by this extent.
+extentend(long) the last page this extent can ever hope to manage
+extentlength(int) the number of pages allocated in this extent
+extentstatus(int) status bits for the whole extent.
+has_deallocated - most likely, this extent has a deallocated
+page somewhere
+if !had_deallocated, the extent has no deallocated page
+has_free - most likely, this extent has a free page somewhere
+if !has_free, there is no free page in the extent
+all_free - most likely, this extent only has free pages, good
+candidate for shrinking the file.
+if !all_free, the extent is not all free
+has_unfilled_pages - most likely, this extent has unfilled pages.
+if !has_unfilled_pages, all pages are filled
+keep_unfilled_pages - this extent keeps track of unfilled pages
+(post v1.3).  if not set, this extent has no notion of
+unfilled page and has no unfilledpage bitmap.
+no_dealloc_page_map - this extents do not have a dealloc and a
+free page bit maps.  prior to 2.0, there are 2 bit
+maps, a deallocate page bit map and a free page bit
+map.  cloudscape 2.0 and later merged the dealloc page
+bit map into the free page bit map.
+retired - this extent contains only 'retired' pages, never use
+any page from this extent.  the pages don't actually
+exist, i.e., it maps to nothing (physicaloffset is
+garbage).  the purpose of this extent is to blot out a
+range of logical page numbers that no longer exists
+for this container.  use this to reuse a physical page
+when a logical page has exhausted all recordid or for
+logical pages that has been shrunk out.
+prealloclength(int)  the number of pages that have been preallocated
+reserved1(int)
+reserved2(long)	reserved for future use
+reserved3(long)	reserved for future use
+freepages(bit)	bitmap of free pages
+bit[i] is on iff page i is free for immediate (re)use.
+[
+on disk version before 2.0
+deallocpages(bit) bitmap of deallocated pages
+bit[i] is on iff page i has been deallocated.
+]
+unfilledpages(bit)	bitmap of pages that has free space
+bit[i] is on if page i is likely to be < 1/2 full
+org.apache.derby.iapi.services.io.formatablebitset is used to store the bit map.
+formatablebitset is an externalizable class.
+@end_format
+<pre>
+a page can have the following logical state:
+<br>free - a page that is free to be used
+<br>valid - a page that is currently in use
+<p>
+there is another type of transitional pages which pages that have been
+allocated on disk but has not yet been used.  these pages are free.
+<p>
+bit[k] freepages
+bit[i] is on iff page i maybe free for reuse.  user must get the
+dealloc page lock on the free page to make sure the transaction.
+<p>
+k is the size of the bit array, it must be >= length.
+@see allocpage
+*/
+public class allocextent implements externalizable
+private long extentoffset 	   begin physical offset
+private long extentstart 	   first logical page number
+private long extentend 		   last logical page number
+// page[extentstart] to page[extentend] are the pages in the range of this
+// alloc extent.
+// page[exentstart] to page[extentstart+extentlength-1] are actually
+// allocated in this extent
+// when the extent is completely allocated,
+// extentend == extentstart+extentlength -1
+private int extentlength 	   number of pages allocated in the extent
+int extentstatus
+private int prealloclength
+private int reserved1
+private long reserved2
+private long reserved3
+// extent status bits
+private static final int has_deallocated   0x1
+private static final int has_free   0x2
+private static final int all_free   0x4
+private static final int has_unfilled_pages   0x10
+private static final int keep_unfilled_pages   0x10000000
+private static final int no_dealloc_page_map   0x20000000
+private static final int retired   0x8
+/**
+public per page status
+*/
+protected static final int allocated_page   0
+protected static final int deallocated_page   1
+protected static final int free_page   2
+// a page which is not a freepage is a regular old
+// allocated page.  only an allocated page can be unfilled.
+formatablebitset freepages
+formatablebitset unfilledpages
+/**
+statically calculates how many pages this extent can manage given the
+availspace number of bytes to store this extent in
+if read/writeexternal changes, this must change too
+*/
+protected static int max_range int availspace
+/* extent offset, start, end, length, status, prealloclength, reserved1,2,3 */
+int bookkeeping   	8    offset
+8    start
+8    end
+4    length
+4    status
+4    prealloclength
+4    reserved1
+8    reserved2
+8    reserved3
+availspace    bookkeeping
+// each bit array is allowed to the 1/3 the remaining space
+availspace    3
+if  availspace <  0
+return 0
+// ask bit array how many bits it can store in this amount of space
+return formatablebitset maxbitsforspace availspace
+/*
+* methods
+*/
+/*
+* ctors
+*/
+protected allocextent long offset     physical offset
+long start      starting logical page number
+int length      how many pages are in this extent
+int pagesize     size of all the pages in the extent
+int maxlength     initial size of the bit map arrays
+if  sanitymanager debug
+if  length > maxlength
+sanitymanager throwassert
+length       maxlength
+this extentoffset   offset
+this extentstart   start
+this extentend   start maxlength 1
+this extentlength   length
+prealloclength   extentlength
+if  length > 0
+extentstatus   has_free   all_free
+else
+extentstatus   0
+extentstatus    keep_unfilled_pages     v1 3 or beyond
+extentstatus    no_dealloc_page_map     v2 0 or beyond
+int numbits    1  length 8   8
+if  numbits > maxlength
+numbits   maxlength
+freepages   new formatablebitset numbits
+unfilledpages   new formatablebitset numbits
+// by definition, all pages are free to begin with, no pages are
+// deallocated and no page is unfilled
+for  int i   0  i < length  i
+freepages set i
+/*
+copy constructor
+*/
+protected allocextent allocextent original
+extentoffset   original extentoffset
+extentstart	   original extentstart
+extentend	   original extentend
+extentlength   original extentlength
+extentstatus   original extentstatus
+prealloclength   original prealloclength
+freepages   new formatablebitset original freepages
+unfilledpages   new formatablebitset original unfilledpages
+/*
+* methods of externalizable
+*/
+public allocextent
+public void writeexternal objectoutput out  throws ioexception
+// any change to this routine must change maxrange
+out writelong extentoffset
+out writelong extentstart
+out writelong extentend
+out writeint extentlength
+out writeint extentstatus
+out writeint prealloclength
+out writeint 0  		   reserved1
+out writelong 0  		   reserved2
+out writelong 0  		   reserved3
+freepages writeexternal out
+unfilledpages writeexternal out
+public void readexternal objectinput in
+throws ioexception  classnotfoundexception
+// any change to this routine must change maxrange
+extentoffset   in readlong
+extentstart	  in readlong
+extentend	  in readlong
+extentlength   in readint
+extentstatus   in readint
+prealloclength   in readint
+reserved1   in readint
+reserved2   in readlong
+reserved3   in readlong
+freepages   new formatablebitset   	   don't know how to point to it
+freepages readexternal in
+// this extent is created before 2.0
+if   extentstatus   no_dealloc_page_map     0
+formatablebitset deallocpages   new formatablebitset
+deallocpages readexternal in
+// fold this into free page bit map
+freepages or deallocpages
+extentstatus    no_dealloc_page_map     dealloc page map has been merged
+if   extentstatus   keep_unfilled_pages     keep_unfilled_pages
+unfilledpages   new formatablebitset
+unfilledpages readexternal in
+else					   before we keep track of unfilled pages pre 1 3
+// make sure there are enough space
+unfilledpages   new formatablebitset freepages getlength
+extentstatus    keep_unfilled_pages     now we keep track of them
+/*
+* methods specific to allocextent
+*/
+/*
+* write operation that is called underneath the log
+*
+* page goes thru the following transition:
+* allocated_page <-> deallocated page -> free page <-> allocated_page
+*
+*/
+/**
+allocate this page - this is called underneath the log record
+@exception standardexception standard cloudscape error policy
+*/
+protected void allocpage long pagenum  throws standardexception
+if  sanitymanager debug
+if  pagenum > getlastpagenum
+// adding a brand new page, it should be at most one off from the last page
+if  pagenum > extentend
+sanitymanager throwassert     pagenum
+extentstart       extentend
+if  pagenum    getlastpagenum     1
+sanitymanager throwassert
+getlastpagenum
+pagenum
+else
+// reuseing a page, make sure it is in range and is not already in use
+checkinrange pagenum
+int bitnum    int  pagenum extentstart
+// either the pagenum is now free (do) or deallocated (undo)
+if   freepages isset bitnum
+sanitymanager throwassert
+pagenum
+// don't know if we are redoing (from free -> valid)
+// or undoing (from dealloc -> valid), reset them both
+int bitnum    int  pagenum extentstart
+if  bitnum >  freepages getlength   	   expand the bit map
+int numbits    1  bitnum 8   8
+if  numbits >  int  extentend   extentstart   1
+numbits    int  extentend   extentstart   1
+freepages grow numbits
+unfilledpages grow numbits
+// the first page to be allocated has pagenum == extentstart.
+int numpagealloced    int  pagenum extentstart 1
+if  numpagealloced > extentlength
+extentlength   numpagealloced
+freepages clear bitnum
+// do not set the unfilled bit on a newly allocated page because
+// we only keep track of unfilled head page, not unfilled overflow
+// page.
+/**
+deallocate logical page pagenum - this is called underneath the log record.
+pagenum must be a page managed by this extent and it must be valid
+@exception standardexception standard cloudscape error policy
+*/
+protected void deallocpage long pagenum  throws standardexception
+int bitnum    int  pagenum extentstart
+// the pagenum must now be either valid (do) or free (undo)
+if  sanitymanager debug
+if  freepages isset bitnum
+sanitymanager throwassert
+pagenum
+freepages set bitnum
+unfilledpages clear bitnum      deallocated page is never unfilled
+setextentfreepagestatus true
+/**
+* compress free pages at end of this extent.
+* <p>
+* search backward from end of extent and prepare data structures
+* to return pages at end of extent to the os. returns the lowest
+* page that can be returned to the os.
+* <p>
+*
+* @return return bit of page where all pages that follow can
+*         be returned to the os.
+**/
+protected int compress
+basecontainerhandle owner
+rawtransaction      ntt
+allocpage           alloc_page
+throws standardexception
+int compress_bitnum         1
+int num_pages_compressed   0
+for  int i    extentlength   1   i >  0  i
+if  freepages isset i
+compress_bitnum   i
+num_pages_compressed
+else
+break
+// new_highest_page is the last page to remain in the file after
+// the truncate, the above loop set compress_bitnum to lowest
+// free page in the set of contiguous free pages at end of extent.
+int new_highest_page   compress_bitnum   1
+if  num_pages_compressed > 0
+if  sanitymanager debug
+for  int i   new_highest_page   1  i < extentlength  i
+if   freepages isset i
+sanitymanager throwassert
+new_highest_page
+num_pages_compressed
+extentlength
+extentstart
+i
+freepages isset i
+todebugstring
+sanitymanager assert
+new_highest_page   num_pages_compressed   1
+extentlength
+";new_highest_page = " + new_highest_page +
+num_pages_compressed
+extentlength
+// the following assert could be made invalid by a new type of
+// access method, but currently page 1 of btree and heap contain
+// control rows, so will never become free and thus should never
+// be compressed.
+if  extentstart    1
+sanitymanager assert new_highest_page >  0
+if  num_pages_compressed >  extentlength
+sanitymanager throwassert
+new_highest_page
+num_pages_compressed
+extentlength
+todebugstring
+/*
+sanitymanager.debug_print("allocextent",
+"calling actioncompressspaceoperation:" +
+";new_highest_page = " + new_highest_page +
+";num_pages_compressed = " +  num_pages_compressed +
+";extentlength = " +  extentlength +
+";extent: \n" + todebugstring());
+*/
+owner getallocationactionset   actioncompressspaceoperation
+ntt  alloc_page  new_highest_page  num_pages_compressed
+return compress_bitnum
+else
+return  1
+protected void compresspages
+int        new_highest_page
+int        num_pages_truncated
+if  sanitymanager debug
+if  new_highest_page >  0
+for  int i   new_highest_page   1  i < extentlength  i
+if   freepages isset i
+sanitymanager throwassert
+new_highest_page
+num_pages_truncated
+extentlength
+extentstart
+i
+freepages isset i
+todebugstring
+sanitymanager assert
+new_highest_page   num_pages_truncated   1     extentlength
+";new_highest_page = " + new_highest_page +
+num_pages_truncated
+extentlength
+// the following assert could be made invalid by a new type of
+// access method, but currently page 1 of btree and heap contain
+// control rows, so will never become free and thus should never
+// be compressed.
+if  extentstart    1
+sanitymanager assert new_highest_page >  0
+sanitymanager assert num_pages_truncated < extentlength
+if  new_highest_page >  0
+freepages shrink new_highest_page   1
+unfilledpages shrink new_highest_page   1
+// this routine assumes the caller
+// will be doing the truncate, and just updates the data structures.
+prealloclength   extentlength    new_highest_page   1
+return
+/**
+* undo the compress space operation.
+* <p>
+* undo of this operation doesn't really "undo" the operation, it just
+* makes sure the data structures are ok after the undo.  we are
+* guaranteed at the point of the transaction doing the
+* undo of the compress space operation fixes up the bit maps to
+* only point at pages within the new_highest_page range.
+* <p>
+* prior to logging the compress space operation all pages greater
+* than
+* there are only 2 possibilities at this point:
+* 1) the truncate of pages greater than new_highest_page happened before
+*    the abort took place.  w
+* 2)
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected void undocompresspages
+int        new_highest_page
+int        num_pages_truncated
+if  new_highest_page >  0
+freepages shrink new_highest_page   1
+unfilledpages shrink new_highest_page   1
+prealloclength   extentlength    new_highest_page   1
+return
+protected long getextentend
+return extentend
+/*
+* read operation that is called above the log
+*/
+/**
+get a page number that is free
+*/
+protected long getfreepagenumber long pnum
+// if we can reuse page, do so, otherwise add a brand new page
+if  mayhavefreepage
+// the last allocated page may be from a previous alloc extent, but
+// if that extent is full and we are the first extent that can
+// accomodate a new page, we may be picked.  in that case, pnum may
+// be before the start of this extent.
+int i    pnum < extentstart  ? freepages anysetbit
+freepages anysetbit  int  pnum extentstart
+if  i     1
+if  sanitymanager debug
+if  i >  extentlength
+sanitymanager throwassert     i
+extentlength
+return i extentstart
+// the hint is wrong, no free page in the extent
+// do this unlogged, it is just a hint, don't care if it is lost
+if  pnum < extentstart
+setextentfreepagestatus false
+// maximally, we can have up to extendend page
+if  sanitymanager debug
+sanitymanager assert extentstart extentlength <  extentend
+// need to add a brand new page, current end of extent is at page
+// extentstart+extentlength-1;
+return extentstart extentlength
+/**
+get the physical offset of pagenum.
+if deallocok is true, then even if pagenum is deallocated, it is ok.
+if deallocok is false, then an exception is thrown if pagenum is
+deallocated.
+an exception is always thrown if pagenum is a free page
+@exception standardexception standard cloudscape error policy
+*/
+protected long getpageoffset long pagenum  int pagesize  boolean deallocok  throws standardexception
+return pagenum   pagesize
+/**
+return the status of this extent
+*/
+protected boolean isretired
+return   extentstatus   retired     0
+private boolean mayhavefreepage
+return   extentstatus   has_free     0
+private void setextentfreepagestatus boolean hasfree
+if  hasfree
+extentstatus    has_free
+else
+extentstatus    ~has_free
+protected boolean canaddfreepage long lastallocatedpage
+// the last page to be allocated == extentend
+if  extentstart   extentlength <  extentend
+return true
+// else, check to see if this may have any free page
+if   mayhavefreepage
+return false
+// we may have a free page, but that is not certain, double check
+if  lastallocatedpage < extentstart
+return  freepages anysetbit       1
+else
+return   freepages anysetbit  int  lastallocatedpage extentstart        1
+/**
+return the status of a particular page
+*/
+protected int getpagestatus long pagenum
+if  sanitymanager debug
+checkinrange pagenum
+int status   0
+int bitnum    int  pagenum extentstart
+if  freepages isset bitnum
+status   free_page
+else
+status   allocated_page
+return status
+/**
+get the first logical page number managed by this extent.
+*/
+protected long getfirstpagenum
+return extentstart
+/**
+get the last logical page number managed by this extent.
+*/
+protected long getlastpagenum
+return extentstart extentlength 1
+/**
+* translate bit position in map to page number.
+* <p>
+*
+* @return the page number of this "bit" in the extent map.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected long getpagenum int bit_pos
+return extentstart   bit_pos
+/*
+* page preallocation
+*/
+/**
+* get the last preallocated pagenumber managed by this alloc page
+*/
+protected long getlastpreallocpagenum
+if  extentlength > prealloclength
+prealloclength   extentlength
+return extentstart   prealloclength   1
+/**
+preallocated n pages, passed in the last preallocated page number.
+*/
+protected void setlastpreallocpagenum long preallocpagenum
+if  sanitymanager debug
+sanitymanager assert preallocpagenum >  getlastpreallocpagenum
+// cannot prealloc more than this extent can handle
+if  preallocpagenum > extentend
+preallocpagenum   extentend
+prealloclength    int  preallocpagenum   extentstart   1
+/*
+get the logical page number that is bigger than prevpagenumber
+and is a valid page.  if no such page in this extent, return
+containerhandle.invalid_page_handle
+*/
+protected long getnextvalidpagenumber long prevpagenumber
+long pagenum
+long lastpage   getlastpagenum
+if  prevpagenumber < extentstart
+pagenum   extentstart
+else
+pagenum   prevpagenumber  1
+while pagenum <  lastpage
+int status   getpagestatus pagenum
+if  status    allocated_page
+break
+pagenum
+if  pagenum > lastpage
+pagenum   containerhandle invalid_page_number
+return pagenum
+protected long getlastvalidpagenumber
+long pagenum   getlastpagenum
+while pagenum >  extentstart
+int status   getpagestatus pagenum
+if  status    allocated_page
+break
+pagenum
+if  pagenum < extentstart
+pagenum   containerhandle invalid_page_number
+return pagenum
+private void checkinrange long pagenum
+if  sanitymanager debug
+if  pagenum < extentstart    pagenum >  extentstart extentlength
+sanitymanager throwassert
+pagenum
+protected void updateunfilledpageinfo allocextent inputextent
+if  sanitymanager debug
+if  inputextent unfilledpages getlength
+unfilledpages getlength
+sanitymanager throwassert
+inputextent unfilledpages getlength
+unfilledpages getlength
+// just use the passed in inputextent, we know (wink wink) that the
+// unfilled page info is being updated just when the allocation cache
+// is being invalidated.  nobody is going to have a reference to the
+// inputextent after this so is it save to share the formatablebitset.
+// if we cannot guarentee that the inputextent will be unchanged by the
+// caller, we need to copy it
+//		unfilledpages = new formatablebitset(inputextent.unfilledpages);
+// right now, just reference it directly
+unfilledpages   inputextent unfilledpages
+if  unfilledpages anysetbit   >  0
+extentstatus    has_unfilled_pages
+else
+extentstatus    ~has_unfilled_pages
+/*
+keep track of unfilled pages, if the extent changed, returns true.
+*/
+protected boolean trackunfilledpage long pagenumber  boolean unfilled
+checkinrange pagenumber
+int bitnum    int  pagenumber extentstart
+boolean bitset   unfilledpages isset bitnum
+if  unfilled    bitset
+if  unfilled
+unfilledpages set bitnum
+extentstatus    has_unfilled_pages
+else
+unfilledpages clear bitnum
+return true
+return false
+/**
+get a page number that is unfilled, pagenum is the last page that was
+rejected.
+*/
+protected long getunfilledpagenumber long pagenum
+if   extentstatus   has_unfilled_pages     0
+return containerhandle invalid_page_number
+int i   unfilledpages anysetbit
+if  i     1
+if  i extentstart    pagenum
+return i extentstart
+else
+// unfortunately, we found the same page number that
+// was rejected.  it would be unwise to unset bit
+// pagenum because just because it was rejected does not mean
+// the page is full, the row we are trying to insert may just
+// be too big.  if we unset it, we will never find that page
+// again even though it may be a perfectly good page for any
+// other row.  just get the next set bit.
+i   unfilledpages anysetbit i
+if  i     1
+return i extentstart
+return containerhandle invalid_page_number
+/**
+get the number of used page in this extent
+*/
+protected int getallocatedpagecount
+// allocated page is one which is not free or deallocated.
+int allocatedpagecount   extentlength
+if   mayhavefreepage
+return allocatedpagecount
+byte free   freepages getbytearray
+int numbytes   free length
+for  int i   0  i < numbytes  i
+if  free    0
+for  int j   0  j < 8  j
+if    1 << j    free     0
+allocatedpagecount
+if  sanitymanager debug
+if  allocatedpagecount < 0
+sanitymanager throwassert
+allocatedpagecount
+todebugstring
+return allocatedpagecount
+/**
+get the number of unfilled pages in this extent
+*/
+protected int getunfilledpagecount
+int unfilledpagecount   0
+int freepagessize   freepages size
+for  int i   0  i < unfilledpages size    i
+if  unfilledpages isset i
+i >  freepagessize     freepages isset i
+unfilledpagecount
+if  sanitymanager debug
+sanitymanager assert unfilledpagecount >  0
+return unfilledpagecount
+/**
+get the total number of pages in this extent
+*/
+protected int gettotalpagecount
+return extentlength
+protected string todebugstring
+if  sanitymanager debug
+string str
+extentstart       extentend
+for  long i   extentstart  i < extentstart extentlength  i
+str        i
+switch getpagestatus i
+case free_page  str       break
+case allocated_page  str       break
+// int bitnum = (int)(i-extentstart);
+// if (unfilledpages.isset(bitnum))
+//    str += "          page is estimated to be unfilled\n";
+if  getlastpagenum   < extentend
+str        getlastpagenum         extentend
+str
+return str
+else
+return null

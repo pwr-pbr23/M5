@@ -1,0 +1,231 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql plan
+import java io ioexception
+import java io serializable
+import java util arraylist
+import java util iterator
+import java util linkedhashmap
+import java util list
+import java util map
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive metastore warehouse
+import org apache hadoop hive ql exec task
+import org apache hadoop hive ql exec utilities
+/**
+* conditional task resolution interface. this is invoked at run time to get the
+* task to invoke. developers can plug in their own resolvers
+*/
+public class conditionalresolvermergefiles implements conditionalresolver
+serializable
+private static final long serialversionuid   1l
+public conditionalresolvermergefiles
+/**
+* conditionalresolvermergefilesctx.
+*
+*/
+public static class conditionalresolvermergefilesctx implements serializable
+private static final long serialversionuid   1l
+list<task<? extends serializable>> listtasks
+private string dir
+private dynamicpartitionctx dpctx     merge task could be after dynamic partition insert
+public conditionalresolvermergefilesctx
+/**
+* @param dir
+*/
+public conditionalresolvermergefilesctx
+list<task<? extends serializable>> listtasks  string dir
+this listtasks   listtasks
+this dir   dir
+/**
+* @return the dir
+*/
+public string getdir
+return dir
+/**
+* @param dir
+*          the dir to set
+*/
+public void setdir string dir
+this dir   dir
+/**
+* @return the listtasks
+*/
+public list<task<? extends serializable>> getlisttasks
+return listtasks
+/**
+* @param listtasks
+*          the listtasks to set
+*/
+public void setlisttasks list<task<? extends serializable>> listtasks
+this listtasks   listtasks
+public dynamicpartitionctx getdpctx
+return dpctx
+public void setdpctx dynamicpartitionctx dp
+dpctx   dp
+public list<task<? extends serializable>> gettasks hiveconf conf
+object objctx
+conditionalresolvermergefilesctx ctx    conditionalresolvermergefilesctx  objctx
+string dirname   ctx getdir
+list<task<? extends serializable>> restsks   new arraylist<task<? extends serializable>>
+// check if a map-reduce job is needed to merge the files
+// if the current size is smaller than the target, merge
+long trgtsize   conf getlongvar hiveconf confvars hivemergemapfilessize
+long avgconditionsize   conf
+getlongvar hiveconf confvars hivemergemapfilesavgsize
+trgtsize   math max trgtsize  avgconditionsize
+task<? extends serializable> mvtask   ctx getlisttasks   get 0
+task<? extends serializable> mrtask   ctx getlisttasks   get 1
+try
+path dirpath   new path dirname
+filesystem inpfs   dirpath getfilesystem conf
+dynamicpartitionctx dpctx   ctx getdpctx
+if  inpfs exists dirpath
+// for each dynamic partition, check if it needs to be merged.
+mapredwork work    mapredwork  mrtask getwork
+// dynamic partition: replace input path (root to dp paths) with dynamic partition
+// input paths.
+if  dpctx    null     dpctx getnumdpcols   > 0
+// get list of dynamic partitions
+filestatus status   utilities getfilestatusrecurse dirpath
+dpctx getnumdpcols    inpfs
+// cleanup pathtopartitioninfo
+map<string  partitiondesc> ptpi   work getpathtopartitioninfo
+assert ptpi size      1
+string path   ptpi keyset   iterator   next
+tabledesc tbldesc   ptpi get path  gettabledesc
+ptpi remove path      the root path is not useful anymore
+// cleanup pathtoaliases
+map<string  arraylist<string>> pta   work getpathtoaliases
+assert pta size      1
+path   pta keyset   iterator   next
+arraylist<string> aliases   pta get path
+pta remove path      the root path is not useful anymore
+// populate pathtopartitioninfo and pathtoaliases w/ dp paths
+long totalsz   0
+boolean domerge   false
+// list of paths that don't need to merge but need to move to the dest location
+list<string> tomove   new arraylist<string>
+for  int i   0  i < status length    i
+long len   getmergesize inpfs  status getpath    avgconditionsize
+if  len >  0
+domerge   true
+totalsz    len
+map<string  string> fullpartspec   new linkedhashmap<string  string>
+dpctx getpartspec
+warehouse makespecfromname fullpartspec  status getpath
+partitiondesc pdesc   new partitiondesc tbldesc   linkedhashmap  fullpartspec
+work resolvedynamicpartitionmerge conf  status getpath    tbldesc
+aliases  pdesc
+else
+tomove add status getpath   tostring
+if  domerge
+// add the merge mr job
+setupmapredwork conf  work  trgtsize  totalsz
+restsks add mrtask
+// add the move task for those partitions that do not need merging
+if  tomove size   > 0
+// modify the existing move task as it is already in the candidate running tasks
+movework mvwork    movework  mvtask getwork
+loadfiledesc lfd   mvwork getloadfilework
+string targetdir   lfd gettargetdir
+list<string> targetdirs   new arraylist<string> tomove size
+int numdpcols   dpctx getnumdpcols
+for  int i   0  i < tomove size    i
+string tomovestr   tomove get i
+if  tomovestr endswith path separator
+tomovestr   tomovestr substring 0  tomovestr length     1
+string  movestrsplits   tomovestr split path separator
+int dpindex   movestrsplits length   numdpcols
+string target   targetdir
+while  dpindex < movestrsplits length
+target   target   path separator   movestrsplits
+dpindex
+targetdirs add target
+loadmultifilesdesc lmfd   new loadmultifilesdesc tomove
+targetdirs  lfd getisdfsdir    lfd getcolumns    lfd getcolumntypes
+mvwork setloadfilework null
+mvwork setloadtablework null
+mvwork setmultifilesdesc lmfd
+// running the movetask and mr task in parallel may
+// cause the mvtask write to /ds=1 and mr task write
+// to /ds=1_1 for the same partition.
+// make the movetask as the child of the mr task
+list<task <? extends serializable>> ctasks   mrtask getdependenttasks
+if  ctasks    null
+iterator<task <? extends serializable>> itr   ctasks iterator
+while  itr hasnext
+task<? extends serializable> cld   itr next
+itr remove
+mvtask adddependenttask cld
+mrtask adddependenttask mvtask
+else      add the move task
+restsks add mvtask
+else      no dynamic partitions
+long totalsz   getmergesize inpfs  dirpath  avgconditionsize
+if  totalsz >  0       add the merge job
+setupmapredwork conf  work  trgtsize  totalsz
+restsks add mrtask
+else      don't need to merge  add the move job
+restsks add mvtask
+else
+restsks add mvtask
+catch  ioexception e
+e printstacktrace
+return restsks
+private void setupmapredwork hiveconf conf  mapredwork work  long targetsize  long totalsize
+if  work getnumreducetasks   > 0
+int maxreducers   conf getintvar hiveconf confvars maxreducers
+int reducers    int    totalsize   targetsize   1    targetsize
+reducers   math max 1  reducers
+reducers   math min maxreducers  reducers
+work setnumreducetasks reducers
+work setmaxsplitsize targetsize
+work setminsplitsize targetsize
+work setminsplitsizepernode targetsize
+work setminsplitsizeperrack targetsize
+/**
+* whether to merge files inside directory given the threshold of the average file size.
+*
+* @param inpfs input file system.
+* @param dirpath input file directory.
+* @param avgsize threshold of average file size.
+* @return -1 if not need to merge (either because of there is only 1 file or the
+* average size is larger than avgsize). otherwise the size of the total size of files.
+* if return value is 0 that means there are multiple files each of which is an empty file.
+* this could be true when the table is bucketized and all buckets are empty.
+*/
+private long getmergesize filesystem inpfs  path dirpath  long avgsize
+try
+filestatus fstats   inpfs liststatus dirpath
+if  fstats length <  1
+return  1
+long totalsz   0
+for  filestatus fstat   fstats
+totalsz    fstat getlen
+if  totalsz < avgsize   fstats length
+return totalsz
+else
+return  1
+catch  ioexception e
+return  1

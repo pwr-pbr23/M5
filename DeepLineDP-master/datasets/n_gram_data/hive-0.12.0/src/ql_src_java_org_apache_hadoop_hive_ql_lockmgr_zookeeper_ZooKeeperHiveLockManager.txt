@@ -1,0 +1,544 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql lockmgr zookeeper
+import java io ioexception
+import java net inetaddress
+import java util arraylist
+import java util collections
+import java util comparator
+import java util hashmap
+import java util linkedlist
+import java util list
+import java util map
+import java util queue
+import java util regex matcher
+import java util regex pattern
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive ql errormsg
+import org apache hadoop hive ql lockmgr hivelock
+import org apache hadoop hive ql lockmgr hivelockmanager
+import org apache hadoop hive ql lockmgr hivelockmanagerctx
+import org apache hadoop hive ql lockmgr hivelockmode
+import org apache hadoop hive ql lockmgr hivelockobj
+import org apache hadoop hive ql lockmgr hivelockobject
+import org apache hadoop hive ql lockmgr hivelockobject hivelockobjectdata
+import org apache hadoop hive ql lockmgr lockexception
+import org apache hadoop hive ql metadata dummypartition
+import org apache hadoop hive ql metadata hive
+import org apache hadoop hive ql metadata hiveexception
+import org apache hadoop hive ql metadata partition
+import org apache hadoop hive ql metadata table
+import org apache hadoop hive ql session sessionstate loghelper
+import org apache zookeeper createmode
+import org apache zookeeper keeperexception
+import org apache zookeeper watcher
+import org apache zookeeper zoodefs ids
+import org apache zookeeper zookeeper
+import com google common annotations visiblefortesting
+public class zookeeperhivelockmanager implements hivelockmanager
+hivelockmanagerctx ctx
+public static final log log   logfactory getlog
+static final private loghelper console   new loghelper log
+private zookeeper zookeeper
+// all the locks are created under this parent
+private string    parent
+private int sessiontimeout
+private string quorumservers
+private int sleeptime
+private int numretriesforlock
+private int numretriesforunlock
+private static string clientip
+static
+clientip
+try
+inetaddress clientaddr   inetaddress getlocalhost
+clientip   clientaddr gethostaddress
+catch  exception e1
+public zookeeperhivelockmanager
+/**
+* @param conf  the hive configuration
+* get the quorum server address from the configuration. the format is:
+* host1:port, host2:port..
+**/
+private static string getquorumservers hiveconf conf
+string hosts   conf getvar hiveconf confvars hive_zookeeper_quorum
+string port   conf getvar hiveconf confvars hive_zookeeper_client_port
+return hosts       port
+/**
+* @param ctx  the lock manager context (containing the hive configuration file)
+* start the zookeeper client based on the zookeeper cluster specified in the conf.
+**/
+public void setcontext hivelockmanagerctx ctx  throws lockexception
+this ctx   ctx
+hiveconf conf   ctx getconf
+sessiontimeout   conf getintvar hiveconf confvars hive_zookeeper_session_timeout
+quorumservers   zookeeperhivelockmanager getquorumservers conf
+sleeptime   conf getintvar hiveconf confvars hive_lock_sleep_between_retries    1000
+numretriesforlock   conf getintvar hiveconf confvars hive_lock_numretries
+numretriesforunlock   conf getintvar hiveconf confvars hive_unlock_numretries
+try
+renewzookeeperinstance sessiontimeout  quorumservers
+parent   conf getvar hiveconf confvars hive_zookeeper_namespace
+try
+zookeeper create      parent  new byte  ids open_acl_unsafe  createmode persistent
+catch  keeperexception e
+// ignore if the parent already exists
+if  e code      keeperexception code nodeexists
+log warn     parent  e
+catch  exception e
+log error    e
+throw new lockexception errormsg zookeeper_client_could_not_be_initialized getmsg
+@override
+public void refresh
+hiveconf conf   ctx getconf
+sleeptime   conf getintvar hiveconf confvars hive_lock_sleep_between_retries    1000
+numretriesforlock   conf getintvar hiveconf confvars hive_lock_numretries
+numretriesforunlock   conf getintvar hiveconf confvars hive_unlock_numretries
+private void renewzookeeperinstance int sessiontimeout  string quorumservers
+throws interruptedexception  ioexception
+if  zookeeper    null
+return
+zookeeper   new zookeeper quorumservers  sessiontimeout  new dummywatcher
+/**
+* @param key    object to be locked
+* get the name of the last string. for eg. if you need to lock db/t/ds=1=/hr=1,
+* the last name would be db/t/ds=1/hr=1
+**/
+private static string getlastobjectname string parent  hivelockobject key
+return     parent       key getname
+/**
+* @param key    object to be locked
+* get the list of names for all the parents.
+* for eg: if you need to lock db/t/ds=1/hr=1, the following list will be returned:
+* {db, db/t, db/t/ds=1, db/t/ds=1/hr=1}
+**/
+private list<string> getobjectnames hivelockobject key
+list<string> parents   new arraylist<string>
+string   curparent         parent
+string names         key getname   split
+for  string name   names
+curparent   curparent   name
+parents add curparent
+curparent   curparent
+return parents
+/**
+* @param  lockobjects  list of objects and the modes of the locks requested
+* @param  keepalive    whether the lock is to be persisted after the statement
+*
+* acuire all the locks. release all the locks and return null if any lock
+* could not be acquired.
+**/
+public list<hivelock> lock list<hivelockobj> lockobjects
+boolean keepalive  throws lockexception
+// sort the objects first. you are guaranteed that if a partition is being locked,
+// the table has already been locked
+collections sort lockobjects  new comparator<hivelockobj>
+@override
+public int compare hivelockobj o1  hivelockobj o2
+int cmp   o1 getname   compareto o2 getname
+if  cmp    0
+if  o1 getmode      o2 getmode
+return cmp
+// exclusive locks occur before shared locks
+if  o1 getmode      hivelockmode exclusive
+return  1
+return  1
+return cmp
+// walk the list and acquire the locks - if any lock cant be acquired, release all locks, sleep
+// and retry
+hivelockobj prevlockobj   null
+list<hivelock> hivelocks   new arraylist<hivelock>
+for  hivelockobj lockobject   lockobjects
+// no need to acquire a lock twice on the same object
+// it is ensured that exclusive locks occur before shared locks on the same object
+if   prevlockobj    null      prevlockobj getname   equals lockobject getname
+prevlockobj   lockobject
+continue
+hivelock lock   null
+try
+lock   lock lockobject getobj    lockobject getmode    keepalive  true
+catch  lockexception e
+console printerror
+log error    e
+lock   null
+if  lock    null
+releaselocks hivelocks
+return null
+hivelocks add lock
+prevlockobj   lockobject
+return hivelocks
+/**
+* @param hivelocks
+*          list of hive locks to be released release all the locks specified. if some of the
+*          locks have already been released, ignore them
+**/
+public void releaselocks list<hivelock> hivelocks
+if  hivelocks    null
+int len   hivelocks size
+for  int pos   len 1  pos >  0  pos
+hivelock hivelock   hivelocks get pos
+try
+log info     hivelock gethivelockobject   getname
+unlock hivelock
+catch  lockexception e
+// the lock may have been released. ignore and continue
+log warn    e
+/**
+* @param key
+*          the object to be locked
+* @param mode
+*          the mode of the lock
+* @param keepalive
+*          whether the lock is to be persisted after the statement acuire the
+*          lock. return null if a conflicting lock is present.
+**/
+public zookeeperhivelock lock hivelockobject key  hivelockmode mode
+boolean keepalive  throws lockexception
+return lock key  mode  keepalive  false
+/**
+* @param name
+*          the name of the zookeeper child
+* @param data
+*          the data for the zookeeper child
+* @param mode
+*          the mode in which the child needs to be created
+* @throws keeperexception
+* @throws interruptedexception
+**/
+private string createchild string name  byte data  createmode mode
+throws keeperexception  interruptedexception
+return zookeeper create name  data  ids open_acl_unsafe  mode
+private string getlockname string parent  hivelockmode mode
+return parent           mode
+private zookeeperhivelock lock  hivelockobject key  hivelockmode mode
+boolean keepalive  boolean parentcreated  throws lockexception
+int trynum   1
+zookeeperhivelock ret   null
+do
+try
+if  trynum > 1
+thread sleep sleeptime
+if  zookeeper getstate      zookeeper states closed
+// reconnect if the connection is closed.
+zookeeper   null
+prepareretry
+ret   lockprimitive key  mode  keepalive  parentcreated
+if  ret    null
+break
+trynum
+catch  exception e1
+trynum
+if  e1 instanceof keeperexception
+keeperexception e    keeperexception  e1
+switch  e code
+case connectionloss
+case operationtimeout
+log warn    e
+break
+default
+log error    e
+break
+if  trynum >  numretriesforlock
+throw new lockexception e1
+while  trynum < numretriesforlock
+return ret
+private zookeeperhivelock lockprimitive hivelockobject key
+hivelockmode mode  boolean keepalive  boolean parentcreated
+throws keeperexception  interruptedexception
+string res
+// if the parents have already been created, create the last child only
+list<string> names   new arraylist<string>
+string lastname
+hivelockobjectdata lockdata   key getdata
+lockdata setclientip clientip
+if  parentcreated
+lastname   getlastobjectname parent  key
+names add lastname
+else
+names   getobjectnames key
+lastname   names get names size     1
+// create the parents first
+for  string name   names
+try
+res   createchild name  new byte  createmode persistent
+catch  keeperexception e
+if  e code      keeperexception code nodeexists
+//if the exception is not 'nodeexists', re-throw it
+throw e
+res   createchild getlockname lastname  mode   key getdata   tostring
+getbytes    keepalive ? createmode persistent_sequential
+createmode ephemeral_sequential
+int seqno   getsequencenumber res  getlockname lastname  mode
+if  seqno     1
+zookeeper delete res   1
+return null
+list<string> children   zookeeper getchildren lastname  false
+string exlock   getlockname lastname  hivelockmode exclusive
+string shlock   getlockname lastname  hivelockmode shared
+for  string child   children
+child   lastname       child
+// is there a conflicting lock on the same object with a lower sequence
+// number
+int childseq   seqno
+if  child startswith exlock
+childseq   getsequencenumber child  exlock
+if   mode    hivelockmode exclusive     child startswith shlock
+childseq   getsequencenumber child  shlock
+if   childseq >  0      childseq < seqno
+zookeeper delete res   1
+console printerror
+key getdisplayname         mode
+return null
+return new zookeeperhivelock res  key  mode
+/* remove the lock specified */
+public void unlock hivelock hivelock  throws lockexception
+unlockwithretry ctx getconf    zookeeper  hivelock  parent
+private void unlockwithretry hiveconf conf  zookeeper zkpclient
+hivelock hivelock  string parent  throws lockexception
+int trynum   0
+do
+try
+trynum
+if  trynum > 1
+thread sleep sleeptime
+prepareretry
+unlockprimitive conf  zkpclient  hivelock  parent
+break
+catch  exception e
+if  trynum >  numretriesforunlock
+throw new lockexception e
+while  trynum < numretriesforunlock
+return
+/* remove the lock specified */
+@visiblefortesting
+static void unlockprimitive hiveconf conf  zookeeper zkpclient
+hivelock hivelock  string parent  throws lockexception
+zookeeperhivelock zlock    zookeeperhivelock hivelock
+try
+// can throw keeperexception.nonodeexception, which might mean something is wrong
+zkpclient delete zlock getpath     1
+// delete the parent node if all the children have been deleted
+hivelockobject obj   zlock gethivelockobject
+string name    getlastobjectname parent  obj
+try
+list<string> children   zkpclient getchildren name  false
+if  children    null    children isempty
+zkpclient delete name   1
+catch  keeperexception nonodeexception e
+log debug     name
+catch  exception e
+log error    e
+throw new lockexception e
+/* release all locks - including persistent locks */
+public static void releasealllocks hiveconf conf  throws exception
+zookeeper zkpclient   null
+try
+int sessiontimeout   conf getintvar hiveconf confvars hive_zookeeper_session_timeout
+string quorumservers   getquorumservers conf
+watcher dummwatcher   new dummywatcher
+zkpclient   new zookeeper quorumservers  sessiontimeout  dummwatcher
+string parent   conf getvar hiveconf confvars hive_zookeeper_namespace
+list<hivelock> locks   getlocks conf  zkpclient  null  parent  false  false
+exception lastexceptiongot   null
+if  locks    null
+for  hivelock lock   locks
+try
+unlockprimitive conf  zkpclient  lock  parent
+catch  exception e
+lastexceptiongot   e
+// if we got exception during doing the unlock, rethrow it here
+if lastexceptiongot    null
+throw lastexceptiongot
+catch  exception e
+log error    e
+throw new exception errormsg zookeeper_client_could_not_be_initialized getmsg
+finally
+if  zkpclient    null
+zkpclient close
+zkpclient   null
+/* get all locks */
+public list<hivelock> getlocks boolean verifytablepartition  boolean fetchdata
+throws lockexception
+return getlocks ctx getconf    zookeeper  null  parent  verifytablepartition  fetchdata
+/* get all locks for a particular object */
+public list<hivelock> getlocks hivelockobject key  boolean verifytablepartitions
+boolean fetchdata  throws lockexception
+return getlocks ctx getconf    zookeeper  key  parent  verifytablepartitions  fetchdata
+/**
+* @param conf        hive configuration
+* @param zkpclient   the zookeeper client
+* @param key         the object to be compared against - if key is null, then get all locks
+**/
+private static list<hivelock> getlocks hiveconf conf  zookeeper zkpclient
+hivelockobject key  string parent  boolean verifytablepartition  boolean fetchdata
+throws lockexception
+list<hivelock> locks   new arraylist<hivelock>
+list<string> children
+boolean recurse   true
+string commonparent
+try
+if  key    null
+commonparent       parent       key getname
+children   zkpclient getchildren commonparent  false
+recurse   false
+else
+commonparent       parent
+children   zkpclient getchildren commonparent  false
+catch  exception e
+// no locks present
+return locks
+queue<string> childn   new linkedlist<string>
+if  children    null     children isempty
+for  string child   children
+childn add commonparent       child
+while  true
+string curchild   childn poll
+if  curchild    null
+return locks
+if  recurse
+try
+children   zkpclient getchildren curchild  false
+for  string child   children
+childn add curchild       child
+catch  exception e
+// nothing to do
+hivelockmode mode   getlockmode conf  curchild
+if  mode    null
+continue
+hivelockobjectdata data   null
+// set the lock object with a dummy data, and then do a set if needed.
+hivelockobject obj   getlockobject conf  curchild  mode  data  parent  verifytablepartition
+if  obj    null
+continue
+if   key    null
+obj getname   equals key getname
+if  fetchdata
+try
+data   new hivelockobjectdata new string zkpclient getdata curchild  new dummywatcher    null
+data setclientip clientip
+catch  exception e
+log error     curchild  e
+// ignore error
+obj setdata data
+hivelock lck    hivelock  new zookeeperhivelock curchild  obj  mode
+locks add lck
+/** remove all redundant nodes **/
+private void removeallredundantnodes
+try
+renewzookeeperinstance sessiontimeout  quorumservers
+checkredundantnode     parent
+if  zookeeper    null
+zookeeper close
+zookeeper   null
+catch  exception e
+log warn    e
+private void checkredundantnode string node
+try
+// nothing to do if it is a lock mode
+if  getlockmode ctx getconf    node     null
+return
+list<string> children   zookeeper getchildren node  false
+for  string child   children
+checkredundantnode node       child
+children   zookeeper getchildren node  false
+if   children    null      children isempty
+zookeeper delete node   1
+catch  exception e
+log warn     node  e
+/* release all transient locks, by simply closing the client */
+public void close   throws lockexception
+try
+if  zookeeper    null
+zookeeper close
+zookeeper   null
+if  hiveconf getboolvar ctx getconf    hiveconf confvars hive_zookeeper_clean_extra_nodes
+removeallredundantnodes
+catch  exception e
+log error     e
+throw new lockexception e
+/**
+* get the sequence number from the path. the sequence number is always at the end of the path.
+**/
+private int getsequencenumber string respath  string path
+string tst   respath substring path length
+try
+return  new integer tst   intvalue
+catch  exception e
+return  1     invalid number
+/**
+* get the object from the path of the lock.
+* the object may correspond to a table, a partition or a parent to a partition.
+* for eg: if table t is partitioned by ds, hr and ds=1/hr=1 is a valid partition,
+* the lock may also correspond to t@ds=1, which is not a valid object
+* @param verifytablepartition
+**/
+private static hivelockobject getlockobject hiveconf conf  string path
+hivelockmode mode  hivelockobjectdata data
+string parent  boolean verifytablepartition
+throws lockexception
+try
+hive db   hive get conf
+int indx   path lastindexof     mode tostring
+string objname   path substring      parent      length    indx 1
+string names   objname split
+if  names length < 2
+return null
+if   verifytablepartition
+return new hivelockobject names  data
+// do not throw exception if table does not exist
+table tab   db gettable names  names  false
+if  tab    null
+return null
+if  names length    2
+return new hivelockobject tab  data
+map<string  string> partspec   new hashmap<string  string>
+for  indx   2  indx < names length  indx
+string partvals   names split
+partspec put partvals  partvals
+partition partn
+try
+partn   db getpartition tab  partspec  false
+catch  hiveexception e
+partn   null
+if  partn    null
+return new hivelockobject new dummypartition tab  path  partspec   data
+return new hivelockobject partn  data
+catch  exception e
+log error     e
+throw new lockexception e
+private static pattern shmode   pattern compile
+private static pattern exmode   pattern compile
+/* get the mode of the lock encoded in the path */
+private static hivelockmode getlockmode hiveconf conf  string path
+matcher shmatcher   shmode matcher path
+matcher exmatcher   exmode matcher path
+if  shmatcher matches
+return hivelockmode shared
+if  exmatcher matches
+return hivelockmode exclusive
+return null
+public static class dummywatcher implements watcher
+public void process org apache zookeeper watchedevent event
+@override
+public void prepareretry   throws lockexception
+try
+renewzookeeperinstance sessiontimeout  quorumservers
+catch  exception e
+throw new lockexception e

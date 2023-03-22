@@ -1,0 +1,221 @@
+package org apache lucene search
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+import java io ioexception
+import java io stringreader
+import java util arraylist
+import java util hashmap
+import java util hashset
+import java util iterator
+import org apache lucene analysis analyzer
+import org apache lucene analysis token
+import org apache lucene analysis tokenstream
+import org apache lucene index indexreader
+import org apache lucene index term
+import org apache lucene index termenum
+import org apache lucene util priorityqueue
+/**
+* fuzzifies all terms provided as strings and then picks the best n differentiating terms.
+* in effect this mixes the behaviour of fuzzyquery and morelikethis but with special consideration
+* of fuzzy scoring factors.
+* this generally produces good results for queries where users may provide details in a number of
+* fields and have no knowledge of boolean query syntax and also want a degree of fuzzy matching and
+* a fast query.
+*
+* for each source term the fuzzy variants are held in a booleanquery with no coord factor (because
+* we are not looking for matches on multiple variants in any one doc). additionally, a specialized
+* termquery is used for variants and does not use that variant term's idf because this would favour rarer
+* terms eg misspellings. instead, all variants use the same idf ranking (the one for the source query
+* term) and this is factored into the variant's boost. if the source query term does not exist in the
+* index the average idf of the variants is used.
+* @author maharwood
+*/
+public class fuzzylikethisquery extends query
+static similarity sim new defaultsimilarity
+query rewrittenquery null
+arraylist fieldvals new arraylist
+analyzer analyzer
+scoretermqueue q
+int max_variants_per_term 50
+boolean ignoretf false
+/**
+*
+* @param maxnumterms the total number of terms clauses that will appear once rewritten as a booleanquery
+* @param analyzer
+*/
+public fuzzylikethisquery int maxnumterms  analyzer analyzer
+q new scoretermqueue maxnumterms
+this analyzer analyzer
+class fieldvals
+string querystring
+string fieldname
+float minsimilarity
+int prefixlength
+public fieldvals string name  float similarity  int length  string querystring
+fieldname   name
+minsimilarity   similarity
+prefixlength   length
+this querystring   querystring
+/**
+* adds user input for "fuzzification"
+* @param querystring the string which will be parsed by the analyzer and for which fuzzy variants will be parsed
+* @param fieldname
+* @param minsimilarity the minimum similarity of the term variants (see fuzzytermenum)
+* @param prefixlength length of required common prefix on variant terms (see fuzzytermenum)
+*/
+public void addterms string querystring  string fieldname float minsimilarity  int prefixlength
+fieldvals add new fieldvals fieldname minsimilarity prefixlength querystring
+private void addterms indexreader reader fieldvals f  throws ioexception
+if f querystring  null  return
+tokenstream ts analyzer tokenstream f fieldname new stringreader f querystring
+token token ts next
+int corpusnumdocs reader numdocs
+term internsavingtemplateterm  new term f fieldname       optimization to avoid constructing new term   objects
+hashset processedterms new hashset
+while token  null
+if  processedterms contains token termtext
+processedterms add token termtext
+scoretermqueue variantsq new scoretermqueue max_variants_per_term     maxnum variants considered for any one term
+float minscore 0
+term startterm internsavingtemplateterm createterm token termtext
+fuzzytermenum fe new fuzzytermenum reader startterm f minsimilarity f prefixlength
+termenum origenum   reader terms startterm
+int df 0
+if startterm equals origenum term
+df origenum docfreq      store the df so all variants use same idf
+int numvariants 0
+int totalvariantdocfreqs 0
+do
+term possiblematch fe term
+if possiblematch  null
+numvariants
+totalvariantdocfreqs  fe docfreq
+float score fe difference
+if variantsq size   < max_variants_per_term    score > minscore
+scoreterm st new scoreterm possiblematch score startterm
+variantsq insert st
+minscore     scoreterm variantsq top    score     maintain minscore
+while fe next
+if numvariants  0
+//no variants to rank here
+break
+int avgdf totalvariantdocfreqs numvariants
+if df  0   no direct match we can use as df for all variants
+df avgdf    use avg df of all variants
+// take the top variants (scored by edit distance) and reset the score
+// to include an idf factor then add to the global queue for ranking overall top query terms
+int size   variantsq size
+for int i   0  i < size  i
+scoreterm st    scoreterm  variantsq pop
+st score  st score st score  sim idf df corpusnumdocs
+q insert st
+token ts next
+public query rewrite indexreader reader  throws ioexception
+if rewrittenquery  null
+return rewrittenquery
+//load up the list of possible terms
+for  iterator iter   fieldvals iterator    iter hasnext
+fieldvals f    fieldvals  iter next
+addterms reader f
+//clear the list of fields
+fieldvals clear
+booleanquery bq new booleanquery
+//create booleanqueries to hold the variants for each token/field pair and ensure it
+// has no coord factor
+//step 1: sort the termqueries by term/field
+hashmap variantqueries new hashmap
+int size   q size
+for int i   0  i < size  i
+scoreterm st    scoreterm  q pop
+arraylist l  arraylist  variantqueries get st fuzziedsourceterm
+if l  null
+l new arraylist
+variantqueries put st fuzziedsourceterm l
+l add st
+//step 2: organize the sorted termqueries into zero-coord scoring boolean queries
+for  iterator iter   variantqueries values   iterator    iter hasnext
+arraylist variants    arraylist  iter next
+if variants size    1
+//optimize where only one selected variant
+scoreterm st  scoreterm  variants get 0
+termquery tq   new fuzzytermquery st term ignoretf
+tq setboost st score      set the boost to a mix of idf and score
+bq add tq  booleanclause occur should
+else
+booleanquery termvariants new booleanquery true     disable coord and idf for these term variants
+for  iterator iterator2   variants iterator    iterator2
+hasnext
+scoreterm st    scoreterm  iterator2 next
+termquery tq   new fuzzytermquery st term ignoretf           found a match
+tq setboost st score      set the boost using the scoreterm's score
+termvariants add tq  booleanclause occur should               add to query
+bq add termvariants  booleanclause occur should               add to query
+//todo possible alternative step 3 - organize above booleans into a new layer of field-based
+// booleans with a minimum-should-match of numfields-1?
+bq setboost getboost
+this rewrittenquery bq
+return bq
+//holds info for a fuzzy term variant - initially score is set to edit distance (for ranking best
+// term variants) then is reset with idf for use in ranking against all other
+// terms/fields
+private static class scoreterm
+public term term
+public float score
+term fuzziedsourceterm
+public scoreterm term term  float score  term fuzziedsourceterm
+this term   term
+this score   score
+this fuzziedsourceterm fuzziedsourceterm
+private static class scoretermqueue extends priorityqueue
+public scoretermqueue int size
+initialize size
+/* (non-javadoc)
+* @see org.apache.lucene.util.priorityqueue#lessthan(java.lang.object, java.lang.object)
+*/
+protected boolean lessthan object a  object b
+scoreterm terma    scoreterm a
+scoreterm termb    scoreterm b
+if  terma score   termb score
+return terma term compareto termb term  > 0
+else
+return terma score < termb score
+//overrides basic termquery to negate effects of idf (idf is factored into boost of containing booleanquery)
+private static class fuzzytermquery extends termquery
+boolean ignoretf
+public fuzzytermquery term t  boolean ignoretf
+super t
+this ignoretf ignoretf
+public similarity getsimilarity searcher searcher
+similarity result   super getsimilarity searcher
+result   new similaritydelegator result
+public float tf float freq
+if ignoretf
+return 1    ignore tf
+return super tf freq
+public float idf int docfreq  int numdocs
+//idf is already factored into individual term boosts
+return 1
+return result
+/* (non-javadoc)
+* @see org.apache.lucene.search.query#tostring(java.lang.string)
+*/
+public string tostring string field
+return null
+public boolean isignoretf
+return ignoretf
+public void setignoretf boolean ignoretf
+this ignoretf   ignoretf

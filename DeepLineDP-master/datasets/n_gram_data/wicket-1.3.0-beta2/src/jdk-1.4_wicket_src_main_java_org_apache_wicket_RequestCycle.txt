@@ -1,0 +1,941 @@
+/*
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache wicket
+import java util iterator
+import org apache wicket behavior ibehavior
+import org apache wicket protocol http bufferedwebresponse
+import org apache wicket protocol http irequestlogger
+import org apache wicket protocol http pageexpiredexception
+import org apache wicket protocol http servlet servletwebrequest
+import org apache wicket request abstractrequestcycleprocessor
+import org apache wicket request clientinfo
+import org apache wicket request irequestcodingstrategy
+import org apache wicket request irequestcycleprocessor
+import org apache wicket request requestparameters
+import org apache wicket request target component bookmarkablelistenerinterfacerequesttarget
+import org apache wicket request target component bookmarkablepagerequesttarget
+import org apache wicket request target component componentrequesttarget
+import org apache wicket request target component ibookmarkablepagerequesttarget
+import org apache wicket request target component ipagerequesttarget
+import org apache wicket request target component pagerequesttarget
+import org apache wicket request target component listener behaviorrequesttarget
+import org apache wicket request target component listener listenerinterfacerequesttarget
+import org apache wicket request target resource sharedresourcerequesttarget
+import org apache wicket util collections arrayliststack
+import org apache wicket util value valuemap
+import org slf4j logger
+import org slf4j loggerfactory
+/**
+* represents the processing of a request. it is responsible for instructing the
+* {@link irequestcycleprocessor request cycle processor} to execute the various
+* steps there are in the handling of a request (resolving the kind of work that
+* needs to be done, handling of events and generating a response), and it holds
+* the intended {@link irequesttarget request target}, which is an abstraction
+* for e.g. the processing of a bookmarkable page.
+* <p>
+* the abstract urlfor() methods are implemented by subclasses of requestcycle
+* and return encoded page urls. the url returned depends on the kind of page
+* being linked to. pages broadly fall into two categories:
+* <p>
+* <table>
+* <tr>
+* <td valign = "top"><b>1. </b></td>
+* <td>a page that does not yet exist in a user session may be encoded as a url
+* that references the not-yet-created page by class name. a set of
+* pageparameters can also be encoded into the url, and these parameters will be
+* passed to the page constructor if the page later needs to be instantiated.
+* <p>
+* any page of this type is bookmarkable, and a hint to that effect is given to
+* the user in the url:
+* <p>
+* <ul>
+* /[application]?bookmarkablepage=[classname]&[param]=[value] [...]
+* </ul>
+* <p>
+* bookmarkable pages must either implement a constructor that takes a
+* pageparameters argument or a default constructor. if a page has both
+* constructors the constuctor with the pageparameters argument will be used.
+* links to bookmarkable pages are created by calling the urlfor(class,
+* pageparameters) method, where class is the page class and pageparameters are
+* the parameters to encode into the url.
+* <p>
+* </td>
+* </tr>
+* <tr>
+* <td valign = "top"><b>2. </b></td>
+* <td>stateful pages (that have already been requested by a user) will be
+* present in the user's session and can be referenced securely with a
+* session-relative number:
+* <p>
+* <ul>
+* /[application]?wicket:interface=[pagemapname]:[pageid]: ...
+* </ul>
+* <p>
+* often, the reason to access an existing session page is due to some kind of
+* "postback" (either a link click or a form submit) from a page (possibly
+* accessed with the browser's back button or possibly not). a call to a
+* registered listener is dispatched like so:
+* <p>
+* <ul>
+* /[application]?wicket:interface=[pagemapname]:[pageid]:[componentpath]:[version]:[interfacename]
+* </ul>
+* <p>
+* for example:
+* <p>
+* <ul>
+* /[application]?wicket:interface=:3:signinform:submit::iformsubmitlistener
+* </ul>
+* </td>
+* </tr>
+* </table>
+* <p>
+* urls for stateful pages (those that already exist in the session map) are
+* created by calling the urlfor(component, class) method, where component is
+* the component being linked to and class is the interface on the component to
+* call.
+* <p>
+* for pages falling into the second category, listener interfaces cannot be
+* invoked unless they have first been registered via the static
+* registersecureinterface() method. this method ensures basic security by
+* restricting the set of interfaces that outsiders can call via get and post
+* requests. each listener interface has a single method which takes only a
+* requestcycle parameter. currently, the following classes register the
+* following kinds of listener interfaces:
+* <p>
+* <table>
+* <tr>
+* <th align = "left">class</th>
+* <th align = "left">interface</th>
+* <th align="left">purpose</th>
+* </tr>
+* <tr>
+* <td>form</td>
+* <td>iformsubmitlistener</td>
+* <td>handle form submits</td>
+* </tr>
+* <tr>
+* <td>image</td>
+* <td>iresourcelistener</td>
+* <td>respond to image resource requests</td>
+* </tr>
+* <tr>
+* <td>link</td>
+* <td>ilinklistener</td>
+* <td>respond to link clicks</td>
+* </tr>
+* <tr>
+* <td>page</td>
+* <td>iredirectlistener</td>
+* <td>respond to redirects</td>
+* </tr>
+* </table>
+* <p>
+* the redirecttointerceptpage() and continuetooriginaldestination() methods can
+* be used to temporarily redirect a user to some page. this is mainly intended
+* for use in signing in users who have bookmarked a page inside a site that
+* requires the user be authenticated before they can access the page. when it
+* is discovered that the user is not signed in, the user is redirected to the
+* sign-in page with redirecttointerceptpage(). when the user has signed in,
+* they are sent on their way with continuetooriginaldestination(). these
+* methods could also be useful in "interstitial" advertising or other kinds of
+* "intercepts".
+* <p>
+*
+* @author jonathan locke
+* @author eelco hillenius
+* @author igor vaynberg (ivaynberg)
+*/
+// todo if it were up to me (eelco), we could get rid of the application and
+// session members and accessors. they can be accessed from the thread locals
+public abstract class requestcycle
+/** thread-local that holds the current request cycle. */
+private static final threadlocal current   new threadlocal
+/** cleaning up after responding to a request. */
+private static final int detach_request   6
+/** request cycle processing is done. */
+private static final int done   7
+/** responding to an uncaught exception. */
+private static final int handle_exception   5
+/** log */
+private static final logger log   loggerfactory getlogger requestcycle class
+/** no processing has been done. */
+private static final int not_started   0
+/** starting the actual request processing. */
+private static final int prepare_request   1
+/** dispatching and handling of events. */
+private static final int process_events   3
+/** resolving the {@link requestparameters} object to a request target. */
+private static final int resolve_target   2
+/** responding using the currently set {@link irequesttarget}. */
+private static final int respond   4
+/**
+* gets request cycle for calling thread.
+*
+* @return request cycle for calling thread
+*/
+public static requestcycle get
+return  requestcycle current get
+/**
+* sets the request cycle for the calling thread. you typically do not need
+* to call this method, as the request cycle is set to current for you in
+* the constructor. however, if you have a <a
+* href="http://issues.apache.org/jira/browse/wicket-366">very special need</a>
+* to set it to something else, you can expose this method.
+*
+* @param cycle
+*            the request cycle to set current
+*/
+protected static void set requestcycle cycle
+current set cycle
+/**
+* true if the request cycle should automatically clear feedback messages
+* after processing. true by default.
+*/
+private boolean automaticallyclearfeedbackmessages   true
+/** the current stage of event processing. */
+private int currentstep   not_started
+/** the original response the request cycle was created with. */
+private final response originalresponse
+/**
+* true if request should be redirected to the resulting page instead of
+* just rendering it back to the user.
+*/
+private boolean redirect
+/** holds the stack of set {@link irequesttarget}, the last set op top. */
+private transient final arrayliststack requesttargets   new arrayliststack 3
+/**
+* any page parameters. only set when the request is resolving and the
+* parameters are passed into a page.
+*/
+private pageparameters pageparameters
+/** the session object. */
+private session session
+/** the time that this request cycle object was created. */
+private final long starttime   system currenttimemillis
+/** the application object. */
+protected final application application
+/** the processor for this request. */
+protected final irequestcycleprocessor processor
+/** the current request. */
+protected request request
+/** the current response. */
+protected response response
+/**
+* constructor. this instance will be set as the current one for this
+* thread.
+*
+* @param application
+*            the application
+* @param request
+*            the request
+* @param response
+*            the response
+*/
+protected requestcycle final application application  final request request
+final response response
+this application   application
+this request   request
+this response   response
+this originalresponse   response
+this processor   safegetrequestprocessor
+// set this requestcycle into threadlocal variable
+current set this
+/**
+* gets the application object.
+*
+* @return application interface
+*/
+public final application getapplication
+return application
+/**
+* gets the new agent info object for this session. this method calls
+* {@link session#getclientinfo()}, which may or may not cache the client
+* info object and typically calls {@link #newclientinfo()} when no client
+* info object was cached.
+*
+* @return the agent info object based on this request
+*/
+public final clientinfo getclientinfo
+return getsession   getclientinfo
+/**
+* get the orignal respone the request was create with. access may be
+* necessary with the response has temporarily being replaced but your
+* components requires access to lets say the cookie methods of a
+* webresponse.
+*
+* @return the original response object.
+*/
+public final response getoriginalresponse
+return this originalresponse
+/**
+* any set page parameters. typically only available when a request to a
+* bookmarkable page with a {@link page#page(pageparameters)} constructor
+* was made.
+*
+* @return the page parameters or null
+*/
+public final pageparameters getpageparameters
+return this pageparameters
+/**
+* gets the processor for delegated request cycle handling.
+*
+* @return the processor for delegated request cycle handling
+*/
+public abstract irequestcycleprocessor getprocessor
+/**
+* gets whether the page for this request should be redirected.
+*
+* @return whether the page for this request should be redirected
+* @deprecated use {@link #isredirect()} instead
+*/
+public final boolean getredirect
+return isredirect
+/**
+* gets the request.
+*
+* @return request object
+*/
+public final request getrequest
+return request
+/**
+* gets the current request target. may be null.
+*
+* @return the current request target, null if none was set yet.
+*/
+public final irequesttarget getrequesttarget
+return   requesttargets isempty    ?  irequesttarget requesttargets peek     null
+/**
+* gets the response.
+*
+* @return response object
+*/
+public final response getresponse
+return response
+/**
+* gets the page that is to be rendered for this request in case the last
+* set request target is of type {@link pagerequesttarget}.
+*
+* @return the page or null
+*/
+public final page getresponsepage
+irequesttarget target   getrequesttarget
+if  target instanceof ipagerequesttarget
+return   ipagerequesttarget target  getpage
+else if  target instanceof bookmarkablepagerequesttarget
+return   bookmarkablepagerequesttarget target  getpage
+return null
+/**
+* gets the page class that is to be instantiated and rendered for this
+* request in case the last set request target is of type
+* {@link bookmarkablepagerequesttarget}.
+*
+* @return the page class or null
+*/
+public final class getresponsepageclass
+irequesttarget target   getrequesttarget
+if  target    null     target instanceof ibookmarkablepagerequesttarget
+return   ibookmarkablepagerequesttarget target  getpageclass
+return null
+/**
+* gets the session.
+*
+* @return session object
+*/
+public final session getsession
+if  session    null
+session   session get
+return session
+/**
+* @return the start time for this request
+*/
+public final long getstarttime
+return starttime
+/**
+* gets whether the page for this request should be redirected.
+*
+* @return whether the page for this request should be redirected
+*/
+public boolean isredirect
+return redirect
+/**
+* template method that is called when a runtime exception is thrown, just
+* before the actual handling of the runtime exception. this is called by
+* {@link abstractrequestcycleprocessor#respond(runtimeexception, requestcycle)}.
+*
+* @param page
+*            any page context where the exception was thrown
+* @param e
+*            the exception
+* @return any error page to redirect to
+*/
+public page onruntimeexception page page  runtimeexception e
+return null
+/**
+* this method is not part of the wicket public api. do not call it.
+* <p>
+* redirects browser to the given page. don't use this method directly, but
+* use {@link #setresponsepage(page)} instead.
+*
+* @param page
+*            the page to redirect to
+*/
+public abstract void redirectto final page page
+/**
+* this method is not part of the wicket public api. do not call it.
+* <p>
+* responds to a request.
+*/
+public final void request
+checkreuse
+// set start step
+currentstep   prepare_request
+// loop through steps
+steps
+/**
+* this method is not part of the wicket public api. do not call it.
+* <p>
+* responds to a request to re-render a single component.
+* </p>
+* <p>
+* note: this method is typically only used for testing purposes.
+* </p>
+*
+* @param component
+*            to be re-rendered
+*/
+public final void request final component component
+checkreuse
+if  component isauto
+throw new wicketruntimeexception
+request new componentrequesttarget component
+/**
+* this method is not part of the wicket public api. do not call it.
+* <p>
+* responds to a request with the request target.
+*
+* @param target
+*            request target
+*/
+public final void request irequesttarget target
+checkreuse
+// set it as the current target, on the top of the stack
+requesttargets push target
+// set start step
+currentstep   process_events
+// loop through steps
+steps
+/**
+* permit clients like testers to examine feedback messages after
+* processing.
+*
+* @param automaticallyclearfeedbackmessages
+*            true to automatically detach request cycle at end of
+*            processing
+*/
+public void setautomaticallyclearfeedbackmessages boolean automaticallyclearfeedbackmessages
+// fixme this method is a quick fix for a unit testing problem that
+// should not exist
+this automaticallyclearfeedbackmessages   automaticallyclearfeedbackmessages
+/**
+* sets whether the page for this request should be redirected.
+*
+* @param redirect
+*            true if the page for this request cycle should be redirected
+*            to rather than directly rendered.
+*/
+public final void setredirect final boolean redirect
+this redirect   redirect
+/**
+* @param request
+*            the request to set.
+*/
+public final void setrequest request request
+this request   request
+/**
+* sets the request target as the current.
+*
+* @param requesttarget
+*            the request target to set as current
+*/
+public final void setrequesttarget irequesttarget requesttarget
+if  log isdebugenabled
+if   requesttargets isempty
+irequesttarget former    irequesttarget requesttargets peek
+log debug     former       requesttarget
+else
+log debug     requesttarget
+// change the current step to a step that will handle the
+// new target if need be
+if  currentstep >  respond
+if  log isdebugenabled
+log debug
+// we are not actually doing event processing again,
+// but since we are still in the loop here, the next
+// actual value will be respond again
+currentstep   process_events
+// note: if we are at process_events, leave it as we don't
+// want to re-execute that step again
+requesttargets push requesttarget
+/**
+* sets response.
+*
+* @param response
+*            the response
+* @return the original response
+*/
+public final response setresponse final response response
+final response orig   this response
+this response   response
+return orig
+/**
+* convenience method that sets page class as the response. this will
+* generate a redirect to the page with a bookmarkable url
+*
+* @param pageclass
+*            the page class to render as a response
+*/
+public final void setresponsepage final class pageclass
+setresponsepage pageclass  null
+/**
+* sets the page class with optionally the page parameters as the render
+* target of this request.
+*
+* @param pageclass
+*            the page class to render as a response
+* @param pageparameters
+*            the page parameters that gets appended to the bookmarkable
+*            url,
+*/
+public final void setresponsepage final class pageclass  final pageparameters pageparameters
+irequesttarget target   new bookmarkablepagerequesttarget pageclass  pageparameters
+setrequesttarget target
+/**
+* sets the page as the render target of this request.
+*
+* @param page
+*            the page to render as a response
+*/
+public final void setresponsepage final page page
+irequesttarget target   new pagerequesttarget page
+setrequesttarget target
+/**
+* @see java.lang.object#tostring()
+*/
+public string tostring
+return         integer tohexstring hashcode
+thread currentthread   getname
+/**
+* returns a bookmarkable url that references a given page class using a
+* given set of page parameters. since the url which is returned contains
+* all information necessary to instantiate and render the page, it can be
+* stored in a user's browser as a stable bookmark.
+*
+* @param pageclass
+*            class of page
+* @param parameters
+*            parameters to page
+* @return bookmarkable url to page
+*/
+public final charsequence urlfor final class pageclass  final pageparameters parameters
+return urlfor null  pageclass  parameters
+/**
+* returns a url that references a given interface on a given behaviour of a
+* component. when the url is requested from the server at a later time, the
+* interface on the behaviour will be called. a url returned by this method
+* will not be stable across sessions and cannot be bookmarked by a user.
+*
+* @param component
+*            the component to reference
+* @param behaviour
+*            the behaviour to reference
+* @param listener
+*            the listener interface on the component
+* @return a url that encodes a page, component, behaviour and interface to
+*         call
+*/
+public final charsequence urlfor final component component  final ibehavior behaviour
+final requestlistenerinterface listener
+int index   component getbehaviors   indexof behaviour
+if  index     1
+throw new illegalargumentexception     this
+component tostring
+requestparameters params   new requestparameters
+params setbehaviorid string valueof index
+if  request instanceof servletwebrequest
+servletwebrequest swr    servletwebrequest request
+// if we're coming in with an existing depth, use it. otherwise,
+// compute from the url. this provides correct behavior for repeated
+// ajax requests: if we need to generate a url within an ajax
+// request for another one, it needs to be at the same depth as the
+// original ajax request.
+int urldepth   swr getrequestparameters   geturldepth
+params seturldepth urldepth >  1 ? urldepth   swr getdepthrelativetowickethandler
+final irequesttarget target   new behaviorrequesttarget component getpage    component
+listener  params
+final irequestcodingstrategy requestcodingstrategy   getprocessor
+getrequestcodingstrategy
+return requestcodingstrategy encode this  target
+/**
+* returns a url that references a given interface on a component. when the
+* url is requested from the server at a later time, the interface will be
+* called. a url returned by this method will not be stable across sessions
+* and cannot be bookmarked by a user.
+*
+* @param component
+*            the component to reference
+* @param listener
+*            the listener interface on the component
+* @return a url that encodes a page, component and interface to call
+*/
+public final charsequence urlfor final component component
+final requestlistenerinterface listener
+// get page holding component and mark it as stateful.
+final page page   component getpage
+final irequesttarget target
+if  listener    iredirectlistener interface    component isstateless
+page isbookmarkable
+target   new bookmarkablelistenerinterfacerequesttarget page getpagemapname
+page getclass    new pageparameters    component  listener
+else
+page setpagestateless boolean false
+// make session non-volatile if not already so
+final session session   getsession
+if  session istemporary
+session bind
+// get the listener interface name
+target   new listenerinterfacerequesttarget page  component  listener
+final irequestcodingstrategy requestcodingstrategy   getprocessor
+getrequestcodingstrategy
+return requestcodingstrategy encode this  target
+/**
+* returns a bookmarkable url that references a given page class using a
+* given set of page parameters. since the url which is returned contains
+* all information necessary to instantiate and render the page, it can be
+* stored in a user's browser as a stable bookmark.
+*
+* @param pagemap
+*            pagemap to use. if null is passed the default page map will be
+*            used
+* @param pageclass
+*            class of page
+* @param parameters
+*            parameters to page
+* @return bookmarkable url to page
+*/
+public final charsequence urlfor final ipagemap pagemap  final class pageclass
+final pageparameters parameters
+final irequesttarget target   new bookmarkablepagerequesttarget pagemap    null
+? pagemap default_name
+pagemap getname    pageclass  parameters
+final irequestcodingstrategy requestcodingstrategy   getprocessor
+getrequestcodingstrategy
+return requestcodingstrategy encode this  target
+/**
+* returns a url that references the given request target.
+*
+* @param requesttarget
+*            the request target to reference
+* @return a url that references the given request target
+*/
+public final charsequence urlfor final irequesttarget requesttarget
+irequestcodingstrategy requestcodingstrategy   getprocessor   getrequestcodingstrategy
+return requestcodingstrategy encode this  requesttarget
+/**
+* returns a url that references the given page. it also
+* {@link session#touch(page) touches} the page in the session so that it is
+* put in the front of the page stack. use this method only if you plan to
+* use it the next request.
+*
+* @param page
+*            the page
+* @return the url pointing to the provided page
+*/
+public final charsequence urlfor final page page
+irequesttarget target   new pagerequesttarget page
+getsession   touch   ipagerequesttarget target  getpage
+return urlfor target
+/**
+* returns a url that references a shared resource through the provided
+* resource reference.
+*
+* @param resourcereference
+*            the resource reference where a url must be generated for.
+* @return the url for the shared resource
+*/
+public final charsequence urlfor final resourcereference resourcereference
+return urlfor resourcereference  null
+/**
+* returns a url that references a shared resource through the provided
+* resource reference.
+*
+* @param resourcereference
+*            the resource reference where a url must be generated for.
+* @param parameters
+*            the parameters to pass to the resource.
+* @return the url for the shared resource
+*/
+public final charsequence urlfor final resourcereference resourcereference  valuemap parameters
+requestparameters requestparameters   new requestparameters
+requestparameters setresourcekey resourcereference getsharedresourcekey
+requestparameters setparameters parameters
+charsequence url   getprocessor   getrequestcodingstrategy   encode this
+new sharedresourcerequesttarget requestparameters
+return url
+/**
+* checks whether no processing has been done yet and throws an exception
+* when a client tries to reuse this instance.
+*/
+private void checkreuse
+if  currentstep    not_started
+throw new wicketruntimeexception
+this
+/**
+* clean up the request cycle.
+*/
+private void detach
+// clean up target stack; calling detach has effects like
+// note: don't remove the targets as testing code might need them
+// furthermore, the targets will be cg-ed with this cycle too
+for  iterator iter   requesttargets iterator    iter hasnext
+irequesttarget target    irequesttarget iter next
+if  target    null
+try
+target detach this
+catch  runtimeexception e
+log error     target      e
+if  automaticallyclearfeedbackmessages
+// remove any rendered and otherwise obsolute feedback messages from
+// the session
+try
+if  sessionexists
+getsession   cleanupfeedbackmessages
+catch  runtimeexception re
+log error    re
+// if we have a request logger, update that now
+try
+irequestlogger requestlogger   getapplication   getrequestlogger
+if  requestlogger    null
+requestlogger requesttime  system currenttimemillis     starttime
+catch  runtimeexception re
+log error    re
+// let the session cleanup after a request, flushing changes etc.
+if  sessionexists
+try
+getsession   requestdetached
+catch  runtimeexception re
+log error     session
+re
+if  getresponse   instanceof bufferedwebresponse
+try
+bufferedwebresponse getresponse    filter
+catch  runtimeexception re
+log error    re
+try
+onendrequest
+catch  runtimeexception e
+log error    e
+try
+getapplication   getsessionstore   onendrequest getrequest
+catch  runtimeexception e
+log error    e
+// release thread local resources
+try
+threaddetach
+catch  runtimeexception re
+log error    re
+/**
+* prepare the request cycle.
+*/
+private void prepare
+try
+getapplication   getsessionstore   onbeginrequest getrequest
+catch  runtimeexception e
+log error    e
+// event callback
+onbeginrequest
+/**
+* call the event processing and and respond methods on the request
+* processor and apply synchronization if needed.
+*/
+private final void processeventsandrespond
+// let the processor handle/ issue any events
+processor processevents this
+// set current stage manually this time
+currentstep   respond
+// generate a response
+processor respond this
+/**
+* call the event processing and and respond methods on the request
+* processor and apply synchronization if needed.
+*/
+private final void respond
+processor respond this
+/**
+* safe version of {@link #getprocessor()} that throws an exception when the
+* processor is null.
+*
+* @return the request processor
+*/
+private final irequestcycleprocessor safegetrequestprocessor
+irequestcycleprocessor processor   getprocessor
+if  processor    null
+throw new wicketruntimeexception
+return processor
+/**
+* @return true if a session exists for the calling thread
+*/
+private boolean sessionexists
+return session exists
+/**
+* handle the current step in the request processing.
+*/
+private final void step
+try
+switch  currentstep
+case prepare_request
+// prepare the request
+prepare
+break
+case resolve_target
+// resolve the target of the request using the request
+// parameters
+final irequesttarget target   processor resolve this  request
+getrequestparameters
+// has to result in a request target
+if  target    null
+throw new wicketruntimeexception
+// add (inserting at the bottom) in case before or during
+// target resolving one or more request targets were pushed
+// on the stack before this. if that is the case, they
+// should be handled before this
+requesttargets add 0  target
+break
+case process_events
+processeventsandrespond
+break
+case respond
+// generate a response
+respond
+break
+default
+// nothing
+catch  abortexception e
+throw e
+catch  runtimeexception e
+// set step manually to handle exception
+currentstep   handle_exception
+// probably our last chance the exception can be logged.
+// note that a pageexpiredexception should not be logged, because
+// it's not an internal error
+if    e instanceof pageexpiredexception
+logruntimeexception e
+// try to play nicely and let the request processor handle the
+// exception response. if that doesn't work, any runtime exception
+// will automatically be bubbled up
+if  processor    null
+processor respond e  this
+/**
+* loop through the processing steps starting from the current one.
+*/
+private final void steps
+try
+// get the processor
+irequestcycleprocessor processor   safegetrequestprocessor
+// arbitrary maximum number of steps
+final int maxsteps   100
+// loop through steps
+for  int totalsteps   0  currentstep < done  totalsteps
+// there is no way to catch infinite loops since the response
+// step can always throw an abstractrestartresponseexception and
+// start the process over at the respond step. so we do a sanity
+// check here and limit the total number of steps to an
+// arbitrary maximum that we consider unreasonable for working
+// code.
+if  totalsteps >  maxsteps
+throw new illegalstateexception     maxsteps
+try
+step
+currentstep
+catch  abstractrestartresponseexception e
+// if a redirect exception has been issued we abort what we
+// were doing and begin responding to the top target on the
+// stack
+currentstep   respond
+finally
+// set step manually to clean up
+currentstep   detach_request
+// clean up the request
+detach
+// set step manually to done
+currentstep   done
+/**
+* releases the current thread local related resources. the threadlocal of
+* this request cycle is reset. if we are in a 'redirect' state, we do not
+* want to lose our messages as - e.g. when handling a form - there's a fat
+* chance we are coming back for the rendering of it.
+*/
+private final void threaddetach
+// detach from session
+if  sessionexists
+getsession   detach
+if  isredirect
+// since we are explicitly redirecting to a page already, we do not
+// want a second redirect to occur automatically
+setredirect false
+// clear threadlocal reference; makes sense as this object should not be
+// reused
+current set null
+/**
+* possibly set the page parameters. only set when the request is resolving
+* and the parameters are passed into a page.
+*
+* @param parameters
+*            the parameters to set
+*/
+final void setpageparameters pageparameters parameters
+if  currentstep    resolve_target
+this pageparameters   parameters
+/**
+* called when an unrecoverable runtime exception during request cycle
+* handling occured, which will result in displaying a user facing error
+* page. clients can override this method in case they want to customize
+* logging. not called for
+* {@link pageexpiredexception page expired exceptions}.
+*
+* @param e
+*            the runtime exception
+*/
+protected void logruntimeexception runtimeexception e
+log error e getmessage    e
+/**
+* creates a new agent info object based on this request. typically, this
+* method is called once by the session and the returned object will be
+* cached in the session after that call; we can expect the client to stay
+* the same for the whole session, and implementations of
+* {@link #newclientinfo()} might be relatively expensive.
+*
+* @return the agent info object based on this request
+*/
+protected abstract clientinfo newclientinfo
+/**
+* called when the request cycle object is beginning its response
+*/
+protected void onbeginrequest
+/**
+* called when the request cycle object has finished its response
+*/
+protected void onendrequest

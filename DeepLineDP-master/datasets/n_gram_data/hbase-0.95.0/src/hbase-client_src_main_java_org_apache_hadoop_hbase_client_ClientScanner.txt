@@ -1,0 +1,330 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase client
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop classification interfacestability
+import org apache hadoop conf configuration
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase client metrics scanmetrics
+import org apache hadoop hbase exceptions donotretryioexception
+import org apache hadoop hbase exceptions notservingregionexception
+import org apache hadoop hbase exceptions outoforderscannernextexception
+import org apache hadoop hbase exceptions regionserverstoppedexception
+import org apache hadoop hbase exceptions unknownscannerexception
+import org apache hadoop hbase protobuf protobufutil
+import org apache hadoop hbase protobuf generated mapreduceprotos
+import org apache hadoop hbase util bytes
+import java io ioexception
+import java util arraylist
+import java util linkedlist
+/**
+* implements the scanner interface for the hbase client.
+* if there are multiple regions in a table, this scanner will iterate
+* through them all.
+*/
+@interfaceaudience public
+@interfacestability stable
+public class clientscanner extends abstractclientscanner
+private final log log   logfactory getlog this getclass
+private scan scan
+private boolean closed   false
+// current region scanner is against.  gets cleared if current region goes
+// wonky: e.g. if it splits on us.
+private hregioninfo currentregion   null
+private scannercallable callable   null
+private final linkedlist<result> cache   new linkedlist<result>
+private final int caching
+private long lastnext
+// keep lastresult returned successfully in case we have to reset scanner.
+private result lastresult   null
+private scanmetrics scanmetrics   null
+private final long maxscannerresultsize
+private final hconnection connection
+private final byte tablename
+private final int scannertimeout
+/**
+* create a new clientscanner for the specified table. an hconnection will be
+* retrieved using the passed configuration.
+* note that the passed {@link scan}'s start row maybe changed changed.
+*
+* @param conf the {@link configuration} to use.
+* @param scan {@link scan} to use in this scanner
+* @param tablename the table that we wish to scan
+* @throws ioexception
+*/
+public clientscanner final configuration conf  final scan scan
+final byte tablename  throws ioexception
+this conf  scan  tablename  hconnectionmanager getconnection conf
+/**
+* create a new clientscanner for the specified table
+* note that the passed {@link scan}'s start row maybe changed changed.
+*
+* @param conf the {@link configuration} to use.
+* @param scan {@link scan} to use in this scanner
+* @param tablename the table that we wish to scan
+* @param connection connection identifying the cluster
+* @throws ioexception
+*/
+public clientscanner final configuration conf  final scan scan
+final byte tablename  hconnection connection  throws ioexception
+if  log isdebugenabled
+log debug
+bytes tostring tablename
+bytes tostringbinary scan getstartrow
+this scan   scan
+this tablename   tablename
+this lastnext   system currenttimemillis
+this connection   connection
+if  scan getmaxresultsize   > 0
+this maxscannerresultsize   scan getmaxresultsize
+else
+this maxscannerresultsize   conf getlong
+hconstants hbase_client_scanner_max_result_size_key
+hconstants default_hbase_client_scanner_max_result_size
+this scannertimeout   conf getint hconstants hbase_client_scanner_timeout_period
+hconstants default_hbase_client_scanner_timeout_period
+// check if application wants to collect scan metrics
+byte enablemetrics   scan getattribute
+scan scan_attributes_metrics_enable
+if  enablemetrics    null    bytes toboolean enablemetrics
+scanmetrics   new scanmetrics
+// use the caching from the scan.  if not set, use the default cache setting for this table.
+if  this scan getcaching   > 0
+this caching   this scan getcaching
+else
+this caching   conf getint
+hconstants hbase_client_scanner_caching
+hconstants default_hbase_client_scanner_caching
+// initialize the scanner
+nextscanner this caching  false
+protected hconnection getconnection
+return this connection
+protected byte gettablename
+return this tablename
+protected scan getscan
+return scan
+protected long gettimestamp
+return lastnext
+// returns true if the passed region endkey
+private boolean checkscanstoprow final byte  endkey
+if  this scan getstoprow   length > 0
+// there is a stop row, check to see if we are past it.
+byte  stoprow   scan getstoprow
+int cmp   bytes compareto stoprow  0  stoprow length
+endkey  0  endkey length
+if  cmp <  0
+// stoprow <= endkey (endkey is equals to or larger than stoprow)
+// this is a stop.
+return true
+return false    unlikely
+/*
+* gets a scanner for the next region.  if this.currentregion != null, then
+* we will move to the endrow of this.currentregion.  else we will get
+* scanner at the scan.getstartrow().  we will go no further, just tidy
+* up outstanding scanners, if <code>currentregion != null</code> and
+* <code>done</code> is true.
+* @param nbrows
+* @param done server-side says we're done scanning.
+*/
+private boolean nextscanner int nbrows  final boolean done
+throws ioexception
+// close the previous scanner if it's open
+if  this callable    null
+this callable setclose
+callable withretries
+this callable   null
+// where to start the next scanner
+byte  localstartkey
+// if we're at end of table, close and return false to stop iterating
+if  this currentregion    null
+byte  endkey   this currentregion getendkey
+if  endkey    null
+bytes equals endkey  hconstants empty_byte_array
+checkscanstoprow endkey
+done
+close
+if  log isdebugenabled
+log debug     this currentregion
+return false
+localstartkey   endkey
+if  log isdebugenabled
+log debug     this currentregion
+else
+localstartkey   this scan getstartrow
+if  log isdebugenabled
+log debug
+bytes tostringbinary localstartkey
+try
+callable   getscannercallable localstartkey  nbrows
+// open a scanner on the region server starting at the
+// beginning of the region
+callable withretries
+this currentregion   callable gethregioninfo
+if  this scanmetrics    null
+this scanmetrics countofregions incrementandget
+catch  ioexception e
+close
+throw e
+return true
+protected scannercallable getscannercallable byte  localstartkey
+int nbrows
+scan setstartrow localstartkey
+scannercallable s   new scannercallable getconnection
+gettablename    scan  this scanmetrics
+s setcaching nbrows
+return s
+/**
+* publish the scan metrics. for now, we use scan.setattribute to pass the metrics back to the
+* application or tableinputformat.later, we could push it to other systems. we don't use metrics
+* framework because it doesn't support multi-instances of the same metrics on the same machine;
+* for scan/map reduce scenarios, we will have multiple scans running at the same time.
+*
+* by default, scan metrics are disabled; if the application wants to collect them, this behavior
+* can be turned on by calling calling:
+*
+* scan.setattribute(scan_attributes_metrics_enable, bytes.tobytes(boolean.true))
+*/
+private void writescanmetrics   throws ioexception
+if  this scanmetrics    null
+return
+mapreduceprotos scanmetrics pscanmetrics   protobufutil toscanmetrics scanmetrics
+scan setattribute scan scan_attributes_metrics_data  pscanmetrics tobytearray
+public result next   throws ioexception
+// if the scanner is closed and there's nothing left in the cache, next is a no-op.
+if  cache size      0    this closed
+return null
+if  cache size      0
+result  values   null
+long remainingresultsize   maxscannerresultsize
+int countdown   this caching
+// we need to reset it if it's a new callable that was created
+// with a countdown in nextscanner
+callable setcaching this caching
+// this flag is set when we want to skip the result returned.  we do
+// this when we reset scanner because it split under us.
+boolean skipfirst   false
+boolean retryafteroutoforderexception    true
+do
+try
+if  skipfirst
+// skip only the first row (which was the last row of the last
+// already-processed batch).
+callable setcaching 1
+values   callable withretries
+callable setcaching this caching
+skipfirst   false
+// server returns a null values if scanning is to stop.  else,
+// returns an empty array if scanning is to go on and we've just
+// exhausted current region.
+values   callable withretries
+retryafteroutoforderexception    true
+catch  donotretryioexception e
+if  e instanceof unknownscannerexception
+long timeout   lastnext   scannertimeout
+// if we are over the timeout, throw this exception to the client
+// else, it's because the region moved and we used the old id
+// against the new region server; reset the scanner.
+if  timeout < system currenttimemillis
+long elapsed   system currenttimemillis     lastnext
+scannertimeoutexception ex   new scannertimeoutexception
+elapsed
+scannertimeout
+ex initcause e
+throw ex
+else
+throwable cause   e getcause
+if   cause    null       cause instanceof notservingregionexception
+cause instanceof regionserverstoppedexception
+e instanceof outoforderscannernextexception
+throw e
+// else, its signal from depths of scannercallable that we got an
+// nsre on a next and that we need to reset the scanner.
+if  this lastresult    null
+this scan setstartrow this lastresult getrow
+// skip first row returned.  we already let it out on previous
+// invocation.
+skipfirst   true
+if  e instanceof outoforderscannernextexception
+if  retryafteroutoforderexception
+retryafteroutoforderexception   false
+else
+throw new donotretryioexception
+e
+// clear region
+this currentregion   null
+callable   null
+continue
+long currenttime   system currenttimemillis
+if  this scanmetrics    null
+this scanmetrics sumofmillissecbetweennexts addandget currenttime lastnext
+lastnext   currenttime
+if  values    null    values length > 0
+for  result rs   values
+cache add rs
+for  keyvalue kv   rs raw
+remainingresultsize    kv heapsize
+countdown
+this lastresult   rs
+// values == null means server-side filter has determined we must stop
+while  remainingresultsize > 0    countdown > 0    nextscanner countdown  values    null
+if  cache size   > 0
+return cache poll
+// if we exhausted this scanner before calling close, write out the scan metrics
+writescanmetrics
+return null
+/**
+* get <param>nbrows</param> rows.
+* how many rpcs are made is determined by the {@link scan#setcaching(int)}
+* setting (or hbase.client.scanner.caching in hbase-site.xml).
+* @param nbrows number of rows to return
+* @return between zero and <param>nbrows</param> rowresults.  scan is done
+* if returned array is of zero-length (we never return null).
+* @throws ioexception
+*/
+public result  next int nbrows  throws ioexception
+// collect values to be returned here
+arraylist<result> resultsets   new arraylist<result> nbrows
+for int i   0  i < nbrows  i
+result next   next
+if  next    null
+resultsets add next
+else
+break
+return resultsets toarray new result
+public void close
+if  callable    null
+callable setclose
+try
+callable withretries
+catch  ioexception e
+// we used to catch this error, interpret, and rethrow. however, we
+// have since decided that it's not nice for a scanner's close to
+// throw exceptions. chances are it was just an unknownscanner
+// exception due to lease time out.
+finally
+// we want to output the scan metrics even if an error occurred on close
+try
+writescanmetrics
+catch  ioexception e
+// as above, we still don't want the scanner close() method to throw.
+callable   null
+closed   true

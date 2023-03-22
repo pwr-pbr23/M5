@@ -1,0 +1,480 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq broker region
+import java io ioexception
+import java util linkedlist
+import java util concurrent atomic atomicboolean
+import java util concurrent atomic atomiclong
+import javax jms jmsexception
+import org apache activemq activemqmessageaudit
+import org apache activemq broker broker
+import org apache activemq broker connectioncontext
+import org apache activemq broker region cursors filependingmessagecursor
+import org apache activemq broker region cursors pendingmessagecursor
+import org apache activemq broker region cursors vmpendingmessagecursor
+import org apache activemq broker region policy messageevictionstrategy
+import org apache activemq broker region policy oldestmessageevictionstrategy
+import org apache activemq command consumercontrol
+import org apache activemq command consumerinfo
+import org apache activemq command message
+import org apache activemq command messageack
+import org apache activemq command messagedispatch
+import org apache activemq command messagedispatchnotification
+import org apache activemq command messagepull
+import org apache activemq command response
+import org apache activemq thread scheduler
+import org apache activemq transaction synchronization
+import org apache activemq transport transmitcallback
+import org apache activemq usage systemusage
+import org slf4j logger
+import org slf4j loggerfactory
+public class topicsubscription extends abstractsubscription
+private static final logger log   loggerfactory getlogger topicsubscription class
+private static final atomiclong cursor_name_counter   new atomiclong 0
+protected pendingmessagecursor matched
+protected final systemusage usagemanager
+protected atomiclong dispatchedcounter   new atomiclong
+boolean singledestination   true
+destination destination
+private final scheduler scheduler
+private int maximumpendingmessages    1
+private messageevictionstrategy messageevictionstrategy   new oldestmessageevictionstrategy
+private int discarded
+private final object matchedlistmutex   new object
+private final atomiclong enqueuecounter   new atomiclong 0
+private final atomiclong dequeuecounter   new atomiclong 0
+private final atomicboolean prefetchwindowopen   new atomicboolean false
+private int memoryusagehighwatermark   95
+// allow duplicate suppression in a ring network of brokers
+protected int maxproducerstoaudit   1024
+protected int maxauditdepth   1000
+protected boolean enableaudit   false
+protected activemqmessageaudit audit
+protected boolean active   false
+public topicsubscription broker broker connectioncontext context  consumerinfo info  systemusage usagemanager  throws exception
+super broker  context  info
+this usagemanager   usagemanager
+string matchedname       cursor_name_counter getandincrement         info getconsumerid   tostring
+if  info getdestination   istemporary      broker gettempdatastore    null
+this matched   new vmpendingmessagecursor false
+else
+this matched   new filependingmessagecursor broker matchedname false
+this scheduler   broker getscheduler
+public void init   throws exception
+this matched setsystemusage usagemanager
+this matched setmemoryusagehighwatermark getcursormemoryhighwatermark
+this matched start
+if  enableaudit
+audit  new activemqmessageaudit maxauditdepth  maxproducerstoaudit
+this active true
+@override
+public void add messagereference node  throws exception
+if  isduplicate node
+return
+// lets use an indirect reference so that we can associate a unique
+// locator /w the message.
+node   new indirectmessagereference node getmessage
+enqueuecounter incrementandget
+if   isfull      matched isempty
+// if maximumpendingmessages is set we will only discard messages which
+// have not been dispatched (i.e. we allow the prefetch buffer to be filled)
+dispatch node
+setslowconsumer false
+else
+if  info getprefetchsize   > 1    matched size   > info getprefetchsize
+// slow consumers should log and set their state as such.
+if   isslowconsumer
+log warn tostring
+setslowconsumer true
+for  destination dest  destinations
+dest slowconsumer getcontext    this
+if  maximumpendingmessages    0
+boolean warnedaboutwait   false
+while  active
+synchronized  matchedlistmutex
+while  matched isfull
+if  getcontext   getstopping   get
+log warn tostring
+node getmessageid
+enqueuecounter decrementandget
+return
+if   warnedaboutwait
+log info tostring         matched
+matched getsystemusage   gettempusage   getpercentusage
+matched getsystemusage   getmemoryusage   getpercentusage
+warnedaboutwait   true
+matchedlistmutex wait 20
+// temporary storage could be full - so just try to add the message
+// see https://issues.apache.org/activemq/browse/amq-2475
+if  matched tryaddmessagelast node  10
+break
+synchronized  matchedlistmutex
+// note - be careful about the slavebroker!
+if  maximumpendingmessages > 0
+// calculate the high water mark from which point we
+// will eagerly evict expired messages
+int max   messageevictionstrategy getevictexpiredmessageshighwatermark
+if  maximumpendingmessages > 0    maximumpendingmessages < max
+max   maximumpendingmessages
+if   matched isempty      matched size   > max
+removeexpiredmessages
+// lets discard old messages as we are a slow consumer
+while   matched isempty      matched size   > maximumpendingmessages
+int pageinsize   matched size     maximumpendingmessages
+// only page in a 1000 at a time - else we could blow the memory
+pageinsize   math max 1000  pageinsize
+linkedlist<messagereference> list   null
+messagereference oldmessages null
+synchronized matched
+list   matched pageinlist pageinsize
+oldmessages   messageevictionstrategy evictmessages list
+for  messagereference ref   list
+ref decrementreferencecount
+int messagestoevict   0
+if  oldmessages    null
+messagestoevict   oldmessages length
+for  int i   0  i < messagestoevict  i
+messagereference oldmessage   oldmessages
+discard oldmessage
+// lets avoid an infinite loop if we are given a bad eviction strategy
+// for a bad strategy lets just not evict
+if  messagestoevict    0
+log warn      destination       messageevictionstrategy       list size
+break
+dispatchmatched
+private boolean isduplicate messagereference node
+boolean duplicate   false
+if  enableaudit    audit    null
+duplicate   audit isduplicate node
+if  log isdebugenabled
+if  duplicate
+log debug this       node getmessageid
+return duplicate
+/**
+* discard any expired messages from the matched list. called from a
+* synchronized block.
+*
+* @throws ioexception
+*/
+protected void removeexpiredmessages   throws ioexception
+try
+matched reset
+while  matched hasnext
+messagereference node   matched next
+node decrementreferencecount
+if  broker isexpired node
+matched remove
+dispatchedcounter incrementandget
+node decrementreferencecount
+destination node getregiondestination    getdestinationstatistics   getexpired   increment
+broker messageexpired getcontext    node  this
+break
+finally
+matched release
+@override
+public void processmessagedispatchnotification messagedispatchnotification mdn
+synchronized  matchedlistmutex
+try
+matched reset
+while  matched hasnext
+messagereference node   matched next
+node decrementreferencecount
+if  node getmessageid   equals mdn getmessageid
+matched remove
+dispatchedcounter incrementandget
+node decrementreferencecount
+break
+finally
+matched release
+@override
+public synchronized void acknowledge final connectioncontext context  final messageack ack  throws exception
+// handle the standard acknowledgment case.
+if  ack isstandardack      ack ispoisonack      ack isindividualack
+if  context isintransaction
+context gettransaction   addsynchronization new synchronization
+@override
+public void aftercommit   throws exception
+synchronized  topicsubscription this
+if  singledestination    destination    null
+destination getdestinationstatistics   getdequeues   add ack getmessagecount
+dequeuecounter addandget ack getmessagecount
+dispatchmatched
+else
+if  singledestination    destination    null
+destination getdestinationstatistics   getdequeues   add ack getmessagecount
+destination getdestinationstatistics   getinflight   subtract ack getmessagecount
+dequeuecounter addandget ack getmessagecount
+dispatchmatched
+return
+else if  ack isdeliveredack
+// message was delivered but not acknowledged: update pre-fetch counters.
+// also. get these for a consumer expired message.
+if  destination    null     ack isintransaction
+destination getdestinationstatistics   getdequeues   add ack getmessagecount
+destination getdestinationstatistics   getinflight   subtract ack getmessagecount
+dequeuecounter addandget ack getmessagecount
+dispatchmatched
+return
+else if  ack isredeliveredack
+// nothing to do atm
+return
+throw new jmsexception     ack
+@override
+public response pullmessage connectioncontext context  messagepull pull  throws exception
+// the slave should not deliver pull messages.
+if  getprefetchsize      0
+prefetchwindowopen set true
+dispatchmatched
+// if there was nothing dispatched.. we may need to setup a timeout.
+if  prefetchwindowopen get
+// immediate timeout used by receivenowait()
+if  pull gettimeout       1
+prefetchwindowopen set false
+// send a null message to signal nothing pending.
+dispatch null
+if  pull gettimeout   > 0
+scheduler executeafterdelay new runnable
+@override
+public void run
+pulltimeout
+pull gettimeout
+return null
+/**
+* occurs when a pull times out. if nothing has been dispatched since the
+* timeout was setup, then send the null message.
+*/
+private final void pulltimeout
+synchronized  matchedlistmutex
+if  prefetchwindowopen compareandset true  false
+try
+dispatch null
+catch  exception e
+context getconnection   serviceexception e
+@override
+public int getpendingqueuesize
+return matched
+@override
+public int getdispatchedqueuesize
+return  int  dispatchedcounter get     dequeuecounter get
+public int getmaximumpendingmessages
+return maximumpendingmessages
+@override
+public long getdispatchedcounter
+return dispatchedcounter get
+@override
+public long getenqueuecounter
+return enqueuecounter get
+@override
+public long getdequeuecounter
+return dequeuecounter get
+/**
+* @return the number of messages discarded due to being a slow consumer
+*/
+public int discarded
+synchronized  matchedlistmutex
+return discarded
+/**
+* @return the number of matched messages (messages targeted for the
+*         subscription but not yet able to be dispatched due to the
+*         prefetch buffer being full).
+*/
+public int matched
+synchronized  matchedlistmutex
+return matched size
+/**
+* sets the maximum number of pending messages that can be matched against
+* this consumer before old messages are discarded.
+*/
+public void setmaximumpendingmessages int maximumpendingmessages
+this maximumpendingmessages   maximumpendingmessages
+public messageevictionstrategy getmessageevictionstrategy
+return messageevictionstrategy
+/**
+* sets the eviction strategy used to decide which message to evict when the
+* slow consumer needs to discard messages
+*/
+public void setmessageevictionstrategy messageevictionstrategy messageevictionstrategy
+this messageevictionstrategy   messageevictionstrategy
+public int getmaxproducerstoaudit
+return maxproducerstoaudit
+public synchronized void setmaxproducerstoaudit int maxproducerstoaudit
+this maxproducerstoaudit   maxproducerstoaudit
+if  audit    null
+audit setmaximumnumberofproducerstotrack maxproducerstoaudit
+public int getmaxauditdepth
+return maxauditdepth
+public synchronized void setmaxauditdepth int maxauditdepth
+this maxauditdepth   maxauditdepth
+if  audit    null
+audit setauditdepth maxauditdepth
+public boolean isenableaudit
+return enableaudit
+public synchronized void setenableaudit boolean enableaudit
+this enableaudit   enableaudit
+if  enableaudit    audit    null
+audit   new activemqmessageaudit maxauditdepth maxproducerstoaudit
+// implementation methods
+// -------------------------------------------------------------------------
+@override
+public boolean isfull
+return getdispatchedqueuesize   >  info getprefetchsize       prefetchwindowopen get
+@override
+public int getinflightsize
+return getdispatchedqueuesize
+/**
+* @return true when 60% or more room is left for dispatching messages
+*/
+@override
+public boolean islowwatermark
+return getdispatchedqueuesize   <   info getprefetchsize      4
+/**
+* @return true when 10% or less room is left for dispatching messages
+*/
+@override
+public boolean ishighwatermark
+return getdispatchedqueuesize   >   info getprefetchsize      9
+/**
+* @param memoryusagehighwatermark the memoryusagehighwatermark to set
+*/
+public void setmemoryusagehighwatermark int memoryusagehighwatermark
+this memoryusagehighwatermark   memoryusagehighwatermark
+/**
+* @return the memoryusagehighwatermark
+*/
+public int getmemoryusagehighwatermark
+return this memoryusagehighwatermark
+/**
+* @return the usagemanager
+*/
+public systemusage getusagemanager
+return this usagemanager
+/**
+* @return the matched
+*/
+public pendingmessagecursor getmatched
+return this matched
+/**
+* @param matched the matched to set
+*/
+public void setmatched pendingmessagecursor matched
+this matched   matched
+/**
+* inform the messageconsumer on the client to change it's prefetch
+*
+* @param newprefetch
+*/
+@override
+public void updateconsumerprefetch int newprefetch
+if  context    null    context getconnection      null    context getconnection   ismanageable
+consumercontrol cc   new consumercontrol
+cc setconsumerid info getconsumerid
+cc setprefetch newprefetch
+context getconnection   dispatchasync cc
+private void dispatchmatched   throws ioexception
+synchronized  matchedlistmutex
+if   matched isempty       isfull
+try
+matched reset
+while  matched hasnext       isfull
+messagereference message   matched next
+message decrementreferencecount
+matched remove
+// message may have been sitting in the matched list a while
+// waiting for the consumer to ak the message.
+if  message isexpired
+discard message
+continue     just drop it
+dispatch message
+prefetchwindowopen set false
+finally
+matched release
+private void dispatch final messagereference node  throws ioexception
+message message   node getmessage
+if  node    null
+node incrementreferencecount
+// make sure we can dispatch a message.
+messagedispatch md   new messagedispatch
+md setmessage message
+md setconsumerid info getconsumerid
+if  node    null
+md setdestination   destination node getregiondestination    getactivemqdestination
+dispatchedcounter incrementandget
+// keep track if this subscription is receiving messages from a single destination.
+if  singledestination
+if  destination    null
+destination    destination node getregiondestination
+else
+if  destination    node getregiondestination
+singledestination   false
+if  info isdispatchasync
+if  node    null
+md settransmitcallback new transmitcallback
+@override
+public void onsuccess
+destination regiondestination    destination  node getregiondestination
+regiondestination getdestinationstatistics   getdispatched   increment
+regiondestination getdestinationstatistics   getinflight   increment
+node decrementreferencecount
+@override
+public void onfailure
+destination regiondestination    destination  node getregiondestination
+regiondestination getdestinationstatistics   getdispatched   increment
+regiondestination getdestinationstatistics   getinflight   increment
+node decrementreferencecount
+context getconnection   dispatchasync md
+else
+context getconnection   dispatchsync md
+if  node    null
+destination regiondestination    destination  node getregiondestination
+regiondestination getdestinationstatistics   getdispatched   increment
+regiondestination getdestinationstatistics   getinflight   increment
+node decrementreferencecount
+private void discard messagereference message
+message decrementreferencecount
+matched remove message
+discarded
+if destination    null
+destination getdestinationstatistics   getdequeues   increment
+if  log isdebugenabled
+log debug this       message
+destination dest    destination  message getregiondestination
+if  dest    null
+dest messagediscarded getcontext    this  message
+broker getroot   sendtodeadletterqueue getcontext    message  this
+@override
+public string tostring
+return         info getconsumerid         destinations size         getdispatchedqueuesize
+getdequeuecounter         matched         discarded
+@override
+public void destroy
+this active false
+synchronized  matchedlistmutex
+try
+matched destroy
+catch  exception e
+log warn    e
+setslowconsumer false
+@override
+public int getprefetchsize
+return info getprefetchsize
+@override
+public void setprefetchsize int newsize
+info setprefetchsize newsize
+try
+dispatchmatched
+catch exception e
+log trace

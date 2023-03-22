@@ -1,0 +1,703 @@
+/*
+derby - class org.apache.derby.impl.sql.compile.likeescapeoperatornode
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl sql compile
+import org apache derby iapi services compiler methodbuilder
+import org apache derby iapi sql compile c_nodetypes
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby iapi sql dictionary datadictionary
+import org apache derby iapi sql conn languageconnectioncontext
+import org apache derby iapi types typeid
+import org apache derby iapi types stringdatavalue
+import org apache derby iapi types datatypedescriptor
+import org apache derby iapi sql compile typecompiler
+import org apache derby iapi reference sqlstate
+import org apache derby impl sql compile expressionclassbuilder
+import org apache derby iapi services compiler localfield
+import org apache derby iapi util reusefactory
+import java lang reflect modifier
+import org apache derby iapi services classfile vmopcode
+import org apache derby iapi types like
+import java sql types
+import org apache derby iapi reference classname
+import java util vector
+/**
+this node represents a like comparison operator (no escape)
+if the like pattern is a constant or a parameter then if possible
+the like is modified to include a >= and < operator. in some cases
+the like can be eliminated.  by adding =, >= or < operators it may
+allow indexes to be used to greatly narrow the search range of the
+query, and allow optimizer to estimate number of rows to affected.
+constant or parameter like pattern with prefix followed by optional wild
+card e.g. derby%
+char(n), varchar(n) where n < 255
+>=   prefix padded with '\u0000' to length n -- e.g. derby\u0000\u0000
+<=   prefix appended with '\uffff' -- e.g. derby\uffff
+[ can eliminate like if constant. ]
+char(n), varchar(n), long varchar where n >= 255
+>= prefix backed up one characer
+<= prefix appended with '\uffff'
+no elimination of like
+parameter like pattern starts with wild card e.g. %derby
+char(n), varchar(n) where n <= 256
+>= '\u0000' padded with '\u0000' to length n
+<= '\uffff'
+no elimination of like
+char(n), varchar(n), long varchar where n > 256
+>= null
+<= '\uffff'
+note that the unicode value '\uffff' is defined as not a character value
+and can be used by a program for any purpose. we use it to set an upper
+bound on a character range with a less than predicate. we only need a single
+'\uffff' appended because the string 'derby\uffff\uffff' is not a valid
+string because '\uffff' is not a valid character.
+**/
+public final class likeescapeoperatornode extends ternaryoperatornode
+/**************************************************************************
+* fields of the class
+**************************************************************************
+*/
+boolean addedequals
+string  escape
+/**
+* initializer for a likeescapeoperatornode
+*
+* receiver like pattern [ escape escapevalue ]
+*
+* @param receiver      the left operand of the like:
+*                              column, charconstant or parameter
+* @param leftoperand   the right operand of the like: the pattern
+* @param rightoperand  the optional escape clause, null if not present
+*/
+public void init
+object receiver
+object leftoperand
+object rightoperand
+/* by convention, the method name for the like operator is "like" */
+super init
+receiver  leftoperand  rightoperand
+reusefactory getinteger ternaryoperatornode like   null
+/**
+* implement binding for like expressions.
+* <p>
+* overrides bindoperatornode.bindexpression because like has special
+* requirements for parameter binding.
+*
+* @return  the new top of the expression tree.
+*
+* @exception standardexception thrown on failure
+*/
+public valuenode bindexpression
+fromlist        fromlist
+subquerylist    subquerylist
+vector          aggregatevector
+throws standardexception
+super bindexpression fromlist  subquerylist  aggregatevector
+string pattern   null
+// pattern must be a string or a parameter
+if    leftoperand requirestypefromcontext
+leftoperand gettypeid   isstringtypeid
+throw standardexception newexception
+sqlstate lang_db2_function_incompatible
+// escape must be a string or a parameter
+if   rightoperand    null
+rightoperand requirestypefromcontext
+rightoperand gettypeid   isstringtypeid
+throw standardexception newexception
+sqlstate lang_db2_function_incompatible
+// deal with operand parameters
+/*
+*  is there a ? parameter on the left? ie. "? like 'derby'"
+*
+*  do left first because its length is always maximum;
+*  a parameter on the right copies its length from
+*  the left, since it won't match if it is any longer than it.
+*/
+if  receiver requirestypefromcontext
+receiver settype
+new datatypedescriptor
+typeid getbuiltintypeid types varchar   true
+//check if this parameter can pick up it's collation from pattern
+//or escape clauses in that order. if not, then it will take it's
+//collation from the compilation schema.
+if   leftoperand requirestypefromcontext
+receiver gettypeservices   setcollationderivation
+leftoperand gettypeservices   getcollationderivation
+receiver gettypeservices   setcollationtype
+leftoperand gettypeservices   getcollationtype
+else if  rightoperand    null     rightoperand requirestypefromcontext
+receiver gettypeservices   setcollationderivation
+rightoperand gettypeservices   getcollationderivation
+receiver gettypeservices   setcollationtype
+rightoperand gettypeservices   getcollationtype
+else
+receiver setcollationusingcompilationschema
+stringdatavalue collation_derivation_implicit
+/*
+*  is there a ? parameter for the pattern of like? ie. "column like ?"
+*
+*  copy from the receiver -- legal if both are parameters,
+*  both will be max length.
+*  remind: should nullability be copied, or set to true?
+*/
+if  leftoperand requirestypefromcontext
+/*
+* set the pattern to the type of the left parameter, if
+* the left is a string, otherwise set it to be varchar.
+*/
+if  receiver gettypeid   isstringtypeid
+leftoperand settype receiver gettypeservices
+else
+leftoperand settype
+new datatypedescriptor
+typeid getbuiltintypeid types varchar   true
+//collation of ? operand should be picked up from the context.
+//by the time we come here, receiver will have correct collation
+//set on it and hence we can rely on it to get correct collation
+//for the other ? in like clause
+leftoperand gettypeservices   setcollationderivation
+receiver gettypeservices   getcollationderivation
+leftoperand gettypeservices   setcollationtype
+receiver gettypeservices   getcollationtype
+/*
+*  is there a ? parameter for the escape of like?
+*  copy from the receiver -- legal if both are parameters,
+*  both will be max length.  nullability is set to true.
+*/
+if  rightoperand    null    rightoperand requirestypefromcontext
+/*
+* set the pattern to the type of the left parameter, if
+* the left is a string, otherwise set it to be varchar.
+*/
+if  receiver gettypeid   isstringtypeid
+rightoperand settype receiver gettypeservices
+else
+rightoperand settype
+new datatypedescriptor
+typeid getbuiltintypeid types varchar   true
+//collation of ? operand should be picked up from the context.
+//by the time we come here, receiver will have correct collation
+//set on it and hence we can rely on it to get correct collation
+//for the other ? in like clause
+rightoperand gettypeservices   setcollationderivation
+receiver gettypeservices   getcollationderivation
+rightoperand gettypeservices   setcollationtype
+receiver gettypeservices   getcollationtype
+bindtobuiltin
+typecompiler receivertc   receiver gettypecompiler
+typecompiler lefttc       leftoperand gettypecompiler
+/* the receiver must be a string type
+*/
+if    receiver gettypeid   isstringtypeid
+throw standardexception newexception
+sqlstate lang_db2_function_incompatible
+/* if either the left or right operands are non-string types,
+* then we generate an implicit cast to varchar.
+*/
+if   leftoperand gettypeid   isstringtypeid
+leftoperand   castargtostring leftoperand
+lefttc        leftoperand gettypecompiler
+if  rightoperand    null
+rightoperand   castargtostring rightoperand
+/*
+* remember whether or not the right side (the like pattern) is a string
+* constant.  we need to remember here so that we can transform like
+* 'constant' into = 'constant' for non unicode based collation columns.
+*/
+boolean leftconstant    leftoperand instanceof charconstantnode
+if  leftconstant
+pattern     charconstantnode  leftoperand  getstring
+boolean rightconstant    rightoperand instanceof charconstantnode
+if  rightconstant
+escape     charconstantnode  rightoperand  getstring
+if  escape length      1
+throw standardexception newexception
+sqlstate lang_invalid_escape_character  escape
+else if  rightoperand    null
+// no escape clause: let optimization continue for the = case below
+rightconstant   true
+/* if we are comparing a char with a national char then
+* we generate a cast above the receiver to force preprocess to
+* not attempt any of the > <= optimizations since there is no
+* way to determine the 'next' character for the <= operand.
+*
+* todo-collate - probably need to do something about different
+*                collation types here.
+*/
+// the left and the pattern of the like must be same collation type
+// and derivation.
+if   receiver gettypeservices   comparecollationinfo
+leftoperand gettypeservices
+// throw error.
+throw standardexception newexception
+sqlstate lang_like_collation_mismatch
+receiver gettypeservices   getsqlstring
+receiver gettypeservices   getcollationname
+leftoperand gettypeservices   getsqlstring
+leftoperand gettypeservices   getcollationname
+/* if the left side of like is a columnreference and right side is a
+* string constant without a wildcard (eg. column like 'derby') then we
+* transform the like into the equivalent like and =.
+* if we have an escape clause it also must be a constant
+* (eg. column like 'derby' escape '%').
+*
+* these types of transformations are normally done at preprocess time,
+* but we make an exception and do this one at bind time because we
+* transform a not like 'a' into (a like 'a') = false prior to
+* preprocessing.
+*
+* the transformed tree will become:
+*
+*        and
+*       /   \
+*     like   =
+*/
+if   receiver instanceof columnreference
+leftconstant
+rightconstant
+if  like isoptimizable pattern
+string newpattern   null
+/*
+* if our pattern has no pattern chars (after stripping them out
+* for the escape case), we are good to apply = to this match
+*/
+if  escape    null
+/* we return a new pattern stripped of escape chars */
+newpattern
+like stripescapesnopatternchars
+pattern  escape charat 0
+else if  pattern indexof        1
+pattern indexof        1
+// no pattern characters.
+newpattern   pattern
+if  newpattern    null
+// met all conditions, transform like into a "like and ="
+valuenode leftclone   receiver getclone
+// remember that we did xform, see preprocess()
+addedequals   true
+// create equals node of the form (eg. column like 'derby' :
+//       =
+//     /   \
+//  column  'derby'
+binarycomparisonoperatornode equals
+binarycomparisonoperatornode  getnodefactory   getnode
+c_nodetypes binary_equals_operator_node
+leftclone
+valuenode  getnodefactory   getnode
+c_nodetypes char_constant_node
+newpattern
+getcontextmanager
+getcontextmanager
+// set forqueryrewrite to bypass comparability checks
+equals setforqueryrewrite true
+equals    binarycomparisonoperatornode
+equals bindexpression
+fromlist  subquerylist  aggregatevector
+// create new and node and hook in "equals" the new "=' node
+//
+//        and
+//       /   \
+//     like   =
+//           / \
+//       column 'derby'
+andnode newand
+andnode  getnodefactory   getnode
+c_nodetypes and_node
+this
+equals
+getcontextmanager
+finishbindexpr
+newand postbindfixup
+return newand
+finishbindexpr
+return this
+private valuenode castargtonationalstring
+valuenode       vn
+typecompiler    vntc
+typeid          vntypeid
+throws standardexception
+valuenode newnode     valuenode
+getnodefactory   getnode
+c_nodetypes cast_node
+vn
+new datatypedescriptor vntypeid
+true
+vntc getcasttocharwidth vn gettypeservices
+getcontextmanager
+castnode  newnode  bindcastnodeonly
+return newnode
+private void finishbindexpr
+throws standardexception
+// deal with compatability of operands and result type
+bindcomparisonoperator
+/*
+** the result type of like is boolean
+*/
+boolean nullableresult
+receiver gettypeservices   isnullable
+leftoperand gettypeservices   isnullable
+if  rightoperand    null
+nullableresult    rightoperand gettypeservices   isnullable
+settype new datatypedescriptor typeid boolean_id  nullableresult
+/**
+* bind this operator
+*
+* @exception standardexception  thrown on error
+*/
+public void bindcomparisonoperator
+throws standardexception
+typeid receivertype   receiver gettypeid
+typeid lefttype       leftoperand gettypeid
+/*
+** check the type of the operands - this function is allowed only on
+** string types.
+*/
+if   receivertype isstringtypeid
+throw standardexception newexception
+sqlstate lang_like_bad_type  receivertype getsqltypename
+if   lefttype isstringtypeid
+throw standardexception newexception
+sqlstate lang_like_bad_type  lefttype getsqltypename
+if  rightoperand    null      rightoperand gettypeid   isstringtypeid
+throw standardexception newexception
+sqlstate lang_like_bad_type
+rightoperand gettypeid   getsqltypename
+/**
+* preprocess an expression tree.  we do a number of transformations
+* here (including subqueries, in lists, like and between) plus
+* subquery flattening.
+* note: this is done before the outer resultsetnode is preprocessed.
+*
+* @param numtables          number of tables in the dml statement
+* @param outerfromlist      fromlist from outer query block
+* @param outersubquerylist  subquerylist from outer query block
+* @param outerpredicatelist predicatelist from outer query block
+*
+* @return the modified expression
+*
+* @exception standardexception  thrown on error
+*/
+public valuenode preprocess
+int             numtables
+fromlist        outerfromlist
+subquerylist    outersubquerylist
+predicatelist   outerpredicatelist
+throws standardexception
+boolean eliminatelikecomparison   false
+string  greaterequalstring        null
+string  lessthanstring            null
+/* we must 1st preprocess the component parts */
+super preprocess
+numtables  outerfromlist  outersubquerylist  outerpredicatelist
+/* don't try to optimize for (c)lob type since it doesn't allow
+* comparison.
+* resolve: should this check be for long varchar also?
+*/
+if  receiver gettypeid   getsqltypename   equals
+return this
+/* no need to consider transformation if we already did transformation
+* that added = * at bind time.
+*/
+if  addedequals
+return this
+/* if like pattern is not a constant and not a parameter,
+* then can't optimize, eg. column like column
+*/
+if    leftoperand instanceof charconstantnode
+leftoperand requirestypefromcontext
+return this
+/* this transformation is only worth doing if it is pushable, ie, if
+* the receiver is a columnreference.
+*/
+if    receiver instanceof columnreference
+// we also do an early return here if in bindexpression we found
+// we had a national char and put a cast above the receiver.
+//
+return this
+/*
+* in first implementation of non default collation don't attempt
+* any transformations for like.
+*
+* future possibilities:
+* o is it valid to produce a >= clause for a leading constant with
+*   a wildcard that works across all possible collations?  is
+*   c1 like a% the same as c1 like a% and c1 >= a'\u0000''\u0000',... ?
+*
+*   this is what was done for national char's.  it seems like a
+*   given collation could sort: ab, a'\u0000'.  is there any guarantee
+*   about the sort of the unicode '\u0000'.
+*
+* o national char's don't try to produce a < than, is there a way
+*   in collation?
+*/
+if  receiver gettypeservices   getcollationtype
+stringdatavalue collation_type_ucs_basic
+// don't do any < or >= transformations for non default collations.
+return this
+/* this is where we do the transformation for like to make it
+* optimizable.
+* c1 like 'asdf%' -> c1 like 'asdf%' and c1 >= 'asdf' and c1 < 'asdg'
+* c1 like ?       -> c1 like ? and c1 >= ?
+*     where ? gets calculated at the beginning of execution.
+*/
+// build string constants if right side (pattern) is a constant
+if  leftoperand instanceof charconstantnode
+string pattern     charconstantnode  leftoperand  getstring
+if   like isoptimizable pattern
+return this
+int maxwidth   receiver gettypeservices   getmaximumwidth
+greaterequalstring
+like greaterequalstring pattern  escape  maxwidth
+/* we do not generate the < and we cannot drop the like
+* when doing like on a national char column.
+*/
+if   receiver gettypeid   isnationalstringtypeid
+lessthanstring
+like lessthanstring pattern  escape  maxwidth
+eliminatelikecomparison
+like islikecomparisonneeded pattern
+/* for some unknown reason we need to clone the receiver if it is
+* a columnreference because reusing them in qualifiers for a scan
+* does not work.
+*/
+/* the transformed tree has to be normalized.  either:
+*        and                   and
+*       /   \                 /   \
+*     like   and     or:   like   and
+*           /   \                /   \
+*          >=    and           >=    true
+*               /   \
+*              <     true
+* unless the like string is of the form constant%, in which
+* case we can do away with the like altogether:
+*        and                   and
+*       /   \                 /   \
+*      >=   and      or:     >=  true
+*          /   \
+*         <    true
+*/
+andnode   newand     null
+valuenode truenode
+valuenode  getnodefactory   getnode
+c_nodetypes boolean_constant_node
+boolean true
+getcontextmanager
+/* create the and <, if lessthanstring is non-null or
+* (leftoperand is a parameter and not a national string).
+*
+* currently for a national string we do not add a < than operator
+* since we don't know (?) how to calculate such a string.
+*/
+if  lessthanstring    null
+leftoperand requirestypefromcontext
+receiver gettypeid   isnationalstringtypeid
+querytreenode likeltopt
+if  leftoperand requirestypefromcontext
+// pattern string is a parameter
+likeltopt
+setupoptimizestringfromparameter
+leftoperand
+rightoperand
+receiver gettypeservices   getmaximumwidth
+else
+// pattern string is a constant
+likeltopt
+getnodefactory   getnode
+c_nodetypes char_constant_node
+lessthanstring
+getcontextmanager
+binarycomparisonoperatornode lessthan
+binarycomparisonoperatornode  getnodefactory   getnode
+c_nodetypes binary_less_than_operator_node
+receiver getclone
+likeltopt
+getcontextmanager
+// disable comparability checks
+lessthan setforqueryrewrite true
+/* set type info for the operator node */
+lessthan bindcomparisonoperator
+// use between selectivity for the <
+lessthan setbetweenselectivity
+/* create the and */
+newand    andnode  getnodefactory   getnode
+c_nodetypes and_node
+lessthan
+truenode
+getcontextmanager
+newand postbindfixup
+/* create the and >=.  right side could be a charconstantnode or a
+* parameternode.
+*/
+valuenode likegeopt
+if  leftoperand requirestypefromcontext
+// the pattern is a ?, eg. c1 like ?
+// create an expression off the parameter
+// new sqlchar(like.greaterequalstring(?));
+likegeopt
+setupoptimizestringfromparameter
+leftoperand
+rightoperand
+receiver gettypeservices   getmaximumwidth
+else
+// the pattern is a constant, eg. c1 like 'derby'
+likegeopt
+valuenode  getnodefactory   getnode
+c_nodetypes char_constant_node
+greaterequalstring
+getcontextmanager
+// greaterequal from (reciever like pattern):
+//       >=
+//      /   \
+//  reciever pattern
+binarycomparisonoperatornode greaterequal
+binarycomparisonoperatornode  getnodefactory   getnode
+c_nodetypes binary_greater_equals_operator_node
+receiver getclone
+likegeopt
+getcontextmanager
+// disable comparability checks
+greaterequal setforqueryrewrite true
+/* set type info for the operator node */
+greaterequal bindcomparisonoperator
+// use between selectivity for the >=
+greaterequal setbetweenselectivity
+/* create the and */
+if  newand    null
+newand    andnode  getnodefactory   getnode
+c_nodetypes and_node
+greaterequal
+truenode
+getcontextmanager
+else
+newand    andnode  getnodefactory   getnode
+c_nodetypes and_node
+greaterequal
+newand
+getcontextmanager
+newand postbindfixup
+/* finally, we put an and like on top of the left deep tree, but
+* only if it is still necessary.
+*/
+if   eliminatelikecomparison
+newand    andnode
+getnodefactory   getnode
+c_nodetypes and_node
+this
+newand
+getcontextmanager
+newand postbindfixup
+/* mark this node as transformed so that we don't get
+* calculated into the selectivity multiple times.
+*/
+settransformed
+return newand
+/**
+* do code generation for this binary operator.
+*
+* this code was copied from binaryoperatornode and stripped down
+*
+* @param acb   the expressionclassbuilder for the class we're generating
+* @param mb    the method the code to place the code
+*
+*
+* @exception standardexception thrown on error
+*/
+public void generateexpression
+expressionclassbuilder  acb
+methodbuilder           mb
+throws standardexception
+/*
+** if i have a operator.getorderabletype() == constant, then just cache
+** it in a field.  if i have query_invariant, then it would be good to
+** cache it in something that is initialized each execution,
+** but how?
+*/
+/*
+** let the receiver type be determined by an
+** overridable method so that if methods are
+** not implemented on the lowest interface of
+** a class, they can note that in the implementation
+** of the node that uses the method.
+*/
+// receivertype = getreceiverinterfacename();
+/*
+** generate lhs (field = <receiver operand>). this assignment is
+** used as the receiver of the method call for this operator.
+**
+** (<receiver operand>).method(
+**     <left operand>,
+**     <right operand>,
+**     [<escaperightop>,]
+**     result field>)
+*/
+receiver generateexpression acb  mb        first arg
+receiverinterfacetype   receiver gettypecompiler   interfacename
+mb upcast receiverinterfacetype            cast the method instance
+leftoperand generateexpression acb  mb
+mb upcast leftinterfacetype                first arg with cast
+if  rightoperand    null
+rightoperand generateexpression acb  mb
+mb upcast rightinterfacetype           second arg with cast
+/* figure out the result type name */
+// resulttypename = gettypecompiler().interfacename();
+mb callmethod
+vmopcode invokeinterface
+
+methodname
+resultinterfacetype
+rightoperand    null ? 1   2
+private valuenode setupoptimizestringfromparameter
+valuenode   parameternode
+valuenode   escapenode
+string      methodname
+int         maxwidth
+throws standardexception
+vector param
+if  escapenode    null
+param   new vector 2
+methodname
+else
+param   new vector 1
+staticmethodcallnode methodcall    staticmethodcallnode
+getnodefactory   getnode
+c_nodetypes static_method_call_node
+methodname
+getcontextmanager
+// using a method call directly, thus need internal sql capability
+methodcall internalcall   true
+param addelement parameternode
+if  escapenode    null
+param addelement escapenode
+querytreenode maxwidthnode   getnodefactory   getnode
+c_nodetypes int_constant_node
+new integer maxwidth
+getcontextmanager
+param addelement maxwidthnode
+methodcall addparms param
+valuenode java2sql
+valuenode  getnodefactory   getnode
+c_nodetypes java_to_sql_value_node
+methodcall
+getcontextmanager
+java2sql    valuenode  java2sql bindexpression null  null  null
+castnode likeopt    castnode
+getnodefactory   getnode
+c_nodetypes cast_node
+java2sql
+parameternode gettypeservices
+getcontextmanager
+likeopt bindcastnodeonly
+return likeopt

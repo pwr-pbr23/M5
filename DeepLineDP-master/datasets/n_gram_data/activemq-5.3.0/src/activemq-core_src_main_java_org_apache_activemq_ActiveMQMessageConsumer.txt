@@ -1,0 +1,886 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq
+import org apache activemq blob blobdownloader
+import org apache activemq command activemqblobmessage
+import org apache activemq command activemqdestination
+import org apache activemq command activemqmessage
+import org apache activemq command activemqtempdestination
+import org apache activemq command commandtypes
+import org apache activemq command consumerid
+import org apache activemq command consumerinfo
+import org apache activemq command messageack
+import org apache activemq command messagedispatch
+import org apache activemq command messageid
+import org apache activemq command messagepull
+import org apache activemq command removeinfo
+import org apache activemq management jmsconsumerstatsimpl
+import org apache activemq management statscapable
+import org apache activemq management statsimpl
+import org apache activemq selector selectorparser
+import org apache activemq thread scheduler
+import org apache activemq transaction synchronization
+import org apache activemq util callback
+import org apache activemq util introspectionsupport
+import org apache activemq util jmsexceptionsupport
+import org apache commons logging log
+import org apache commons logging logfactory
+import java io ioexception
+import java util arraylist
+import java util hashmap
+import java util iterator
+import java util linkedlist
+import java util list
+import java util map
+import java util concurrent executorservice
+import java util concurrent executors
+import java util concurrent timeunit
+import java util concurrent atomic atomicboolean
+import java util concurrent atomic atomicreference
+import javax jms illegalstateexception
+import javax jms invaliddestinationexception
+import javax jms jmsexception
+import javax jms message
+import javax jms messageconsumer
+import javax jms messagelistener
+/**
+* a client uses a <code>messageconsumer</code> object to receive messages
+* from a destination. a <code> messageconsumer</code> object is created by
+* passing a <code>destination</code> object to a message-consumer creation
+* method supplied by a session.
+* <p>
+* <code>messageconsumer</code> is the parent interface for all message
+* consumers.
+* <p>
+* a message consumer can be created with a message selector. a message selector
+* allows the client to restrict the messages delivered to the message consumer
+* to those that match the selector.
+* <p>
+* a client may either synchronously receive a message consumer's messages or
+* have the consumer asynchronously deliver them as they arrive.
+* <p>
+* for synchronous receipt, a client can request the next message from a message
+* consumer using one of its <code> receive</code> methods. there are several
+* variations of <code>receive</code> that allow a client to poll or wait for
+* the next message.
+* <p>
+* for asynchronous delivery, a client can register a
+* <code>messagelistener</code> object with a message consumer. as messages
+* arrive at the message consumer, it delivers them by calling the
+* <code>messagelistener</code>'s<code>
+* onmessage</code> method.
+* <p>
+* it is a client programming error for a <code>messagelistener</code> to
+* throw an exception.
+*
+* @version $revision: 1.22 $
+* @see javax.jms.messageconsumer
+* @see javax.jms.queuereceiver
+* @see javax.jms.topicsubscriber
+* @see javax.jms.session
+*/
+public class activemqmessageconsumer implements messageavailableconsumer  statscapable  activemqdispatcher
+private static final log log   logfactory getlog activemqmessageconsumer class
+protected static final scheduler scheduler   scheduler getinstance
+protected final activemqsession session
+protected final consumerinfo info
+// these are the messages waiting to be delivered to the client
+private final messagedispatchchannel unconsumedmessages   new messagedispatchchannel
+// the are the messages that were delivered to the consumer but that have
+// not been acknowledged. it's kept in reverse order since we
+// always walk list in reverse order.
+private final linkedlist<messagedispatch> deliveredmessages   new linkedlist<messagedispatch>
+private int deliveredcounter
+private int additionalwindowsize
+private long redeliverydelay
+private int ackcounter
+private int dispatchedcount
+private final atomicreference<messagelistener> messagelistener   new atomicreference<messagelistener>
+private jmsconsumerstatsimpl stats
+private final string selector
+private boolean synchronizationregistered
+private atomicboolean started   new atomicboolean false
+private messageavailablelistener availablelistener
+private redeliverypolicy redeliverypolicy
+private boolean optimizeacknowledge
+private atomicboolean deliveryingacknowledgements   new atomicboolean
+private executorservice executorservice
+private messagetransformer transformer
+private boolean cleardispatchlist
+private messageack pendingack
+private long lastdeliveredsequenceid
+private ioexception failureerror
+/**
+* create a messageconsumer
+*
+* @param session
+* @param dest
+* @param name
+* @param selector
+* @param prefetch
+* @param maximumpendingmessagecount todo
+* @param nolocal
+* @param browser
+* @param dispatchasync
+* @param messagelistener
+* @throws jmsexception
+*/
+public activemqmessageconsumer activemqsession session  consumerid consumerid  activemqdestination dest
+string name  string selector  int prefetch
+int maximumpendingmessagecount  boolean nolocal  boolean browser
+boolean dispatchasync  messagelistener messagelistener  throws jmsexception
+if  dest    null
+throw new invaliddestinationexception
+else if  dest getphysicalname      null
+throw new invaliddestinationexception
+else if  dest istemporary
+string physicalname   dest getphysicalname
+if  physicalname    null
+throw new illegalargumentexception     dest
+string connectionid   session connection getconnectioninfo   getconnectionid   getvalue
+if  physicalname indexof connectionid  < 0
+throw new invaliddestinationexception
+if  session connection isdeleted dest
+throw new invaliddestinationexception
+if  prefetch < 0
+throw new jmsexception
+this session   session
+this redeliverypolicy   session connection getredeliverypolicy
+settransformer session gettransformer
+this info   new consumerinfo consumerid
+this info setexclusive this session connection isexclusiveconsumer
+this info setsubscriptionname name
+this info setprefetchsize prefetch
+this info setcurrentprefetchsize prefetch
+this info setmaximumpendingmessagelimit maximumpendingmessagecount
+this info setnolocal nolocal
+this info setdispatchasync dispatchasync
+this info setretroactive this session connection isuseretroactiveconsumer
+this info setselector null
+// allows the options on the destination to configure the consumerinfo
+if  dest getoptions      null
+map<string  string> options   new hashmap<string  string> dest getoptions
+introspectionsupport setproperties this info  options
+this info setdestination dest
+this info setbrowser browser
+if  selector    null    selector trim   length      0
+// validate the selector
+selectorparser parse selector
+this info setselector selector
+this selector   selector
+else if  info getselector      null
+// validate the selector
+selectorparser parse this info getselector
+this selector   this info getselector
+else
+this selector   null
+this stats   new jmsconsumerstatsimpl session getsessionstats    dest
+this optimizeacknowledge   session connection isoptimizeacknowledge      session isautoacknowledge
+info isbrowser
+this info setoptimizedacknowledge this optimizeacknowledge
+if  messagelistener    null
+setmessagelistener messagelistener
+try
+this session addconsumer this
+this session syncsendpacket info
+catch  jmsexception e
+this session removeconsumer this
+throw e
+if  session connection isstarted
+start
+private boolean isautoacknowledgeeach
+return session isautoacknowledge        session isdupsokacknowledge      getdestination   isqueue
+private boolean isautoacknowledgebatch
+return session isdupsokacknowledge       getdestination   isqueue
+public statsimpl getstats
+return stats
+public jmsconsumerstatsimpl getconsumerstats
+return stats
+public redeliverypolicy getredeliverypolicy
+return redeliverypolicy
+/**
+* sets the redelivery policy used when messages are redelivered
+*/
+public void setredeliverypolicy redeliverypolicy redeliverypolicy
+this redeliverypolicy   redeliverypolicy
+public messagetransformer gettransformer
+return transformer
+/**
+* sets the transformer used to transform messages before they are sent on
+* to the jms bus
+*/
+public void settransformer messagetransformer transformer
+this transformer   transformer
+/**
+* @return returns the value.
+*/
+public consumerid getconsumerid
+return info getconsumerid
+/**
+* @return the consumer name - used for durable consumers
+*/
+public string getconsumername
+return this info getsubscriptionname
+/**
+* @return true if this consumer does not accept locally produced messages
+*/
+protected boolean isnolocal
+return info isnolocal
+/**
+* retrieve is a browser
+*
+* @return true if a browser
+*/
+protected boolean isbrowser
+return info isbrowser
+/**
+* @return activemqdestination
+*/
+protected activemqdestination getdestination
+return info getdestination
+/**
+* @return returns the prefetchnumber.
+*/
+public int getprefetchnumber
+return info getprefetchsize
+/**
+* @return true if this is a durable topic subscriber
+*/
+public boolean isdurablesubscriber
+return info getsubscriptionname      null    info getdestination   istopic
+/**
+* gets this message consumer's message selector expression.
+*
+* @return this message consumer's message selector, or null if no message
+*         selector exists for the message consumer (that is, if the message
+*         selector was not set or was set to null or the empty string)
+* @throws jmsexception if the jms provider fails to receive the next
+*                 message due to some internal error.
+*/
+public string getmessageselector   throws jmsexception
+checkclosed
+return selector
+/**
+* gets the message consumer's <code>messagelistener</code>.
+*
+* @return the listener for the message consumer, or null if no listener is
+*         set
+* @throws jmsexception if the jms provider fails to get the message
+*                 listener due to some internal error.
+* @see javax.jms.messageconsumer#setmessagelistener(javax.jms.messagelistener)
+*/
+public messagelistener getmessagelistener   throws jmsexception
+checkclosed
+return this messagelistener get
+/**
+* sets the message consumer's <code>messagelistener</code>.
+* <p>
+* setting the message listener to null is the equivalent of unsetting the
+* message listener for the message consumer.
+* <p>
+* the effect of calling <code>messageconsumer.setmessagelistener</code>
+* while messages are being consumed by an existing listener or the consumer
+* is being used to consume messages synchronously is undefined.
+*
+* @param listener the listener to which the messages are to be delivered
+* @throws jmsexception if the jms provider fails to receive the next
+*                 message due to some internal error.
+* @see javax.jms.messageconsumer#getmessagelistener
+*/
+public void setmessagelistener messagelistener listener  throws jmsexception
+checkclosed
+if  info getprefetchsize      0
+throw new jmsexception
+if  listener    null
+boolean wasrunning   session isrunning
+if  wasrunning
+session stop
+this messagelistener set listener
+session redispatch this  unconsumedmessages
+if  wasrunning
+session start
+else
+this messagelistener set null
+public messageavailablelistener getavailablelistener
+return availablelistener
+/**
+* sets the listener used to notify synchronous consumers that there is a
+* message available so that the {@link messageconsumer#receivenowait()} can
+* be called.
+*/
+public void setavailablelistener messageavailablelistener availablelistener
+this availablelistener   availablelistener
+/**
+* used to get an enqueued message from the unconsumedmessages list. the
+* amount of time this method blocks is based on the timeout value. - if
+* timeout==-1 then it blocks until a message is received. - if timeout==0
+* then it it tries to not block at all, it returns a message if it is
+* available - if timeout>0 then it blocks up to timeout amount of time.
+* expired messages will consumed by this method.
+*
+* @throws jmsexception
+* @return null if we timeout or if the consumer is closed.
+*/
+private messagedispatch dequeue long timeout  throws jmsexception
+try
+long deadline   0
+if  timeout > 0
+deadline   system currenttimemillis     timeout
+while  true
+messagedispatch md   unconsumedmessages dequeue timeout
+if  md    null
+if  timeout > 0     unconsumedmessages isclosed
+timeout   math max deadline   system currenttimemillis    0
+else
+if  failureerror    null
+throw jmsexceptionsupport create failureerror
+else
+return null
+else if  md getmessage      null
+return null
+else if  md getmessage   isexpired
+if  log isdebugenabled
+log debug getconsumerid         md
+beforemessageisconsumed md
+aftermessageisconsumed md  true
+if  timeout > 0
+timeout   math max deadline   system currenttimemillis    0
+else
+if  log istraceenabled
+log trace getconsumerid         md
+return md
+catch  interruptedexception e
+thread currentthread   interrupt
+throw jmsexceptionsupport create e
+/**
+* receives the next message produced for this message consumer.
+* <p>
+* this call blocks indefinitely until a message is produced or until this
+* message consumer is closed.
+* <p>
+* if this <code>receive</code> is done within a transaction, the consumer
+* retains the message until the transaction commits.
+*
+* @return the next message produced for this message consumer, or null if
+*         this message consumer is concurrently closed
+*/
+public message receive   throws jmsexception
+checkclosed
+checkmessagelistener
+sendpullcommand 0
+messagedispatch md   dequeue  1
+if  md    null
+return null
+beforemessageisconsumed md
+aftermessageisconsumed md  false
+return createactivemqmessage md
+/**
+* @param md
+* @return
+*/
+private activemqmessage createactivemqmessage final messagedispatch md  throws jmsexception
+activemqmessage m    activemqmessage md getmessage   copy
+if  m getdatastructuretype    commandtypes activemq_blob_message
+activemqblobmessage m  setblobdownloader new blobdownloader session getblobtransferpolicy
+if  transformer    null
+message transformedmessage   transformer consumertransform session  this  m
+if  transformedmessage    null
+m   activemqmessagetransformation transformmessage transformedmessage  session connection
+if  session isclientacknowledge
+m setacknowledgecallback new callback
+public void execute   throws exception
+session checkclosed
+session acknowledge
+else if  session isindividualacknowledge
+m setacknowledgecallback new callback
+public void execute   throws exception
+session checkclosed
+acknowledge md
+return m
+/**
+* receives the next message that arrives within the specified timeout
+* interval.
+* <p>
+* this call blocks until a message arrives, the timeout expires, or this
+* message consumer is closed. a <code>timeout</code> of zero never
+* expires, and the call blocks indefinitely.
+*
+* @param timeout the timeout value (in milliseconds), a time out of zero
+*                never expires.
+* @return the next message produced for this message consumer, or null if
+*         the timeout expires or this message consumer is concurrently
+*         closed
+*/
+public message receive long timeout  throws jmsexception
+checkclosed
+checkmessagelistener
+if  timeout    0
+return this receive
+sendpullcommand timeout
+while  timeout > 0
+messagedispatch md
+if  info getprefetchsize      0
+md   dequeue  1      we let the broker let us know when we
+// timeout.
+else
+md   dequeue timeout
+if  md    null
+return null
+beforemessageisconsumed md
+aftermessageisconsumed md  false
+return createactivemqmessage md
+return null
+/**
+* receives the next message if one is immediately available.
+*
+* @return the next message produced for this message consumer, or null if
+*         one is not available
+* @throws jmsexception if the jms provider fails to receive the next
+*                 message due to some internal error.
+*/
+public message receivenowait   throws jmsexception
+checkclosed
+checkmessagelistener
+sendpullcommand  1
+messagedispatch md
+if  info getprefetchsize      0
+md   dequeue  1      we let the broker let us know when we
+// timeout.
+else
+md   dequeue 0
+if  md    null
+return null
+beforemessageisconsumed md
+aftermessageisconsumed md  false
+return createactivemqmessage md
+/**
+* closes the message consumer.
+* <p>
+* since a provider may allocate some resources on behalf of a <code>
+* messageconsumer</code>
+* outside the java virtual machine, clients should close them when they are
+* not needed. relying on garbage collection to eventually reclaim these
+* resources may not be timely enough.
+* <p>
+* this call blocks until a <code>receive</code> or message listener in
+* progress has completed. a blocked message consumer <code>receive </code>
+* call returns null when this message consumer is closed.
+*
+* @throws jmsexception if the jms provider fails to close the consumer due
+*                 to some internal error.
+*/
+public void close   throws jmsexception
+if   unconsumedmessages isclosed
+if  session gettransactioncontext   isintransaction
+session gettransactioncontext   addsynchronization new synchronization
+public void aftercommit   throws exception
+doclose
+public void afterrollback   throws exception
+doclose
+else
+doclose
+void doclose   throws jmsexception
+dispose
+removeinfo removecommand   info createremovecommand
+removecommand setlastdeliveredsequenceid lastdeliveredsequenceid
+this session asyncsendpacket removecommand
+void clearmessagesinprogress
+// we are called from inside the transport reconnection logic
+// which involves us clearing all the connections' consumers
+// dispatch lists and clearing them
+// so rather than trying to grab a mutex (which could be already
+// owned by the message listener calling the send) we will just set
+// a flag so that the list can be cleared as soon as the
+// dispatch thread is ready to flush the dispatch list
+cleardispatchlist   true
+void deliveracks
+messageack ack   null
+if  deliveryingacknowledgements compareandset false  true
+if  isautoacknowledgeeach
+synchronized deliveredmessages
+ack   makeackforalldeliveredmessages messageack standard_ack_type
+if  ack    null
+deliveredmessages clear
+ackcounter   0
+else
+ack   pendingack
+pendingack   null
+else if  pendingack    null    pendingack isstandardack
+ack   pendingack
+pendingack   null
+if  ack    null
+final messageack acktosend   ack
+if  executorservice    null
+executorservice   executors newsinglethreadexecutor
+executorservice submit new runnable
+public void run
+try
+session sendack acktosend true
+catch  jmsexception e
+log error getconsumerid        e
+finally
+deliveryingacknowledgements set false
+else
+deliveryingacknowledgements set false
+public void dispose   throws jmsexception
+if   unconsumedmessages isclosed
+// do we have any acks we need to send out before closing?
+// ack any delivered messages now.
+if   session gettransacted
+deliveracks
+if  isautoacknowledgebatch
+acknowledge
+if  executorservice    null
+executorservice shutdown
+try
+executorservice awaittermination 60  timeunit seconds
+catch  interruptedexception e
+thread currentthread   interrupt
+if  session isclientacknowledge
+if   this info isbrowser
+// rollback duplicates that aren't acknowledged
+list<messagedispatch> tmp   null
+synchronized  this deliveredmessages
+tmp   new arraylist<messagedispatch> this deliveredmessages
+for  messagedispatch old   tmp
+this session connection rollbackduplicate this  old getmessage
+tmp clear
+if   session istransacted
+synchronized deliveredmessages
+deliveredmessages clear
+list<messagedispatch> list   unconsumedmessages removeall
+if   this info isbrowser
+for  messagedispatch old   list
+// ensure we don't filter this as a duplicate
+session connection rollbackduplicate this  old getmessage
+unconsumedmessages close
+this session removeconsumer this
+/**
+* @throws illegalstateexception
+*/
+protected void checkclosed   throws illegalstateexception
+if  unconsumedmessages isclosed
+throw new illegalstateexception
+/**
+* if we have a zero prefetch specified then send a pull command to the
+* broker to pull a message we are about to receive
+*/
+protected void sendpullcommand long timeout  throws jmsexception
+if  info getprefetchsize      0    unconsumedmessages isempty
+messagepull messagepull   new messagepull
+messagepull configure info
+messagepull settimeout timeout
+session asyncsendpacket messagepull
+protected void checkmessagelistener   throws jmsexception
+session checkmessagelistener
+protected void setoptimizeacknowledge boolean value
+if  optimizeacknowledge     value
+deliveracks
+optimizeacknowledge   value
+protected void setprefetchsize int prefetch
+deliveracks
+this info setcurrentprefetchsize prefetch
+private void beforemessageisconsumed messagedispatch md  throws jmsexception
+md setdeliverysequenceid session getnextdeliveryid
+lastdeliveredsequenceid   md getmessage   getmessageid   getbrokersequenceid
+if   isautoacknowledgebatch
+synchronized deliveredmessages
+deliveredmessages addfirst md
+if  session gettransacted
+acklater md  messageack delivered_ack_type
+private void aftermessageisconsumed messagedispatch md  boolean messageexpired  throws jmsexception
+if  unconsumedmessages isclosed
+return
+if  messageexpired
+synchronized  deliveredmessages
+deliveredmessages remove md
+stats getexpiredmessagecount   increment
+acklater md  messageack delivered_ack_type
+else
+stats onmessage
+if  session gettransacted
+// do nothing.
+else if  isautoacknowledgeeach
+if  deliveryingacknowledgements compareandset false  true
+synchronized  deliveredmessages
+if   deliveredmessages isempty
+if  optimizeacknowledge
+ackcounter
+if  ackcounter >   info getcurrentprefetchsize      65
+messageack ack   makeackforalldeliveredmessages messageack standard_ack_type
+if  ack    null
+deliveredmessages clear
+ackcounter   0
+session sendack ack
+else
+messageack ack   makeackforalldeliveredmessages messageack standard_ack_type
+if  ack  null
+deliveredmessages clear
+session sendack ack
+deliveryingacknowledgements set false
+else if  isautoacknowledgebatch
+acklater md  messageack standard_ack_type
+else if  session isclientacknowledge    session isindividualacknowledge
+acklater md  messageack delivered_ack_type
+else
+throw new illegalstateexception
+/**
+* creates a messageack for all messages contained in deliveredmessages.
+* caller should hold the lock for deliveredmessages.
+*
+* @param type ack-type (i.e. messageack.standard_ack_type)
+* @return <code>null</code> if nothing to ack.
+*/
+private messageack makeackforalldeliveredmessages byte type
+synchronized  deliveredmessages
+if  deliveredmessages isempty
+return null
+messagedispatch md   deliveredmessages getfirst
+messageack ack   new messageack md  type  deliveredmessages size
+ack setfirstmessageid deliveredmessages getlast   getmessage   getmessageid
+return ack
+private void acklater messagedispatch md  byte acktype  throws jmsexception
+// don't acknowledge now, but we may need to let the broker know the
+// consumer got the message to expand the pre-fetch window
+if  session gettransacted
+session dostarttransaction
+if   synchronizationregistered
+synchronizationregistered   true
+session gettransactioncontext   addsynchronization new synchronization
+public void beforeend   throws exception
+acknowledge
+synchronizationregistered   false
+public void aftercommit   throws exception
+commit
+synchronizationregistered   false
+public void afterrollback   throws exception
+rollback
+synchronizationregistered   false
+deliveredcounter
+messageack oldpendingack   pendingack
+pendingack   new messageack md  acktype  deliveredcounter
+pendingack settransactionid session gettransactioncontext   gettransactionid
+if  oldpendingack  null
+pendingack setfirstmessageid pendingack getlastmessageid
+else if   oldpendingack getacktype      pendingack getacktype
+pendingack setfirstmessageid oldpendingack getfirstmessageid
+else
+// old pending ack being superseded by ack of another type, if is is not a delivered
+// ack and hence important, send it now so it is not lost.
+if    oldpendingack isdeliveredack
+if  log isdebugenabled
+log debug     oldpendingack       pendingack
+session sendack oldpendingack
+else
+if  log isdebugenabled
+log debug     oldpendingack       pendingack
+if   0 5   info getprefetchsize    <   deliveredcounter   additionalwindowsize
+session sendack pendingack
+pendingack null
+deliveredcounter   0
+additionalwindowsize   0
+/**
+* acknowledge all the messages that have been delivered to the client up to
+* this point.
+*
+* @throws jmsexception
+*/
+public void acknowledge   throws jmsexception
+synchronized deliveredmessages
+// acknowledge all messages so far.
+messageack ack   makeackforalldeliveredmessages messageack standard_ack_type
+if  ack    null
+return     no msgs
+if  session gettransacted
+session dostarttransaction
+ack settransactionid session gettransactioncontext   gettransactionid
+session sendack ack
+pendingack   null
+// adjust the counters
+deliveredcounter   math max 0  deliveredcounter   deliveredmessages size
+additionalwindowsize   math max 0  additionalwindowsize   deliveredmessages size
+if   session gettransacted
+deliveredmessages clear
+void acknowledge messagedispatch md  throws jmsexception
+messageack ack   new messageack md messageack individual_ack_type 1
+session sendack ack
+synchronized deliveredmessages
+deliveredmessages remove md
+public void commit   throws jmsexception
+synchronized  deliveredmessages
+deliveredmessages clear
+redeliverydelay   0
+public void rollback   throws jmsexception
+synchronized  unconsumedmessages getmutex
+if  optimizeacknowledge
+// remove messages read but not acked at the broker yet through
+// optimizeacknowledge
+if   this info isbrowser
+synchronized deliveredmessages
+for  int i   0   i < deliveredmessages size        i < ackcounter   i
+// ensure we don't filter this as a duplicate
+messagedispatch md   deliveredmessages removelast
+session connection rollbackduplicate this  md getmessage
+synchronized deliveredmessages
+if  deliveredmessages isempty
+return
+// only increase the redelivery delay after the first redelivery..
+messagedispatch lastmd   deliveredmessages getfirst
+final int currentredeliverycount   lastmd getmessage   getredeliverycounter
+if  currentredeliverycount > 0
+redeliverydelay   redeliverypolicy getredeliverydelay redeliverydelay
+messageid firstmsgid   deliveredmessages getlast   getmessage   getmessageid
+for  iterator<messagedispatch> iter   deliveredmessages iterator    iter hasnext
+messagedispatch md   iter next
+md getmessage   onmessagerolledback
+// ensure we don't filter this as a duplicate
+session connection rollbackduplicate this  md getmessage
+if  redeliverypolicy getmaximumredeliveries      redeliverypolicy no_maximum_redeliveries
+lastmd getmessage   getredeliverycounter   > redeliverypolicy getmaximumredeliveries
+// we need to nack the messages so that they get sent to the
+// dlq.
+// acknowledge the last message.
+messageack ack   new messageack lastmd  messageack posion_ack_type  deliveredmessages size
+ack setfirstmessageid firstmsgid
+session sendack ack true
+// adjust the window size.
+additionalwindowsize   math max 0  additionalwindowsize   deliveredmessages size
+redeliverydelay   0
+else
+// only redelivery_ack after first delivery
+if  currentredeliverycount > 0
+messageack ack   new messageack lastmd  messageack redelivered_ack_type  deliveredmessages size
+ack setfirstmessageid firstmsgid
+session sendack ack true
+// stop the delivery of messages.
+unconsumedmessages stop
+for  iterator<messagedispatch> iter   deliveredmessages iterator    iter hasnext
+messagedispatch md   iter next
+unconsumedmessages enqueuefirst md
+if  redeliverydelay > 0     unconsumedmessages isclosed
+// start up the delivery again a little later.
+scheduler executeafterdelay new runnable
+public void run
+try
+if  started get
+start
+catch  jmsexception e
+session connection onasyncexception e
+redeliverydelay
+else
+start
+deliveredcounter    deliveredmessages size
+deliveredmessages clear
+if  messagelistener get      null
+session redispatch this  unconsumedmessages
+public void dispatch messagedispatch md
+messagelistener listener   this messagelistener get
+try
+synchronized  unconsumedmessages getmutex
+if  cleardispatchlist
+// we are reconnecting so lets flush the in progress
+// messages
+cleardispatchlist   false
+list<messagedispatch> list   unconsumedmessages removeall
+if   this info isbrowser
+for  messagedispatch old   list
+// ensure we don't filter this as a duplicate
+session connection rollbackduplicate this  old getmessage
+if  pendingack    null    pendingack isdeliveredack
+// on resumption a pending delivered ack will be out of sync with
+// re deliveries.
+if  log isdebugenabled
+log debug     pendingack
+pendingack   null
+if   unconsumedmessages isclosed
+if  this info isbrowser       session connection isduplicate this  md getmessage
+if  listener    null    unconsumedmessages isrunning
+activemqmessage message   createactivemqmessage md
+beforemessageisconsumed md
+try
+boolean expired   message isexpired
+if   expired
+listener onmessage message
+aftermessageisconsumed md  expired
+catch  runtimeexception e
+if  isautoacknowledgebatch      isautoacknowledgeeach      session isindividualacknowledge
+// redeliver the message
+else
+// transacted or client ack: deliver the
+// next message.
+aftermessageisconsumed md  false
+log error getconsumerid         e  e
+else
+unconsumedmessages enqueue md
+if  availablelistener    null
+availablelistener onmessageavailable this
+else
+// ignore duplicate
+if  log isdebugenabled
+log debug getconsumerid         md getmessage
+// in a transaction ack delivery of duplicates to ensure prefetch extension kicks in.
+// the normal ack will happen in the transaction.
+if  session istransacted
+acklater md  messageack delivered_ack_type
+else
+acknowledge md
+if    dispatchedcount % 1000    0
+dispatchedcount   0
+thread yield
+catch  exception e
+session connection onclientinternalexception e
+public int getmessagesize
+return unconsumedmessages size
+public void start   throws jmsexception
+if  unconsumedmessages isclosed
+return
+started set true
+unconsumedmessages start
+session executor wakeup
+public void stop
+started set false
+unconsumedmessages stop
+public string tostring
+return     info getconsumerid         started get
+/**
+* delivers a message to the message listener.
+*
+* @return
+* @throws jmsexception
+*/
+public boolean iterate
+messagelistener listener   this messagelistener get
+if  listener    null
+messagedispatch md   unconsumedmessages dequeuenowait
+if  md    null
+try
+activemqmessage message   createactivemqmessage md
+beforemessageisconsumed md
+listener onmessage message
+aftermessageisconsumed md  false
+catch  jmsexception e
+session connection onclientinternalexception e
+return true
+return false
+public boolean isinuse activemqtempdestination destination
+return info getdestination   equals destination
+public long getlastdeliveredsequenceid
+return lastdeliveredsequenceid
+public ioexception getfailureerror
+return failureerror
+public void setfailureerror ioexception failureerror
+this failureerror   failureerror

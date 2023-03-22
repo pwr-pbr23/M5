@@ -1,0 +1,216 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase procedure
+import java io ioexception
+import java util collection
+import java util hashset
+import java util list
+import java util set
+import java util concurrent concurrentmap
+import java util concurrent executorservice
+import java util concurrent future
+import java util concurrent rejectedexecutionexception
+import java util concurrent synchronousqueue
+import java util concurrent threadpoolexecutor
+import java util concurrent timeunit
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop classification interfacestability
+import org apache hadoop hbase daemonthreadfactory
+import org apache hadoop hbase errorhandling foreignexception
+import org apache hadoop hbase errorhandling foreignexceptiondispatcher
+import com google common collect mapmaker
+/**
+* this is the master side of a distributed complex procedure execution.
+* <p>
+* the {@link procedure} is generic and subclassing or customization shouldn't be
+* necessary -- any customization should happen just in {@link subprocedure}s.
+*/
+@interfaceaudience public
+@interfacestability evolving
+public class procedurecoordinator
+private static final log log   logfactory getlog procedurecoordinator class
+final static long timeout_millis_default   60000
+final static long wake_millis_default   500
+private final procedurecoordinatorrpcs rpcs
+private final executorservice pool
+// running procedure table.  maps procedure name to running procedure reference
+private final concurrentmap<string  procedure> procedures
+new mapmaker   concurrencylevel 4  weakvalues   makemap
+/**
+* create and start a procedurecoordinator.
+*
+* the rpc object registers the procedurecoordinator and starts any threads in this
+* constructor.
+*
+* @param rpcs
+* @param pool used for executing procedures.
+*/
+public procedurecoordinator procedurecoordinatorrpcs rpcs  threadpoolexecutor pool
+this rpcs   rpcs
+this pool   pool
+this rpcs start this
+/**
+* default thread pool for the procedure
+*/
+public static threadpoolexecutor defaultpool string coordname  long keepalivetime  int opthreads
+long wakefrequency
+return new threadpoolexecutor 1  opthreads  keepalivetime  timeunit seconds
+new synchronousqueue<runnable>
+new daemonthreadfactory     coordname
+/**
+* shutdown the thread pools and release rpc resources
+* @throws ioexception
+*/
+public void close   throws ioexception
+// have to use shutdown now to break any latch waiting
+pool shutdownnow
+rpcs close
+/**
+* submit an procedure to kick off its dependent subprocedures.
+* @param proc procedure to execute
+* @return <tt>true</tt> if the procedure was started correctly, <tt>false</tt> if the
+*         procedure or any subprocedures could not be started.  failure could be due to
+*         submitting a procedure multiple times (or one with the same name), or some sort
+*         of io problem.  on errors, the procedure's monitor holds a reference to the exception
+*         that caused the failure.
+*/
+boolean submitprocedure procedure proc
+// if the submitted procedure was null, then we don't want to run it
+if  proc    null
+return false
+string procname   proc getname
+// make sure we aren't already running a procedure of that name
+synchronized  procedures
+procedure oldproc   procedures get procname
+if  oldproc    null
+// procedures are always eventually completed on both successful and failed execution
+if  oldproc completedlatch getcount      0
+log warn     procname
+return false
+log debug     procname
+procedures remove procname
+// kick off the procedure's execution in a separate thread
+future<void> f   null
+try
+synchronized  procedures
+f   this pool submit proc
+// if everything got started properly, we can add it known running procedures
+this procedures put procname  proc
+return true
+catch  rejectedexecutionexception e
+log warn     procname
+e
+// the thread pool is full and we can't run the procedure
+proc receive new foreignexception procname  e
+// cancel procedure proactively
+if  f    null
+f cancel true
+return false
+/**
+* the connection to the rest of the procedure group (members and coordinator) has been
+* broken/lost/failed. this should fail any interested procedures, but not attempt to notify other
+* members since we cannot reach them anymore.
+* @param message description of the error
+* @param cause the actual cause of the failure
+*/
+void rpcconnectionfailure final string message  final ioexception cause
+collection<procedure> tonotify   procedures values
+for  procedure proc   tonotify
+if  proc    null
+continue
+// notify the elements, if they aren't null
+proc receive new foreignexception proc getname    cause
+/**
+* abort the procedure with the given name
+* @param procname name of the procedure to abort
+* @param reason serialized information about the abort
+*/
+public void abortprocedure string procname  foreignexception reason
+// if we know about the procedure, notify it
+synchronized procedures
+procedure proc   procedures get procname
+if  proc    null
+return
+proc receive reason
+/**
+* exposed for hooking with unit tests.
+* @param procname
+* @param procargs
+* @param expectedmembers
+* @return
+*/
+procedure createprocedure foreignexceptiondispatcher fed  string procname  byte procargs
+list<string> expectedmembers
+// build the procedure
+return new procedure this  fed  wake_millis_default  timeout_millis_default
+procname  procargs  expectedmembers
+/**
+* kick off the named procedure
+* @param procname name of the procedure to start
+* @param procargs arguments for the procedure
+* @param expectedmembers expected members to start
+* @return handle to the running procedure, if it was started correctly, <tt>null</tt> otherwise
+* @throws rejectedexecutionexception if there are no more available threads to run the procedure
+*/
+public procedure startprocedure foreignexceptiondispatcher fed  string procname  byte procargs
+list<string> expectedmembers  throws rejectedexecutionexception
+procedure proc   createprocedure fed  procname  procargs  expectedmembers
+if   this submitprocedure proc
+log error     procname
+return null
+return proc
+/**
+* notification that the procedure had the specified member acquired its part of the barrier
+* via {@link subprocedure#acquirebarrier()}.
+* @param procname name of the procedure that acquired
+* @param member name of the member that acquired
+*/
+void memberacquiredbarrier string procname  final string member
+procedure proc   procedures get procname
+if  proc    null
+proc barrieracquiredbymember member
+/**
+* notification that the procedure had another member finished executing its in-barrier subproc
+* via {@link subprocedure#insidebarrier()}.
+* @param procname name of the subprocedure that finished
+* @param member name of the member that executed and released its barrier
+*/
+void memberfinishedbarrier string procname  final string member
+procedure proc   procedures get procname
+if  proc    null
+proc barrierreleasedbymember member
+/**
+* @return the rpcs implementation for all current procedures
+*/
+procedurecoordinatorrpcs getrpcs
+return rpcs
+/**
+* returns the procedure.  this procedure is a live instance so should not be modified but can
+* be inspected.
+* @param name name of the procedure
+* @return procedure or null if not present any more
+*/
+public procedure getprocedure string name
+return procedures get name
+/**
+* @return return set of all procedure names.
+*/
+public set<string> getprocedurenames
+return new hashset<string> procedures keyset

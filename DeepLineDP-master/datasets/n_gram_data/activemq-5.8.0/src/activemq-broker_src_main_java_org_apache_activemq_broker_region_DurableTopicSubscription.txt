@@ -1,0 +1,259 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq broker region
+import java io ioexception
+import java util collections
+import java util concurrent concurrenthashmap
+import java util concurrent atomic atomicboolean
+import java util concurrent atomic atomiclong
+import javax jms invalidselectorexception
+import javax jms jmsexception
+import org apache activemq broker broker
+import org apache activemq broker connectioncontext
+import org apache activemq broker region cursors pendingmessagecursor
+import org apache activemq broker region cursors storedurablesubscribercursor
+import org apache activemq broker region policy policyentry
+import org apache activemq command activemqdestination
+import org apache activemq command consumerinfo
+import org apache activemq command message
+import org apache activemq command messageack
+import org apache activemq command messagedispatch
+import org apache activemq command messageid
+import org apache activemq store topicmessagestore
+import org apache activemq usage systemusage
+import org apache activemq usage usage
+import org apache activemq usage usagelistener
+import org apache activemq util subscriptionkey
+import org slf4j logger
+import org slf4j loggerfactory
+public class durabletopicsubscription extends prefetchsubscription implements usagelistener
+private static final logger log   loggerfactory getlogger durabletopicsubscription class
+private final concurrenthashmap<messageid  integer> redeliveredmessages   new concurrenthashmap<messageid  integer>
+private final concurrenthashmap<activemqdestination  destination> durabledestinations   new concurrenthashmap<activemqdestination  destination>
+private final subscriptionkey subscriptionkey
+private final boolean keepdurablesubsactive
+private final atomicboolean active   new atomicboolean
+private final atomiclong offlinetimestamp   new atomiclong  1
+public durabletopicsubscription broker broker  systemusage usagemanager  connectioncontext context  consumerinfo info  boolean keepdurablesubsactive
+throws jmsexception
+super broker  usagemanager  context  info
+this pending   new storedurablesubscribercursor broker  context getclientid    info getsubscriptionname    info getprefetchsize    this
+this pending setsystemusage usagemanager
+this pending setmemoryusagehighwatermark getcursormemoryhighwatermark
+this keepdurablesubsactive   keepdurablesubsactive
+subscriptionkey   new subscriptionkey context getclientid    info getsubscriptionname
+public final boolean isactive
+return active get
+public final long getofflinetimestamp
+return offlinetimestamp get
+public void setofflinetimestamp long timestamp
+offlinetimestamp set timestamp
+@override
+public boolean isfull
+return  active get      super isfull
+@override
+public void gc
+/**
+* store will have a pending ack for all durables, irrespective of the
+* selector so we need to ack if node is un-matched
+*/
+@override
+public void unmatched messagereference node  throws ioexception
+messageack ack   new messageack
+ack setacktype messageack unmatched_ack_type
+ack setmessageid node getmessageid
+destination regiondestination    destination  node getregiondestination
+regiondestination acknowledge this getcontext    this  ack  node
+@override
+protected void setpendingbatchsize pendingmessagecursor pending  int numbertodispatch
+// statically configured via maxpagesize
+@override
+public void add connectioncontext context  destination destination  throws exception
+if   destinations contains destination
+super add context  destination
+// do it just once per destination
+if  durabledestinations containskey destination getactivemqdestination
+return
+durabledestinations put destination getactivemqdestination    destination
+if  active get      keepdurablesubsactive
+topic topic    topic  destination
+topic activate context  this
+if  pending isempty topic
+topic recoverretroactivemessages context  this
+this enqueuecounter    pending size
+else if  destination getmessagestore      null
+topicmessagestore store    topicmessagestore  destination getmessagestore
+try
+this enqueuecounter    store getmessagecount subscriptionkey getclientid    subscriptionkey getsubscriptionname
+catch  ioexception e
+jmsexception jmsex   new jmsexception     e
+jmsex setlinkedexception e
+throw jmsex
+dispatchpending
+public void activate systemusage memorymanager  connectioncontext context  consumerinfo info  regionbroker regionbroker  throws exception
+if   active get
+this context   context
+this info   info
+if  log isdebugenabled
+log debug     this
+if   keepdurablesubsactive
+for  destination destination   durabledestinations values
+topic topic    topic  destination
+add context  topic
+topic activate context  this
+// on activation we should update the configuration based on our new consumer info.
+activemqdestination dest   this info getdestination
+if  dest    null    regionbroker getdestinationpolicy      null
+policyentry entry   regionbroker getdestinationpolicy   getentryfor dest
+if  entry    null
+entry configure broker  usagemanager  this
+synchronized  pendinglock
+pending setsystemusage memorymanager
+pending setmemoryusagehighwatermark getcursormemoryhighwatermark
+pending setmaxauditdepth getmaxauditdepth
+pending setmaxproducerstoaudit getmaxproducerstoaudit
+pending start
+// if nothing was in the persistent store, then try to use the
+// recovery policy.
+if  pending isempty
+for  destination destination   durabledestinations values
+topic topic    topic  destination
+topic recoverretroactivemessages context  this
+this active set true
+this offlinetimestamp set  1
+dispatchpending
+this usagemanager getmemoryusage   addusagelistener this
+public void deactivate boolean keepdurablesubsactive  throws exception
+if  log isdebugenabled
+log debug     keepdurablesubsactive       this
+active set false
+offlinetimestamp set system currenttimemillis
+this usagemanager getmemoryusage   removeusagelistener this
+synchronized  pendinglock
+pending stop
+synchronized  dispatchlock
+for  destination destination   durabledestinations values
+topic topic    topic  destination
+if   keepdurablesubsactive
+topic deactivate context  this
+else
+topic getdestinationstatistics   getinflight   subtract dispatched size
+// before we add these back to pending they need to be in producer order not
+// dispatch order so we can add them to the front of the pending list.
+collections reverse dispatched
+for  final messagereference node   dispatched
+// mark the dispatched messages as redelivered for next time.
+integer count   redeliveredmessages get node getmessageid
+if  count    null
+redeliveredmessages put node getmessageid    integer valueof count intvalue     1
+else
+redeliveredmessages put node getmessageid    integer valueof 1
+if  keepdurablesubsactive    pending istransient
+pending addmessagefirst node
+pending rollback node getmessageid
+else
+node decrementreferencecount
+dispatched clear
+if   keepdurablesubsactive    pending istransient
+try
+pending reset
+while  pending hasnext
+messagereference node   pending next
+node decrementreferencecount
+pending remove
+finally
+pending release
+prefetchextension set 0
+@override
+protected messagedispatch createmessagedispatch messagereference node  message message
+messagedispatch md   super createmessagedispatch node  message
+if  node    queuemessagereference null_message
+integer count   redeliveredmessages get node getmessageid
+if  count    null
+md setredeliverycounter count intvalue
+return md
+@override
+public void add messagereference node  throws exception
+if   active get       keepdurablesubsactive
+return
+super add node
+@override
+protected void dispatchpending   throws ioexception
+if  isactive
+super dispatchpending
+public void removepending messagereference node  throws ioexception
+pending remove node
+@override
+protected void doaddrecoveredmessage messagereference message  throws exception
+synchronized  pending
+pending addrecoveredmessage message
+@override
+public int getpendingqueuesize
+if  active get      keepdurablesubsactive
+return super getpendingqueuesize
+// todo: need to get from store
+return 0
+@override
+public void setselector string selector  throws invalidselectorexception
+throw new unsupportedoperationexception
+@override
+protected boolean candispatch messagereference node
+return isactive
+@override
+protected void acknowledge connectioncontext context  messageack ack  messagereference node  throws ioexception
+destination regiondestination    destination  node getregiondestination
+regiondestination acknowledge context  this  ack  node
+redeliveredmessages remove node getmessageid
+node decrementreferencecount
+@override
+public synchronized string tostring
+return     getsubscriptionkey         info getconsumerid         isactive
+durabledestinations size         enqueuecounter       getpendingqueuesize         dispatchcounter
+dispatched size         getprefetchextension
+public subscriptionkey getsubscriptionkey
+return subscriptionkey
+/**
+* release any references that we are holding.
+*/
+@override
+public void destroy
+synchronized  pendinglock
+try
+pending reset
+while  pending hasnext
+messagereference node   pending next
+node decrementreferencecount
+finally
+pending release
+pending clear
+synchronized  dispatchlock
+for  messagereference node   dispatched
+node decrementreferencecount
+dispatched clear
+setslowconsumer false
+@override
+public void onusagechanged usage usage  int oldpercentusage  int newpercentusage
+if  oldpercentusage > newpercentusage    oldpercentusage >  90
+try
+dispatchpending
+catch  ioexception e
+log warn    e
+@override
+protected boolean isdropped messagereference node
+return false
+public boolean iskeepdurablesubsactive
+return keepdurablesubsactive

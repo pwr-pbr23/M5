@@ -1,0 +1,570 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing,
+* software distributed under the license is distributed on an
+* "as is" basis, without warranties or conditions of any
+* kind, either express or implied.  see the license for the
+* specific language governing permissions and limitations
+* under the license.
+*/
+package org apache hive hcatalog mapreduce
+import java io ioexception
+import java net uri
+import java util arraylist
+import java util hashmap
+import java util linkedhashmap
+import java util list
+import java util map
+import java util map entry
+import org apache hadoop conf configuration
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop fs permission fspermission
+import org apache hadoop hive common fileutils
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive ql metadata hivestoragehandler
+import org apache hadoop hive metastore hivemetastoreclient
+import org apache hadoop hive metastore warehouse
+import org apache hadoop hive metastore api fieldschema
+import org apache hadoop hive metastore api invalidoperationexception
+import org apache hadoop hive metastore api metaexception
+import org apache hadoop hive metastore api partition
+import org apache hadoop hive metastore api storagedescriptor
+import org apache hadoop hive ql metadata table
+import org apache hadoop hive shims shimloader
+import org apache hadoop mapred jobconf
+import org apache hadoop mapreduce jobcontext
+import org apache hadoop mapreduce jobstatus state
+import org apache hadoop mapreduce taskattemptcontext
+import org apache hive hcatalog common errortype
+import org apache hive hcatalog common hcatconstants
+import org apache hive hcatalog common hcatexception
+import org apache hive hcatalog common hcatutil
+import org apache hive hcatalog data schema hcatfieldschema
+import org apache hive hcatalog data schema hcatschema
+import org apache hive hcatalog data schema hcatschemautils
+import org apache hive hcatalog har haroutputcommitterpostprocessor
+import org apache thrift texception
+import org slf4j logger
+import org slf4j loggerfactory
+/**
+* part of the fileoutput*container classes
+* see {@link fileoutputformatcontainer} for more information
+*/
+class fileoutputcommittercontainer extends outputcommittercontainer
+private static final string temp_dir_name
+private static final string logs_dir_name
+private static final logger log   loggerfactory getlogger fileoutputcommittercontainer class
+private final boolean dynamicpartitioningused
+private boolean partitionsdiscovered
+private map<string  map<string  string>> partitionsdiscoveredbypath
+private map<string  jobcontext> contextdiscoveredbypath
+private final hivestoragehandler cachedstoragehandler
+haroutputcommitterpostprocessor harprocessor   new haroutputcommitterpostprocessor
+private string ptnrootlocation   null
+private outputjobinfo jobinfo   null
+/**
+* @param context current jobcontext
+* @param basecommitter outputcommitter to contain
+* @throws ioexception
+*/
+public fileoutputcommittercontainer jobcontext context
+org apache hadoop mapred outputcommitter basecommitter  throws ioexception
+super context  basecommitter
+jobinfo   hcatoutputformat getjobinfo context
+dynamicpartitioningused   jobinfo isdynamicpartitioningused
+this partitionsdiscovered    dynamicpartitioningused
+cachedstoragehandler   hcatutil getstoragehandler context getconfiguration    jobinfo gettableinfo   getstorerinfo
+@override
+public void aborttask taskattemptcontext context  throws ioexception
+if   dynamicpartitioningused
+getbaseoutputcommitter   aborttask hcatmapredutil createtaskattemptcontext context
+@override
+public void committask taskattemptcontext context  throws ioexception
+if   dynamicpartitioningused
+//see hcatalog-499
+fileoutputformatcontainer setworkoutputpath context
+getbaseoutputcommitter   committask hcatmapredutil createtaskattemptcontext context
+@override
+public boolean needstaskcommit taskattemptcontext context  throws ioexception
+if   dynamicpartitioningused
+return getbaseoutputcommitter   needstaskcommit hcatmapredutil createtaskattemptcontext context
+else
+// called explicitly through filerecordwritercontainer.close() if dynamic - return false by default
+return false
+@override
+public void setupjob jobcontext context  throws ioexception
+if  getbaseoutputcommitter      null     dynamicpartitioningused
+getbaseoutputcommitter   setupjob hcatmapredutil createjobcontext context
+// in dynamic usecase, called through filerecordwritercontainer
+@override
+public void setuptask taskattemptcontext context  throws ioexception
+if   dynamicpartitioningused
+getbaseoutputcommitter   setuptask hcatmapredutil createtaskattemptcontext context
+@override
+public void abortjob jobcontext jobcontext  state state  throws ioexception
+try
+if  dynamicpartitioningused
+discoverpartitions jobcontext
+org apache hadoop mapred jobcontext mapredjobcontext   hcatmapredutil
+createjobcontext jobcontext
+if  getbaseoutputcommitter      null     dynamicpartitioningused
+getbaseoutputcommitter   abortjob mapredjobcontext  state
+else if  dynamicpartitioningused
+for  jobcontext currcontext   contextdiscoveredbypath values
+try
+new jobconf currcontext getconfiguration
+getoutputcommitter   abortjob currcontext
+state
+catch  exception e
+throw new ioexception e
+path src
+outputjobinfo jobinfo   hcatoutputformat getjobinfo jobcontext
+if  dynamicpartitioningused
+src   new path getpartitionrootlocation jobinfo getlocation    jobinfo gettableinfo   gettable
+getpartitionkeyssize
+else
+src   new path jobinfo getlocation
+filesystem fs   src getfilesystem jobcontext getconfiguration
+// note fs.delete will fail on windows. the reason is in outputcommitter,
+// hadoop is still writing to _logs/history. on linux, os don't care file is still
+// open and remove the directory anyway, but on windows, os refuse to remove a
+// directory containing open files. so on windows, we will leave output directory
+// behind when job fail. user needs to remove the output directory manually
+log info    src
+fs delete src  true
+finally
+canceldelegationtokens jobcontext
+public static final string succeeded_file_name
+static final string successful_job_output_dir_marker
+private static boolean getoutputdirmarking configuration conf
+return conf getboolean successful_job_output_dir_marker
+false
+@override
+public void commitjob jobcontext jobcontext  throws ioexception
+try
+if  dynamicpartitioningused
+discoverpartitions jobcontext
+// commit each partition so it gets moved out of the job work
+// dir
+for  jobcontext context   contextdiscoveredbypath values
+new jobconf context getconfiguration
+getoutputcommitter   commitjob context
+if  getbaseoutputcommitter      null     dynamicpartitioningused
+getbaseoutputcommitter   commitjob
+hcatmapredutil createjobcontext jobcontext
+registerpartitions jobcontext
+// create _success file if so requested.
+outputjobinfo jobinfo   hcatoutputformat getjobinfo jobcontext
+if  getoutputdirmarking jobcontext getconfiguration
+path outputpath   new path jobinfo getlocation
+filesystem filesys   outputpath getfilesystem jobcontext
+getconfiguration
+// create a file in the folder to mark it
+if  filesys exists outputpath
+path filepath   new path outputpath
+succeeded_file_name
+if   filesys exists filepath        may have been
+// created by
+// basecommitter.commitjob()
+filesys create filepath  close
+finally
+canceldelegationtokens jobcontext
+@override
+public void cleanupjob jobcontext context  throws ioexception
+throw new ioexception
+private string getpartitionrootlocation string ptnlocn  int numptnkeys
+if  ptnrootlocation    null
+// we only need to calculate it once, it'll be the same for other partitions in this job.
+path ptnroot   new path ptnlocn
+for  int i   0  i < numptnkeys  i
+//          log.info("getting parent of "+ptnroot.getname());
+ptnroot   ptnroot getparent
+ptnrootlocation   ptnroot tostring
+//      log.info("returning final parent : "+ptnrootlocation);
+return ptnrootlocation
+/**
+* generate partition metadata object to be used to add to metadata.
+* @param context the job context.
+* @param jobinfo the outputjobinfo.
+* @param partlocnroot the table-equivalent location root of the partition
+*                       (temporary dir if dynamic partition, table dir if static)
+* @param partkvs the keyvalue pairs that form the partition
+* @param outputschema the output schema for the partition
+* @param params the parameters to store inside the partition
+* @param table the table metadata object under which this partition will reside
+* @param fs filesystem object to operate on the underlying filesystem
+* @param grpname group name that owns the table dir
+* @param perms fspermission that's the default permission of the table dir.
+* @return constructed partition metadata object
+* @throws java.io.ioexception
+*/
+private partition constructpartition
+jobcontext context  outputjobinfo jobinfo
+string partlocnroot  map<string  string> partkvs
+hcatschema outputschema  map<string  string> params
+table table  filesystem fs
+string grpname  fspermission perms  throws ioexception
+partition partition   new partition
+partition setdbname table getdbname
+partition settablename table gettablename
+partition setsd new storagedescriptor table getttable   getsd
+list<fieldschema> fields   new arraylist<fieldschema>
+for  hcatfieldschema fieldschema   outputschema getfields
+fields add hcatschemautils getfieldschema fieldschema
+partition getsd   setcols fields
+partition setvalues fileoutputformatcontainer getpartitionvaluelist table  partkvs
+partition setparameters params
+// sets permissions and group name on partition dirs and files.
+path partpath
+if  boolean valueof  string table getproperty
+jobinfo getlocation      null    jobinfo getlocation   length   > 0
+// honor external table that specifies the location
+partpath   new path jobinfo getlocation
+else
+partpath   new path partlocnroot
+int i   0
+for  fieldschema partkey   table getpartitionkeys
+if  i      0
+applygroupandperms fs  partpath  perms  grpname  false
+partpath   constructpartialpartpath partpath  partkey getname   tolowercase    partkvs
+// apply the group and permissions to the leaf partition and files.
+// need not bother in case of hdfs as permission is taken care of by setting umask
+if   shimloader gethadoopshims   gethcatshim   isfileinhdfs fs  partpath
+applygroupandperms fs  partpath  perms  grpname  true
+// set the location in the storagedescriptor
+if  dynamicpartitioningused
+string dynamicpartitiondestination   getfinaldynamicpartitiondestination table  partkvs
+if  harprocessor isenabled
+harprocessor exec context  partition  partpath
+partition getsd   setlocation
+harprocessor getprocessedlocation new path dynamicpartitiondestination
+else
+partition getsd   setlocation dynamicpartitiondestination
+else
+partition getsd   setlocation partpath tostring
+return partition
+private void applygroupandperms filesystem fs  path dir  fspermission permission
+string group  boolean recursive
+throws ioexception
+fs setpermission dir  permission
+if  recursive
+for  filestatus filestatus   fs liststatus dir
+if  filestatus isdir
+applygroupandperms fs  filestatus getpath    permission  group  true
+else
+fs setpermission filestatus getpath    permission
+private string getfinaldynamicpartitiondestination table table  map<string  string> partkvs
+// file:///tmp/hcat_junit_warehouse/employee/_dyn0.7770480401313761/emp_country=in/emp_state=ka  ->
+// file:///tmp/hcat_junit_warehouse/employee/emp_country=in/emp_state=ka
+path partpath   new path table getttable   getsd   getlocation
+for  fieldschema partkey   table getpartitionkeys
+partpath   constructpartialpartpath partpath  partkey getname   tolowercase    partkvs
+return partpath tostring
+private map<string  string> getstorerparametermap storerinfo storer
+map<string  string> params   new hashmap<string  string>
+//copy table level hcat.* keys to the partition
+for  entry<object  object> entry   storer getproperties   entryset
+params put entry getkey   tostring    entry getvalue   tostring
+return params
+private path constructpartialpartpath path partialpath  string partkey  map<string  string> partkvs
+stringbuilder sb   new stringbuilder fileutils escapepathname partkey
+sb append
+sb append fileutils escapepathname partkvs get partkey
+return new path partialpath  sb tostring
+/**
+* update table schema, adding new columns as added for the partition.
+* @param client the client
+* @param table the table
+* @param partitionschema the schema of the partition
+* @throws java.io.ioexception signals that an i/o exception has occurred.
+* @throws org.apache.hadoop.hive.metastore.api.invalidoperationexception the invalid operation exception
+* @throws org.apache.hadoop.hive.metastore.api.metaexception the meta exception
+* @throws org.apache.thrift.texception the t exception
+*/
+private void updatetableschema hivemetastoreclient client  table table
+hcatschema partitionschema  throws ioexception  invalidoperationexception  metaexception  texception
+list<fieldschema> newcolumns   hcatutil validatepartitionschema table  partitionschema
+if  newcolumns size      0
+list<fieldschema> tablecolumns   new arraylist<fieldschema> table getttable   getsd   getcols
+tablecolumns addall newcolumns
+//update table schema to add the newly added columns
+table getttable   getsd   setcols tablecolumns
+client alter_table table getdbname    table gettablename    table getttable
+/**
+* move all of the files from the temp directory to the final location
+* @param fs the output file system
+* @param file the file to move
+* @param srcdir the source directory
+* @param destdir the target directory
+* @param dryrun - a flag that simply tests if this move would succeed or not based
+*                 on whether other files exist where we're trying to copy
+* @throws java.io.ioexception
+*/
+private void movetaskoutputs filesystem fs
+path file
+path srcdir
+path destdir  final boolean dryrun  throws ioexception
+if  file getname   equals temp_dir_name     file getname   equals logs_dir_name     file getname   equals succeeded_file_name
+return
+final path finaloutputpath   getfinalpath file  srcdir  destdir
+if  fs isfile file
+if  dryrun
+if log isdebugenabled
+log debug     file
+finaloutputpath
+if  fs exists finaloutputpath
+throw new hcatexception errortype error_move_failed      finaloutputpath
+else
+if log isdebugenabled
+log debug     file       finaloutputpath
+// make sure the parent directory exists.  it is not an error
+// to recreate an existing directory
+fs mkdirs finaloutputpath getparent
+if   fs rename file  finaloutputpath
+if   fs delete finaloutputpath  true
+throw new hcatexception errortype error_move_failed      finaloutputpath
+if   fs rename file  finaloutputpath
+throw new hcatexception errortype error_move_failed      finaloutputpath
+else if fs getfilestatus file  isdir
+filestatus children   fs liststatus file
+filestatus firstchild   null
+if  children    null
+int index 0
+while  index < children length
+if   children getpath   getname   equals temp_dir_name      children getpath   getname   equals logs_dir_name      children getpath   getname   equals succeeded_file_name
+firstchild   children
+break
+index
+if firstchild  null    firstchild isdir
+// if the first child is directory, then rest would be directory too according to hcatalog dir structure
+// recurse in that case
+for  filestatus child   children
+movetaskoutputs fs  child getpath    srcdir  destdir  dryrun
+else
+if   dryrun
+if  dynamicpartitioningused
+// optimization: if the first child is file, we have reached the leaf directory, move the parent directory itself
+// instead of moving each file under the directory. see hcatalog-538
+final path parentdir   finaloutputpath getparent
+// create the directory
+path placeholder   new path parentdir
+if  fs mkdirs parentdir
+// it is weired but we need a placeholder,
+// otherwise rename cannot move file to the right place
+fs create placeholder  close
+if  log isdebugenabled
+log debug     file       parentdir
+if   fs rename file  parentdir
+final string msg       file       parentdir
+log error msg
+throw new hcatexception errortype error_move_failed  msg
+fs delete placeholder  false
+else
+// in case of no partition we have to move each file
+for  filestatus child   children
+movetaskoutputs fs  child getpath    srcdir  destdir  dryrun
+else
+if fs exists finaloutputpath
+throw new hcatexception errortype error_move_failed      finaloutputpath
+else
+// should never happen
+final string msg
+throw new hcatexception errortype error_move_failed  msg
+/**
+* find the final name of a given output file, given the output directory
+* and the work directory.
+* @param file the file to move
+* @param src the source directory
+* @param dest the target directory
+* @return the final path for the specific output file
+* @throws java.io.ioexception
+*/
+private path getfinalpath path file  path src
+path dest  throws ioexception
+uri taskoutputuri   file touri
+uri relativepath   src touri   relativize taskoutputuri
+if  taskoutputuri    relativepath
+throw new hcatexception errortype error_move_failed
+src       file
+if  relativepath getpath   length   > 0
+return new path dest  relativepath getpath
+else
+return dest
+/**
+* run to discover dynamic partitions available
+*/
+private void discoverpartitions jobcontext context  throws ioexception
+if   partitionsdiscovered
+//      log.info("discover ptns called");
+outputjobinfo jobinfo   hcatoutputformat getjobinfo context
+harprocessor setenabled jobinfo getharrequested
+list<integer> dynamicpartcols   jobinfo getposofdynpartcols
+int maxdynamicpartitions   jobinfo getmaxdynamicpartitions
+path loadpath   new path jobinfo getlocation
+filesystem fs   loadpath getfilesystem context getconfiguration
+// construct a path pattern (e.g., /*/*) to find all dynamically generated paths
+string dynpathspec   loadpath touri   getpath
+dynpathspec   dynpathspec replaceall
+//      log.info("searching for "+dynpathspec);
+path pathpattern   new path dynpathspec
+filestatus status   fs globstatus pathpattern
+partitionsdiscoveredbypath   new linkedhashmap<string  map<string  string>>
+contextdiscoveredbypath   new linkedhashmap<string  jobcontext>
+if  status length    0
+//        log.warn("no partition found genereated by dynamic partitioning in ["
+//            +loadpath+"] with depth["+jobinfo.gettable().getpartitionkeyssize()
+//            +"], dynspec["+dynpathspec+"]");
+else
+if   maxdynamicpartitions     1      status length > maxdynamicpartitions
+this partitionsdiscovered   true
+throw new hcatexception errortype error_too_many_dynamic_ptns
+maxdynamicpartitions
+hiveconf confvars dynamicpartitionmaxparts varname
+for  filestatus st   status
+linkedhashmap<string  string> fullpartspec   new linkedhashmap<string  string>
+warehouse makespecfromname fullpartspec  st getpath
+partitionsdiscoveredbypath put st getpath   tostring    fullpartspec
+jobconf jobconf    jobconf context getconfiguration
+jobcontext currcontext   hcatmapredutil createjobcontext
+jobconf
+context getjobid
+internalutil createreporter hcatmapredutil createtaskattemptcontext jobconf
+shimloader gethadoopshims   gethcatshim   createtaskattemptid
+hcatoutputformat configureoutputstoragehandler currcontext  jobinfo  fullpartspec
+contextdiscoveredbypath put st getpath   tostring    currcontext
+//      for (entry<string,map<string,string>> spec : partitionsdiscoveredbypath.entryset()){
+//        log.info("partition "+ spec.getkey());
+//        for (entry<string,string> e : spec.getvalue().entryset()){
+//          log.info(e.getkey() + "=>" +e.getvalue());
+//        }
+//      }
+this partitionsdiscovered   true
+private void registerpartitions jobcontext context  throws ioexception
+if  dynamicpartitioningused
+discoverpartitions context
+outputjobinfo jobinfo   hcatoutputformat getjobinfo context
+configuration conf   context getconfiguration
+table table   new table jobinfo gettableinfo   gettable
+path tblpath   new path table getttable   getsd   getlocation
+filesystem fs   tblpath getfilesystem conf
+if  table getpartitionkeys   size      0
+//move data from temp directory the actual table directory
+//no metastore operation required.
+path src   new path jobinfo getlocation
+movetaskoutputs fs  src  src  tblpath  false
+fs delete src  true
+return
+hivemetastoreclient client   null
+hcattableinfo tableinfo   jobinfo gettableinfo
+list<partition> partitionsadded   new arraylist<partition>
+try
+hiveconf hiveconf   hcatutil gethiveconf conf
+client   hcatutil gethiveclient hiveconf
+storerinfo storer   internalutil extractstorerinfo table getttable   getsd   table getparameters
+filestatus tblstat   fs getfilestatus tblpath
+string grpname   tblstat getgroup
+fspermission perms   tblstat getpermission
+list<partition> partitionstoadd   new arraylist<partition>
+if   dynamicpartitioningused
+partitionstoadd add
+constructpartition
+context jobinfo
+tblpath tostring    jobinfo getpartitionvalues
+jobinfo getoutputschema    getstorerparametermap storer
+table  fs
+grpname perms
+else
+for  entry<string map<string string>> entry   partitionsdiscoveredbypath entryset
+partitionstoadd add
+constructpartition
+context jobinfo
+getpartitionrootlocation entry getkey   entry getvalue   size     entry getvalue
+jobinfo getoutputschema    getstorerparametermap storer
+table  fs
+grpname perms
+arraylist<map<string string>> ptninfos   new arraylist<map<string string>>
+for partition ptn   partitionstoadd
+ptninfos add internalutil createptnkeyvaluemap new table tableinfo gettable     ptn
+//publish the new partition(s)
+if  dynamicpartitioningused    harprocessor isenabled        partitionstoadd isempty
+path src   new path ptnrootlocation
+// check here for each dir we're copying out, to see if it
+// already exists, error out if so
+movetaskoutputs fs  src  src  tblpath  true
+movetaskoutputs fs  src  src  tblpath  false
+fs delete src  true
+try
+updatetableschema client  table  jobinfo getoutputschema
+log info    table gettablename    ptninfos
+client add_partitions partitionstoadd
+partitionsadded   partitionstoadd
+catch  exception e
+// there was an error adding partitions : rollback fs copy and rethrow
+for  partition p   partitionstoadd
+path ptnpath   new path harprocessor getparentfspath new path p getsd   getlocation
+if  fs exists ptnpath
+fs delete ptnpath true
+throw e
+else
+// no harprocessor, regular operation
+updatetableschema client  table  jobinfo getoutputschema
+log info    table gettablename    ptninfos
+if  dynamicpartitioningused     partitionstoadd size  >0
+path src   new path ptnrootlocation
+movetaskoutputs fs  src  src  tblpath  true
+movetaskoutputs fs  src  src  tblpath  false
+fs delete src  true
+client add_partitions partitionstoadd
+partitionsadded   partitionstoadd
+catch  exception e
+if  partitionsadded size   > 0
+try
+// basecommitter.cleanupjob failed, try to clean up the
+// metastore
+for  partition p   partitionsadded
+client droppartition tableinfo getdatabasename
+tableinfo gettablename    p getvalues
+catch  exception te
+// keep cause as the original exception
+throw new hcatexception
+errortype error_publishing_partition  e
+if  e instanceof hcatexception
+throw  hcatexception  e
+else
+throw new hcatexception errortype error_publishing_partition  e
+finally
+hcatutil closehiveclientquietly client
+private void canceldelegationtokens jobcontext context  throws ioexception
+log info
+hivemetastoreclient client   null
+try
+hiveconf hiveconf   hcatutil
+gethiveconf context getconfiguration
+client   hcatutil gethiveclient hiveconf
+// cancel the deleg. tokens that were acquired for this job now that
+// we are done - we should cancel if the tokens were acquired by
+// hcatoutputformat and not if they were supplied by oozie.
+// in the latter case the hcat_key_token_signature property in
+// the conf will not be set
+string tokenstrform   client gettokenstrform
+if  tokenstrform    null
+context getconfiguration   get
+hcatconstants hcat_key_token_signature     null
+client canceldelegationtoken tokenstrform
+catch  metaexception e
+log warn    e
+catch  texception e
+log warn    e
+finally
+hcatutil closehiveclientquietly client

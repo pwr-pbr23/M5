@@ -1,0 +1,591 @@
+/*
+derby - class org.apache.derby.impl.store.access.btree.openbtree
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store access btree
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby iapi reference sqlstate
+import org apache derby iapi store access conglomerate logicalundo
+import org apache derby iapi store access conglomerate transactionmanager
+import org apache derby iapi store access dynamiccompiledopenconglominfo
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi store access spaceinfo
+import org apache derby iapi store raw containerhandle
+import org apache derby iapi store raw lockingpolicy
+import org apache derby iapi store raw recordhandle
+import org apache derby iapi store raw transaction
+import org apache derby iapi types datavaluedescriptor
+import org apache derby impl store access conglomerate openconglomeratescratchspace
+/**
+an open b-tree contains fields and methods common to scans and controllers.
+<p>
+<b>concurrency notes<\b>
+<p>
+an instance of an open b-tree is owned by a single context.  the b-tree code
+assumes that the context ensures that only one thread at a time is using
+the open b-tree.  the open b-tree itself does not enforce or check this.
+**/
+public class openbtree
+{
+/*
+** fields of openbtree
+*/
+/**
+* the following group of fields are all basic input parameters which are
+* provided by the calling code when doing any sort of operation requiring
+* an open conglomerate (openscan(), open(), opencostcontroller(), ...).
+* these are just saved values from what was initially input.
+**/
+private btree                           init_conglomerate
+/**
+the transactionmanager that open'd this btree.  in the case of internal
+transactions used by split this will be the internal transaction, and
+init_open_user_scans will be the user transaction that began the internal
+transaction.
+**/
+private transactionmanager              init_xact_manager
+private transaction                     init_rawtran
+/**
+the containerhandle mode the container is opened with.  remember this so
+that if the btree needs to do smo with another transaction, it would open
+the container with the same mode.
+**/
+private int                             init_openmode
+/**
+table or page locking?
+**/
+protected int                           init_lock_level
+private dynamiccompiledopenconglominfo  init_dynamic_info
+private boolean                         init_hold
+/**
+the locking policy to use for for access to this btree.
+**/
+private btreelockingpolicy              init_btree_locking_policy
+/**
+the (open) container which contains the b-tree.
+**/
+protected containerhandle container
+/**
+the conglomerate containerid for error reporting.
+**/
+protected long  err_containerid
+/**
+in the case of splits, notify all scans in this transaction to save their
+current position by key, because the split may move the row they are
+positioned on.  this is done by calling open_user_scans.savescanpositions().
+note that not all openbtree's will have a non-null open_user_scans.  for
+instance logical undo of btree operations will get a openbtree with a null
+open_user_scans, this is all right because this operation should never need
+to call savescanpositions() (ie. it will never do a split).
+**/
+protected transactionmanager init_open_user_scans   null
+protected logicalundo btree_undo   null
+/**
+* scratch space used for stuff like templates, export rows, ...
+**/
+protected openconglomeratescratchspace  runtime_mem
+/**************************************************************************
+* public accessors of this class:
+**************************************************************************
+*/
+public final transactionmanager getxactmgr
+{
+return init_xact_manager
+}
+public final transaction getrawtran
+{
+return init_rawtran
+}
+public final int getlocklevel
+{
+return init_lock_level
+}
+public final containerhandle getcontainer
+{
+return container
+}
+public final int getopenmode
+{
+return init_openmode
+}
+public final btree getconglomerate
+{
+return init_conglomerate
+}
+public final boolean gethold
+{
+return init_hold
+}
+public final btreelockingpolicy getlockingpolicy
+{
+return init_btree_locking_policy
+}
+public final void setlockingpolicy btreelockingpolicy policy
+{
+init_btree_locking_policy   policy
+}
+public final boolean isclosed
+{
+return container    null
+}
+public final openconglomeratescratchspace getruntimemem
+{
+return runtime_mem
+}
+/**************************************************************************
+* public methods of rowcountable class:
+**************************************************************************
+*/
+/**
+* get the total estimated number of rows in the container.
+* <p>
+* the number is a rough estimate and may be grossly off.  in general
+* the server will cache the row count and then occasionally write
+* the count unlogged to a backing store.  if the system happens to
+* shutdown before the store gets a chance to update the row count it
+* may wander from reality.
+* <p>
+* this call is currently only supported on heap conglomerates, it
+* will throw an exception if called on btree conglomerates.
+*
+* @return the total estimated number of rows in the conglomerate.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public long getestimatedrowcount
+throws standardexception
+{
+if  container    null
+reopen
+// don't return 0 rows (return 1 instead), as this often leads the
+// optimizer to produce plans which don't use indexes because of the 0
+// row edge case.
+//
+// eventually the plan is recompiled when rows are added, but we
+// have seen multiple customer cases of deadlocks and timeouts
+// because of these 0 row based plans.
+long row_count
+this container getestimatedrowcount    unused flag    0
+return row_count    0 ? 1   row_count
+}
+/**
+* set the total estimated number of rows in the container.
+* <p>
+* often, after a scan, the client of rawstore has a much better estimate
+* of the number of rows in the container than what store has.  for
+* instance if we implement some sort of update statistics command, or
+* just after a create index a complete scan will have been done of the
+* table.  in this case this interface allows the client to set the
+* estimated row count for the container, and store will use that number
+* for all future references.
+* <p>
+* this call is currently only supported on heap conglomerates, it
+* will throw an exception if called on btree conglomerates.
+*
+* @param count the estimated number of rows in the container.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void setestimatedrowcount long count
+throws standardexception
+{
+if  container    null
+reopen
+this container setestimatedrowcount count     unused flag    0
+}
+/**************************************************************************
+* public methods of conglomeratecontroller interface:
+**************************************************************************
+*/
+/**
+* check consistency of a btree.
+* <p>
+* read in root and check consistency of entire tree.  currently raises
+* sanity check errors.
+* <p>
+* resolve (mikem) if this is to be supported in non-sanity servers what
+* should it do?
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void checkconsistency
+throws standardexception
+{
+controlrow root   null
+try
+{
+if  this container    null
+{
+throw standardexception newexception
+sqlstate btree_is_closed  new long err_containerid
+}
+if  sanitymanager debug
+sanitymanager assert this init_conglomerate format_ids    null
+root   controlrow get this  btree rootpageid
+int actualpages   root checkconsistency this  null  true
+// resolve (mikem) - anything useful to assert about number of pages
+// in the tree?
+}
+finally
+{
+if  root    null
+root release
+}
+}
+/**************************************************************************
+* public methods of scancontroller interface:
+**************************************************************************
+*/
+/**
+* is the open btree table locked?
+**/
+public boolean istablelocked
+{
+return init_lock_level    transactioncontroller mode_table
+}
+/*
+** methods of openbtree
+*/
+/**
+initialize the open conglomerate.
+if container is null, open the container, otherwise use the container
+passed in.
+@exception standardexception standard exception policy.
+**/
+/**
+* initialize the open conglomerate.
+* <p>
+* if container is null, open the container, otherwise use the container
+* passed in.  the container is always opened with no locking, it is up
+* to the caller to make the appropriate container locking call.
+* <p>
+*
+* @param open_user_scans the user transaction which opened this btree.
+* @param xact_manager    the current transaction, usually the same as
+*                        "open_user_scans", but in the case of split it
+*                        is the internal xact nested below the user xact.
+* @param input_container the open container holding the index, if it is
+*                        already open, else null which will mean this
+*                        routine will open it.
+* @param rawtran         the current raw store transaction.
+* @param open_mode       the opening mode for the containerhandle.
+* @param conglomerate    readonly description of the conglomerate.
+* @param undo            logical undo object to associate with all updates
+*                        done on this open btree.
+*
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void init
+transactionmanager              open_user_scans
+transactionmanager              xact_manager
+containerhandle                 input_container
+transaction                     rawtran
+boolean                         hold
+int                             open_mode
+int                             lock_level
+btreelockingpolicy              btree_locking_policy
+btree                           conglomerate
+logicalundo                     undo
+dynamiccompiledopenconglominfo  dynamic_info
+throws standardexception
+{
+// if the b-tree is already open, close it.
+if (this.container != null)
+{
+if  sanitymanager debug
+sanitymanager assert false
+close();
+}
+err_containerid   conglomerate id getcontainerid
+// locking policy to pass back to concrete implementation lock calls
+this init_btree_locking_policy   btree_locking_policy
+// if the conglomerate is temporary, open with is_kept set.
+// resolve(mikem): track 1825
+// don't want to open temp cantainer with is_kept always.
+if  conglomerate istemporary
+open_mode    containerhandle mode_temp_is_kept
+// now open the container if it wasn't already opened by the client.
+// no locks will be requested by raw store on this open.
+if  input_container    null
+{
+// open the container.
+this container
+rawtran opencontainer
+conglomerate id
+lockingpolicy  null    get no locks on btree
+open_mode
+}
+else
+{
+// use the open container passed in.
+this container   input_container
+// resolve (sku) - containerhandle should have an interface to
+// verify that it is opened with open_mode
+}
+if  this container    null
+{
+throw standardexception newexception
+sqlstate btree_container_not_found
+new long err_containerid
+}
+// remember the conglomerate so its properties can be found.
+init_conglomerate     conglomerate
+// remember the transaction manager so commit() can be called
+init_xact_manager     xact_manager
+init_rawtran          rawtran
+init_openmode         open_mode
+// isolation level of this btree.
+init_lock_level       lock_level
+init_dynamic_info     dynamic_info
+init_hold             hold
+// remember the transaction manager so savescanpositions() can be called
+this init_open_user_scans   open_user_scans
+// logical undo class to pass to raw store, on inserts/deletes.
+this btree_undo   undo
+// either use passed in "compiled" runtime scratch space, or create
+// new space.
+this runtime_mem
+dynamic_info    null ?
+openconglomeratescratchspace  dynamic_info
+new openconglomeratescratchspace
+conglomerate format_ids
+conglomerate collation_ids
+}
+/**
+* open the container after it has been closed previously.
+* <p>
+* open the container, obtaining necessary locks.  most work is actually
+* done by rawstore.opencontainer().  will only reopen() if the container
+* is not already open.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public containerhandle reopen
+throws standardexception
+{
+// reget transaction from context manager, in the case of xa
+// transaction this may have changed.
+//
+/* todo - xa transactions my change the current transaction on the
+* context stack.  will want to something like:
+*
+* init_rawtran = context_manager.getcurrenttransaction()
+*/
+// if the b-tree is already open, close it.
+/*
+if (this.container != null)
+{
+close();
+}
+*/
+if  sanitymanager debug
+{
+sanitymanager assert init_xact_manager    null
+sanitymanager assert init_xact_manager getrawstorexact      null
+sanitymanager assert init_conglomerate    null
+}
+if  container    null
+{
+// open the container.
+this container
+init_xact_manager getrawstorexact   opencontainer
+init_conglomerate id
+lockingpolicy  null    get no locks on btree
+init_openmode
+}
+return this container
+}
+/**
+close the open conglomerate.
+**/
+public void close
+throws standardexception
+{
+if  container    null
+container close
+container   null
+}
+/**
+check if all the
+columns are indexable and storable.  eventually this routine could
+check whether all the types were right also.
+@exception standardexception standard exception policy.
+**/
+void isindexablerowconsistent datavaluedescriptor row
+throws standardexception
+{
+if  sanitymanager debug
+{
+datavaluedescriptor template
+this init_conglomerate createtemplate getrawtran
+for  int i   0  i < row length  i
+{
+// compare class's rather than format id's to pick up
+// different problems with wrong collation implementation.
+if   row getclass   equals template getclass
+{
+sanitymanager throwassert
+i
+row getclass   getname
+i
+template getclass   getname
+}
+}
+}
+}
+/**
+* return the container handle.
+* <p>
+* @return the open container handle of the btree.
+**/
+public containerhandle getcontainerhandle
+{
+return container
+}
+/**
+* get height of the tree.
+* <p>
+* read in root and return the height (number of levels) of the tree.
+* the level of a tree is 0 in the leaf and increases by 1 for each
+* level of the tree as you go up the tree.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public int getheight
+throws standardexception
+{
+// container.checkconsistency();
+controlrow root   null
+try
+{
+root   controlrow get this  btree rootpageid
+int height   root getlevel     1
+return height
+}
+finally
+{
+if  root    null
+root release
+}
+}
+public recordhandle makerecordhandle
+long    page_number
+int     rec_id
+throws standardexception
+{
+return
+container makerecordhandle
+page_number  rec_id
+}
+/**
+* dump information about tree into the log.
+* <p>
+* traverse the tree dumping info about tree into the log.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void debugconglomerate
+throws standardexception
+{
+// container.checkconsistency();
+controlrow root   null
+try
+{
+if  sanitymanager debug
+{
+sanitymanager debug_print
+container getid
+sanitymanager debug_print
+this init_conglomerate
+}
+root   controlrow get this  btree rootpageid
+root printtree this
+}
+finally
+{
+if  root    null
+root release
+}
+}
+/**
+* testing infrastructure to cause unusual paths through the code.
+* <p>
+* through the use of debug flags allow test code to cause otherwise
+* hard to cause paths through the code.
+* <p>
+*
+* @return whether the latch has been released by this routine.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public static boolean test_errors
+openbtree           open_btree
+string              debug_string
+boolean             release_scan_lock
+btreelockingpolicy  btree_locking_policy
+leafcontrolrow      leaf
+boolean             input_latch_released
+throws standardexception
+{
+boolean latch_released   input_latch_released
+// special test to see if latch release code works
+if  sanitymanager debug
+{
+string debug_lost_latch   debug_string
+if  sanitymanager debug_on debug_lost_latch
+{
+// simulate a lost latch because of a wait for a lock.
+if   latch_released
+{
+if  release_scan_lock
+{
+btree_locking_policy unlockscan
+leaf page getpagenumber
+}
+leaf release
+latch_released   true
+sanitymanager debug_print
+debug_lost_latch  debug_lost_latch
+sanitymanager debug_clear debug_lost_latch
+}
+}
+string debug_deadlock   debug_string
+if  sanitymanager debug_on debug_deadlock
+{
+sanitymanager debug_print debug_deadlock  debug_deadlock
+sanitymanager debug_clear debug_deadlock
+// simulate a deadlock error.
+standardexception se
+standardexception newexception
+sqlstate deadlock
+se setreport standardexception report_always
+throw se
+}
+}
+return latch_released
+}
+public spaceinfo getspaceinfo
+throws standardexception
+{
+return container getspaceinfo
+}
+// return column sort order information
+public boolean getcolumnsortorderinfo
+throws	standardexception
+{
+return init_conglomerate ascdescinfo
+}
+}

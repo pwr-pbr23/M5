@@ -1,0 +1,780 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase master snapshot
+import java io filenotfoundexception
+import java io ioexception
+import java util arraylist
+import java util collections
+import java util hashmap
+import java util hashset
+import java util iterator
+import java util list
+import java util map
+import java util set
+import java util concurrent threadpoolexecutor
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop classification interfacestability
+import org apache hadoop conf configuration
+import org apache hadoop fs fsdatainputstream
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase tablename
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase stoppable
+import org apache hadoop hbase catalog metareader
+import org apache hadoop hbase errorhandling foreignexception
+import org apache hadoop hbase executor executorservice
+import org apache hadoop hbase master assignmentmanager
+import org apache hadoop hbase master mastercoprocessorhost
+import org apache hadoop hbase master masterfilesystem
+import org apache hadoop hbase master masterservices
+import org apache hadoop hbase master metricsmaster
+import org apache hadoop hbase master snapshotsentinel
+import org apache hadoop hbase master cleaner hfilecleaner
+import org apache hadoop hbase master cleaner hfilelinkcleaner
+import org apache hadoop hbase procedure procedure
+import org apache hadoop hbase procedure procedurecoordinator
+import org apache hadoop hbase procedure procedurecoordinatorrpcs
+import org apache hadoop hbase procedure zkprocedurecoordinatorrpcs
+import org apache hadoop hbase protobuf protobufutil
+import org apache hadoop hbase protobuf generated hbaseprotos snapshotdescription
+import org apache hadoop hbase protobuf generated hbaseprotos snapshotdescription type
+import org apache hadoop hbase snapshot clientsnapshotdescriptionutils
+import org apache hadoop hbase snapshot hbasesnapshotexception
+import org apache hadoop hbase snapshot restoresnapshotexception
+import org apache hadoop hbase snapshot restoresnapshothelper
+import org apache hadoop hbase snapshot snapshotcreationexception
+import org apache hadoop hbase snapshot snapshotdescriptionutils
+import org apache hadoop hbase snapshot snapshotdoesnotexistexception
+import org apache hadoop hbase snapshot snapshotexistsexception
+import org apache hadoop hbase snapshot tablepartiallyopenexception
+import org apache hadoop hbase snapshot unknownsnapshotexception
+import org apache hadoop hbase util environmentedgemanager
+import org apache hadoop hbase util fstabledescriptors
+import org apache hadoop hbase util fsutils
+import org apache zookeeper keeperexception
+/**
+* this class manages the procedure of taking and restoring snapshots. there is only one
+* snapshotmanager for the master.
+* <p>
+* the class provides methods for monitoring in-progress snapshot actions.
+* <p>
+* note: currently there can only be one snapshot being taken at a time over the cluster. this is a
+* simplification in the current implementation.
+*/
+@interfaceaudience private
+@interfacestability unstable
+public class snapshotmanager implements stoppable
+private static final log log   logfactory getlog snapshotmanager class
+/** by default, check to see if the snapshot is complete every wake millis (ms) */
+private static final int snapshot_wake_millis_default   500
+/**
+* wait time before removing a finished sentinel from the in-progress map
+*
+* note: this is used as a safety auto cleanup.
+* the snapshot and restore handlers map entries are removed when a user asks if a snapshot or
+* restore is completed. this operation is part of the hbaseadmin snapshot/restore api flow.
+* in case something fails on the client side and the snapshot/restore state is not reclaimed
+* after a default timeout, the entry is removed from the in-progress map.
+* at this point, if the user asks for the snapshot/restore status, the result will be
+* snapshot done if exists or failed if it doesn't exists.
+*/
+private static final int snapshot_sentinels_cleanup_timeout   60   1000
+/** enable or disable snapshot support */
+public static final string hbase_snapshot_enabled
+/**
+* conf key for # of ms elapsed between checks for snapshot errors while waiting for
+* completion.
+*/
+private static final string snapshot_wake_millis_key
+/** by default, check to see if the snapshot is complete (ms) */
+private static final int snapshot_timeout_millis_default   60000
+/**
+* conf key for # of ms elapsed before injecting a snapshot timeout error when waiting for
+* completion.
+*/
+private static final string snapshot_timeout_millis_key
+/** name of the operation to use in the controller */
+public static final string online_snapshot_controller_description
+/** conf key for # of threads used by the snapshotmanager thread pool */
+private static final string snapshot_pool_threads_key
+/** number of current operations running on the master */
+private static final int snapshot_pool_threads_default   1
+private boolean stopped
+private final masterservices master      needed by tableeventhandlers
+private final metricsmaster metricsmaster
+private final procedurecoordinator coordinator
+// is snapshot feature enabled?
+private boolean issnapshotsupported   false
+// snapshot handlers map, with table name as key.
+// the map is always accessed and modified under the object lock using synchronized.
+// snapshottable() will insert an handler in the table.
+// issnapshotdone() will remove the handler requested if the operation is finished.
+private map<tablename  snapshotsentinel> snapshothandlers
+new hashmap<tablename  snapshotsentinel>
+// restore sentinels map, with table name as key.
+// the map is always accessed and modified under the object lock using synchronized.
+// restoresnapshot()/clonesnapshot() will insert an handler in the table.
+// isrestoredone() will remove the handler requested if the operation is finished.
+private map<tablename  snapshotsentinel> restorehandlers
+new hashmap<tablename  snapshotsentinel>
+private final path rootdir
+private final executorservice executorservice
+/**
+* construct a snapshot manager.
+* @param master
+*/
+public snapshotmanager final masterservices master  final metricsmaster metricsmaster
+throws keeperexception  ioexception  unsupportedoperationexception
+this master   master
+this metricsmaster   metricsmaster
+this rootdir   master getmasterfilesystem   getrootdir
+checksnapshotsupport master getconfiguration    master getmasterfilesystem
+// get the configuration for the coordinator
+configuration conf   master getconfiguration
+long wakefrequency   conf getint snapshot_wake_millis_key  snapshot_wake_millis_default
+long timeoutmillis   conf getlong snapshot_timeout_millis_key  snapshot_timeout_millis_default
+int opthreads   conf getint snapshot_pool_threads_key  snapshot_pool_threads_default
+// setup the default procedure coordinator
+string name   master getservername   tostring
+threadpoolexecutor tpool   procedurecoordinator defaultpool name  opthreads
+procedurecoordinatorrpcs comms   new zkprocedurecoordinatorrpcs
+master getzookeeper    snapshotmanager online_snapshot_controller_description  name
+this coordinator   new procedurecoordinator comms  tpool  timeoutmillis  wakefrequency
+this executorservice   master getexecutorservice
+resettempdir
+/**
+* fully specify all necessary components of a snapshot manager. exposed for testing.
+* @param master services for the master where the manager is running
+* @param coordinator procedure coordinator instance.  exposed for testing.
+* @param pool hbase executorservcie instance, exposed for testing.
+*/
+public snapshotmanager final masterservices master  final metricsmaster metricsmaster
+procedurecoordinator coordinator  executorservice pool
+throws ioexception  unsupportedoperationexception
+this master   master
+this metricsmaster   metricsmaster
+this rootdir   master getmasterfilesystem   getrootdir
+checksnapshotsupport master getconfiguration    master getmasterfilesystem
+this coordinator   coordinator
+this executorservice   pool
+resettempdir
+/**
+* gets the list of all completed snapshots.
+* @return list of snapshotdescriptions
+* @throws ioexception file system exception
+*/
+public list<snapshotdescription> getcompletedsnapshots   throws ioexception
+return getcompletedsnapshots snapshotdescriptionutils getsnapshotsdir rootdir
+/**
+* gets the list of all completed snapshots.
+* @param snapshotdir snapshot directory
+* @return list of snapshotdescriptions
+* @throws ioexception file system exception
+*/
+private list<snapshotdescription> getcompletedsnapshots path snapshotdir  throws ioexception
+list<snapshotdescription> snapshotdescs   new arraylist<snapshotdescription>
+// first create the snapshot root path and check to see if it exists
+filesystem fs   master getmasterfilesystem   getfilesystem
+if  snapshotdir    null  snapshotdir   snapshotdescriptionutils getsnapshotsdir rootdir
+// if there are no snapshots, return an empty list
+if   fs exists snapshotdir
+return snapshotdescs
+// ignore all the snapshots in progress
+filestatus snapshots   fs liststatus snapshotdir
+new snapshotdescriptionutils completedsnaphotdirectoriesfilter fs
+// loop through all the completed snapshots
+for  filestatus snapshot   snapshots
+path info   new path snapshot getpath    snapshotdescriptionutils snapshotinfo_file
+// if the snapshot is bad
+if   fs exists info
+log error     snapshot getpath
+continue
+fsdatainputstream in   null
+try
+in   fs open info
+snapshotdescription desc   snapshotdescription parsefrom in
+snapshotdescs add desc
+catch  ioexception e
+log warn     snapshot getpath    e
+finally
+if  in    null
+in close
+return snapshotdescs
+/**
+* cleans up any snapshots in the snapshot/.tmp directory that were left from failed
+* snapshot attempts.
+*
+* @throws ioexception if we can't reach the filesystem
+*/
+void resettempdir   throws ioexception
+// cleanup any existing snapshots.
+path tmpdir   snapshotdescriptionutils getworkingsnapshotdir rootdir
+if   master getmasterfilesystem   getfilesystem   delete tmpdir  true
+log warn     tmpdir
+/**
+* delete the specified snapshot
+* @param snapshot
+* @throws snapshotdoesnotexistexception if the specified snapshot does not exist.
+* @throws ioexception for filesystem ioexceptions
+*/
+public void deletesnapshot snapshotdescription snapshot  throws snapshotdoesnotexistexception  ioexception
+// call coproc pre hook
+mastercoprocessorhost cphost   master getcoprocessorhost
+if  cphost    null
+cphost predeletesnapshot snapshot
+// check to see if it is completed
+if   issnapshotcompleted snapshot
+throw new snapshotdoesnotexistexception snapshot
+string snapshotname   snapshot getname
+log debug     snapshotname
+// first create the snapshot description and check to see if it exists
+masterfilesystem fs   master getmasterfilesystem
+path snapshotdir   snapshotdescriptionutils getcompletedsnapshotdir snapshotname  rootdir
+// delete the existing snapshot
+if   fs getfilesystem   delete snapshotdir  true
+throw new hbasesnapshotexception     snapshotdir
+// call coproc post hook
+if  cphost    null
+cphost postdeletesnapshot snapshot
+/**
+* check if the specified snapshot is done
+*
+* @param expected
+* @return true if snapshot is ready to be restored, false if it is still being taken.
+* @throws ioexception ioexception if error from hdfs or rpc
+* @throws unknownsnapshotexception if snapshot is invalid or does not exist.
+*/
+public boolean issnapshotdone snapshotdescription expected  throws ioexception
+// check the request to make sure it has a snapshot
+if  expected    null
+throw new unknownsnapshotexception
+string ssstring   clientsnapshotdescriptionutils tostring expected
+// check to see if the sentinel exists,
+// and if the task is complete removes it from the in-progress snapshots map.
+snapshotsentinel handler   removesentineliffinished this snapshothandlers  expected
+// stop tracking "abandoned" handlers
+cleanupsentinels
+if  handler    null
+// if there's no handler in the in-progress map, it means one of the following:
+//   - someone has already requested the snapshot state
+//   - the requested snapshot was completed long time ago (cleanupsentinels() timeout)
+//   - the snapshot was never requested
+// in those cases returns to the user the "done state" if the snapshots exists on disk,
+// otherwise raise an exception saying that the snapshot is not running and doesn't exist.
+if   issnapshotcompleted expected
+throw new unknownsnapshotexception     ssstring
+// was done, return true;
+return true
+// pass on any failure we find in the sentinel
+try
+handler rethrowexceptioniffailed
+catch  foreignexception e
+// give some procedure info on an exception.
+string status
+procedure p   coordinator getprocedure expected getname
+if  p    null
+status   p getstatus
+else
+status   expected getname         coordinator getprocedurenames
+throw new hbasesnapshotexception     ssstring        status  e
+expected
+// check to see if we are done
+if  handler isfinished
+log debug     ssstring
+return true
+else if  log isdebugenabled
+log debug     ssstring
+return false
+/**
+* check to see if the specified table has a snapshot in progress.  currently we have a
+* limitation only allowing a single snapshot per table at a time.
+* @param tablename name of the table being snapshotted.
+* @return <tt>true</tt> if there is a snapshot in progress on the specified table.
+*/
+synchronized boolean istakingsnapshot final tablename tablename
+snapshotsentinel handler   this snapshothandlers get tablename
+return handler    null     handler isfinished
+/**
+* check to make sure that we are ok to run the passed snapshot. checks to make sure that we
+* aren't already running a snapshot or restore on the requested table.
+* @param snapshot description of the snapshot we want to start
+* @throws hbasesnapshotexception if the filesystem could not be prepared to start the snapshot
+*/
+private synchronized void preparetotakesnapshot snapshotdescription snapshot
+throws hbasesnapshotexception
+filesystem fs   master getmasterfilesystem   getfilesystem
+path workingdir   snapshotdescriptionutils getworkingsnapshotdir snapshot  rootdir
+tablename snapshottable
+tablename valueof snapshot gettable
+// make sure we aren't already running a snapshot
+if  istakingsnapshot snapshottable
+snapshotsentinel handler   this snapshothandlers get snapshottable
+throw new snapshotcreationexception
+clientsnapshotdescriptionutils tostring snapshot
+clientsnapshotdescriptionutils tostring handler getsnapshot     snapshot
+// make sure we aren't running a restore on the same table
+if  isrestoringtable snapshottable
+snapshotsentinel handler   restorehandlers get snapshottable
+throw new snapshotcreationexception
+clientsnapshotdescriptionutils tostring snapshot
+clientsnapshotdescriptionutils tostring handler getsnapshot     snapshot
+try
+// delete the working directory, since we aren't running the snapshot. likely leftovers
+// from a failed attempt.
+fs delete workingdir  true
+// recreate the working directory for the snapshot
+if   fs mkdirs workingdir
+throw new snapshotcreationexception     workingdir
+snapshot
+catch  hbasesnapshotexception e
+throw e
+catch  ioexception e
+throw new snapshotcreationexception
+e  snapshot
+/**
+* take a snapshot of a disabled table.
+* @param snapshot description of the snapshot to take. modified to be {@link type#disabled}.
+* @throws hbasesnapshotexception if the snapshot could not be started
+*/
+private synchronized void snapshotdisabledtable snapshotdescription snapshot
+throws hbasesnapshotexception
+// setup the snapshot
+preparetotakesnapshot snapshot
+// set the snapshot to be a disabled snapshot, since the client doesn't know about that
+snapshot   snapshot tobuilder   settype type disabled  build
+// take the snapshot of the disabled table
+disabledtablesnapshothandler handler
+new disabledtablesnapshothandler snapshot  master  metricsmaster
+snapshottable snapshot  handler
+/**
+* take a snapshot of an enabled table.
+* @param snapshot description of the snapshot to take.
+* @throws hbasesnapshotexception if the snapshot could not be started
+*/
+private synchronized void snapshotenabledtable snapshotdescription snapshot
+throws hbasesnapshotexception
+// setup the snapshot
+preparetotakesnapshot snapshot
+// take the snapshot of the enabled table
+enabledtablesnapshothandler handler
+new enabledtablesnapshothandler snapshot  master  this  metricsmaster
+snapshottable snapshot  handler
+/**
+* take a snapshot using the specified handler.
+* on failure the snapshot temporary working directory is removed.
+* note: preparetotakesnapshot() called before this one takes care of the rejecting the
+*       snapshot request if the table is busy with another snapshot/restore operation.
+* @param snapshot the snapshot description
+* @param handler the snapshot handler
+*/
+private synchronized void snapshottable snapshotdescription snapshot
+final takesnapshothandler handler  throws hbasesnapshotexception
+try
+handler prepare
+this executorservice submit handler
+this snapshothandlers put tablename valueof snapshot gettable     handler
+catch  exception e
+// cleanup the working directory by trying to delete it from the fs.
+path workingdir   snapshotdescriptionutils getworkingsnapshotdir snapshot  rootdir
+try
+if   this master getmasterfilesystem   getfilesystem   delete workingdir  true
+log error     workingdir
+clientsnapshotdescriptionutils tostring snapshot
+catch  ioexception e1
+log error     workingdir
+clientsnapshotdescriptionutils tostring snapshot
+// fail the snapshot
+throw new snapshotcreationexception    e  snapshot
+/**
+* take a snapshot based on the enabled/disabled state of the table.
+*
+* @param snapshot
+* @throws hbasesnapshotexception when a snapshot specific exception occurs.
+* @throws ioexception when some sort of generic io exception occurs.
+*/
+public void takesnapshot snapshotdescription snapshot  throws ioexception
+// check to see if we already completed the snapshot
+if  issnapshotcompleted snapshot
+throw new snapshotexistsexception     snapshot getname
+snapshot
+log debug
+// stop tracking "abandoned" handlers
+cleanupsentinels
+// check to see if the table exists
+htabledescriptor desc   null
+try
+desc   master gettabledescriptors   get
+tablename valueof snapshot gettable
+catch  filenotfoundexception e
+string msg       snapshot gettable
+log error msg
+throw new snapshotcreationexception msg  e  snapshot
+catch  ioexception e
+throw new snapshotcreationexception
+snapshot gettable    e  snapshot
+if  desc    null
+throw new snapshotcreationexception     snapshot gettable
+snapshot
+// set the snapshot version, now that we are ready to take it
+snapshot   snapshot tobuilder   setversion snapshotdescriptionutils snapshot_layout_version
+build
+// call pre coproc hook
+mastercoprocessorhost cphost   master getcoprocessorhost
+if  cphost    null
+cphost presnapshot snapshot  desc
+// if the table is enabled, then have the rs run actually the snapshot work
+tablename snapshottable   tablename valueof snapshot gettable
+assignmentmanager assignmentmgr   master getassignmentmanager
+if  assignmentmgr getzktable   isenabledtable snapshottable
+log debug
+snapshotenabledtable snapshot
+log debug     clientsnapshotdescriptionutils tostring snapshot
+// for disabled table, snapshot is created by the master
+else if  assignmentmgr getzktable   isdisabledtable snapshottable
+log debug
+snapshotdisabledtable snapshot
+log debug     clientsnapshotdescriptionutils tostring snapshot
+else
+log error     snapshot gettable
+tablepartiallyopenexception tpoe   new tablepartiallyopenexception snapshot gettable
+throw new snapshotcreationexception    tpoe  snapshot
+// call post coproc hook
+if  cphost    null
+cphost postsnapshot snapshot  desc
+/**
+* set the handler for the current snapshot
+* <p>
+* exposed for testing
+* @param tablename
+* @param handler handler the master should use
+*
+* todo get rid of this if possible, repackaging, modify tests.
+*/
+public synchronized void setsnapshothandlerfortesting
+final tablename tablename
+final snapshotsentinel handler
+if  handler    null
+this snapshothandlers put tablename  handler
+else
+this snapshothandlers remove tablename
+/**
+* @return distributed commit coordinator for all running snapshots
+*/
+procedurecoordinator getcoordinator
+return coordinator
+/**
+* check to see if the snapshot is one of the currently completed snapshots
+* returns true if the snapshot exists in the "completed snapshots folder".
+*
+* @param snapshot expected snapshot to check
+* @return <tt>true</tt> if the snapshot is stored on the {@link filesystem}, <tt>false</tt> if is
+*         not stored
+* @throws ioexception if the filesystem throws an unexpected exception,
+* @throws illegalargumentexception if snapshot name is invalid.
+*/
+private boolean issnapshotcompleted snapshotdescription snapshot  throws ioexception
+try
+final path snapshotdir   snapshotdescriptionutils getcompletedsnapshotdir snapshot  rootdir
+filesystem fs   master getmasterfilesystem   getfilesystem
+// check to see if the snapshot already exists
+return fs exists snapshotdir
+catch  illegalargumentexception iae
+throw new unknownsnapshotexception    iae
+/**
+* clone the specified snapshot into a new table.
+* the operation will fail if the destination table has a snapshot or restore in progress.
+*
+* @param snapshot snapshot descriptor
+* @param htabledescriptor table descriptor of the table to create
+*/
+synchronized void clonesnapshot final snapshotdescription snapshot
+final htabledescriptor htabledescriptor  throws hbasesnapshotexception
+tablename tablename   htabledescriptor gettablename
+// make sure we aren't running a snapshot on the same table
+if  istakingsnapshot tablename
+throw new restoresnapshotexception     tablename
+// make sure we aren't running a restore on the same table
+if  isrestoringtable tablename
+throw new restoresnapshotexception     tablename
+try
+clonesnapshothandler handler
+new clonesnapshothandler master  snapshot  htabledescriptor  metricsmaster  prepare
+this executorservice submit handler
+this restorehandlers put tablename  handler
+catch  exception e
+string msg       clientsnapshotdescriptionutils tostring snapshot
+tablename
+log error msg  e
+throw new restoresnapshotexception msg  e
+/**
+* restore the specified snapshot
+* @param reqsnapshot
+* @throws ioexception
+*/
+public void restoresnapshot snapshotdescription reqsnapshot  throws ioexception
+filesystem fs   master getmasterfilesystem   getfilesystem
+path snapshotdir   snapshotdescriptionutils getcompletedsnapshotdir reqsnapshot  rootdir
+mastercoprocessorhost cphost   master getcoprocessorhost
+// check if the snapshot exists
+if   fs exists snapshotdir
+log error     reqsnapshot getname
+throw new snapshotdoesnotexistexception reqsnapshot
+// read snapshot information
+snapshotdescription fssnapshot   snapshotdescriptionutils readsnapshotinfo fs  snapshotdir
+htabledescriptor snapshottabledesc
+fstabledescriptors gettabledescriptorfromfs fs  snapshotdir
+tablename tablename   tablename valueof reqsnapshot gettable
+// stop tracking "abandoned" handlers
+cleanupsentinels
+// execute the restore/clone operation
+if  metareader tableexists master getcatalogtracker    tablename
+if  master getassignmentmanager   getzktable   isenabledtable
+tablename valueof fssnapshot gettable
+throw new unsupportedoperationexception
+tablename valueof fssnapshot gettable
+// call coproc pre hook
+if  cphost    null
+cphost prerestoresnapshot reqsnapshot  snapshottabledesc
+restoresnapshot fssnapshot  snapshottabledesc
+log info     fssnapshot getname         tablename
+if  cphost    null
+cphost postrestoresnapshot reqsnapshot  snapshottabledesc
+else
+htabledescriptor htd   restoresnapshothelper clonetableschema snapshottabledesc  tablename
+if  cphost    null
+cphost preclonesnapshot reqsnapshot  htd
+clonesnapshot fssnapshot  htd
+log info     fssnapshot getname         tablename
+if  cphost    null
+cphost postclonesnapshot reqsnapshot  htd
+/**
+* restore the specified snapshot.
+* the restore will fail if the destination table has a snapshot or restore in progress.
+*
+* @param snapshot snapshot descriptor
+* @param htabledescriptor table descriptor
+*/
+private synchronized void restoresnapshot final snapshotdescription snapshot
+final htabledescriptor htabledescriptor  throws hbasesnapshotexception
+tablename tablename   htabledescriptor gettablename
+// make sure we aren't running a snapshot on the same table
+if  istakingsnapshot tablename
+throw new restoresnapshotexception     tablename
+// make sure we aren't running a restore on the same table
+if  isrestoringtable tablename
+throw new restoresnapshotexception     tablename
+try
+restoresnapshothandler handler
+new restoresnapshothandler master  snapshot  htabledescriptor  metricsmaster  prepare
+this executorservice submit handler
+restorehandlers put tablename  handler
+catch  exception e
+string msg       clientsnapshotdescriptionutils tostring
+snapshot
+tablename
+log error msg  e
+throw new restoresnapshotexception msg  e
+/**
+* verify if the restore of the specified table is in progress.
+*
+* @param tablename table under restore
+* @return <tt>true</tt> if there is a restore in progress of the specified table.
+*/
+private synchronized boolean isrestoringtable final tablename tablename
+snapshotsentinel sentinel   this restorehandlers get tablename
+return sentinel    null     sentinel isfinished
+/**
+* returns the status of a restore operation.
+* if the in-progress restore is failed throws the exception that caused the failure.
+*
+* @param snapshot
+* @return false if in progress, true if restore is completed or not requested.
+* @throws ioexception if there was a failure during the restore
+*/
+public boolean isrestoredone final snapshotdescription snapshot  throws ioexception
+// check to see if the sentinel exists,
+// and if the task is complete removes it from the in-progress restore map.
+snapshotsentinel sentinel   removesentineliffinished this restorehandlers  snapshot
+// stop tracking "abandoned" handlers
+cleanupsentinels
+if  sentinel    null
+// there is no sentinel so restore is not in progress.
+return true
+log debug     snapshot getname
+sentinel getsnapshot   getname
+tablename valueof snapshot gettable
+// if the restore is failed, rethrow the exception
+sentinel rethrowexceptioniffailed
+// check to see if we are done
+if  sentinel isfinished
+log debug     clientsnapshotdescriptionutils tostring snapshot
+return true
+if  log isdebugenabled
+log debug
+clientsnapshotdescriptionutils tostring snapshot
+return false
+/**
+* return the handler if it is currently live and has the same snapshot target name.
+* the handler is removed from the sentinels map if completed.
+* @param sentinels live handlers
+* @param snapshot snapshot description
+* @return null if doesn't match, else a live handler.
+*/
+private synchronized snapshotsentinel removesentineliffinished
+final map<tablename  snapshotsentinel> sentinels
+final snapshotdescription snapshot
+if   snapshot hastable
+return null
+tablename snapshottable   tablename valueof snapshot gettable
+snapshotsentinel h   sentinels get snapshottable
+if  h    null
+return null
+if   h getsnapshot   getname   equals snapshot getname
+// specified snapshot is to the one currently running
+return null
+// remove from the "in-progress" list once completed
+if  h isfinished
+sentinels remove snapshottable
+return h
+/**
+* removes "abandoned" snapshot/restore requests.
+* as part of the hbaseadmin snapshot/restore api the operation status is checked until completed,
+* and the in-progress maps are cleaned up when the status of a completed task is requested.
+* to avoid having sentinels staying around for long time if something client side is failed,
+* each operation tries to clean up the in-progress maps sentinels finished from a long time.
+*/
+private void cleanupsentinels
+cleanupsentinels this snapshothandlers
+cleanupsentinels this restorehandlers
+/**
+* remove the sentinels that are marked as finished and the completion time
+* has exceeded the removal timeout.
+* @param sentinels map of sentinels to clean
+*/
+private synchronized void cleanupsentinels final map<tablename  snapshotsentinel> sentinels
+long currenttime   environmentedgemanager currenttimemillis
+iterator<map entry<tablename  snapshotsentinel>> it
+sentinels entryset   iterator
+while  it hasnext
+map entry<tablename  snapshotsentinel> entry   it next
+snapshotsentinel sentinel   entry getvalue
+if  sentinel isfinished
+currenttime   sentinel getcompletiontimestamp    > snapshot_sentinels_cleanup_timeout
+it remove
+//
+// implementing stoppable interface
+//
+@override
+public void stop string why
+// short circuit
+if  this stopped  return
+// make sure we get stop
+this stopped   true
+// pass the stop onto take snapshot handlers
+for  snapshotsentinel snapshothandler  this snapshothandlers values
+snapshothandler cancel why
+// pass the stop onto all the restore handlers
+for  snapshotsentinel restorehandler  this restorehandlers values
+restorehandler cancel why
+try
+coordinator close
+catch  ioexception e
+log error    e
+@override
+public boolean isstopped
+return this stopped
+/**
+* throws an exception if snapshot operations (take a snapshot, restore, clone) are not supported.
+* called at the beginning of snapshot() and restoresnapshot() methods.
+* @throws unsupportedoperationexception if snapshot are not supported
+*/
+public void checksnapshotsupport   throws unsupportedoperationexception
+if   this issnapshotsupported
+throw new unsupportedoperationexception
+hbase_snapshot_enabled
+/**
+* called at startup, to verify if snapshot operation is supported, and to avoid
+* starting the master if there're snapshots present but the cleaners needed are missing.
+* otherwise we can end up with snapshot data loss.
+* @param conf the {@link configuration} object to use
+* @param mfs the masterfilesystem to use
+* @throws ioexception in case of file-system operation failure
+* @throws unsupportedoperationexception in case cleaners are missing and
+*         there're snapshot in the system
+*/
+private void checksnapshotsupport final configuration conf  final masterfilesystem mfs
+throws ioexception  unsupportedoperationexception
+// verify if snapshot is disabled by the user
+string enabled   conf get hbase_snapshot_enabled
+boolean snapshotenabled   conf getboolean hbase_snapshot_enabled  false
+boolean userdisabled    enabled    null    enabled trim   length   > 0     snapshotenabled
+// extract cleaners from conf
+set<string> hfilecleaners   new hashset<string>
+string cleaners   conf getstrings hfilecleaner master_hfile_cleaner_plugins
+if  cleaners    null  collections addall hfilecleaners  cleaners
+set<string> logcleaners   new hashset<string>
+cleaners   conf getstrings hconstants hbase_master_logcleaner_plugins
+if  cleaners    null  collections addall logcleaners  cleaners
+// check if an older version of snapshot directory was present
+path oldsnapshotdir   new path mfs getrootdir    hconstants old_snapshot_dir_name
+filesystem fs   mfs getfilesystem
+list<snapshotdescription> ss   getcompletedsnapshots new path rootdir  oldsnapshotdir
+if  ss    null     ss isempty
+log error     oldsnapshotdir
+log error     hconstants snapshot_dir_name
+// if the user has enabled the snapshot, we force the cleaners to be present
+// otherwise we still need to check if cleaners are enabled or not and verify
+// that there're no snapshot in the .snapshot folder.
+if  snapshotenabled
+// inject snapshot cleaners, if snapshot.enable is true
+hfilecleaners add snapshothfilecleaner class getname
+hfilecleaners add hfilelinkcleaner class getname
+logcleaners add snapshotlogcleaner class getname
+// set cleaners conf
+conf setstrings hfilecleaner master_hfile_cleaner_plugins
+hfilecleaners toarray new string
+conf setstrings hconstants hbase_master_logcleaner_plugins
+logcleaners toarray new string
+else
+// verify if cleaners are present
+snapshotenabled   logcleaners contains snapshotlogcleaner class getname
+hfilecleaners contains snapshothfilecleaner class getname
+hfilecleaners contains hfilelinkcleaner class getname
+// warn if the cleaners are enabled but the snapshot.enabled property is false/not set.
+if  snapshotenabled
+log warn
+hbase_snapshot_enabled
+userdisabled ?
+// mark snapshot feature as enabled if cleaners are present and user has not disabled it.
+this issnapshotsupported   snapshotenabled     userdisabled
+// if cleaners are not enabled, verify that there're no snapshot in the .snapshot folder
+// otherwise we end up with snapshot data loss.
+if   snapshotenabled
+log info
+path snapshotdir   snapshotdescriptionutils getsnapshotsdir mfs getrootdir
+if  fs exists snapshotdir
+filestatus snapshots   fsutils liststatus fs  snapshotdir
+new snapshotdescriptionutils completedsnaphotdirectoriesfilter fs
+if  snapshots    null
+log error
+checksnapshotsupport

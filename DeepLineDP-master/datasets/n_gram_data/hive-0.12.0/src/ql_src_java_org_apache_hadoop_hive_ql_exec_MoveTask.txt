@@ -1,0 +1,422 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql exec
+import java io ioexception
+import java io serializable
+import java security accesscontrolexception
+import java util arraylist
+import java util arrays
+import java util hashset
+import java util linkedhashmap
+import java util list
+import java util map
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs localfilesystem
+import org apache hadoop fs path
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive metastore metastoreutils
+import org apache hadoop hive metastore api invalidoperationexception
+import org apache hadoop hive metastore api order
+import org apache hadoop hive ql context
+import org apache hadoop hive ql drivercontext
+import org apache hadoop hive ql exec mr mapredtask
+import org apache hadoop hive ql exec mr mapredlocaltask
+import org apache hadoop hive ql hooks lineageinfo datacontainer
+import org apache hadoop hive ql hooks writeentity
+import org apache hadoop hive ql io hivefileformatutils
+import org apache hadoop hive ql io rcfile merge blockmergetask
+import org apache hadoop hive ql lockmgr hivelock
+import org apache hadoop hive ql lockmgr hivelockmanager
+import org apache hadoop hive ql lockmgr hivelockobj
+import org apache hadoop hive ql metadata hiveexception
+import org apache hadoop hive ql metadata partition
+import org apache hadoop hive ql metadata table
+import org apache hadoop hive ql optimizer physical bucketingsortingctx bucketcol
+import org apache hadoop hive ql optimizer physical bucketingsortingctx sortcol
+import org apache hadoop hive ql parse basesemanticanalyzer
+import org apache hadoop hive ql plan dynamicpartitionctx
+import org apache hadoop hive ql plan loadfiledesc
+import org apache hadoop hive ql plan loadmultifilesdesc
+import org apache hadoop hive ql plan loadtabledesc
+import org apache hadoop hive ql plan mapwork
+import org apache hadoop hive ql plan mapredwork
+import org apache hadoop hive ql plan movework
+import org apache hadoop hive ql plan api stagetype
+import org apache hadoop hive ql session sessionstate
+import org apache hadoop util stringutils
+/**
+* movetask implementation.
+**/
+public class movetask extends task<movework> implements serializable
+private static final long serialversionuid   1l
+private static transient final log log   logfactory getlog movetask class
+public movetask
+super
+private void movefile path sourcepath  path targetpath  boolean isdfsdir
+throws exception
+filesystem fs   sourcepath getfilesystem conf
+if  isdfsdir
+// just do a rename on the uris, they belong to the same fs
+string mesg       targetpath tostring
+string mesg_detail       sourcepath tostring
+console printinfo mesg  mesg_detail
+// delete the output directory if it already exists
+fs delete targetpath  true
+// if source exists, rename. otherwise, create a empty directory
+if  fs exists sourcepath
+path deletepath   null
+// if it multiple level of folder are there fs.rename is failing so first
+// create the targetpath.getparent() if it not exist
+if  hiveconf getboolvar conf  hiveconf confvars hive_insert_into_multilevel_dirs
+deletepath   createtargetpath targetpath  fs
+if   fs rename sourcepath  targetpath
+try
+if  deletepath    null
+fs delete deletepath  true
+catch  ioexception e
+log info
+deletepath
+throw new hiveexception     sourcepath
+targetpath
+else if   fs mkdirs targetpath
+throw new hiveexception     targetpath
+else
+// this is a local file
+string mesg       targetpath tostring
+string mesg_detail       sourcepath tostring
+console printinfo mesg  mesg_detail
+// delete the existing dest directory
+localfilesystem dstfs   filesystem getlocal conf
+if  dstfs delete targetpath  true      dstfs exists targetpath
+console printinfo mesg  mesg_detail
+// if source exists, rename. otherwise, create a empty directory
+if  fs exists sourcepath
+fs copytolocalfile sourcepath  targetpath
+else
+if   dstfs mkdirs targetpath
+throw new hiveexception
+targetpath
+else
+throw new accesscontrolexception
+targetpath
+private path createtargetpath path targetpath  filesystem fs  throws ioexception
+path deletepath   null
+path mkdirpath   targetpath getparent
+if  mkdirpath    null    fs exists mkdirpath
+path actualpath   mkdirpath
+// targetpath path is /x/y/z/1/2/3 here /x/y/z is present in the file system
+// create the structure till /x/y/z/1/2 to work rename for multilevel directory
+// and if rename fails delete the path /x/y/z/1
+// if targetpath have multilevel directories like /x/y/z/1/2/3 , /x/y/z/1/2/4
+// the renaming of the directories are not atomic the execution will happen one
+// by one
+while  actualpath    null     fs exists actualpath
+deletepath   actualpath
+actualpath   actualpath getparent
+fs mkdirs mkdirpath
+return deletepath
+// release all the locks acquired for this object
+// this becomes important for multi-table inserts when one branch may take much more
+// time than the others. it is better to release the lock for this particular insert.
+// the other option is to wait for all the branches to finish, or set
+// hive.multi.insert.move.tasks.share.dependencies to true, which will mean that the
+// first multi-insert results will be available when all of the branches of multi-table
+// inserts are done.
+private void releaselocks loadtabledesc ltd  throws hiveexception
+// nothing needs to be done
+if   conf getboolvar hiveconf confvars hive_support_concurrency
+return
+context ctx   drivercontext getctx
+hivelockmanager lockmgr   ctx gethivelockmgr
+writeentity output   ctx getloadtableoutputmap   get ltd
+list<hivelockobj> lockobjects   ctx getoutputlockobjects   get output
+if  lockobjects    null
+return
+for  hivelockobj lockobj   lockobjects
+list<hivelock> locks   lockmgr getlocks lockobj getobj    false  true
+for  hivelock lock   locks
+if  lock gethivelockmode      lockobj getmode
+log info     output tostring
+lock gethivelockobject   getname
+lockmgr unlock lock
+ctx gethivelocks   remove lock
+@override
+public int execute drivercontext drivercontext
+try
+// do any hive related operations like moving tables and files
+// to appropriate locations
+loadfiledesc lfd   work getloadfilework
+if  lfd    null
+path targetpath   new path lfd gettargetdir
+path sourcepath   new path lfd getsourcedir
+movefile sourcepath  targetpath  lfd getisdfsdir
+// multi-file load is for dynamic partitions when some partitions do not
+// need to merge and they can simply be moved to the target directory.
+loadmultifilesdesc lmfd   work getloadmultifileswork
+if  lmfd    null
+boolean isdfsdir   lmfd getisdfsdir
+int i   0
+while  i <lmfd getsourcedirs   size
+path srcpath   new path lmfd getsourcedirs   get i
+path destpath   new path lmfd gettargetdirs   get i
+filesystem fs   destpath getfilesystem conf
+if   fs exists destpath getparent
+fs mkdirs destpath getparent
+movefile srcpath  destpath  isdfsdir
+i
+// next we do this for tables and partitions
+loadtabledesc tbd   work getloadtablework
+if  tbd    null
+stringbuilder mesg   new stringbuilder
+append  tbd gettable   gettablename
+if  tbd getpartitionspec   size   > 0
+mesg append
+map<string  string> partspec   tbd getpartitionspec
+for  string key  partspec keyset
+mesg append key  append    append partspec get key   append
+mesg setlength mesg length   2
+mesg append
+string mesg_detail       tbd getsourcedir
+console printinfo mesg tostring    mesg_detail
+table table   db gettable tbd gettable   gettablename
+if  work getcheckfileformat
+// get all files from the src directory
+filestatus dirs
+arraylist<filestatus> files
+filesystem fs
+try
+fs   filesystem get table getdatalocation    conf
+dirs   fs globstatus new path tbd getsourcedir
+files   new arraylist<filestatus>
+for  int i   0   dirs    null    i < dirs length   i
+files addall arrays aslist fs liststatus dirs getpath
+// we only check one file, so exit the loop when we have at least
+// one.
+if  files size   > 0
+break
+catch  ioexception e
+throw new hiveexception
+e
+if  hiveconf getboolvar conf  hiveconf confvars hivecheckfileformat
+// check if the file format of the file matches that of the table.
+boolean flag   hivefileformatutils checkinputformat
+fs  conf  tbd gettable   getinputfileformatclass    files
+if   flag
+throw new hiveexception
+// create a data container
+datacontainer dc   null
+if  tbd getpartitionspec   size      0
+dc   new datacontainer table getttable
+db loadtable new path tbd getsourcedir     tbd gettable
+gettablename    tbd getreplace    tbd getholdddltime
+if  work getoutputs      null
+work getoutputs   add new writeentity table  true
+else
+log info     tbd getpartitionspec   tostring
+// check if the bucketing and/or sorting columns were inferred
+list<bucketcol> bucketcols   null
+list<sortcol> sortcols   null
+int numbuckets    1
+task task   this
+string path   tbd getsourcedir
+// find the first ancestor of this movetask which is some form of map reduce task
+// (either standard, local, or a merge)
+while  task getparenttasks      null    task getparenttasks   size      1
+task    task task getparenttasks   get 0
+// if it was a merge task or a local map reduce task, nothing can be inferred
+if  task instanceof blockmergetask    task instanceof mapredlocaltask
+break
+// if it's a standard map reduce task, check what, if anything, it inferred about
+// the directory this move task is moving
+if  task instanceof mapredtask
+mapredwork work    mapredwork task getwork
+mapwork mapwork   work getmapwork
+bucketcols   mapwork getbucketedcolsbydirectory   get path
+sortcols   mapwork getsortedcolsbydirectory   get path
+if  work getreducework      null
+numbuckets   work getreducework   getnumreducetasks
+if  bucketcols    null    sortcols    null
+// this must be a final map reduce task (the task containing the file sink
+// operator that writes the final output)
+assert work isfinalmapred
+break
+// if it's a move task, get the path the files were moved from, this is what any
+// preceding map reduce task inferred information about, and moving does not invalidate
+// those assumptions
+// this can happen when a conditional merge is added before the final movetask, but the
+// condition for merging is not met, see genmrfilesink1.
+if  task instanceof movetask
+if    movetask task  getwork   getloadfilework      null
+path     movetask task  getwork   getloadfilework   getsourcedir
+// deal with dynamic partitions
+dynamicpartitionctx dpctx   tbd getdpctx
+if  dpctx    null    dpctx getnumdpcols   > 0       dynamic partitions
+list<linkedhashmap<string  string>> dps   utilities getfulldpspecs conf  dpctx
+// publish dp columns to its subscribers
+if  dps    null    dps size   > 0
+pushfeed feedtype dynamic_partitions  dps
+// load the list of dp partitions and return the list of partition specs
+// todo: in a follow-up to hive-1361, we should refactor loaddynamicpartitions
+// to use utilities.getfulldpspecs() to get the list of full partspecs.
+// after that check the number of dps created to not exceed the limit and
+// iterate over it and call loadpartition() here.
+// the reason we don't do inside hive-1361 is the latter is large and we
+// want to isolate any potential issue it may introduce.
+arraylist<linkedhashmap<string  string>> dp
+db loaddynamicpartitions
+new path tbd getsourcedir
+tbd gettable   gettablename
+tbd getpartitionspec
+tbd getreplace
+dpctx getnumdpcols
+tbd getholdddltime
+isskewedstoredasdirs tbd
+if  dp size      0    conf getboolvar hiveconf confvars hive_error_on_empty_partition
+throw new hiveexception
+// for each partition spec, get the partition
+// and put it to writeentity for post-exec hook
+for  linkedhashmap<string  string> partspec  dp
+partition partn   db getpartition table  partspec  false
+if  bucketcols    null    sortcols    null
+updatepartitionbucketsortcolumns table  partn  bucketcols  numbuckets  sortcols
+writeentity enty   new writeentity partn  true
+if  work getoutputs      null
+work getoutputs   add enty
+// need to update the queryplan's output as well so that post-exec hook get executed.
+// this is only needed for dynamic partitioning since for sp the the writeentity is
+// constructed at compile time and the queryplan already contains that.
+// for dp, writeentity creation is deferred at this stage so we need to update
+// queryplan here.
+if  queryplan getoutputs      null
+queryplan setoutputs new hashset<writeentity>
+queryplan getoutputs   add enty
+// update columnar lineage for each partition
+dc   new datacontainer table getttable    partn gettpartition
+if  sessionstate get      null
+sessionstate get   getlineagestate   setlineage tbd getsourcedir    dc
+table getcols
+console printinfo     partspec
+dc   null     reset data container to prevent it being added again
+else      static partitions
+list<string> partvals   metastoreutils getpvals table getpartcols
+tbd getpartitionspec
+db validatepartitionnamecharacters partvals
+db loadpartition new path tbd getsourcedir     tbd gettable   gettablename
+tbd getpartitionspec    tbd getreplace    tbd getholdddltime
+tbd getinherittablespecs    isskewedstoredasdirs tbd
+partition partn   db getpartition table  tbd getpartitionspec    false
+if  bucketcols    null    sortcols    null
+updatepartitionbucketsortcolumns table  partn  bucketcols  numbuckets  sortcols
+dc   new datacontainer table getttable    partn gettpartition
+// add this partition to post-execution hook
+if  work getoutputs      null
+work getoutputs   add new writeentity partn  true
+if  sessionstate get      null    dc    null
+sessionstate get   getlineagestate   setlineage tbd getsourcedir    dc
+table getcols
+releaselocks tbd
+return 0
+catch  exception e
+console printerror     e getmessage
+stringutils stringifyexception e
+return  1
+private boolean isskewedstoredasdirs loadtabledesc tbd
+return  tbd getlbctx      null  ? false   tbd getlbctx
+isskewedstoredasdir
+/**
+* alters the bucketing and/or sorting columns of the partition provided they meet some
+* validation criteria, e.g. the number of buckets match the number of files, and the
+* columns are not partition columns
+* @param table
+* @param partn
+* @param bucketcols
+* @param numbuckets
+* @param sortcols
+* @throws ioexception
+* @throws invalidoperationexception
+* @throws hiveexception
+*/
+private void updatepartitionbucketsortcolumns table table  partition partn
+list<bucketcol> bucketcols  int numbuckets  list<sortcol> sortcols
+throws ioexception  invalidoperationexception  hiveexception
+boolean updatebucketcols   false
+if  bucketcols    null
+filesystem filesys   partn getpartitionpath   getfilesystem conf
+filestatus filestatus   utilities getfilestatusrecurse
+partn getpartitionpath    1  filesys
+// verify the number of buckets equals the number of files
+// this will not hold for dynamic partitions where not every reducer produced a file for
+// those partitions.  in this case the table is not bucketed as hive requires a files for
+// each bucket.
+if  filestatus length    numbuckets
+list<string> newbucketcols   new arraylist<string>
+updatebucketcols   true
+for  bucketcol bucketcol   bucketcols
+if  bucketcol getindexes   get 0  < partn getcols   size
+newbucketcols add partn getcols   get
+bucketcol getindexes   get 0   getname
+else
+// if the table is bucketed on a partition column, not valid for bucketing
+updatebucketcols   false
+break
+if  updatebucketcols
+partn getbucketcols   clear
+partn getbucketcols   addall newbucketcols
+partn gettpartition   getsd   setnumbuckets numbuckets
+boolean updatesortcols   false
+if  sortcols    null
+list<order> newsortcols   new arraylist<order>
+updatesortcols   true
+for  sortcol sortcol   sortcols
+if  sortcol getindexes   get 0  < partn getcols   size
+newsortcols add new order
+partn getcols   get sortcol getindexes   get 0   getname
+sortcol getsortorder        ? basesemanticanalyzer hive_column_order_asc
+basesemanticanalyzer hive_column_order_desc
+else
+// if the table is sorted on a partition column, not valid for sorting
+updatesortcols   false
+break
+if  updatesortcols
+partn getsortcols   clear
+partn getsortcols   addall newsortcols
+if  updatebucketcols    updatesortcols
+db alterpartition table getdbname    table gettablename    partn
+/*
+* does the move task involve moving to a local file system
+*/
+public boolean islocal
+loadtabledesc tbd   work getloadtablework
+if  tbd    null
+return false
+loadfiledesc lfd   work getloadfilework
+if  lfd    null
+if  lfd getisdfsdir
+return false
+else
+return true
+return false
+@override
+public stagetype gettype
+return stagetype move
+@override
+public string getname
+return

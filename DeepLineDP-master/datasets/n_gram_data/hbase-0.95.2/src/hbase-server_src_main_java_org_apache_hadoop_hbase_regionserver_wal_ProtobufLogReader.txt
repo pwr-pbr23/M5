@@ -1,0 +1,224 @@
+/**
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver wal
+import java io eofexception
+import java io ioexception
+import java nio bytebuffer
+import java util arrays
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop fs fsdatainputstream
+import org apache hadoop hbase codec codec
+import org apache hadoop hbase protobuf generated walprotos
+import org apache hadoop hbase protobuf generated walprotos walkey
+import org apache hadoop hbase protobuf generated walprotos waltrailer
+import org apache hadoop hbase util bytes
+import com google protobuf invalidprotocolbufferexception
+/**
+* a protobuf based wal has the following structure:
+* <p>
+* &lt;pb_wal_magic&gt;&lt;walheader&gt;&lt;waledits&gt;...&lt;waledits&gt;&lt;trailer&gt;
+* &lt;trailersize&gt; &lt;pb_wal_complete_magic&gt;
+* </p>
+* the reader reads meta information (wal compression state, waltrailer, etc) in
+* {@link protobuflogreader#initreader(fsdatainputstream)}. a waltrailer is an extensible structure
+* which is appended at the end of the wal. this is empty for now; it can contain some meta
+* information such as region level stats, etc in future.
+*/
+@interfaceaudience private
+public class protobuflogreader extends readerbase
+private static final log log   logfactory getlog protobuflogreader class
+static final byte pb_wal_magic   bytes tobytes
+static final byte pb_wal_complete_magic   bytes tobytes
+private fsdatainputstream inputstream
+private codec decoder celldecoder
+private walcellcodec bytestringuncompressor bytestringuncompressor
+private boolean hascompression   false
+// waleditsstopoffset is the position of the last byte to read. after reading the last waledit entry
+// in the hlog, the inputstream's position is equal to waleditsstopoffset.
+private long waleditsstopoffset
+private boolean trailerpresent
+public protobuflogreader
+super
+@override
+public void close   throws ioexception
+if  this inputstream    null
+this inputstream close
+this inputstream   null
+@override
+public long getposition   throws ioexception
+return inputstream getpos
+@override
+public void reset   throws ioexception
+initinternal null  false
+initaftercompression       we need a new decoder  at least
+@override
+protected void initreader fsdatainputstream stream  throws ioexception
+initinternal stream  true
+private void initinternal fsdatainputstream stream  boolean isfirst  throws ioexception
+close
+long expectedpos   pb_wal_magic length
+if  stream    null
+stream   fs open path
+stream seek expectedpos
+if  stream getpos      expectedpos
+throw new ioexception     stream getpos
+// initialize metadata or, when we reset, just skip the header.
+walprotos walheader builder builder   walprotos walheader newbuilder
+boolean hasheader   builder mergedelimitedfrom stream
+if   hasheader
+throw new eofexception
+if  isfirst
+walprotos walheader header   builder build
+this hascompression   header hashascompression      header gethascompression
+this inputstream   stream
+this waleditsstopoffset   this filelength
+long currentposition   stream getpos
+trailerpresent   settrailerifpresent
+this seekonfs currentposition
+if  log isdebugenabled
+log debug     this waleditsstopoffset
+this filelength           trailerpresent
+/**
+* to check whether a trailer is present in a wal, it seeks to position (filelength -
+* pb_wal_complete_magic.size() - bytes.sizeof_int). it reads the int value to know the size of
+* the trailer, and checks whether the trailer is present at the end or not by comparing the last
+* pb_wal_complete_magic.size() bytes. in case trailer is not present, it returns false;
+* otherwise, sets the trailer and sets this.waleditsstopoffset variable up to the point just
+* before the trailer.
+* <ul>
+* the trailer is ignored in case:
+* <li>filelength is 0 or not correct (when file is under recovery, etc).
+* <li>the trailer size is negative.
+* </ul>
+* <p>
+* in case the trailer size > this.trailermaxsize, it is read after a warn message.
+* @return true if a valid trailer is present
+* @throws ioexception
+*/
+private boolean settrailerifpresent
+try
+long trailersizeoffset   this filelength    pb_wal_complete_magic length   bytes sizeof_int
+if  trailersizeoffset <  0  return false    no trailer possible
+this seekonfs trailersizeoffset
+// read the int as trailer size.
+int trailersize   this inputstream readint
+bytebuffer buf   bytebuffer allocate protobuflogreader pb_wal_complete_magic length
+this inputstream readfully buf array    buf arrayoffset    buf capacity
+if   arrays equals buf array    pb_wal_complete_magic
+log warn
+return false
+if  trailersize < 0
+log warn     trailersize
+return false
+else if  trailersize > this trailerwarnsize
+// continue reading after warning the user.
+log warn
+trailersize       this trailerwarnsize
+// seek to the position where trailer starts.
+long positionoftrailer   trailersizeoffset   trailersize
+this seekonfs positionoftrailer
+// read the trailer.
+buf   bytebuffer allocate trailersize     for trailer
+this inputstream readfully buf array    buf arrayoffset    buf capacity
+trailer   waltrailer parsefrom buf array
+this waleditsstopoffset   positionoftrailer
+return true
+catch  ioexception ioe
+log warn    ioe
+return false
+@override
+protected void initaftercompression   throws ioexception
+walcellcodec codec   walcellcodec create this conf  this compressioncontext
+this celldecoder   codec getdecoder this inputstream
+if  this hascompression
+this bytestringuncompressor   codec getbytestringuncompressor
+@override
+protected boolean hascompression
+return this hascompression
+@override
+protected boolean readnext hlog entry entry  throws ioexception
+while  true
+if  trailerpresent    this inputstream getpos      this waleditsstopoffset  return false
+walkey builder builder   walkey newbuilder
+boolean hasnext   false
+try
+hasnext   builder mergedelimitedfrom inputstream
+catch  invalidprotocolbufferexception ipbe
+log error    ipbe
+if   hasnext  return false
+if   builder isinitialized
+// todo: not clear if we should try to recover from corrupt pb that looks semi-legit.
+//       if we can get the kv count, we could, theoretically, try to get next record.
+log error
+return false
+walkey walkey   builder build
+entry getkey   readfieldsfrompb walkey  this bytestringuncompressor
+if   walkey hasfollowingkvcount      0    walkey getfollowingkvcount
+log warn
+continue
+int expectedcells   walkey getfollowingkvcount
+long posbefore   this inputstream getpos
+try
+int actualcells   entry getedit   readfromcells celldecoder  expectedcells
+if  expectedcells    actualcells
+throw new eofexception     actualcells      other info added in catch
+catch  exception ex
+string posafterstr
+try
+posafterstr   this inputstream getpos
+catch  throwable t
+log trace    t
+string message       expectedcells
+posbefore       posafterstr
+ioexception realeofex   extracthiddeneof ex
+if  realeofex    null
+log error     message  realeofex
+return false
+message       message
+log error message
+throw new ioexception message  ex
+if  trailerpresent    this inputstream getpos   > this waleditsstopoffset
+log error     this path
+this inputstream getpos
+this waleditsstopoffset
+throw new ioexception
+return true
+private ioexception extracthiddeneof exception ex
+// there are two problems we are dealing with here. hadoop stream throws generic exception
+// for eof, not eofexception; and scanner further hides it inside runtimeexception.
+ioexception ioex   null
+if  ex instanceof eofexception
+return  eofexception ex
+else if  ex instanceof ioexception
+ioex    ioexception ex
+else if  ex instanceof runtimeexception
+ex getcause      null    ex getcause   instanceof ioexception
+ioex    ioexception ex getcause
+if  ioex    null
+if  ioex getmessage   contains     return ioex
+return null
+return null
+@override
+public waltrailer getwaltrailer
+return trailer
+@override
+protected void seekonfs long pos  throws ioexception
+this inputstream seek pos

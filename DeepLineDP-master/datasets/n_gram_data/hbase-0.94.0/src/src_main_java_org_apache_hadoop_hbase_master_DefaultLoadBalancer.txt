@@ -1,0 +1,631 @@
+/**
+* copyright 2011 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase master
+import java io filenotfoundexception
+import java io ioexception
+import java util arraylist
+import java util arrays
+import java util collection
+import java util collections
+import java util comparator
+import java util hashmap
+import java util list
+import java util map
+import java util navigablemap
+import java util random
+import java util set
+import java util treemap
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs filesystem
+import org apache hadoop hbase clusterstatus
+import org apache hadoop hbase hdfsblocksdistribution
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase servername
+import org apache hadoop hbase tableexistsexception
+import org apache hadoop hbase regionserver hregion
+import org apache hadoop hbase util bytes
+import com google common base joiner
+import com google common collect arraylistmultimap
+import com google common collect minmaxpriorityqueue
+import com google common collect sets
+/**
+* makes decisions about the placement and movement of regions across
+* regionservers.
+*
+* <p>cluster-wide load balancing will occur only when there are no regions in
+* transition and according to a fixed period of a time using {@link #balancecluster(map)}.
+*
+* <p>inline region placement with {@link #immediateassignment} can be used when
+* the master needs to handle closed regions that it currently does not have
+* a destination set for.  this can happen during master failover.
+*
+* <p>on cluster startup, bulk assignment can be used to determine
+* locations for all regions in a cluster.
+*
+* <p>this classes produces plans for the {@link assignmentmanager} to execute.
+*/
+public class defaultloadbalancer implements loadbalancer
+private static final log log   logfactory getlog loadbalancer class
+private static final random random   new random system currenttimemillis
+// slop for regions
+private float slop
+private configuration config
+private clusterstatus status
+private masterservices services
+public void setclusterstatus clusterstatus st
+this status   st
+public void setmasterservices masterservices masterservices
+this services   masterservices
+@override
+public void setconf configuration conf
+this slop   conf getfloat     float  0 2
+if  slop < 0  slop   0
+else if  slop > 1  slop   1
+this config   conf
+@override
+public configuration getconf
+return this config
+/*
+* the following comparator assumes that regionid from hregioninfo can
+* represent the age of the region - larger regionid means the region
+* is younger.
+* this comparator is used in balancecluster() to account for the out-of-band
+* regions which were assigned to the server after some other region server
+* crashed.
+*/
+private static class regioninfocomparator implements comparator<hregioninfo>
+@override
+public int compare hregioninfo l  hregioninfo r
+long diff   r getregionid     l getregionid
+if  diff < 0  return  1
+if  diff > 0  return 1
+return 0
+regioninfocomparator ricomparator   new regioninfocomparator
+private class regionplancomparator implements comparator<regionplan>
+@override
+public int compare regionplan l  regionplan r
+long diff   r getregioninfo   getregionid     l getregioninfo   getregionid
+if  diff < 0  return  1
+if  diff > 0  return 1
+return 0
+regionplancomparator rpcomparator   new regionplancomparator
+/**
+* generate a global load balancing plan according to the specified map of
+* server information to the most loaded regions of each server.
+*
+* the load balancing invariant is that all servers are within 1 region of the
+* average number of regions per server.  if the average is an integer number,
+* all servers will be balanced to the average.  otherwise, all servers will
+* have either floor(average) or ceiling(average) regions.
+*
+* hbase-3609 modeled regionstomove using guava's minmaxpriorityqueue so that
+*   we can fetch from both ends of the queue.
+* at the beginning, we check whether there was empty region server
+*   just discovered by master. if so, we alternately choose new / old
+*   regions from head / tail of regionstomove, respectively. this alternation
+*   avoids clustering young regions on the newly discovered region server.
+*   otherwise, we choose new regions from head of regionstomove.
+*
+* another improvement from hbase-3609 is that we assign regions from
+*   regionstomove to underloaded servers in round-robin fashion.
+*   previously one underloaded server would be filled before we move onto
+*   the next underloaded server, leading to clustering of young regions.
+*
+* finally, we randomly shuffle underloaded servers so that they receive
+*   offloaded regions relatively evenly across calls to balancecluster().
+*
+* the algorithm is currently implemented as such:
+*
+* <ol>
+* <li>determine the two valid numbers of regions each server should have,
+*     <b>min</b>=floor(average) and <b>max</b>=ceiling(average).
+*
+* <li>iterate down the most loaded servers, shedding regions from each so
+*     each server hosts exactly <b>max</b> regions.  stop once you reach a
+*     server that already has &lt;= <b>max</b> regions.
+*     <p>
+*     order the regions to move from most recent to least.
+*
+* <li>iterate down the least loaded servers, assigning regions so each server
+*     has exactly </b>min</b> regions.  stop once you reach a server that
+*     already has &gt;= <b>min</b> regions.
+*
+*     regions being assigned to underloaded servers are those that were shed
+*     in the previous step.  it is possible that there were not enough
+*     regions shed to fill each underloaded server to <b>min</b>.  if so we
+*     end up with a number of regions required to do so, <b>neededregions</b>.
+*
+*     it is also possible that we were able to fill each underloaded but ended
+*     up with regions that were unassigned from overloaded servers but that
+*     still do not have assignment.
+*
+*     if neither of these conditions hold (no regions needed to fill the
+*     underloaded servers, no regions leftover from overloaded servers),
+*     we are done and return.  otherwise we handle these cases below.
+*
+* <li>if <b>neededregions</b> is non-zero (still have underloaded servers),
+*     we iterate the most loaded servers again, shedding a single server from
+*     each (this brings them from having <b>max</b> regions to having
+*     <b>min</b> regions).
+*
+* <li>we now definitely have more regions that need assignment, either from
+*     the previous step or from the original shedding from overloaded servers.
+*     iterate the least loaded servers filling each to <b>min</b>.
+*
+* <li>if we still have more regions that need assignment, again iterate the
+*     least loaded servers, this time giving each one (filling them to
+*     </b>max</b>) until we run out.
+*
+* <li>all servers will now either host <b>min</b> or <b>max</b> regions.
+*
+*     in addition, any server hosting &gt;= <b>max</b> regions is guaranteed
+*     to end up with <b>max</b> regions at the end of the balancing.  this
+*     ensures the minimal number of regions possible are moved.
+* </ol>
+*
+* todo: we can at-most reassign the number of regions away from a particular
+*       server to be how many they report as most loaded.
+*       should we just keep all assignment in memory?  any objections?
+*       does this mean we need heapsize on hmaster?  or just careful monitor?
+*       (current thinking is we will hold all assignments in memory)
+*
+* @param clusterstate map of regionservers and their load/region information to
+*                   a list of their most loaded regions
+* @return a list of regions to be moved, including source and destination,
+*         or null if cluster is already balanced
+*/
+public list<regionplan> balancecluster
+map<servername  list<hregioninfo>> clusterstate
+boolean emptyregionserverpresent   false
+long starttime   system currenttimemillis
+int numservers   clusterstate size
+if  numservers    0
+log debug
+return null
+navigablemap<serverandload  list<hregioninfo>> serversbyload
+new treemap<serverandload  list<hregioninfo>>
+int numregions   0
+// iterate so we can count regions as we build the map
+for  map entry<servername  list<hregioninfo>> server  clusterstate entryset
+list<hregioninfo> regions   server getvalue
+int sz   regions size
+if  sz    0  emptyregionserverpresent   true
+numregions    sz
+serversbyload put new serverandload server getkey    sz   regions
+// check if we even need to do any load balancing
+float average    float numregions   numservers     for logging
+// hbase-3681 check sloppiness first
+int floor    int  math floor average    1   slop
+int ceiling    int  math ceil average    1   slop
+if  serversbyload lastkey   getload   <  ceiling
+serversbyload firstkey   getload   >  floor
+// skipped because no server outside (min,max) range
+log info
+numservers
+numregions       average
+serversbyload lastkey   getload
+serversbyload firstkey   getload
+return null
+int min   numregions   numservers
+int max   numregions % numservers    0 ? min   min   1
+// using to check balance result.
+stringbuilder strbalanceparam   new stringbuilder
+strbalanceparam append    append numregions
+append    append numservers  append    append max
+append    append min
+log debug strbalanceparam tostring
+// balance the cluster
+// todo: look at data block locality or a more complex load to do this
+minmaxpriorityqueue<regionplan> regionstomove
+minmaxpriorityqueue orderedby rpcomparator  create
+list<regionplan> regionstoreturn   new arraylist<regionplan>
+// walk down most loaded, pruning each to the max
+int serversoverloaded   0
+// flag used to fetch regions from head and tail of list, alternately
+boolean fetchfromtail   false
+map<servername  balanceinfo> serverbalanceinfo
+new treemap<servername  balanceinfo>
+for  map entry<serverandload  list<hregioninfo>> server
+serversbyload descendingmap   entryset
+serverandload sal   server getkey
+int regioncount   sal getload
+if  regioncount <  max
+serverbalanceinfo put sal getservername    new balanceinfo 0  0
+break
+serversoverloaded
+list<hregioninfo> regions   server getvalue
+int numtooffload   math min regioncount   max  regions size
+// account for the out-of-band regions which were assigned to this server
+// after some other region server crashed
+collections sort regions  ricomparator
+int numtaken   0
+for  int i   0  i <  numtooffload
+hregioninfo hri   regions get i      fetch from head
+if  fetchfromtail
+hri   regions get regions size     1   i
+i
+// don't rebalance meta regions.
+if  hri ismetaregion    continue
+regionstomove add new regionplan hri  sal getservername    null
+numtaken
+if  numtaken >  numtooffload  break
+// fetch in alternate order if there is new region server
+if  emptyregionserverpresent
+fetchfromtail    fetchfromtail
+serverbalanceinfo put sal getservername
+new balanceinfo numtooffload    1  numtaken
+int totalnummoved   regionstomove size
+// walk down least loaded, filling each to the min
+int neededregions   0     number of regions needed to bring all up to min
+fetchfromtail   false
+map<servername  integer> underloadedservers   new hashmap<servername  integer>
+for  map entry<serverandload  list<hregioninfo>> server
+serversbyload entryset
+int regioncount   server getkey   getload
+if  regioncount >  min
+break
+underloadedservers put server getkey   getservername    min   regioncount
+// number of servers that get new regions
+int serversunderloaded   underloadedservers size
+int incr   1
+list<servername> sns
+arrays aslist underloadedservers keyset   toarray new servername
+collections shuffle sns  random
+while  regionstomove size   > 0
+int cnt   0
+int i   incr > 0 ? 0   underloadedservers size   1
+for    i >  0    i < underloadedservers size    i    incr
+if  regionstomove isempty    break
+servername si   sns get i
+int numtotake   underloadedservers get si
+if  numtotake    0  continue
+addregionplan regionstomove  fetchfromtail  si  regionstoreturn
+if  emptyregionserverpresent
+fetchfromtail    fetchfromtail
+underloadedservers put si  numtotake 1
+cnt
+balanceinfo bi   serverbalanceinfo get si
+if  bi    null
+bi   new balanceinfo 0  0
+serverbalanceinfo put si  bi
+bi setnumregionsadded bi getnumregionsadded   1
+if  cnt    0  break
+// iterates underloadedservers in the other direction
+incr    incr
+for  integer i   underloadedservers values
+// if we still want to take some, increment needed
+neededregions    i
+// if none needed to fill all to min and none left to drain all to max,
+// we are done
+if  neededregions    0    regionstomove isempty
+long endtime   system currenttimemillis
+log info      endtime starttime
+totalnummoved
+serversoverloaded
+serversunderloaded
+return regionstoreturn
+// need to do a second pass.
+// either more regions to assign out or servers that are still underloaded
+// if we need more to fill min, grab one from each most loaded until enough
+if  neededregions    0
+// walk down most loaded, grabbing one from each until we get enough
+for  map entry<serverandload  list<hregioninfo>> server
+serversbyload descendingmap   entryset
+balanceinfo balanceinfo
+serverbalanceinfo get server getkey   getservername
+int idx
+balanceinfo    null ? 0   balanceinfo getnextregionforunload
+if  idx >  server getvalue   size    break
+hregioninfo region   server getvalue   get idx
+if  region ismetaregion    continue     don't move meta regions
+regionstomove add new regionplan region  server getkey   getservername    null
+totalnummoved
+if    neededregions    0
+// no more regions needed, done shedding
+break
+// now we have a set of regions that must be all assigned out
+// assign each underloaded up to the min, then if leftovers, assign to max
+// walk down least loaded, assigning to each to fill up to min
+for  map entry<serverandload  list<hregioninfo>> server
+serversbyload entryset
+int regioncount   server getkey   getload
+if  regioncount >  min  break
+balanceinfo balanceinfo   serverbalanceinfo get server getkey   getservername
+if balanceinfo    null
+regioncount    balanceinfo getnumregionsadded
+if regioncount >  min
+continue
+int numtotake   min   regioncount
+int numtaken   0
+while numtaken < numtotake    0 < regionstomove size
+addregionplan regionstomove  fetchfromtail
+server getkey   getservername    regionstoreturn
+numtaken
+if  emptyregionserverpresent
+fetchfromtail    fetchfromtail
+// if we still have regions to dish out, assign underloaded to max
+if  0 < regionstomove size
+for  map entry<serverandload  list<hregioninfo>> server
+serversbyload entryset
+int regioncount   server getkey   getload
+if regioncount >  max
+break
+addregionplan regionstomove  fetchfromtail
+server getkey   getservername    regionstoreturn
+if  emptyregionserverpresent
+fetchfromtail    fetchfromtail
+if  regionstomove isempty
+break
+long endtime   system currenttimemillis
+if   regionstomove isempty      neededregions    0
+// emit data so can diagnose how balancer went astray.
+log warn     totalnummoved
+numservers       serversoverloaded
+serversunderloaded
+stringbuilder sb   new stringbuilder
+for  map entry<servername  list<hregioninfo>> e  clusterstate entryset
+if  sb length   > 0  sb append
+sb append e getkey   tostring
+sb append
+sb append e getvalue   size
+log warn     sb tostring
+// all done!
+log info      endtime starttime
+totalnummoved
+serversoverloaded
+serversunderloaded
+return regionstoreturn
+/**
+* add a region from the head or tail to the list of regions to return.
+*/
+void addregionplan final minmaxpriorityqueue<regionplan> regionstomove
+final boolean fetchfromtail  final servername sn  list<regionplan> regionstoreturn
+regionplan rp   null
+if   fetchfromtail  rp   regionstomove remove
+else rp   regionstomove removelast
+rp setdestination sn
+regionstoreturn add rp
+/**
+* stores additional per-server information about the regions added/removed
+* during the run of the balancing algorithm.
+*
+* for servers that shed regions, we need to track which regions we have
+* already shed.  <b>nextregionforunload</b> contains the index in the list
+* of regions on the server that is the next to be shed.
+*/
+private static class balanceinfo
+private final int nextregionforunload
+private int numregionsadded
+public balanceinfo int nextregionforunload  int numregionsadded
+this nextregionforunload   nextregionforunload
+this numregionsadded   numregionsadded
+public int getnextregionforunload
+return nextregionforunload
+public int getnumregionsadded
+return numregionsadded
+public void setnumregionsadded int numadded
+this numregionsadded   numadded
+/**
+* generates a bulk assignment plan to be used on cluster startup using a
+* simple round-robin assignment.
+* <p>
+* takes a list of all the regions and all the servers in the cluster and
+* returns a map of each server to the regions that it should be assigned.
+* <p>
+* currently implemented as a round-robin assignment.  same invariant as
+* load balancing, all servers holding floor(avg) or ceiling(avg).
+*
+* todo: use block locations from hdfs to place regions with their blocks
+*
+* @param regions all regions
+* @param servers all servers
+* @return map of server to the regions it should take, or null if no
+*         assignment is possible (ie. no regions or no servers)
+*/
+public map<servername  list<hregioninfo>> roundrobinassignment
+list<hregioninfo> regions  list<servername> servers
+if  regions isempty      servers isempty
+return null
+map<servername  list<hregioninfo>> assignments
+new treemap<servername list<hregioninfo>>
+int numregions   regions size
+int numservers   servers size
+int max    int math ceil  float numregions numservers
+int serveridx   0
+if  numservers > 1
+serveridx   random nextint numservers
+int regionidx   0
+for  int j   0  j < numservers  j
+servername server   servers get  j   serveridx  % numservers
+list<hregioninfo> serverregions   new arraylist<hregioninfo> max
+for  int i regionidx  i<numregions  i    numservers
+serverregions add regions get i % numregions
+assignments put server  serverregions
+regionidx
+return assignments
+/**
+* generates a bulk assignment startup plan, attempting to reuse the existing
+* assignment information from meta, but adjusting for the specified list of
+* available/online servers available for assignment.
+* <p>
+* takes a map of all regions to their existing assignment from meta.  also
+* takes a list of online servers for regions to be assigned to.  attempts to
+* retain all assignment, so in some instances initial assignment will not be
+* completely balanced.
+* <p>
+* any leftover regions without an existing server to be assigned to will be
+* assigned randomly to available servers.
+* @param regions regions and existing assignment from meta
+* @param servers available servers
+* @return map of servers and regions to be assigned to them
+*/
+public map<servername  list<hregioninfo>> retainassignment
+map<hregioninfo  servername> regions  list<servername> servers
+// group all of the old assignments by their hostname.
+// we can't group directly by servername since the servers all have
+// new start-codes.
+// group the servers by their hostname. it's possible we have multiple
+// servers on the same host on different ports.
+arraylistmultimap<string  servername> serversbyhostname
+arraylistmultimap create
+for  servername server   servers
+serversbyhostname put server gethostname    server
+// now come up with new assignments
+map<servername  list<hregioninfo>> assignments
+new treemap<servername  list<hregioninfo>>
+for  servername server   servers
+assignments put server  new arraylist<hregioninfo>
+// collection of the hostnames that used to have regions
+// assigned, but for which we no longer have any rs running
+// after the cluster restart.
+set<string> oldhostsnolongerpresent   sets newtreeset
+int numrandomassignments   0
+int numretainedassigments   0
+for  map entry<hregioninfo  servername> entry   regions entryset
+hregioninfo region   entry getkey
+servername oldservername   entry getvalue
+list<servername> localservers   new arraylist<servername>
+if  oldservername    null
+localservers   serversbyhostname get oldservername gethostname
+if  localservers isempty
+// no servers on the new cluster match up with this hostname,
+// assign randomly.
+servername randomserver   servers get random nextint servers size
+assignments get randomserver  add region
+numrandomassignments
+if  oldservername    null  oldhostsnolongerpresent add oldservername gethostname
+else if  localservers size      1
+// the usual case - one new server on same host
+assignments get localservers get 0   add region
+numretainedassigments
+else
+// multiple new servers in the cluster on this same host
+int size   localservers size
+servername target   localservers get random nextint size
+assignments get target  add region
+numretainedassigments
+string randomassignmsg
+if  numrandomassignments > 0
+randomassignmsg   numrandomassignments
+joiner on    join oldhostsnolongerpresent
+log info     regions size
+numretainedassigments
+randomassignmsg
+return assignments
+/**
+* returns an ordered list of hosts that are hosting the blocks for this
+* region.  the weight of each host is the sum of the block lengths of all
+* files on that host, so the first host in the list is the server which
+* holds the most bytes of the given region's hfiles.
+*
+* @param fs the filesystem
+* @param region region
+* @return ordered list of hosts holding blocks of the specified region
+*/
+@suppresswarnings
+private list<servername> gettopblocklocations filesystem fs
+hregioninfo region
+list<servername> topservernames   null
+try
+htabledescriptor tabledescriptor   gettabledescriptor
+region gettablename
+if  tabledescriptor    null
+hdfsblocksdistribution blocksdistribution
+hregion computehdfsblocksdistribution config  tabledescriptor
+region getencodedname
+list<string> tophosts   blocksdistribution gettophosts
+topservernames   maphostnametoservername tophosts
+catch  ioexception ioe
+log debug
+region getencodedname     ioe
+return topservernames
+/**
+* return htabledescriptor for a given tablename
+* @param tablename the table name
+* @return htabledescriptor
+* @throws ioexception
+*/
+private htabledescriptor gettabledescriptor byte tablename
+throws ioexception
+htabledescriptor tabledescriptor   null
+try
+if   this services    null
+tabledescriptor   this services gettabledescriptors
+get bytes tostring tablename
+catch  filenotfoundexception fnfe
+log debug
+tablename   fnfe
+return tabledescriptor
+/**
+* map hostname to servername, the output servername list will have the same
+* order as input hosts.
+* @param hosts the list of hosts
+* @return servername list
+*/
+private list<servername> maphostnametoservername list<string> hosts
+if   hosts    null    status    null
+return null
+list<servername> topservernames   new arraylist<servername>
+collection<servername> regionservers   status getservers
+// create a mapping from hostname to servername for fast lookup
+hashmap<string  servername> hosttoservername
+new hashmap<string  servername>
+for  servername sn   regionservers
+hosttoservername put sn gethostname    sn
+for  string host   hosts
+servername sn   hosttoservername get host
+// it is possible that hdfs is up ( thus host is valid ),
+// but rs is down ( thus sn is null )
+if  sn    null
+topservernames add sn
+return topservernames
+/**
+* generates an immediate assignment plan to be used by a new master for
+* regions in transition that do not have an already known destination.
+*
+* takes a list of regions that need immediate assignment and a list of
+* all available servers.  returns a map of regions to the server they
+* should be assigned to.
+*
+* this method will return quickly and does not do any intelligent
+* balancing.  the goal is to make a fast decision not the best decision
+* possible.
+*
+* currently this is random.
+*
+* @param regions
+* @param servers
+* @return map of regions to the server it should be assigned to
+*/
+public map<hregioninfo  servername> immediateassignment
+list<hregioninfo> regions  list<servername> servers
+map<hregioninfo servername> assignments
+new treemap<hregioninfo servername>
+for hregioninfo region   regions
+assignments put region  servers get random nextint servers size
+return assignments
+public servername randomassignment list<servername> servers
+if  servers    null    servers isempty
+log warn
+return null
+return servers get random nextint servers size

@@ -1,0 +1,1128 @@
+/*
+derby - class org.apache.derby.iapi.store.raw.page
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby iapi store raw
+import org apache derby iapi services io formatablebitset
+import org apache derby iapi error standardexception
+import org apache derby iapi store access conglomerate logicalundo
+import org apache derby iapi store access qualifier
+import org apache derby iapi types datavaluedescriptor
+/**
+a page contains an ordered set of records which are the stored form of rows.
+a record is a stream of bytes created from a row array. the record
+contains one or more fields, fields have a one to one correlation with
+the datavaluedescriptor's contained within a row array.
+<p>
+a page represents <b>exclusive</b> access to a data page within a container.
+exclusive access is released by calling the unlatch() method, once that
+occurs the caller must no longer use the page reference.
+<p>
+several of the methods in page take a recordhandle as an argument.
+recordhandles are obtained from a page, while holding exclusive access of
+page or a from a previous exclusive access of a page representing the same
+data page.
+all recordhandle's used as arguments to methods (with the exception of
+recordexists()) must be valid for the current state of the page. if they
+are not valid then the method will throw an exception. a caller can ensure
+that a record handle is valid by:
+<ul>
+<li> obtaining the handle during this exclusive access of this page
+<li> checking the record still exists with the method recordexists()
+<li> not using a handle after a delete().
+</ul>
+<p>
+several of the methods in page take a slot number as an argument.  a slot
+always correspond to a record, which may be deleted or undeleted.
+<br>
+mt - latched - in general every method requires the page to be latched.
+<p>
+<b>latching</b>
+<p>
+all page methods which are not valid for a latched page throw an
+exception if the page is not latched.  [@exception clauses on all
+the methods should be updated to reflect this].
+<p>
+<b>aux objects</b>
+<br>
+the page cache will manage a client object along with the page as long
+as it remains in cache.  this object is called the "aux object".  the
+aux object is associated with the page with setauxobject(), and can be
+retreived later with getauxobject().  the aux object will remain valid
+as long as the page is latched, but callers cannot assume that an aux
+object will ever stick around once the page is unlatched.  however, the
+page manager promises to call pagebeingevicted() once before clearing
+the aux reference from the page.
+@see object
+@see containerhandle
+@see recordhandle
+@see auxobject
+*/
+public interface page
+/**************************************************************************
+* constants of the class
+**************************************************************************
+*/
+/**
+* the slot number of the first slot.  this is guaranteed to be zero.
+**/
+public static final int first_slot_number     0
+/**
+* a slot number guaranteed to be invalid.
+**/
+public static final int invalid_slot_number    1
+/**
+* return the page number of this page.
+* <p>
+* page numbers are unique within a container and start at
+* containerhandle.first_page_number and increment by 1 regardless of the
+* page size.
+* <p>
+*
+* <br> mt - latched
+*
+* @see containerhandle
+*
+* @return the page number of this page.
+**/
+public long getpagenumber
+/**************************************************************************
+* public methods of this class: record handle interface.
+*     the following interfaces to page use the record id or record handle
+*     (rather than the slot interface).
+**************************************************************************
+*/
+/**
+* return an invalid record handle.
+* <p>
+*
+* @return an invalid record handle.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public recordhandle getinvalidrecordhandle
+/**
+* return a record handle for the given constant record id.
+* <p>
+* return a record handle that doesn't represent a record but rather has
+* a special meaning.  used for special cases like creating a key
+* specific to the page, but not specific to a row on the page.
+* <p>
+* see recordhandle interface for a list of "special record handles."
+*
+* @see recordhandle
+*
+* @return the created record handle.
+*
+* @param recordhandleconstant the special recordid
+*
+* @exception standardexception if input is not a special record identifier.
+**/
+public recordhandle makerecordhandle int recordhandleconstant
+throws	standardexception
+/**
+* get a record handle from a previously stored record id.
+* <p>
+* get a record handle from a previously stored record identifier that was
+* obtained from a recordhandle.
+* <p>
+* <br> mt - latched
+*
+* @return a valid record handle or null if the record no longer exists.
+*
+* @param recordid previously stored recordid.
+*
+* @see recordhandle#getid
+**/
+recordhandle getrecordhandle int recordid
+/**
+* does the record still exist on the page?
+* <p>
+* if "ignoredelete" is true and the record handle represents a record on
+* the page (either marked deleted or not) return true.  if "ignoredelete"
+* is false return true if the record handle represents a record on the
+* page and the record is not marked as deleted.  return false otherwise.
+*
+* <br> mt - latched
+*
+* @return boolean indicating if the record still exists on the page.
+*
+* @param handle        handle of the record to look for.
+* @param ignoredelete  if true, then routine will return true even if the
+*                      row is marked deleted.
+*
+* @exception  standardexception  standard exception policy.
+**/
+boolean recordexists recordhandle handle  boolean ignoredelete
+throws standardexception
+/**
+* fetch and lock a non-deleted record.
+* <p>
+* lock and fetch a non-deleted record identified by a recordhandle.
+* reads data from the page into row.
+* <p>
+* <b>locking policy</b>
+* <br>
+* calls the lockrecordforread() method of the lockingpolicy object
+* passed to the opencontainer() call before the record is accessed.
+* <br>
+* the page latch may be released and re-latched within this method.
+* this will occur if the record lock has to be waited for.
+*
+* @param handle        handle to record.
+* @param row           row to be filled in with data from the record.
+* @param validcolumns  a bit map of which columns in the row is to be
+*                      fetched.  validcolumns will not be changed by
+*                      rawstore.
+* @param forupdate     true if the intention is to update this record,
+*                      false otherwise.
+*
+* @return a handle to the record, null if the record has been deleted.
+*
+* @exception standardexception	standard cloudscape error policy,
+*                              a statemente level exception is thrown if
+*                              the record handle does not match a record
+*                              on the page.
+*
+* @see page#delete
+* @see lockingpolicy
+**/
+recordhandle fetch
+recordhandle        handle
+object            row
+formatablebitset    validcolumns
+boolean             forupdate
+throws standardexception
+/**
+* is it likely that an insert will fit on this page?
+* <p>
+* return true if there is a good chance an insert will fit on this page,
+* false otherwise.  if this returns true then an insert may still fail by
+* throwing an exception or by returning null, see insertatslot for details.
+* it is very probable that this call is much faster than the version that
+* takes a row. in situations where it is expected that the
+* majority of times a row will fit on a page this method should be used
+* and the null return handled from insert/insertatslot.
+*
+* <br>
+* mt - latched
+*
+* @return true if it is likely an insert will fit on the page.
+*
+* @exception  standardexception  standard exception policy.
+**/
+boolean spaceforinsert
+throws standardexception
+/**
+* will insert of this row fit on this page?
+* <p>
+* return true if this record is guaranteed to be inserted successfully
+* using insert() or insertatslot(). this guarantee is only valid if the
+* following conditions are fulfilled before an insert is called with t
+* his row.
+* <ul>
+* <li> the page is not unlatched
+* <li> the page is not modified in any way, ie. no updates or other inserts
+* <li> the row is not modified in such a way that would change its
+*      storage size
+* </ul>
+*
+* <br>
+* mt - latched
+*
+* @return true if insert of this row will fit on this page.
+*
+* @param row                   the row to check for insert.
+* @param validcolumns          bit map to interpret valid columns in row.
+* @param overflowthreshold     the percentage of the page to use for the
+*                              insert.  100 means use 100% of the page,
+*                              50 means use 50% of page (ie. make sure
+*                              2 rows fit per page).
+*
+* @exception  standardexception  standard exception policy.
+**/
+boolean spaceforinsert
+object            row
+formatablebitset    validcolumns
+int                 overflowthreshold
+throws standardexception
+/**
+* insert a record anywhere on the page.
+* <p>
+*
+* <b>locking policy</b>
+* <br>
+* calls the lockrecordforwrite() method of the lockingpolicy object
+* passed to the opencontainer() call before the record is inserted.
+* <br>
+* mt - latched
+*
+* @param row           the row version of the data
+* @param validcolumns  a bit map of which columns in the row is valid.
+*                      validcolumns will not be changed by rawstore.
+* @param insertflag    see values for insertflag below.
+*
+* @return a recordhandle representing the new record.
+*
+* @exception standardexception	standard cloudscape error policy
+* @exception standardexception the container was not opened in update mode.
+* @exception standardexception row cannot fit on the page or row is null.
+**/
+recordhandle insert
+object            row
+formatablebitset    validcolumns
+byte                insertflag
+int                 overflowthreshold
+throws standardexception
+/**
+* update the record identified by the record handle.
+* <p>
+* update the record, the new column values are found in row[] and if
+* validcolumns is not-null, only use the columns indicated as valid in
+* the bit set.
+* <p>
+* <br>
+* the page latch may be released and re-latched within this method.
+* this will occur if the record lock has to be waited for.
+*
+* @param handle        the record handle
+* @param row           the row version of the data
+* @param validcolumns  a bit map of which columns in the row is valid.
+*                      validcolumns will not be changed by rawstore.
+*
+* @return true if the record is updated.
+*         false if it is not because the record is already deleted.
+*
+* @exception standardexception	standard cloudscape error policy
+* @exception standardexception the container was not opened in update mode.
+* @exception standardexception if the record handle does not match
+*                              a record on the page.
+*
+* @see page#updateatslot
+*
+* @exception  standardexception  standard exception policy.
+**/
+boolean update
+recordhandle        handle
+object            row
+formatablebitset                 validcolumns
+throws standardexception
+/**
+* mark the record identified by position as deleted.
+* <p>
+* mark the record identified by position as deleted. the record may be
+* undeleted sometime later using undelete() by any transaction that sees
+* the record.
+* <p>
+* <b>locking policy</b>
+* <p>
+* calls the lockrecordforwrite() method of the lockingpolicy object
+* passed to the opencontainer() call before the record is deleted.
+*
+* <br>
+* the page latch may be released and re-latched within this method.
+* this will occur if the record lock has to be waited for.
+*
+* @param handle    record handle to record
+* @param undo      if logical undo may be necessary, a function pointer to
+*                  the access code where the logical undo logic resides.
+*                  null if logical undo is not necessary.
+*
+* @return true if the record was updated.
+*         false if it wasn't because it is already deleted.
+*
+* @exception standardexception	standard cloudscape error policy
+* @exception standardexception the container was not opened in update mode.
+* @exception standardexception if the record handle does not match
+*                              a record on the page.
+*
+* @see page#deleteatslot
+* @see lockingpolicy
+**/
+public boolean delete
+recordhandle    handle
+logicalundo     undo
+throws standardexception
+/**
+* move record to a page toward the beginning of the file.
+* <p>
+* as part of compressing the table records need to be moved from the
+* end of the file toward the beginning of the file.  only the
+* contiguous set of free pages at the very end of the file can
+* be given back to the os.  this call is used to purge the row from
+* the current page, insert it into a previous page, and return the
+* new row location
+* mark the record identified by position as deleted. the record may be
+* undeleted sometime later using undelete() by any transaction that sees
+* the record.
+* <p>
+* the interface is optimized to work on a number of rows at a time,
+* optimally processing all rows on the page at once.  the call will
+* process either all rows on the page, or the number of slots in the
+* input arrays - whichever is smaller.
+* <b>locking policy</b>
+* <p>
+* must be called with table locked, not locks are requested.  because
+* it is called with table locks the call will go ahead and purge any
+* row which is marked deleted.  it will also use purge rather than
+* delete to remove the old row after it moves it to a new page.  this
+* is ok since the table lock insures that no other transaction will
+* use space on the table before this transaction commits.
+*
+* <br>
+* a page latch on the new page will be requested and released.
+*
+* @param slot           slot of row to move.
+* @param row            a template to read the current row into as part
+*                       of moving it.
+* @param old_handle     an array to be filled in by the call with the
+*                       old handles of all rows moved.
+* @param new_handle     an array to be filled in by the call with the
+*                       new handles of all rows moved.
+*
+* @return the number of rows processed.
+*
+* @exception standardexception	standard cloudscape error policy
+*
+* @see lockingpolicy
+**/
+public int moverecordforcompressatslot
+int             slot
+object        row
+recordhandle  old_handle
+recordhandle  new_handle
+throws standardexception
+/**
+* fetch the number of fields in a record.
+* <p>
+* <b>locking policy</b>
+* <p>
+* no locks are obtained.
+*
+* <br>
+* mt - latched
+*
+* @param handle    record handle to deleted or non-deleted record
+*
+* @return the number of fields in the record
+*
+* @exception standardexception	standard cloudscape error policy, a
+*                              statement level exception is thrown if the
+*                              record handle does not match a record on
+*                              the page.
+**/
+public int fetchnumfields recordhandle handle
+throws standardexception
+/**************************************************************************
+* public methods of this class: slot interface.
+*     the following interfaces to page use the slot number
+*     (rather than the record handle interface).
+**************************************************************************
+*/
+/**
+* get the slot number.
+* <p>
+* get the slot number of a record on a latched page using its record
+* handle.
+*
+* <p><b>note</b>
+* the slot number is only good for as long as the page is latched.
+*
+* <br>
+* mt - latched
+*
+* @param handle the record handle
+*
+* @return the slot number
+*
+* @exception standardexception	standard cloudscape error policy
+**/
+int getslotnumber recordhandle handle
+throws standardexception
+/**
+* get the record handle of row at slot.
+* <p>
+* get the record handle of a record on a latched page using its slot
+* number.
+*
+* <br>
+* mt - latched
+*
+* @param slot the slot number
+*
+* @return the record handle.
+*
+* @exception standardexception	standard cloudscape error policy
+**/
+recordhandle getrecordhandleatslot int slot
+throws standardexception
+/**
+* find slot for record with an id greater than the passed in identifier.
+* <p>
+* find the slot for the first record on the page with an id greater than
+* the passed in identifier.
+*
+* <br>
+* returns the slot of the first record on the page with an id greater than
+* the one passed in.  usefulness of this functionality depends on the
+* client's use of the raw store interfaces.  if all "new" records are
+* always inserted at the end of the page, and the raw store continues to
+* guarantee that all record id's will be allocated in increasing order on
+* a given page (assuming a page_reusable_record_id container), then a page
+* is always sorted in record id order.  for instance current heap tables
+* function this way.  if the client ever inserts at a particular slot
+* number, rather than at the "end" then the record id's will not be sorted.
+* <br>
+* in the case where all record id's are always sorted on a page, then this
+* routine can be used by scan's which "lose" their position because the
+* row they have as a position was purged.  they can reposition their scan
+* at the "next" row after the row that is now missing from the table.
+* <br>
+* this method returns the record regardless of its deleted status.
+* <br>
+* mt - latched
+*
+* @param handle record handle to find the next higher id.
+*
+* @return  record id of the first record on the page with a record id
+*          higher than the one passed in.  if no such record exists,
+*          -1 is returned.
+*
+* @exception  standardexception  standard exception policy.
+**/
+int getnextslotnumber recordhandle handle
+throws standardexception
+/**
+* insert a record at the specified slot.
+* <p>
+* all records that occupy first_slot_number to (slot - 1) are not moved.
+* <br>
+* all records that occupy slot to (recordcount() - 1) are moved up one
+* slot.
+* <br>
+* the new record is inserted at the specified slot. <br>
+* if slot == first_slot_number, then the new record will be inserted at
+* the first slot. <br>
+* if slot == recordcount(), then the record is inserted in a new slot, no
+* records are moved. <br>
+*
+* if slot is > recordcount() or if slot < first_slot_number, an exception
+* will be thrown.
+*
+* <p><b>space policy</b><br>
+* if the row will not fit on a page then:
+* <ul>
+* <li> an exception is thrown if the page has no other rows, this is an
+*      indication that the row could never fit on a page in this container.
+* <li> null is returned if there are other rows on the page, this is an
+*      indication that the row can potentially be inserted successfully
+*      onto an empty page.
+* </ul>
+*
+* <p>
+* <b>locking policy</b>
+* <br>
+* calls the lockrecordforwrite() method of the lockingpolicy object passed
+* to the opencontainer() call before the record is inserted.
+* <br>
+* mt - latched
+*
+* @param slot          the specified slot
+* @param row           the row version of the data
+* @param undo          if logical undo may be necessary, a function pointer
+*                      to the access code where the logical undo logic
+*                      resides. null if logical undo is not necessary.
+* @param validcolumns  a bit map of which columns in the row is valid.
+*                      validcolumns will not be changed by rawstore.
+* @param insertflag    if insert_undo_with_purge set, then the undo of this
+*                      insert will purge the row rather than mark it as
+*                      deleted, which is the default bahavior for
+*                      insertatslot and insert.
+*
+* @return a recordhandle representing the new record, or null if the row
+*         will not fit on a non-empty page.
+*
+* @exception standardexception	standard cloudscape error policy
+* @exception standardexception the container was not opened in update mode.
+* @exception standardexception the row cannot fit on the page
+*
+* @see logicalundo
+* @see logicalundoable
+**/
+recordhandle insertatslot
+int                     slot
+object   row
+formatablebitset                 validcolumns
+logicalundo             undo
+byte                    insertflag
+int                     overflowthreshold
+throws standardexception
+/**
+* values for insertflag.
+* <p>
+*
+* insert_initial			- flag initializer
+*
+* insert_default			- default insert behavior, if the record does
+*                            not fit on the page where the insert
+*                            operation is called, an error will be
+*                            returned, instead of overflowing the record.
+*
+* insert_undo_with_purge	- if this is set, then the undo of this insert
+*                            will purge the row rather than mark it as
+*                            deleted, which is the default behaviro for
+*                            insertatslot and insert.
+*
+* insert_conditional		- if this flag is set, then, the overflow is
+*                            conditional.  the record will be overflowed
+*                            only if it exceeds the threshold specified
+*                            by the properties, or the parameter.
+*
+* insert_overflow			- if this flag is set, then the insert
+*                            operation will overflow the record if it does
+*                            not fit on the page.
+*
+* insert_for_split		    - a record is being updated that causes new
+*                            portions to be inserted *and* the last new
+*                            portion needs to point to an existing portion.
+*
+* rules for the insert flags:
+* 1. if insert_default is set, insert_conditional and insert_overflow
+*    will be ignored
+* 2. insert_undo_with_purge can be set with any of the other 3 flags.
+* 3. if insert_overflow is not set, insert_conditional will be ignored.
+*    but, it is not necessary to set insert_conditional when setting
+*    insert_overflow.
+* 4. if insert_default, insert_overflow both are not set, then, default
+*    insert action will be taken, i.e. no overflow will be allowed.
+**/
+static final byte insert_initial            byte  0x00 	   init the flag
+static final byte insert_default            byte  0x01 	   default flag
+static final byte insert_undo_with_purge    byte  0x02 	   purge row on undo
+static final byte insert_conditional        byte  0x04 	   conditional
+// insert
+static final byte insert_overflow           byte  0x08 	   insert with
+// possible overflow
+static final byte insert_for_split          byte  0x10 	   rawstore only
+/**
+* fetch a record located in the passed in slot.
+* <p>
+* fetch a record located in the passed in slot and fill-in the passed in
+* storeblerow and the object columns contained within. if row
+* is null then the record is locked but is not fetched.
+* <br>
+* this interface allows the caller to either return a deleted row or not.
+* if "ignoredelete" is set to true, fetch the record regardless of whether
+* it is deleted or not (same as above fetchfromslot).  however, if
+* "ignoredelete" is set to false and the and the slot correspond to a
+* deleted row, null is returned.
+* <br>
+* if a non-null qualifier list is provided then the qualifier array will
+* be applied to the row and the row will only be returned if the row
+* qualifies, otherwise null will be returned.  values in the columns of
+* row may or may not be altered while trying to apply the qualifiers, if
+* null is returned the state of the columns is undefined.  if a null
+* qualifier list is provided then no qualification is applied.
+* <br>
+* if a non-null record handle is passed in, it is assumed that the record
+* handle corresponds to the record in the slot.  if record handle is null,
+* a record handle will be manufactured and returned if the record is not
+* deleted or if "ignoredelete" is true.  this parameter is here for the
+* case where the caller have already manufactured the record handle for
+* locking or other purposes so it would make sense for the page to avoid
+* creating a new record handle object if possible.
+*
+*
+* @param rh           the record handle of the row.  if non-null it must
+*                     refer to the same record as the slot.
+* @param slot         the slot number
+* @param row          row to be filled in with information from record.
+* @param fetchdesc    a structure to efficiently carry a set of parameters
+*                     needed to describe the fetch, these include:
+*
+*                     validcolumns - a bit map of which columns in the
+*                     row to be fetched.  validcolumns will not be
+*                     changed by rawstore.
+*
+*                     qualifier_list -
+*                     a list of qualifiers to apply to the row to see if
+*                     the row should be returned.
+*
+*                     an array of qualifiers which restrict whether or not
+*                     the row should be returned by the fetch.  rows for
+*                     which any one of the qualifiers returns false are
+*                     not returned by the fetch. if null, no qualification
+*                     is done and the requested columns of the rows are
+*                     returned.  qualifiers can only reference columns
+*                     which are included in the scancolumnlist.  the
+*                     column id that a qualifier returns is the column id
+*                     the table, not the column id in the partial row
+*                     being returned.
+*                     qualifier_scratch_space -
+*                     an array of int's that matches the size of the
+*                     row[] array.  used to process qualifiers, if no
+*                     qualifiers are input then array need not be
+*                     input.  passed in rather than allocated so that
+*                     space can be allocated a single time in a scan.
+*                     if not passed in then raw store will allocate and
+*                     deallocate per call.
+*
+* @param ignoredelete if true, return row regardless of whether it is
+*                     deleted or not.  if false, only return non-deleted
+*                     row.
+*
+* @return a handle to the record.
+*
+* @exception standardexception	standard cloudscape error policy
+*
+* @see lockingpolicy
+**/
+public recordhandle fetchfromslot
+recordhandle            rh
+int                     slot
+object                row
+fetchdescriptor         fetchdesc
+boolean                 ignoredelete
+throws standardexception
+/**
+fetch a single field from a deleted or non-deleted record.
+fills in the passed in object column with the field
+identified by fieldid if column is not null, otherwise the record
+is locked but not fetched.
+<br>
+the fieldid of the first field is 0.
+if the fieldid is >= the number of fields on the record,
+column is restored to null
+<p>
+<b>locking policy</b>
+<br>
+no locks are obtained.
+it is up to the caller to obtain the correct locks.
+<br>
+it is guaranteed that the page latch is not released by this method
+@param slot is the slot number
+@param fieldid is the column id
+@param column is to be filled in with information from the record.
+@return the handle to the record that is locked
+@exception standardexception	standard cloudscape error policy, a
+statement level exception is thrown if
+the slot is not on the page.
+@see page#fetchfromslot
+@see lockingpolicy
+*/
+public recordhandle fetchfieldfromslot
+int    slot
+int    fieldid
+object column
+throws standardexception
+/**
+* test if a record is deleted.
+* <p>
+*
+* <p>
+* <b>locking policy</b>
+* <br>
+* no locks are obtained.
+*
+* <br>
+* it is guaranteed that the page latch is not released by this method
+*
+* @param slot slot of record to be tested.
+*
+* @exception standardexception	standard cloudscape error policy, a
+*                              statement level exception is thrown if the
+*                              slot is not on the page.
+**/
+public boolean isdeletedatslot int slot
+throws standardexception
+/**
+update a field within the record, replacing its current value with
+the stored representation of newvalue. record is identified by slot.
+if the field does not exist then it is added to the record, but only if
+(fieldid - 1) exists.
+<br><b>resolve</b> right now it throws an exception if fieldid is not
+already on the record, not add the next one as advertised.
+<p>
+<b>locking policy</b>
+<p>
+calls the lockrecordforwrite() method of the lockingpolicy object
+passed to the opencontainer() call before the record is updated.
+<br>
+it is guaranteed that the page latch is not released by this method
+@param slot is the slot number
+@param fieldid is the column id
+@param newvalue has the new colum value to be stored in the record
+@param undo if logical undo may be necessary, a function pointer to the
+access code where the logical undo logic resides. null if logical undo
+is not necessary.
+@return a handle to the updated record.
+@exception standardexception	standard cloudscape error policy, a
+statement level exception is thrown if
+the slot is not on the page, or if the
+record is deleted, or if the fieldid
+is not on the record and (fieldid - 1)
+does not exist.
+@exception standardexception
+the container was not opened in update mode.
+@see lockingpolicy
+@see logicalundo
+@see logicalundoable
+*/
+public recordhandle updatefieldatslot
+int                 slot
+int                 fieldid
+object newvalue
+logicalundo         undo
+throws standardexception
+/**
+* fetch the number of fields in a record.
+* <p>
+*
+* <p>
+* <b>locking policy</b>
+* <p>
+* no locks are obtained.
+*
+* <br>
+* it is guaranteed that the page latch is not released by this method
+*
+* @param slot is the slot number
+*
+* @return the number of fields in the record
+*
+* @exception standardexception	standard cloudscape error policy
+**/
+public int fetchnumfieldsatslot int slot
+throws standardexception
+/**
+mark the record identified by slot as deleted or undeleted according to the
+delete flag.
+*/
+/**
+* mark the record at slot as deleted or undeleted according to delete flag.
+* <p>
+*
+* <p>
+* <b>locking policy</b>
+* <p>
+* calls the lockrecordforwrite() method of the lockingpolicy object passed
+* to the opencontainer() call before the record is deleted.  if record
+* already deleted, and an attempt is made to delete it, an exception is
+* thrown.  if record not deleted, and an attempt is made to undelete it,
+* an exception is thrown.
+*
+* <br>
+* mt - latched
+*
+* @return a handle to the deleted/undeleted record.
+*
+* @param slot      is the slot number
+* @param delete    true if this record is to be deleted false if this
+*                  deleted record is to be marked undeleted
+* @param undo      if logical undo may be necessary, a function pointer to
+*                  the access code where the logical undo logic resides.
+*                  null if logical undo is not necessary.
+*
+* @exception standardexception	standard cloudscape error policy
+* @exception standardexception the container was not opened in update mode.
+* @exception standardexception a statement level exception is thrown when
+*                              trying to delete an already deleted record,
+*                              or undelete a not deleted record.
+*
+* @exception standardexception a statement level exception is thrown if
+*                              the slot is not on the page.
+*
+* @see lockingpolicy
+* @see page#delete
+* @see logicalundo
+* @see logicalundoable
+*
+**/
+public recordhandle deleteatslot
+int         slot
+boolean     delete
+logicalundo undo
+throws standardexception
+/**
+* purge the row(s) from page.
+* <p>
+* purge the row(s) from page, get rid of the row(s) and slot(s) -
+* <b>use with caution</b>,
+* please see entire description of this operation before attempting to
+* use this.
+*
+* starting from the specified slot, n rows will be purged. that is, rows
+* that occupies from slot to slot+n-1 will be purged from the page.
+*
+* <p>
+* <b>locking policy</b>
+* <p>
+* calls the lockrecordforwrite() method of the lockingpolicy object passed
+* to the opencontainer() call before the records are purged.
+* <p>
+*
+* <b>note : caveat</b><br>
+* this operation will physically get rid of the row from the page, so if a
+* subsequent operation on this page uses a slot that has been purged, then
+* the undo of this operation will fail.  it is only safe to use this
+* operation if the caller knows that it has exclusive access to the page
+* for the duration of the transaction, i.e, effectively holding a page
+* lock on the page
+* <p>
+* <b>note</b><br>
+* outstanding handles to purged rows are no longer valid, accessing them
+* will cause an exception to be thrown.
+*
+* <br>
+*<b>note : data logging for purges</b><br>
+* needdatalogged is used to specify whether data is required to be
+* logged for purge operatios. data logging is required
+* only if the row can be reused or required for key search if a purge is
+* rolled back;(rollback can occur if the system crashes in the middle of
+* purges or some unexpected error condiditions  rolled back.
+* for example:
+* 1)btree expects the data to be there if a purge is rolled back;
+*   needdatalogged=true
+* 2)heaps does not care if data exist because only operation that can occur
+* on a row whose purge rolled back is purging again.(needdatalogged=false)
+*
+* mt - latched
+*
+*
+* @param slot	            the starting slot number
+* @param numpurges	        number of slots to purge.  if <= 0,
+*                          just returns as a no-op.
+* @param needdatalogged    if set to true data is logged for purges else
+*                          only headers.
+*
+* @exception standardexception	standard cloudscape error policy
+* @see lockingpolicy
+**/
+public void purgeatslot
+int     slot
+int     numpurges
+boolean needdatalogged
+throws standardexception
+/**
+* move rows from one page to another, purging in the process.
+* <p>
+*
+* move from this page slot[src_slot] to slot[src_slot+num_rows-1] to
+* destpage slot[dest_slot] to slot[dest_slot + num_rows - 1], in that
+* order. both this page and destpage must be latched and from the same
+* container with the same page and record format.
+*
+* <br>slot[src_slot] to slot[src_slot+numrows-1] will be purged from this
+* page.  recordid on the dest page will be brand new and not in any
+* particular order or range.  recordid of the purged rows in this page is
+* never reused.  deleted and undeleted rows are copied over just the same.
+*
+* exception will be thrown if this page does not have all the rows in the
+* moved over range.
+*
+* <br><b>resolve: reserve space now not copied over because in btree, a
+* row never shrinks.  when this routine is called by heap or by some page
+* which will have shrunken row, then we need to add that </b>
+*
+* <br>destpage must have at least dest_slot row occupying slot[0] to
+* slot[dest_slot-1].  destpage must have enough space to take the copied
+* over data.  rows that occupied slot number > dest_slot will be moved up
+* the slot (i.e., slot[dest_slot] -> slot[dest_slot + num_rows]).
+*
+* <br>if this operation rolls back, this page (the src page) will get the
+* rows back and the dest page will purge the rows that were copied - this
+* is as if the rows were inserted into the dest page with
+* insert_undo_with_purge.
+*
+* <p>
+* <b>locking policy</b>
+* <p>
+* calls the lockrecordforwrite() method of the lockingpolicy object
+* passed to the opencontainer() call before the rows are copied over and
+* bore the records are purged.  i.e, for num_rows moved, there will be
+* 2*num_rows calls to lockrecordforwrite.
+* <p>
+*
+* <p><b>use with caution</b>
+* <br>as with a normal purge, no space is reserved on this page for
+* rollback of the purge, so you must commit before inserting any rows
+* onto this page - unless those inserts are insert_undo_with_purge.
+*
+* @param destpage the page to copy to
+* @param src_slot start copying from this slot
+* @param num_rows copy and purge this many rows from this page
+* @param dest_slot copying into this slot of destpage
+*
+* @exception standardexception standard cloudscape error policy
+**/
+public void copyandpurge
+page    destpage
+int     src_slot
+int     num_rows
+int     dest_slot
+throws standardexception
+/**
+update the complete record identified by the slot.
+<p>
+<b>locking policy</b>
+<p>
+calls the lockrecordforwrite() method of the lockingpolicy object
+passed to the opencontainer() call before the record is undeleted.
+if record already deleted, an exception is thrown.
+<br>
+it is guaranteed that the page latch is not released by this method
+@return a handle to the updated record.
+@param slot is the slot number
+@param validcolumns a bit map of which columns in the row is valid.
+validcolumns will not be changed by rawstore.
+@exception standardexception	standard cloudscape error policy
+@exception standardexception the container was not opened in update mode.
+@exception standardexception if the slot is not on the page.
+@see page#update
+*/
+recordhandle updateatslot
+int                     slot
+object   row
+formatablebitset                 validcolumns
+throws standardexception
+/*
+page operations
+*/
+/**
+unlatch me, the page is exclusivly latched by its current user until
+this method call is made.
+<br>
+after using this method the caller must throw away the
+reference to the page object, e.g.
+<pre>
+ref.unlatch();
+ref = null;
+</pre>
+<br>
+the page will be released automatically at the close of the
+container if this method is not called explictly.
+<br>
+mt - latched
+*/
+public void unlatch
+/**
+return the number of records on the page. the returned count includes rows that are deleted,
+i.e. it is the same as the number of slots on the page.
+<br>
+mt - latched
+@exception standardexception	standard cloudscape error policy
+*/
+public int recordcount   throws standardexception
+/**
+return the number of records on this page that are <b> not </b> marked as deleted.
+<br>
+mt - latched
+@exception standardexception	standard cloudscape error policy
+*/
+public int nondeletedrecordcount   throws standardexception
+/**
+* is this page/deleted row a candidate for immediate reclaim space.
+* <p>
+* used by access methods after executing a delete on "slot_just_deleted"
+* to ask whether a post commit should be queued to try to reclaim space
+* after the delete commits.
+* <p>
+* will return true if the number of non-deleted rows on the page is
+* <= "num_non_deleted_rows".  for instance 0 means schedule reclaim
+* only if all rows are deleted, 1 if all rows but one are deleted.
+* <p>
+* will return true if the row just deleted is either a long row or long
+* column.  in this case doing a reclaim space on the single row may
+* reclaim multiple pages of free space, so better to do it now rather
+* than wait for all rows on page to be deleted.  this case is to address
+* the worst case scenario of all rows with long columns, but very short
+* rows otherwise.  in this case there could be 1000's of rows on the
+* main page with many gigabytes of data on overflow pages in deleted space
+* that would not be reclaimed until all rows on the page were deleted.
+*
+* @return true if a reclaim space should be scheduled post commit on this
+*         page, false otherwise.
+*
+* @param num_non_deleted_rows threshold number of non-deleted rows to
+*                             schedule reclaim space.
+* @param slot_just_deleted    row on page to check for long row/long column
+*
+* @exception  standardexception  standard exception policy.
+**/
+public boolean shouldreclaimspace
+int     num_non_deleted_rows
+int     slot_just_deleted
+throws standardexception
+/**
+set the aux object for this page.
+to clear the auxobject in the page, pass in a null auxobject.
+if the auxobject has already been set, this method will
+call auxobjectinvalidated() on the old aux objkect and replace it with aux.
+<br>
+mt - latched
+@see auxobject
+**/
+public void setauxobject auxobject aux
+/**
+retrieve this page's aux object, returning null if there isn't one. the reference returned
+must only be used while the page is latched, once unlatch is called the reference to the
+aux object must be discarded.
+<br> mt - latched
+@see auxobject
+**/
+public auxobject getauxobject
+/**
+returns true if the page is latched. only intended to be used as a sanity check. callers must
+discard page references once unlatch is called.
+<br>
+mt - latched
+*/
+/*
+* time stamp - for those implmentation that supports it
+*/
+/**
+set the time stamp to what is on page at this instance.  no op if this
+page does not support time stamp.
+@exception standardexception standard cloudscape error policy.
+*/
+void settimestamp pagetimestamp ts  throws standardexception
+/**
+return a time stamp that can be used to identify the page of this
+specific instance.  for pages that don't support timestamp, returns
+null.
+*/
+pagetimestamp currenttimestamp
+/**
+see if timestamp for this page is the same as the current
+instance of the page.  null timestamp never equals the instance of the
+page.
+@param ts the time stamp gotten from an earlier call to this page's
+gettimestamp
+@return true if timestamp is the same
+@exception standardexception standard cloudscape error policy.
+@see pagetimestamp
+*/
+boolean equaltimestamp pagetimestamp ts  throws standardexception
+public boolean islatched
+public static final string diag_page_size
+public static final string diag_reserved_space
+public static final string diag_minimum_rec_size
+public static final string diag_bytes_free
+public static final string diag_bytes_reserved
+public static final string diag_numoverflowed
+public static final string diag_rowsize
+public static final string diag_minrowsize
+public static final string diag_maxrowsize
+public static final string diag_pageoverhead
+public static final string diag_slottable_size

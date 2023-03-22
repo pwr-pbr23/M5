@@ -1,0 +1,214 @@
+/**
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver
+import java io ioexception
+import java lang reflect field
+import java util hashmap
+import java util map
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs filesystem
+import org apache hadoop hbase hbaseconfiguration
+import org apache hadoop hbase stoppable
+import org apache hadoop hbase util threads
+/**
+* manage regionserver shutdown hooks.
+* @see #install(configuration, filesystem, stoppable, thread)
+*/
+public class shutdownhook
+private static final log log   logfactory getlog shutdownhook class
+private static final string client_finalizer_data_method
+/**
+* key for boolean configuration whose default is true.
+*/
+public static final string run_shutdown_hook
+/**
+* key for a long configuration on how much time to wait on the fs shutdown
+* hook. default is 30 seconds.
+*/
+public static final string fs_shutdown_hook_wait
+/**
+* a place for keeping track of all the filesystem shutdown hooks that need
+* to be executed after the last regionserver referring to a given filesystem
+* stops. we keep track of the # of regionserver references in values of the map.
+*/
+private final static map<thread  integer> fsshutdownhooks   new hashmap<thread  integer>
+/**
+* install a shutdown hook that calls stop on the passed stoppable
+* and then thread joins against the passed <code>threadtojoin</code>.
+* when this thread completes, it then runs the hdfs thread (this install
+* removes the hdfs shutdown hook keeping a handle on it to run it after
+* <code>threadtojoin</code> has stopped).
+*
+* <p>to suppress all shutdown hook  handling -- both the running of the
+* regionserver hook and of the hdfs hook code -- set
+* {@link shutdownhook#run_shutdown_hook} in {@link configuration} to
+* <code>false</code>.
+* this configuration value is checked when the hook code runs.
+* @param conf
+* @param fs instance of filesystem used by the regionserver
+* @param stop installed shutdown hook will call stop against this passed
+* <code>stoppable</code> instance.
+* @param threadtojoin after calling stop on <code>stop</code> will then
+* join this thread.
+*/
+public static void install final configuration conf  final filesystem fs
+final stoppable stop  final thread threadtojoin
+thread fsshutdownhook   suppresshdfsshutdownhook fs
+thread t   new shutdownhookthread conf  stop  threadtojoin  fsshutdownhook
+runtime getruntime   addshutdownhook t
+log info     t getname
+/*
+* thread run by shutdown hook.
+*/
+private static class shutdownhookthread extends thread
+private final stoppable stop
+private final thread threadtojoin
+private final thread fsshutdownhook
+private final configuration conf
+shutdownhookthread final configuration conf  final stoppable stop
+final thread threadtojoin  final thread fsshutdownhook
+super     threadtojoin getname
+this stop   stop
+this threadtojoin   threadtojoin
+this conf   conf
+this fsshutdownhook   fsshutdownhook
+@override
+public void run
+boolean b   this conf getboolean run_shutdown_hook  true
+log info     run_shutdown_hook       b
+this fsshutdownhook
+if  b
+this stop stop
+threads shutdown this threadtojoin
+if  this fsshutdownhook    null
+synchronized  fsshutdownhooks
+int refs   fsshutdownhooks get fsshutdownhook
+if  refs    1
+log info
+this fsshutdownhook start
+threads shutdown this fsshutdownhook
+this conf getlong fs_shutdown_hook_wait  30000
+if  refs > 0
+fsshutdownhooks put fsshutdownhook  refs   1
+log info
+/*
+* so, hdfs keeps a static map of all fs instances. in order to make sure
+* things are cleaned up on our way out, it also creates a shutdown hook
+* so that all filesystems can be closed when the process is terminated; it
+* calls filesystem.closeall. this inconveniently runs concurrently with our
+* own shutdown handler, and therefore causes all the filesystems to be closed
+* before the server can do all its necessary cleanup.
+*
+* <p>the dirty reflection in this method sneaks into the filesystem class
+* and grabs the shutdown hook, removes it from the list of active shutdown
+* hooks, and returns the hook for the caller to run at its convenience.
+*
+* <p>this seems quite fragile and susceptible to breaking if hadoop changes
+* anything about the way this cleanup is managed. keep an eye on things.
+* @return the fs shutdown hook
+* @throws runtimeexception if we fail to find or grap the shutdown hook.
+*/
+private static thread suppresshdfsshutdownhook final filesystem fs
+try
+// this introspection has been updated to work for hadoop 0.20, 0.21 and for
+// cloudera 0.20.  0.21 and cloudera 0.20 both have hadoop-4829.  with the
+// latter in place, things are a little messy in that there are now two
+// instances of the data member clientfinalizer; an uninstalled one in
+// filesystem and one in the innner class named cache that actually gets
+// registered as a shutdown hook.  if the latter is present, then we are
+// on 0.21 or cloudera patched 0.20.
+thread hdfsclientfinalizer   null
+// look into the filesystem#cache class for clientfinalizer
+class<?>  classes   filesystem class getdeclaredclasses
+class<?> cache   null
+for  class<?> c  classes
+if  c getsimplename   equals
+cache   c
+break
+field field   null
+try
+field   cache getdeclaredfield client_finalizer_data_method
+catch  nosuchfieldexception e
+// we can get here if the cache class does not have a clientfinalizer
+// instance: i.e. we're running on straight 0.20 w/o hadoop-4829.
+if  field    null
+field setaccessible true
+field cachefield   filesystem class getdeclaredfield
+cachefield setaccessible true
+object cacheinstance   cachefield get fs
+hdfsclientfinalizer    thread field get cacheinstance
+else
+// then we didnt' find clientfinalizer in cache.  presume clean 0.20 hadoop.
+field   filesystem class getdeclaredfield client_finalizer_data_method
+field setaccessible true
+hdfsclientfinalizer    thread field get null
+if  hdfsclientfinalizer    null
+throw new runtimeexception
+if   fsshutdownhooks containskey hdfsclientfinalizer
+runtime getruntime   removeshutdownhook hdfsclientfinalizer
+throw new runtimeexception
+hdfsclientfinalizer
+synchronized  fsshutdownhooks
+integer refs   fsshutdownhooks get hdfsclientfinalizer
+fsshutdownhooks put hdfsclientfinalizer  refs    null ? 1   refs   1
+return hdfsclientfinalizer
+catch  nosuchfieldexception nsfe
+log fatal    nsfe
+throw new runtimeexception
+catch  illegalaccessexception iae
+log fatal    iae
+throw new runtimeexception
+// thread that does nothing. used in below main testing.
+static class donothingthread extends thread
+donothingthread
+super
+@override
+public void run
+super run
+// stoppable with nothing to stop.  used below in main testing.
+static class donothingstoppable implements stoppable
+@override
+public boolean isstopped
+// todo auto-generated method stub
+return false
+@override
+public void stop string why
+// todo auto-generated method stub
+/**
+* main to test basic functionality.  run with clean hadoop 0.20 and hadoop
+* 0.21 and cloudera patched hadoop to make sure our shutdown hook handling
+* works for all compbinations.
+* pass '-dhbase.shutdown.hook=false' to test turning off the running of
+* shutdown hooks.
+* @param args
+* @throws ioexception
+*/
+public static void main final string  args  throws ioexception
+configuration conf   hbaseconfiguration create
+string prop   system getproperty run_shutdown_hook
+if  prop    null
+conf setboolean run_shutdown_hook  boolean parseboolean prop
+// instantiate a filesystem. this will register the fs shutdown hook.
+filesystem fs   filesystem get conf
+thread donothing   new donothingthread
+donothing start
+shutdownhook install conf  fs  new donothingstoppable    donothing

@@ -1,0 +1,775 @@
+/*
+derby - class org.apache.derby.impl.store.raw.xact.xactfactory
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store raw xact
+import org apache derby iapi reference property
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services context contextservice
+import org apache derby iapi services context contextmanager
+import org apache derby iapi services daemon daemonservice
+import org apache derby iapi services daemon serviceable
+import org apache derby iapi services locks compatibilityspace
+import org apache derby iapi services locks lockfactory
+import org apache derby iapi services monitor modulecontrol
+import org apache derby iapi services monitor modulesupportable
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services io formatable
+import org apache derby iapi services io formatidutil
+import org apache derby iapi services uuid uuidfactory
+import org apache derby catalog uuid
+import org apache derby iapi store access accessfactoryglobals
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi store access transactioninfo
+import org apache derby iapi store access accessfactory
+import org apache derby iapi store access xa xaresourcemanager
+import org apache derby iapi store raw lockingpolicy
+import org apache derby iapi store raw globaltransactionid
+import org apache derby iapi store raw rawstorefactory
+import org apache derby iapi store raw transaction
+import org apache derby iapi store raw data datafactory
+import org apache derby iapi store raw log logfactory
+import org apache derby iapi store raw log loginstant
+import org apache derby iapi store raw xact rawtransaction
+import org apache derby iapi store raw xact transactionfactory
+import org apache derby iapi store raw xact transactionid
+import org apache derby impl store raw xact xactxaresourcemanager
+import org apache derby iapi types datavaluefactory
+import org apache derby iapi error standardexception
+import java util enumeration
+import java util properties
+import java util hashtable
+public class xactfactory implements transactionfactory  modulecontrol  modulesupportable
+protected static final string user_context_id
+protected static final string nested_readonly_user_context_id
+protected static final string nested_update_user_context_id
+protected static final string internal_context_id
+protected static final string ntt_context_id
+/*
+** fields
+*/
+protected daemonservice rawstoredaemon
+private   uuidfactory           uuidfactory
+protected contextservice		contextfactory
+protected lockfactory           lockfactory
+protected logfactory            logfactory
+protected datafactory           datafactory
+protected datavaluefactory      datavaluefactory
+protected rawstorefactory       rawstorefactory
+public transactiontable ttab
+private long	tranid
+private lockingpolicy lockingpolicies   new lockingpolicy
+private boolean increatenolog   false 	   creating database  no logging
+private   xaresourcemanager xa_resource
+private object   backupsemaphore   new object
+private long     backupblockingoperations   0
+private boolean  inbackup   false
+/*
+** constructor
+*/
+public xactfactory
+super
+/*
+** methods of modulecontrol
+*/
+public boolean cansupport properties startparams
+return true
+public void	boot boolean create  properties properties
+throws standardexception
+uuidfactory   monitor getmonitor   getuuidfactory
+/*
+datavaluefactory =  (datavaluefactory)
+monitor.findservicemodule(
+this,
+org.apache.derby.iapi.reference.classname.datavaluefactory);
+*/
+// if datafactory has not been booted yet, try now.  this can
+// happen in the unit tests.  usually it is booted before store
+// booting is called.
+datavaluefactory    datavaluefactory
+monitor bootservicemodule
+create
+this,
+org apache derby iapi reference classname datavaluefactory
+properties
+contextfactory   contextservice getfactory
+lockfactory
+lockfactory  monitor bootservicemodule false  this
+org apache derby iapi reference module lockfactory  properties
+// adding entries to locking policy table which means we support that
+// level of concurrency.
+lockingpolicies
+new nolocking
+lockingpolicies
+new nolocking
+lockingpolicies
+new rowlocking1 lockfactory
+lockingpolicies
+new rowlocking2 lockfactory
+lockingpolicies
+new rowlocking2nohold lockfactory
+lockingpolicies
+new rowlockingrr lockfactory
+lockingpolicies
+new rowlocking3 lockfactory
+lockingpolicies
+new nolocking
+// note that current implementation of read uncommitted still gets
+// container and container intent locks to prevent concurrent ddl.  thus
+// the read uncommitted containerlocking implementation is the same as
+// the read committed implementation.  future customer requests may
+// force us to change this - we will then have to figure out how to
+// handle a table being dropped while a read uncommitted scanner is
+// reading it - currently we just block that from happening.
+lockingpolicies
+new containerlocking2 lockfactory
+lockingpolicies
+new containerlocking2 lockfactory
+lockingpolicies
+new containerlocking2 lockfactory
+lockingpolicies
+new containerlocking3 lockfactory
+lockingpolicies
+new containerlocking3 lockfactory
+if  create
+ttab   new transactiontable
+string nolog
+properties getproperty property create_with_no_log
+increatenolog    nolog    null    boolean valueof nolog  booleanvalue
+public void	stop
+if  rawstoredaemon    null
+rawstoredaemon stop
+/*
+** methods of transactionfactory
+*/
+/**
+get the lockfactory to use with this store.
+*/
+public lockfactory getlockfactory
+return lockfactory
+/**
+database creation finished
+@exception standardexception standard derby error policy
+*/
+public void createfinished   throws standardexception
+if   increatenolog
+throw standardexception newexception sqlstate xact_create_no_log
+// make sure there is no active update transaction
+if  ttab hasactiveupdatetransaction
+throw standardexception newexception sqlstate xact_create_no_log
+increatenolog   false
+/**
+* common work done to create local or global transactions.
+*
+* @param rsf    the raw store factory creating this xact.
+* @param cm     the current context manager to associate the xact with.
+* @param compatibilityspace
+*               if null, use the transaction being created, else if
+*               non-null use this compatibilityspace.
+*
+* @exception  standardexception  standard exception policy.
+**/
+private rawtransaction startcommontransaction
+rawstorefactory rsf
+contextmanager  cm
+boolean         readonly
+compatibilityspace compatibilityspace
+string          xact_context_id
+string          transname
+boolean         excludeme
+throws standardexception
+if  sanitymanager debug
+if  rawstorefactory    null
+sanitymanager assert
+rawstorefactory    rsf
+sanitymanager assert
+cm    contextfactory getcurrentcontextmanager
+xact xact
+new xact
+this  logfactory  datafactory  datavaluefactory
+readonly  compatibilityspace
+xact settransname transname
+pushtransactioncontext cm  xact_context_id  xact
+false    abortall
+rsf
+excludeme    excludeme during quiesce state
+return xact
+public rawtransaction starttransaction
+rawstorefactory rsf
+contextmanager cm
+string transname
+throws standardexception
+return startcommontransaction
+rsf  cm  false  null  user_context_id  transname  true
+public rawtransaction startnestedreadonlyusertransaction
+rawstorefactory rsf
+compatibilityspace compatibilityspace
+contextmanager  cm
+string          transname
+throws standardexception
+return startcommontransaction
+rsf  cm  true  compatibilityspace
+nested_readonly_user_context_id  transname  false
+public rawtransaction startnestedupdateusertransaction
+rawstorefactory rsf
+contextmanager  cm
+string          transname
+throws standardexception
+return startcommontransaction
+rsf  cm  false  null
+nested_update_user_context_id  transname  true
+public rawtransaction startglobaltransaction
+rawstorefactory rsf
+contextmanager  cm
+int             format_id
+byte          global_id
+byte          branch_id
+throws standardexception
+globalxactid gid   new globalxactid format_id  global_id  branch_id
+if  ttab findtransactioncontextbyglobalid gid     null
+throw standardexception newexception sqlstate store_xa_xaer_dupid
+rawtransaction xact
+startcommontransaction
+rsf  cm  false  null
+user_context_id  accessfactoryglobals user_trans_name  true
+xact settransactionid gid  xact getid
+return xact
+public rawtransaction findusertransaction
+rawstorefactory rsf
+contextmanager  contextmgr
+string transname
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert
+contextmgr    contextfactory getcurrentcontextmanager
+if  rawstorefactory    null
+sanitymanager assert
+rawstorefactory    rsf
+xactcontext xc    xactcontext contextmgr getcontext user_context_id
+if  xc    null
+return starttransaction rsf  contextmgr  transname
+else
+return xc gettransaction
+public rawtransaction startnestedtoptransaction rawstorefactory rsf  contextmanager cm
+throws standardexception
+if  sanitymanager debug
+if  rawstorefactory    null
+sanitymanager assert
+rawstorefactory    rsf
+xact xact
+new xact
+this  logfactory  datafactory  datavaluefactory  false  null
+// hold latches etc. past commit in ntt
+xact setpostcomplete
+pushtransactioncontext cm  ntt_context_id  xact
+true    abortall
+rsf
+true    excludeme during quiesce state
+return xact
+public rawtransaction startinternaltransaction rawstorefactory rsf  contextmanager cm
+throws standardexception
+if  sanitymanager debug
+if  rawstorefactory    null
+sanitymanager assert
+rawstorefactory    rsf
+xact xact
+new internalxact this  logfactory  datafactory  datavaluefactory
+pushtransactioncontext cm  internal_context_id  xact
+true    abortall
+rsf
+true    excludeme during quiesce state
+return xact
+/*
+* the following transactionfactory methods are to support recovery and
+* should only be used by recovery!
+*/
+/**
+find the transactiontableentry with the given id and make the passed in
+transaction assume the identity and properties of that
+transactiontableentry.
+used in recovery only.
+*/
+public boolean findtransaction transactionid id   rawtransaction tran
+return ttab findandassumetransaction id  tran
+/**
+rollback all active transactions that has updated the raw store.
+use the recovery transaction that is passed in to do all the work.
+used in recovery only.
+<p>
+transactions are rolled back in the following order:
+<ol>
+<li>internal transactions in reversed beginxact chronological order,
+<li>all other transactions in reversed beginxact chronological order,
+</nl>
+@param recoverytransaction use this transaction to do all the user
+transaction work
+@exception standardexception any exception thrown during rollback
+*/
+public void rollbackalltransactions
+rawtransaction  recoverytransaction
+rawstorefactory rsf
+throws standardexception
+if  sanitymanager debug
+if  rawstorefactory    null
+sanitymanager assert
+rawstorefactory    rsf
+sanitymanager assert
+recoverytransaction    null
+int irbcount   0
+// first undo internal transactions if there is any
+if  ttab hasrollbackfirsttransaction
+rawtransaction internaltransaction   startinternaltransaction rsf
+recoverytransaction getcontextmanager
+// make this transaction be aware that it is being used by recovery
+internaltransaction recoverytransaction
+if  sanitymanager debug
+sanitymanager assert
+internaltransaction handlespostterminationwork      false
+while ttab getmostrecentrollbackfirsttransaction
+internaltransaction
+irbcount
+internaltransaction abort
+internaltransaction close
+if  sanitymanager debug
+sanitymanager assert
+ttab hasrollbackfirsttransaction      false
+int rbcount   0
+// recoverytransacion assumes the identity of the most recent xact
+while ttab getmostrecenttransactionforrollback recoverytransaction
+if  sanitymanager debug
+sanitymanager assert
+recoverytransaction handlespostterminationwork      false
+rbcount
+recoverytransaction abort
+if  sanitymanager debug
+if  rbcount > 0    irbcount > 0
+// resolve: put this in the log trace
+//	system.out.println(
+//	    "recovery rolled back " + irbcount +
+//	    " internal transactions,"
+//			+ rbcount + " user transactions");
+/**
+run through all prepared transactions known to this factory
+and restore their state such that they remain after recovery, and
+can be found and handled by a xa transaction manager.  this includes
+creating a context manager for each, pushing a xact context, and
+reclaiming update locks on all data changed by the transaction.
+expected to be called just after the redo and undo recovery loops,
+where the transaction table should be empty except for prepared
+xacts.
+used only in recovery.
+@exception standardexception derby standard error policy
+*/
+public void handlepreparedxacts
+rawstorefactory rsf
+throws standardexception
+if  sanitymanager debug
+if  rawstorefactory    null
+sanitymanager assert
+rawstorefactory    rsf
+int prepared_count   0
+if  ttab haspreparedrecoveredxact
+// if there any prepared xacts
+// at this point recovery has used one context and one transaction
+// to deal with all transactions.  prepared transactions are to
+// be left in the transaction table, but the must have real and
+// separate cm's and transactions associated with them.
+// save old context.  errors may go to funky contexts (the new
+// context we created to bring the prepared transaction into the
+// real world after recovery) after we switch contexts, but any
+// error we get at this point is going to shut down the db.
+while  true
+// allocate new context and associate new xact with it.
+contextmanager cm        contextfactory newcontextmanager
+contextfactory setcurrentcontextmanager cm
+try
+rawtransaction rawtran
+starttransaction
+rawstorefactory  cm
+accessfactoryglobals user_trans_name
+if  ttab getmostrecentpreparedrecoveredxact rawtran
+// found a prepared xact.  the reprepare() call will
+// accumulate locks, and change the transaction table entry
+// to not be "in-recovery" so that it won't show up again.
+rawtran reprepare
+if  sanitymanager debug
+prepared_count
+else
+// get rid of last transaction allocated.
+rawtran destroy
+break
+finally
+contextfactory resetcurrentcontextmanager cm
+if  sanitymanager debug
+// resolve - need to only do this under a debug flag.
+// sanitymanager.debug_print("",
+// "recovery re-prepared " + prepared_count + " xa transactions.");
+/**
+get the earliest log instant that is still active, ie, the first log
+record logged by the earliest transaction that is still active.
+<br>
+the logging system must guarentee that the transaction table is
+populated in the order transactions are started.
+used in recovery only.
+*/
+public loginstant firstupdateinstant
+return ttab getfirstloginstant
+/*
+** methods of corruptable
+*/
+/**
+really this is just a convience routine for callers that might not
+have access to a log factory.
+*/
+public standardexception markcorrupt standardexception originalerror
+logfactory markcorrupt originalerror
+return originalerror
+/*
+**		implementation specific methods.
+*/
+public void setnewtransactionid transactionid oldxid  xact t
+xactid xid
+boolean excludeme   true     by default
+if  oldxid    null
+excludeme   remove oldxid
+synchronized this
+xid   new xactid tranid
+t settransactionid t getglobalid    xid
+// resolve: how does a real global xact id get set?
+// if we got rid of the oldxid, that means this transaction object has
+// merely committed and starting the next transaction with the same
+// xact object.  in that case, the transaction context will remain the
+// same and won't be pushed.  we need to add this transaction with the
+// new id back into the transaction table.  if we did not get rid of
+// the old oldxid, that means this is a brand new transaction being
+// created.  the pushtransactioncontext call will add it to the
+// transaction table with the appropriate flags
+if  oldxid    null
+add t  excludeme
+/**
+**	set the shorttranid, this is called by the log factory after recovery
+*/
+public void resettranid
+xactid xid    xactid ttab largestupdatexactid
+if  xid    null
+tranid   xid getid     1
+else
+tranid   1
+/**
+create a new rawtransaction, a context for it and push the context
+onto the current context manager.  then add the transacion to the
+transaction table.
+@param contextname the name of the transaction context
+@param xact the transaction object
+@param abortall if true, then any error will abort the whole
+transaction.  otherwise, let xactcontext.cleanuponerror decide what to
+do
+@param rsf the raw store factory
+@param excludeme during systeme quiesce, i.e., this transaction should
+not be allowed to be active during a quiesce state.
+@exception standardexception standard derby error policy
+*/
+protected void pushtransactioncontext contextmanager cm  string contextname
+xact xact
+boolean abortall
+rawstorefactory rsf
+boolean excludeme
+throws standardexception
+if  cm getcontext contextname     null
+throw standardexception newexception
+sqlstate xact_transaction_active
+xactcontext xc   new xactcontext cm  contextname  xact  abortall  rsf
+// this transaction is now added to the transaction table.
+// this will cause an idle transaction to take on an identity, which is
+// unfortunate.  the reason why we have to add the transaction to the
+// table right now is because the transaction table is used to bring
+// system  to quisce state to  regulate who can go active during quiesce
+// state, and if we add the transaction
+// when it goes active, then there is a window where this transaction
+// can sneak in.  the transaction table itself does not keep track of
+// whether transactions can be started or not because quiesce related
+// transactions can start after all other user
+// transactions are excluded.
+// resolve: need to put more thought on the overall requirement and
+// design of the transaction table that satisfies the need of all the
+// clients, namely: checkpoint, recovery, quiesce mode, transaction table.
+add xact  excludeme
+/**
+add a transaction to the list of transactions that has updated
+the raw store.
+<p>
+this is called underneath the beginxact log operation's dome method.
+the logging system must guarentee that transactions are added in the
+true order they are started, as defined by the order of beginxact log
+record in the log.
+*/
+protected void addupdatetransaction
+transactionid   id
+rawtransaction  t
+int             transactionstatus
+if  sanitymanager debug
+sanitymanager assert
+id    null
+ttab addupdatetransaction id  t  transactionstatus
+/**
+remove a transaction from the list of transactions that has updated the
+raw store.
+*/
+protected void removeupdatetransaction transactionid id
+if  sanitymanager debug
+sanitymanager assert
+id    null
+ttab removeupdatetransaction id
+/**
+change state of transaction to prepared.  used by recovery to update
+the transaction table entry to prepared state.
+*/
+protected void preparetransaction transactionid id
+if  sanitymanager debug
+sanitymanager assert
+id    null
+ttab preparetransaction id
+/**
+submit this post commit work to the post commit daemon
+*/
+public boolean submitpostcommitwork serviceable work
+if  rawstoredaemon    null
+return rawstoredaemon enqueue work  work serviceasap
+return false
+public void setrawstorefactory rawstorefactory rsf  throws standardexception
+if  sanitymanager debug
+sanitymanager assert rsf    null
+rawstorefactory   rsf
+// no need to remember raw store factory,
+// just remember which daemon to use
+rawstoredaemon   rsf getdaemon
+// now its ok to look for the log and data factory
+// log factory is booted by the data factory
+logfactory    logfactory  monitor findservicemodule this  rsf getlogfactorymodule
+// data factory is booted by the raw store implementation
+datafactory    datafactory  monitor findservicemodule this  rsf getdatafactorymodule
+/**
+returns true if there is no in flight updating tranasaction.
+caller must be aware that if there is no other mechanism to stop
+transactions from starting and ending, then this information is
+outdated as soon as it is reported.
+only call this function in special times - e.g, during recovery
+*/
+public boolean noactiveupdatetransaction
+return  ttab hasactiveupdatetransaction      false
+/**
+* check if there are any prepared transanctions in the
+* transaction table.
+*
+* caller must be aware that if there is no other mechanism to stop
+* transactions from starting and ending, then this information is
+* outdated as soon as it is reported.
+*
+* @return     <tt>true</tt> if there are prepared
+*              transactions in the transaction table,
+*              <tt>false</tt> otherwise.
+*/
+public boolean haspreparedxact
+return  ttab haspreparedxact
+/**
+remove the transaction id an return false iff the transaction is found
+in the table and it doesn't need exclusion from quiesce state
+*/
+protected boolean remove transactionid xactid
+return ttab remove xactid
+protected void add xact xact  boolean excludeme
+ttab add xact  excludeme
+/**
+make a new uuid for whomever that wants it
+*/
+public uuid makenewuuid
+return uuidfactory createuuid
+/**
+decide if a transaction of this contextid needs to flush the log when
+it commits
+*/
+public boolean flushlogoncommit string contextname
+//
+// if this is a user transaction, flush the log
+// if this is an internal or nested top transaction, do not
+// flush, let it age out.
+//
+return  contextname    user_context_id
+contextname equals user_context_id
+/**
+get a locking policy for a transaction.
+*/
+final lockingpolicy getlockingpolicy
+int     mode
+int     isolation
+boolean stricterok
+if  mode    lockingpolicy mode_none
+isolation   transactioncontroller isolation_nolock
+lockingpolicy policy   lockingpolicies
+if   policy    null       stricterok
+return policy
+for  mode    mode <  lockingpolicy mode_container  mode
+for  int i   isolation
+i <  transactioncontroller isolation_serializable
+i
+policy   lockingpolicies
+if  policy    null
+return policy
+return null
+/**
+return the transaction table to be logged with the checkpoint operation
+*/
+public formatable gettransactiontable
+return ttab
+/**
+use this transaction table, which is gotten from a checkpoint
+operation.  use only during recovery.
+*/
+public void usetransactiontable formatable transactiontable
+throws standardexception
+if  ttab    null    transactiontable    null
+throw standardexception newexception
+sqlstate xact_transaction_table_in_use
+if  ttab    null
+if  transactiontable    null
+ttab   new transactiontable
+else
+if  sanitymanager debug
+if   transactiontable instanceof transactiontable
+false
+sanitymanager throwassert
+transactiontable getclass   getname
+ttab    transactiontable transactiontable
+// else transactiontable must be null, if we already have a transaction
+// table, no need to do anything
+public transactioninfo gettransactioninfo
+if  sanitymanager debug
+sanitymanager assert ttab    null
+return ttab gettransactioninfo
+/**
+* @return false, if the database creation finished
+*/
+public boolean indatabasecreation
+return increatenolog
+/**
+* return the module providing xaresource interface to the transaction
+* table.
+*
+* @exception standardexception standard derby exception policy.
+*/
+public    xaresourcemanager    object getxaresourcemanager
+throws standardexception
+if  xa_resource    null
+xa_resource   new xactxaresourcemanager rawstorefactory  ttab
+return xa_resource
+/**
+* block the online backup. backup needs to be blocked while
+* executing any unlogged operations or any opearation that
+* prevents from  making a consistent backup.
+*
+* @param wait if <tt>true</tt>, waits until the backup
+*             is blocked.
+* @return     <tt>true</tt> if backup is blocked.
+*			   <tt>false</tt> otherwise.
+* @exception standardexception if interrupted while waiting for a
+*           backup  to complete.
+*/
+protected boolean blockbackup boolean wait
+throws standardexception
+synchronized backupsemaphore
+// do not allow backup blocking operations, if online backup is
+// is in progress.
+if  inbackup
+if wait
+while inbackup
+try
+backupsemaphore wait
+catch  interruptedexception ie
+throw standardexception interrupt ie
+else
+return false
+// not in online backup, allow backup blocking operations
+backupblockingoperations
+return true
+/**
+* unblock the backup, a backup blocking operation finished.
+*/
+protected void unblockbackup
+synchronized backupsemaphore
+if  sanitymanager debug
+sanitymanager assert backupblockingoperations > 0
+backupblockingoperations
+if  inbackup
+// wake up the online backupthread
+backupsemaphore notifyall
+/**
+* checks if there are any backup blocking operations in progress and
+* prevents new ones from starting until the backup is finished.
+* if backup blocking operations are in progress and  <code> wait </code>
+* parameter value is <tt>true</tt>, then it will wait for the current
+* backup blocking operations to finish.
+*
+* a consistent backup can not be made if there are any backup
+* blocking operations (like unlogged operations) are in progress
+*
+* @param wait if <tt>true</tt>, waits for the current backup blocking
+*             operation in progress to finish.
+* @return     <tt>true</tt> if no backup blocking operations are in
+*             progress
+*             <tt>false</tt> otherwise.
+* @exception standardexception if interrupted or a runtime exception occurs
+*/
+public boolean blockbackupblockingoperations boolean wait
+throws standardexception
+synchronized backupsemaphore
+if  wait
+// set the inbackup state to true first to stop new backup
+// blocking operation from starting.
+inbackup  true
+try
+// wait for backup blocking operation in progress to finish
+while backupblockingoperations > 0
+try
+backupsemaphore wait
+catch  interruptedexception ie
+// make sure we are not stuck in the backup state
+// if we caught an interrupt exception and the
+// calling thread may not have a chance to clear
+// the in backup state.
+inbackup   false
+backupsemaphore notifyall
+throw standardexception interrupt ie
+catch  runtimeexception rte
+// make sure we are not stuck in backup state if we
+// caught a run time exception and the calling thread may
+// not have a chance to clear the in backup state.
+inbackup  false
+backupsemaphore notifyall
+throw rte 		   rethrow run time exception
+else
+// check if any backup blocking operations that are in  progress
+if  backupblockingoperations    0
+inbackup   true
+if  sanitymanager debug
+if  inbackup
+sanitymanager assert backupblockingoperations    0
+return inbackup
+/**
+* backup completed. allow backup blocking operations.
+*/
+public void unblockbackupblockingoperations
+synchronized backupsemaphore
+inbackup   false
+backupsemaphore notifyall

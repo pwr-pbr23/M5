@@ -1,0 +1,496 @@
+/*
+derby - class org.apache.derby.iapi.sql.depend.dependencymanager
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby iapi sql depend
+import org apache derby iapi services context contextmanager
+import org apache derby iapi error standardexception
+import org apache derby iapi sql conn languageconnectioncontext
+import org apache derby iapi store access transactioncontroller
+/**
+dependency manager interface
+<p>
+the dependency manager tracks needs that dependents have of providers. this
+is a general purpose interface which is associated with a
+datadictinary object; infact the dependencymanager is really the
+datadictionary keeping track of dependcies between objects that it handles
+(descriptors) as well as prepared statements.
+<p>
+the primary example of this is a prepared statement's needs of
+schema objects such as tables.
+<p>
+dependencies are used so that we can determine when we
+need to recompile a statement; compiled statements depend
+on schema objects like tables and constraints, and may
+no longer be executable when those tables or constraints are
+altered. for example, consider an insert statement.
+<p>
+an insert statement is likely to have dependencies on the table it
+inserts into, any tables it selects from (including
+subqueries), the authorities it uses to do this,
+and any constraints or triggers it needs to check.
+<p>
+a prepared insert statement has a dependency on the target table
+of the insert. when it is compiled, that dependency is registered
+from the prepared statement on the data dictionary entry for the
+table. this dependency is added to the prepared statement's dependency
+list, which is also accessible from an overall dependency pool.
+<p>
+a ddl statement will mark invalid any prepared statement that
+depends on the schema object the ddl statement is altering or
+dropping.  we tend to want to track at the table level rather than
+the column or constraint level, so that we are not overburdened
+with dependencies.  this does mean that we may invalidate when in
+fact we do not need to; for example, adding a column to a table may
+not actually cause an insert statement compiled for that table
+to stop working; but our level of granularity may force us to
+invalidate the insert because it has to invalidate all statements
+that depend on the table due to some of them actually no longer
+being valid.
+it is up to the user of the dependency system at what granularity
+to track dependencies, where to hang them, and how to identify when
+objects become invalid.  the dependency system is basically supplying
+the ability to find out who is interested in knowing about
+other, distinct operations.  the primary user is the language system,
+and its primary use is for invalidating prepared statements when
+ddl occurs.
+<p>
+the insert will recompile itself when its next execution
+is requested (not when it is invalidated). we don't want it to
+recompile when the ddl is issued, as that would increase the time
+of execution of the ddl command unacceptably.  note that the ddl
+command is also allowed to proceed even if it would make the
+statement no longer compilable.  it can be useful to have a way
+to recompile invalid statements during idle time in the system,
+but our first implementation will simply recompile at the next
+execution.
+<p>
+the start of a recompile will release the connection to
+all dependencies when it releases the activation class and
+generates a new one.
+<p>
+the dependency manager is capable of storing dependencies to
+ensure that other d.m.s can see them and invalidate them
+appropriately. the dependencies in memory only the current
+d.m. can see; the stored dependencies are visible to other d.m.s
+once the transaction in which they were stored is committed.
+<p>
+revisit: given that statements are compiled in a separate top-transaction
+from their execution, we may need/want some intermediate memory
+storage that makes the dependencies visible to all d.m.s in the
+system, without requiring that they be stored.
+<p>
+to ensure that dependencies are cleaned up when a statement is undone,
+the compiler context needs to keep track of what dependent it was
+creating dependencies for, and if it is informed of a statement
+exception that causes it to throw out the statement it was compiling,
+it should also call the dependency manager to have the
+dependencies removed.
+<p>
+several expansions of the basic interface may be desirable:
+<ul>
+<li> to note a type of dependency, and to invalidate or perform
+an invalidation action based on dependency type
+<li> to note a type of invalidation, so the revalidation could
+actually take some action other than recompilation, such as
+simply ensuring the provider objects still existed.
+<li> to control the order of invalidation, so that if (for example)
+the invalidation action actually includes the revalidation attempt,
+revalidation is not attempted until all invalidations have occurred.
+<li> to get a list of dependencies that a dependent or
+a provider has (this is included in the above, although the
+basic system does not need to expose the list).
+<li> to find out which of the dependencies for a dependent were marked
+invalid.
+</ul>
+<p>
+to provide a simple interface that satisfies the basic need,
+and yet supply more advanced functionality as well, we will present
+the simple functionality as defaults and provide ways to specify the
+more advanced functionality.
+<pre>
+interface dependent {
+boolean isvalid();
+invalidtype getinvalidtype(); // returns what it sees
+// as the "most important"
+// of its invalid types.
+void makeinvalid( );
+void makeinvalid( dependencytype dt, invalidtype it );
+void makevalid();
+}
+interface provider() {
+}
+interface dependency() {
+provider getprovider();
+dependent getdependent();
+dependencytype getdependencytype();
+boolean isvalid();
+invalidtype getinvalidtype(); // returns what it sees
+// as the "most important"
+// of its invalid types.
+}
+interface dependencymanager() {
+void adddependency(dependent d, provider p, contextmanager cm);
+void invalidatefor(provider p);
+void invalidatefor(provider p, dependencytype dt, invalidtype it);
+void cleardependencies(dependent d);
+void cleardependencies(dependent d, dependencytype dt);
+enumeration getproviders (dependent d);
+enumeration getproviders (dependent d, dependencytype dt);
+enumeration getinvaliddependencies (dependent d,
+dependencytype dt, invalidtype it);
+enumeration getdependents (provider p);
+enumeration getdependents (provider p, dependencytype dt);
+enumeration getinvaliddependencies (provider p,
+dependencytype dt, invalidtype it);
+}
+</pre>
+<p>
+the simplest things for dependencytype and invalidtype to be are
+integer id's or strings, rather than complex objects.
+<p>
+in terms of ensuring that no makeinvalid calls are made until we have
+identified all objects that could be, so that the calls will be made
+from "leaf" invalid objects (those not in turn relied on by other
+dependents) to dependent objects upon which others depend, the
+dependency manager will need to maintain an internal queue of
+dependencies and make the calls once it has completes its analysis
+of the dependencies of which it is aware.  since it is much simpler
+and potentially faster for makeinvalid calls to be made as soon
+as the dependents are identified, separate implementations may be
+called for, or separate interfaces to trigger the different
+styles of invalidation.
+<p>
+in terms of separate interfaces, the dependencymanager might have
+two methods,
+<pre>
+void makeinvalidimmediate();
+void makeinvalidordered();
+</pre>
+or a flag on the makeinvalid method to choose the style to use.
+<p>
+in terms of separate implementations, the immediateinvalidate
+manager might have simpler internal structures for
+tracking dependencies than the orderedinvalidate manager.
+<p>
+the language system doesn't tend to suffer from this ordering problem,
+as it tends to handle the impact of invalidation by simply deferring
+recompilation until the next execution.  so, a prepared statement
+might be invalidated several times by a transaction that contains
+several ddl operations, and only recompiled once, at its next
+execution.  this is sufficient for the common use of a system, where
+ddl changes tend to be infrequent and clustered.
+<p>
+there could be ways to push this "ordering problem" out of the
+dependency system, but since it knows when it starts and when it
+finished finding all of the invalidating actions, it is likely
+the best home for this.
+<p>
+one other problem that could arise is multiple invalidations occurring
+one after another.  the above design of the dependency system can
+really only react to each invalidation request as a unit, not
+to multiple invalidation requests.
+<p>
+another extension that might be desired is for the dependency manager
+to provide for cascading invalidations -- that is, if it finds
+and marks one dependent object as invalid, if that object can also
+be a provider, to look for its dependent objects and cascade the
+dependency on to them.  this can be a way to address the
+multiple-invalidation request need, if it should arise.  the simplest
+way to do this is to always cascade the same invalidation type;
+otherwise, dependents need to be able to say what a certain type
+of invalidation type gets changed to when it is handed on.
+<p>
+the basic language system does not need support for cascaded
+dependencies -- statements do not depend on other statements
+in a way that involves the dependency system.
+<p>
+i do not know if it would be worthwhile to consider using the
+dependency manager to aid in the implementation of the sql drop
+statements or not. past implementations
+of database systems have not used the dependency system to implement
+this functionality, but have instead hard-coded the lookups like so:
+<pre>
+in droptable:
+scan the tableauthority table looking for authorities on
+this table; drop any that are found.
+scan the columnauthority table looking for authorities on
+this table; drop any that are found.
+scan the view table looking for views on
+this table; drop any that are found.
+scan the column table looking for rows for columns of
+this table; drop any that are found.
+scan the constraint table looking for rows for constraints of
+this table; drop any that are found.
+scan the index table looking for rows for indexes of
+this table; drop the indexes, and any rows that are found.
+drop the table's conglomerate
+drop the table's row in the table table.
+</pre>
+<p>
+the direct approach such as that outlined in the example will
+probably be quicker and is definitely "known technology" over
+the use of a dependency system in this area.
+*/
+public interface dependencymanager
+/* note - every value in this group (actions) must have a matching
+* string in the implementation of getactionstring().
+*/
+public static final int compile_failed   0
+public static final int drop_table   1
+public static final int drop_index   2
+public static final int create_index   3
+public static final int rollback   4
+public static final int changed_cursor   5
+public static final int drop_method_alias   6
+public static final int drop_view   9
+public static final int create_view   10
+public static final int prepared_statement_release   11
+public static final int alter_table   12
+public static final int drop_sps   13
+public static final int user_recompile_request   14
+public static final int bulk_insert   15
+public static final int drop_jar   17
+public static final int replace_jar   18
+public static final int drop_constraint   19
+public static final int set_constraints_enable   20
+public static final int set_constraints_disable   21
+public static final int create_constraint   22
+public static final int internal_recompile_request   23
+public static final int drop_trigger   27
+public static final int create_trigger   28
+public static final int set_triggers_enable   29
+public static final int set_triggers_disable   30
+public static final int modify_column_default   31
+public static final int drop_schema   32
+public static final int compress_table   33
+//using same action for rename table/column
+public static final int rename   34
+public static final int drop_column   37
+public static final int drop_statistics   39
+public static final int update_statistics   40
+//rename index dependency behavior is not as stringent as rename table and column and
+//hence we need a different action for rename index. rename index tries to imitate the
+//drop index behavior for dependency which is not very strict.
+public static final int rename_index   41
+public static final int truncate_table   42
+public static final int drop_synonym   43
+//a generic revoke action for trigger, references, select, insert,
+//  update and delete privileges. for all these privilege types,
+//  a revoke statement causes the dependents to drop
+public static final int revoke_privilege   44
+//this special revoke action is for when revoke should fail if
+//  there are dependents on the privilege being revoked. when
+//  such an action type is received by any dependents, they
+//  should throw an exception. such a form of revoke will succeed
+//  only if there are no dependents on the privilege being revoked.
+//
+//currently, this is supported only for execute privilege on a
+//  routine. in derby, at this point, execute privilege on a
+//  routine can be revoked only if there are no dependents on
+//  that privilege. so, when a revoke execute..,restrict is
+//  issued, this invalidation action will be sent to all
+//  it's dependents.
+public static final int revoke_privilege_restrict   45
+/**
+* extensions to this interface may use action codes > max_action_code without fear of
+* clashing with action codes in this base interface.
+*/
+public static final int max_action_code   0xffff
+/**
+adds a dependency from the dependent on the provider.
+this will be considered to be the default type of
+dependency, when dependency types show up.
+<p>
+implementations of adddependency should be fast --
+performing alot of extra actions to add a dependency would
+be a detriment.
+@param d	the dependent
+@param p	the provider
+@param cm	current contextmanager
+@exception standardexception thrown if something goes wrong
+*/
+void adddependency dependent d  provider p  contextmanager cm  throws standardexception
+/**
+mark all dependencies on the named provider as invalid.
+when invalidation types show up, this will use the default
+invalidation type. the dependencies will still exist once
+they are marked invalid; cleardependencies should be used
+to remove dependencies that a dependent has or provider gives.
+<p>
+implementations of this can take a little time, but are not
+really expected to recompile things against any changes
+made to the provider that caused the invalidation. the
+dependency system makes no guarantees about the state of
+the provider -- implementations can call this before or
+after actually changing the provider to its new state.
+<p>
+implementations should throw dependencystatementexception
+if the invalidation should be disallowed.
+@param p the provider
+@param action	the action causing the invalidate
+@param lcc		the languageconnectioncontext
+@exception standardexception thrown if unable to make it invalid
+*/
+void invalidatefor provider p  int action  languageconnectioncontext lcc
+throws standardexception
+/**
+erases all of the dependencies the dependent has, be they
+valid or invalid, of any dependency type.  this action is
+usually performed as the first step in revalidating a
+dependent; it first erases all the old dependencies, then
+revalidates itself generating a list of new dependencies,
+and then marks itself valid if all its new dependencies are
+valid.
+<p>
+there might be a future want to clear all dependencies for
+a particular provider, e.g. when destroying the provider.
+however, at present, they are assumed to stick around and
+it is the responsibility of the dependent to erase them when
+revalidating against the new version of the provider.
+<p>
+cleardependencies will delete dependencies if they are
+stored; the delete is finalized at the next commit.
+@param lcc	compiler state
+@param d the dependent
+*
+* @exception standardexception		thrown on failure
+*/
+void cleardependencies languageconnectioncontext lcc  dependent d  throws standardexception
+/**
+* clear the specified in memory dependency.
+* this is useful for clean-up when an exception occurs.
+* (we clear all in-memory dependencies added in the current
+* statementcontext.)
+this method will handle dependency's that have already been
+removed from the dependencymanager.
+*/
+public void clearinmemorydependency dependency dy
+/**
+* get a new array of providerinfos representing all the persistent
+* providers for the given dependent.
+*
+* @exception standardexception		thrown on error.
+*/
+public providerinfo getpersistentproviderinfos dependent dependent
+throws standardexception
+/**
+* get a new array of providerinfos representing all the persistent
+* providers from the given list of providers.
+*
+* @exception standardexception		thrown on error.
+*/
+public providerinfo getpersistentproviderinfos providerlist pl
+throws standardexception
+/**
+* clear the in memory column bit map information in any table descriptor
+* provider in a provider list.  this function needs to be called before
+* the table descriptor is reused as provider in column dependency.  for
+* example, this happens in "create publication" statement with target-only
+* ddl where more than one views are defined and they all reference one
+* table.
+*
+* @exception standardexception		thrown on error.
+*/
+public void clearcolumninfoinproviders providerlist pl
+throws standardexception
+/**
+* copy dependencies from one dependent to another.
+*
+* @param copy_from the dependent to copy from
+* @param copyto the dependent to copy to
+* @param persistentonly only copy persistent dependencies
+* @param cm			current contextmanager
+*
+* @exception standardexception		thrown on error.
+*/
+public void copydependencies
+dependent	copy_from
+dependent	copyto
+boolean		persistentonly
+contextmanager cm
+throws standardexception
+/**
+* returns a string representation of the sql action, hence no
+* need to internationalize, which is causing the invokation
+* of the dependency manager.
+*
+* @param action		the action
+*
+* @return string	the string representation
+*/
+string getactionstring int action
+/**
+* count the number of active dependencies, both stored and in memory,
+* in the system.
+*
+* @return int		the number of active dependencies in the system.
+@exception standardexception thrown if something goes wrong
+*/
+public int countdependencies   		throws standardexception
+/**
+* dump out debugging info on all of the dependencies currently
+* within the system.
+*
+* @return string	debugging info on the dependencies.
+*					(null if sanitymanger.debug is false)
+@exception standardexception thrown if something goes wrong
+@exception java.sql.sqlexception thrown if something goes wrong
+*/
+public string dumpdependencies   throws standardexception  java sql sqlexception
+/**
+erases all of the dependencies the dependent has, be they
+valid or invalid, of any dependency type.  this action is
+usually performed as the first step in revalidating a
+dependent; it first erases all the old dependencies, then
+revalidates itself generating a list of new dependencies,
+and then marks itself valid if all its new dependencies are
+valid.
+<p>
+there might be a future want to clear all dependencies for
+a particular provider, e.g. when destroying the provider.
+however, at present, they are assumed to stick around and
+it is the responsibility of the dependent to erase them when
+revalidating against the new version of the provider.
+<p>
+cleardependencies will delete dependencies if they are
+stored; the delete is finalized at the next commit.
+@param lcc	compiler state
+@param d the dependent
+@param tc transaction controller
+@exception standardexception		thrown on failure
+*/
+public void cleardependencies languageconnectioncontext lcc
+dependent d
+transactioncontroller tc
+throws standardexception
+/**
+* copy dependencies from one dependent to another.
+*
+* @param copy_from the dependent to copy from
+* @param copyto the dependent to copy to
+* @param persistentonly only copy persistent dependencies
+* @param cm			current contextmanager
+* @param tc            transaction controller
+*
+* @exception standardexception		thrown on error.
+*/
+public void copydependencies
+dependent	copy_from
+dependent	copyto
+boolean		persistentonly
+contextmanager cm
+transactioncontroller tc
+throws standardexception
+}

@@ -1,0 +1,383 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql exec persistence
+import java io file
+import java io ioexception
+import java util arraylist
+import java util list
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs filesystem
+import org apache hadoop fs localfilesystem
+import org apache hadoop fs path
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive ql exec utilities
+import org apache hadoop hive ql exec filesinkoperator recordwriter
+import org apache hadoop hive ql io hivefileformatutils
+import org apache hadoop hive ql io hiveoutputformat
+import org apache hadoop hive ql metadata hiveexception
+import org apache hadoop hive ql plan tabledesc
+import org apache hadoop hive serde2 serde
+import org apache hadoop hive serde2 objectinspector objectinspector
+import org apache hadoop hive serde2 objectinspector objectinspectorutils
+import org apache hadoop hive serde2 objectinspector objectinspectorutils objectinspectorcopyoption
+import org apache hadoop io writable
+import org apache hadoop io writablecomparable
+import org apache hadoop mapred inputformat
+import org apache hadoop mapred inputsplit
+import org apache hadoop mapred jobconf
+import org apache hadoop mapred reporter
+import org apache hadoop util reflectionutils
+/**
+* simple persistent container for rows.
+*
+* this container interface only accepts adding or appending new rows and iterating through the rows
+* in the order of their insertions.
+*
+* the iterator interface is a lightweight first()/next() api rather than the java iterator
+* interface. this way we do not need to create an iterator object every time we want to start a new
+* iteration. below is simple example of how to convert a typical java's iterator code to the lw
+* iterator interface.
+*
+* iterator itr = rowcontainer.iterator(); while (itr.hasnext()) { v = itr.next(); // do anything
+* with v }
+*
+* can be rewritten to:
+*
+* for ( v = rowcontainer.first(); v != null; v = rowcontainer.next()) { // do anything with v }
+*
+* once the first is called, it will not be able to write again. so there can not be any writes
+* after read. it can be read multiple times, but it does not support multiple reader interleaving
+* reading.
+*
+*/
+public class rowcontainer<row extends list<object>> extends abstractrowcontainer<row>
+protected static log log   logfactory getlog rowcontainer class
+// max # of rows can be put into one block
+private static final int blocksize   25000
+private row currentwriteblock     the last block that add   should append to
+private row currentreadblock     the current block where the cursor is in
+// since currentreadblock may assigned to currentwriteblock, we need to store
+// original read block
+private row firstreadblockpointer
+private int blocksize     number of objects in the block before it is spilled
+// to disk
+private int numflushedblocks     total # of blocks
+private int size     total # of elements in the rowcontainer
+private file tmpfile     temporary file holding the spilled blocks
+path tempoutpath   null
+private file parentfile
+private int itrcursor     iterator cursor in the currblock
+private int readblocksize     size of current read block
+private int addcursor     append cursor in the lastblock
+private serde serde     serialization deserialization for the row
+private objectinspector standardoi     object inspector for the row
+private list<object> keyobject
+private tabledesc tbldesc
+boolean firstcalled   false     once called first  it will never be able to
+// write again.
+int acutalsplitnum   0
+int currentsplitpointer   0
+org apache hadoop mapred recordreader rr   null     record reader
+recordwriter rw   null
+inputformat<writablecomparable  writable> inputformat   null
+inputsplit inputsplits   null
+private row dummyrow   null
+private final reporter reporter
+writable val   null     cached to use serialize data
+configuration jc
+jobconf jobcloneusinglocalfs   null
+private localfilesystem localfs
+public rowcontainer configuration jc  reporter reporter  throws hiveexception
+this blocksize  jc  reporter
+public rowcontainer int bs  configuration jc  reporter reporter
+throws hiveexception
+// no 0-sized block
+this blocksize   bs <  0 ? blocksize   bs
+this size   0
+this itrcursor   0
+this addcursor   0
+this numflushedblocks   0
+this tmpfile   null
+this currentwriteblock    row  new arraylist
+this currentreadblock   this currentwriteblock
+this firstreadblockpointer   currentreadblock
+this serde   null
+this standardoi   null
+this jc   jc
+if  reporter    null
+this reporter   reporter null
+else
+this reporter   reporter
+private jobconf getlocalfsjobconfclone configuration jc
+if  this jobcloneusinglocalfs    null
+this jobcloneusinglocalfs   new jobconf jc
+hiveconf setvar jobcloneusinglocalfs  hiveconf confvars hadoopfs  utilities hadoop_local_fs
+return this jobcloneusinglocalfs
+public void setserde serde sd  objectinspector oi
+this serde   sd
+this standardoi   oi
+@override
+public void add row t  throws hiveexception
+if  this tbldesc    null
+if  addcursor >  blocksize       spill the current block to tmp file
+spillblock currentwriteblock  addcursor
+addcursor   0
+if  numflushedblocks    1
+currentwriteblock    row  new arraylist
+currentwriteblock   t
+else if  t    null
+// the tabledesc will be null in the case that all columns in that table
+// is not used. we use a dummy row to denote all rows in that table, and
+// the dummy row is added by caller.
+this dummyrow   t
+size
+@override
+public row first   throws hiveexception
+if  size    0
+return null
+try
+firstcalled   true
+// when we reach here, we must have some data already (because size >0).
+// we need to see if there are any data flushed into file system. if not,
+// we can
+// directly read from the current write block. otherwise, we need to read
+// from the beginning of the underlying file.
+this itrcursor   0
+closewriter
+closereader
+if  tbldesc    null
+this itrcursor
+return dummyrow
+this currentreadblock   this firstreadblockpointer
+if  this numflushedblocks    0
+this readblocksize   this addcursor
+this currentreadblock   this currentwriteblock
+else
+jobconf localjc   getlocalfsjobconfclone jc
+if  inputsplits    null
+if  this inputformat    null
+inputformat    inputformat<writablecomparable  writable>  reflectionutils newinstance
+tbldesc getinputfileformatclass    localjc
+hiveconf setvar localjc  hiveconf confvars hadoopmapredinputdir
+org apache hadoop util stringutils escapestring parentfile getabsolutepath
+inputsplits   inputformat getsplits localjc  1
+acutalsplitnum   inputsplits length
+currentsplitpointer   0
+rr   inputformat getrecordreader inputsplits
+localjc  reporter
+currentsplitpointer
+nextblock
+// we are guaranteed that we can get data here (since 'size' is not zero)
+row ret   currentreadblock
+removekeys ret
+return ret
+catch  exception e
+throw new hiveexception e
+@override
+public row next   throws hiveexception
+if   firstcalled
+throw new runtimeexception
+if  size    0
+return null
+if  tbldesc    null
+if  this itrcursor < size
+this itrcursor
+return dummyrow
+return null
+row ret
+if  itrcursor < this readblocksize
+ret   this currentreadblock
+removekeys ret
+return ret
+else
+nextblock
+if  this readblocksize    0
+if  currentwriteblock    null    currentreadblock    currentwriteblock
+this itrcursor   0
+this readblocksize   this addcursor
+this firstreadblockpointer   this currentreadblock
+currentreadblock   currentwriteblock
+else
+return null
+return next
+private void removekeys row ret
+if  this keyobject    null    this currentreadblock    this currentwriteblock
+int len   this keyobject size
+int rowsize     arraylist  ret  size
+for  int i   0  i < len  i
+arraylist  ret  remove rowsize   i   1
+arraylist<object> row   new arraylist<object> 2
+private void spillblock row block  int length  throws hiveexception
+try
+if  tmpfile    null
+string suffix
+if  this keyobject    null
+suffix       this keyobject tostring     suffix
+while  true
+parentfile   file createtempfile
+boolean success   parentfile delete      parentfile mkdir
+if  success
+break
+log debug
+tmpfile   file createtempfile    suffix  parentfile
+log info     tmpfile getabsolutepath
+// delete the temp file if the jvm terminate normally through hadoop job
+// kill command.
+// caveat: it won't be deleted if jvm is killed by 'kill -9'.
+parentfile deleteonexit
+tmpfile deleteonexit
+// rfile = new randomaccessfile(tmpfile, "rw");
+hiveoutputformat<?  ?> hiveoutputformat   tbldesc getoutputfileformatclass   newinstance
+tempoutpath   new path tmpfile tostring
+jobconf localjc   getlocalfsjobconfclone jc
+rw   hivefileformatutils getrecordwriter this jobcloneusinglocalfs
+hiveoutputformat  serde getserializedclass    false
+tbldesc getproperties    tempoutpath  reporter
+else if  rw    null
+throw new hiveexception
+row clear
+row add null
+row add null
+if  this keyobject    null
+row set 1  this keyobject
+for  int i   0  i < length    i
+row currentvalrow   block
+row set 0  currentvalrow
+writable outval   serde serialize row  standardoi
+rw write outval
+else
+for  int i   0  i < length    i
+row currentvalrow   block
+writable outval   serde serialize currentvalrow  standardoi
+rw write outval
+if  block    this currentwriteblock
+this addcursor   0
+this numflushedblocks
+catch  exception e
+clear
+log error e tostring    e
+throw new hiveexception e
+/**
+* get the number of elements in the rowcontainer.
+*
+* @return number of elements in the rowcontainer
+*/
+@override
+public int size
+return size
+private boolean nextblock   throws hiveexception
+itrcursor   0
+this readblocksize   0
+if  this numflushedblocks    0
+return false
+try
+if  val    null
+val   serde getserializedclass   newinstance
+boolean nextsplit   true
+int i   0
+if  rr    null
+object key   rr createkey
+while  i < this currentreadblock length    rr next key  val
+nextsplit   false
+this currentreadblock    row  objectinspectorutils copytostandardobject serde
+deserialize val   serde getobjectinspector    objectinspectorcopyoption writable
+if  nextsplit    this currentsplitpointer < this acutalsplitnum
+jobconf localjc   getlocalfsjobconfclone jc
+// open record reader to read next split
+rr   inputformat getrecordreader inputsplits  jobcloneusinglocalfs
+reporter
+currentsplitpointer
+return nextblock
+this readblocksize   i
+return this readblocksize > 0
+catch  exception e
+log error e getmessage    e
+try
+this clear
+catch  hiveexception e1
+log error e getmessage    e
+throw new hiveexception e
+public void copytodfsdirecory filesystem destfs  path destpath  throws ioexception  hiveexception
+if  addcursor > 0
+this spillblock this currentwriteblock  addcursor
+if  tempoutpath    null    tempoutpath tostring   trim   equals
+return
+this closewriter
+log info     tmpfile getabsolutepath
+destpath tostring
+destfs
+copyfromlocalfile true  tempoutpath  new path destpath  new path tempoutpath getname
+clear
+/**
+* remove all elements in the rowcontainer.
+*/
+@override
+public void clear   throws hiveexception
+itrcursor   0
+addcursor   0
+numflushedblocks   0
+this readblocksize   0
+this acutalsplitnum   0
+this currentsplitpointer    1
+this firstcalled   false
+this inputsplits   null
+tempoutpath   null
+addcursor   0
+size   0
+try
+if  rw    null
+rw close false
+if  rr    null
+rr close
+catch  exception e
+log error e tostring
+throw new hiveexception e
+finally
+rw   null
+rr   null
+tmpfile   null
+deletelocalfile parentfile  true
+parentfile   null
+private void deletelocalfile file file  boolean recursive
+try
+if  file    null
+if   file exists
+return
+if  file isdirectory      recursive
+file files   file listfiles
+for  file file2   files
+deletelocalfile file2  true
+boolean deletesuccess   file delete
+if   deletesuccess
+log error     file getabsolutepath
+catch  exception e
+log error     file getabsolutepath    e
+private void closewriter   throws ioexception
+if  this rw    null
+this rw close false
+this rw   null
+private void closereader   throws ioexception
+if  this rr    null
+this rr close
+this rr   null
+public void setkeyobject list<object> dummykey
+this keyobject   dummykey
+public void settabledesc tabledesc tbldesc
+this tbldesc   tbldesc

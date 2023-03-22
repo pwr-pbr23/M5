@@ -1,0 +1,255 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase mapreduce
+import java io ioexception
+import java text parseexception
+import java text simpledateformat
+import java util map
+import java util treemap
+import org apache hadoop classification interfaceaudience
+import org apache hadoop classification interfacestability
+import org apache hadoop conf configuration
+import org apache hadoop conf configured
+import org apache hadoop fs path
+import org apache hadoop hbase hbaseconfiguration
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase client delete
+import org apache hadoop hbase client htable
+import org apache hadoop hbase client mutation
+import org apache hadoop hbase client put
+import org apache hadoop hbase io immutablebyteswritable
+import org apache hadoop hbase regionserver wal hlog
+import org apache hadoop hbase regionserver wal hlogkey
+import org apache hadoop hbase regionserver wal waledit
+import org apache hadoop hbase util bytes
+import org apache hadoop mapreduce job
+import org apache hadoop mapreduce mapper
+import org apache hadoop mapreduce lib input fileinputformat
+import org apache hadoop mapreduce lib output fileoutputformat
+import org apache hadoop util genericoptionsparser
+import org apache hadoop util tool
+import org apache hadoop util toolrunner
+/**
+* a tool to replay wal files as a m/r job.
+* the wal can be replayed for a set of tables or all tables,
+* and a timerange can be provided (in milliseconds).
+* the wal is filtered to the passed set of tables and  the output
+* can optionally be mapped to another set of tables.
+*
+* wal replay can also generate hfiles for later bulk importing,
+* in that case the wal is replayed for a single table only.
+*/
+@interfaceaudience public
+@interfacestability stable
+public class walplayer extends configured implements tool
+final static string name
+final static string bulk_output_conf_key
+final static string hlog_input_key
+final static string tables_key
+final static string table_map_key
+/**
+* a mapper that just writes out keyvalues.
+* this one can be used together with {@link keyvaluesortreducer}
+*/
+static class hlogkeyvaluemapper
+extends mapper<hlogkey  waledit  immutablebyteswritable  keyvalue>
+private byte table
+@override
+public void map hlogkey key  waledit value
+context context
+throws ioexception
+try
+// skip all other tables
+if  bytes equals table  key gettablename
+for  keyvalue kv   value getkeyvalues
+if  hlog ismetafamily kv getfamily     continue
+context write new immutablebyteswritable kv getrow     kv
+catch  interruptedexception e
+e printstacktrace
+@override
+public void setup context context  throws ioexception
+// only a single table is supported when hfiles are generated with hfileoutputformat
+string tables   context getconfiguration   getstrings tables_key
+if  tables    null    tables length    1
+// this can only happen when hlogmapper is used directly by a class other than walplayer
+throw new ioexception
+table   bytes tobytes tables
+/**
+* a mapper that writes out {@link mutation} to be directly applied to
+* a running hbase instance.
+*/
+static class hlogmapper
+extends mapper<hlogkey  waledit  immutablebyteswritable  mutation>
+private map<byte  byte> tables   new treemap<byte  byte> bytes bytes_comparator
+@override
+public void map hlogkey key  waledit value
+context context
+throws ioexception
+try
+if  tables isempty      tables containskey key gettablename
+byte targettable   tables isempty   ?
+key gettablename
+tables get key gettablename
+immutablebyteswritable tableout   new immutablebyteswritable targettable
+put put   null
+delete del   null
+keyvalue lastkv   null
+for  keyvalue kv   value getkeyvalues
+// filtering hlog meta entries, see hlog.completecacheflushlogedit
+if  hlog ismetafamily kv getfamily     continue
+// a waledit may contain multiple operations (hbase-3584) and/or
+// multiple rows (hbase-5229).
+// aggregate as much as possible into a single put/delete
+// operation before writing to the context.
+if  lastkv    null    lastkv gettype      kv gettype       lastkv matchingrow kv
+// row or type changed, write out aggregate kvs.
+if  put    null  context write tableout  put
+if  del    null  context write tableout  del
+if  kv isdelete
+del   new delete kv getrow
+else
+put   new put kv getrow
+if  kv isdelete
+del adddeletemarker kv
+else
+put add kv
+lastkv   kv
+// write residual kvs
+if  put    null  context write tableout  put
+if  del    null  context write tableout  del
+catch  interruptedexception e
+e printstacktrace
+@override
+public void setup context context  throws ioexception
+string tablemap   context getconfiguration   getstrings table_map_key
+string tablestouse   context getconfiguration   getstrings tables_key
+if  tablestouse    null    tablemap    null    tablestouse length    tablemap length
+// this can only happen when hlogmapper is used directly by a class other than walplayer
+throw new ioexception
+int i   0
+for  string table   tablestouse
+tables put bytes tobytes table   bytes tobytes tablemap
+/**
+* @param conf the {@link configuration} to use.
+*/
+public walplayer configuration conf
+super conf
+void setuptime configuration conf  string option  throws ioexception
+string val   conf get option
+if  val    null  return
+long ms
+try
+// first try to parse in user friendly form
+ms   new simpledateformat    parse val  gettime
+catch  parseexception pe
+try
+// then see if just a number of ms's was specified
+ms   long parselong val
+catch  numberformatexception nfe
+throw new ioexception option
+conf setlong option  ms
+/**
+* sets up the actual job.
+*
+* @param args  the command line parameters.
+* @return the newly created job.
+* @throws ioexception when setting up the job fails.
+*/
+public job createsubmittablejob string args
+throws ioexception
+configuration conf   getconf
+setuptime conf  hloginputformat start_time_key
+setuptime conf  hloginputformat end_time_key
+path inputdir   new path args
+string tables   args split
+string tablemap
+if  args length > 2
+tablemap   args split
+if  tablemap length    tables length
+throw new ioexception
+else
+// if not mapping is specified map each table to itself
+tablemap   tables
+conf setstrings tables_key  tables
+conf setstrings table_map_key  tablemap
+job job   new job conf  name       inputdir
+job setjarbyclass walplayer class
+fileinputformat setinputpaths job  inputdir
+job setinputformatclass hloginputformat class
+job setmapoutputkeyclass immutablebyteswritable class
+string hfileoutpath   conf get bulk_output_conf_key
+if  hfileoutpath    null
+// the bulk hfile case
+if  tables length    1
+throw new ioexception
+htable table   new htable conf  tables
+job setmapperclass hlogkeyvaluemapper class
+job setreducerclass keyvaluesortreducer class
+path outputdir   new path hfileoutpath
+fileoutputformat setoutputpath job  outputdir
+job setmapoutputvalueclass keyvalue class
+hfileoutputformat configureincrementalload job  table
+tablemapreduceutil adddependencyjars job getconfiguration
+com google common base preconditions class
+else
+// output to live cluster
+job setmapperclass hlogmapper class
+job setoutputformatclass multitableoutputformat class
+tablemapreduceutil adddependencyjars job
+// no reducers.
+job setnumreducetasks 0
+return job
+/*
+* @param errormsg error message.  can be null.
+*/
+private void usage final string errormsg
+if  errormsg    null    errormsg length   > 0
+system err println     errormsg
+system err println     name
+system err println
+system err println
+system err println
+system err println
+system err println
+system err println
+system err println
+system err println     name
+system err println
+system err println     bulk_output_conf_key
+system err println
+system err println
+system err println     hloginputformat start_time_key
+system err println     hloginputformat end_time_key
+system err println
+/**
+* main entry point.
+*
+* @param args  the command line parameters.
+* @throws exception when running the job fails.
+*/
+public static void main string args  throws exception
+int ret   toolrunner run new walplayer hbaseconfiguration create     args
+system exit ret
+@override
+public int run string args  throws exception
+string otherargs   new genericoptionsparser getconf    args  getremainingargs
+if  otherargs length < 2
+usage     otherargs length
+system exit  1
+job job   createsubmittablejob otherargs
+return job waitforcompletion true  ? 0   1

@@ -1,0 +1,1051 @@
+/*
+derby - class org.apache.derby.impl.store.raw.log.filelogger
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store raw log
+import org apache derby iapi reference sqlstate
+import org apache derby iapi reference messageid
+import org apache derby impl store raw log logcounter
+import org apache derby impl store raw log logrecord
+import org apache derby impl store raw log streamlogscan
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi store raw rawstorefactory
+import org apache derby iapi store raw log loginstant
+import org apache derby iapi store raw log logger
+import org apache derby iapi store raw log logscan
+import org apache derby iapi store raw xact rawtransaction
+import org apache derby iapi store raw xact transactionfactory
+import org apache derby iapi store raw xact transactionid
+import org apache derby iapi store raw compensation
+import org apache derby iapi store raw containerhandle
+import org apache derby iapi store raw lockingpolicy
+import org apache derby iapi store raw loggable
+import org apache derby iapi store raw page
+import org apache derby iapi store raw repreparable
+import org apache derby iapi store raw undoable
+import org apache derby iapi services io formatidoutputstream
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby iapi services i18n messageservice
+import org apache derby iapi services io arrayinputstream
+import org apache derby iapi services io arrayoutputstream
+import org apache derby iapi util bytearray
+import org apache derby iapi services io dynamicbytearrayoutputstream
+import org apache derby iapi services io limitobjectinput
+import java io ioexception
+import org apache derby impl store raw data initpageoperation
+/**
+write log records to a log file as a stream
+(ie. log records added to the end of the file, no concept of pages).
+<p>
+the format of a log record that is not a compensation operation is
+<pre>
+@format_id	no formatid, format is implied by the log file format and the
+log record content.
+@purpose	the log record and optional data
+@upgrade
+@disk_layout
+log record
+(see org.apache.derby.impl.store.raw.log.logrecord)
+length(int)	length of optional data
+optionaldata(byte[length]) optional data written by the log record
+@end_format
+</pre> <hr width="100%">
+<p>	the form of a log record that is a compensation operation is
+<pre>
+@format_id	no formatid, format is implied by the log file format and the
+log record content.
+@purpose	undo a previous log record
+@upgrade
+@disk_layout
+log record that contains the compenstation operation
+(see org.apache.derby.impl.store.raw.log.logrecord)
+undoinstant(long) the log instant of the operation that is to be rolled back
+the undo instant is logically part of the logrecord but is written
+by the logger because it is used and controlled by the rollback
+code but not by the log operation.
+there is no optional data in a compensation operation, all data
+necessary for the rollback must be stored in the operation being
+undone.
+@end_format
+</pre>
+<br>
+<p>multithreading considerations:<br>
+logger must be mt-safe.	each rawtransaction has its own private
+filelogger object. each logger has a logoutputbuffer and a log input
+buffer which are used to read and write to the log.  since multiple
+threads can be in the same transaction, filelogger must be synchronized.
+@see logrecord
+*/
+public class filelogger implements logger
+private logrecord		 logrecord
+protected byte encryptionbuffer
+private dynamicbytearrayoutputstream logoutputbuffer
+private formatidoutputstream logicalout
+private arrayinputstream login
+private logtofile logfactory 	   actually writes the log records
+/**
+make a new logger with its own log record buffers
+mt - not needed for constructor
+*/
+public filelogger logtofile logfactory
+this logfactory   logfactory
+logoutputbuffer   new dynamicbytearrayoutputstream 1024      init size 1k
+logicalout   new formatidoutputstream logoutputbuffer
+// login and logoutputbuffer must share the same buffer because they
+// combined to form an io stream to access the same log record.
+//
+// before each use of login, you must reset login's data to the
+// byte array you want to read from.
+//
+// to log a record, set login's data to point to logoutputbuffer's
+// byte array when you know you have everything you need in the output
+// buffer, then set limit on login and send it to the log operation's
+// dome.
+//
+// keep in mind the dynamic nature of the logoutputbuffer which means
+// it could switch buffer from underneath the logoutputbuffer on every
+// write.
+login   new arrayinputstream
+logrecord   new logrecord
+/**
+close the logger.
+mt - caller provide synchronization
+(resolve: not called by anyone ??)
+*/
+public void close   throws ioexception
+if  logoutputbuffer    null
+logoutputbuffer close
+logoutputbuffer   null
+login   null
+logfactory   null
+logicalout   null
+logrecord   null
+/*
+** methods of logger
+*/
+/**
+writes out a log record to the log stream, and call its dome method to
+apply the change to the rawstore.
+<br>any optional data the dome method need is first written to the log
+stream using operation.writeoptionaldata, then whatever is written to
+the log stream is passed back to the operation for the dome method.
+<p>mt - there could be multiple threads running in the same raw
+transactions and they can be calling the same logger to log different
+log operations.  this whole method is synchronized to make sure log
+records are logged one at a time.
+@param xact the transaction logging the change
+@param operation the log operation
+@return the instant in the log that can be used to identify the log
+record
+@exception standardexception cloudscape standard error policy
+*/
+public synchronized loginstant loganddo rawtransaction xact  loggable operation
+throws standardexception
+boolean islogprepared   false
+boolean inusercode   false
+byte preparedlog
+try
+logoutputbuffer reset
+// always use the short id, only the beginxact log record contains
+// the xactid (long form)
+transactionid transactionid   xact getid
+// write out the log header with the operation embedded
+// this is by definition not a compensation log record,
+// those are called thru the logandundo interface
+logrecord setvalue transactionid  operation
+inusercode   true
+logicalout writeobject logrecord
+inusercode   false
+int optionaldatalength   0
+int optionaldataoffset   0
+int completelength   0
+bytearray preparedlogarray   operation getpreparedlog
+if  preparedlogarray    null
+preparedlog   preparedlogarray getarray
+optionaldatalength   preparedlogarray getlength
+optionaldataoffset   preparedlogarray getoffset
+// there is a race condition if the operation is a begin tran in
+// that between the time the beginxact log record is written to
+// disk and the time the transaction object is updated in the
+// beginxact.dome method, other log records may be written.
+// this will render the transaction table in an inconsistent state
+// since it may think a later transaction is the earliest
+// transaction or it may think that there is no active transactions
+// where there is a bunch of them sitting on the log.
+//
+// similarly, there is a race condition for endxact, i.e.,
+// 1) endxact is written to the log,
+// 2) checkpoint gets that (committed) transaction as the
+//		firstupdatetransaction
+// 3) the transaction calls postcomplete, nulling out itself
+// 4) checkpoint tries to access a closed transaction object
+//
+// the solution is to sync between the time a begin tran or end
+// tran log record is sent to the log stream and its dome method is
+// called to update the transaction table and in memory state
+//
+// we only need to serialized the begin and end xact log records
+// because once a transaction has been started and in the
+// transaction table, its order and transaction state does not
+// change.
+//
+// use the logfactory as the sync object so that a checkpoint can
+// take its snap shot of the undolwm before or after a transaction
+// is started, but not in the middle. (see logtofile.checkpoint)
+//
+// now set the input limit to be the optional data.
+// this limits amount of data availiable to login that dome can
+// use
+login setdata preparedlog
+login setposition optionaldataoffset
+login setlimit optionaldatalength
+if  sanitymanager debug
+if   optionaldatalength     login available
+sanitymanager throwassert
+optionaldatalength
+login available
+else
+preparedlog   null
+optionaldatalength   0
+logicalout writeint optionaldatalength
+completelength   logoutputbuffer getposition     optionaldatalength
+loginstant loginstant   null
+int encryptedlength   0     in case of encryption  we need to pad
+try
+if  logfactory databaseencrypted
+// we must pad the encryption data to be multiple of block
+// size, which is logfactory.getencryptionblocksize()
+encryptedlength   completelength
+if   encryptedlength % logfactory getencryptionblocksize       0
+encryptedlength   encryptedlength   logfactory getencryptionblocksize      encryptedlength % logfactory getencryptionblocksize
+if  encryptionbuffer    null
+encryptionbuffer length < encryptedlength
+encryptionbuffer   new byte
+system arraycopy logoutputbuffer getbytearray    0
+encryptionbuffer  0  completelength optionaldatalength
+if  optionaldatalength > 0
+system arraycopy preparedlog  optionaldataoffset
+encryptionbuffer
+completelength optionaldatalength  optionaldatalength
+// do not bother to clear out the padding area
+int len
+logfactory encrypt encryptionbuffer  0  encryptedlength
+encryptionbuffer  0
+if  sanitymanager debug
+sanitymanager assert len    encryptedlength
+if   operation group      loggable first   loggable last      0
+synchronized  logfactory
+long instant   0
+if  logfactory databaseencrypted
+// encryption has completely drained both the the
+// logouputbuffer array and the preparedlog array
+instant   logfactory
+appendlogrecord encryptionbuffer  0
+encryptedlength  null
+1  0
+else
+instant   logfactory
+appendlogrecord logoutputbuffer getbytearray
+0  completelength  preparedlog
+optionaldataoffset
+optionaldatalength
+loginstant   new logcounter instant
+operation dome xact  loginstant  login
+else
+long instant   0
+if  logfactory databaseencrypted
+// encryption has completely drained both the the
+// logouputbuffer array and the preparedlog array
+instant   logfactory
+appendlogrecord encryptionbuffer  0
+encryptedlength  null   1  0
+else
+instant   logfactory
+appendlogrecord logoutputbuffer getbytearray    0
+completelength  preparedlog
+optionaldataoffset
+optionaldatalength
+loginstant   new logcounter instant
+operation dome xact  loginstant  login
+catch  standardexception se
+throw logfactory markcorrupt
+standardexception newexception
+sqlstate log_do_me_fail  se  operation
+catch  ioexception ioe
+throw logfactory markcorrupt
+standardexception newexception
+sqlstate log_do_me_fail  ioe  operation
+finally
+login clearlimit
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag
+transactionid tostring
+loginstant tostring
+completelength       operation
+return loginstant
+catch  ioexception ioe
+// error writing to the log buffer
+if  inusercode
+throw standardexception newexception
+sqlstate log_write_log_record  ioe  operation
+else
+throw standardexception newexception
+sqlstate log_buffer_full  ioe  operation
+/**
+writes out a compensation log record to the log stream, and call its
+dome method to undo the change of a previous log operation.
+<p>mt - not needed. a transaction must be single threaded thru undo, each
+rawtransaction has its own logger, therefore no need to synchronize.
+the rawtransaction must handle synchronizing with multiple threads
+during rollback.
+@param xact the transaction logging the change
+@param compensation the compensation log operation
+@param undoinstant the log instant of the operation that is to be
+rolled back
+@param in optional data input for the compenastion dome method
+@return the instant in the log that can be used to identify the log
+record
+@exception standardexception cloudscape standard error policy
+*/
+public loginstant logandundo rawtransaction xact
+compensation compensation
+loginstant undoinstant
+limitobjectinput in
+throws standardexception
+boolean inusercode   false
+try
+logoutputbuffer reset
+transactionid transactionid   xact getid
+// write out the log header with the operation embedded
+logrecord setvalue transactionid  compensation
+inusercode   true
+logicalout writeobject logrecord
+inusercode   false
+// write out the undoinstant
+logicalout writelong   logcounter undoinstant  getvalueaslong
+// in this implemetaion, there is no optional data for the
+// compensation operation.  optional data for the rollback comes
+// from the undoable operation - and is passed into this call.
+int completelength   logoutputbuffer getposition
+long instant   0
+if  logfactory databaseencrypted
+// we must pad the encryption data to be multiple of block
+// size, which is logfactory.getencryptionblocksize()
+int encryptedlength   completelength
+if   encryptedlength % logfactory getencryptionblocksize       0
+encryptedlength   encryptedlength   logfactory getencryptionblocksize      encryptedlength % logfactory getencryptionblocksize
+if  encryptionbuffer    null
+encryptionbuffer length < encryptedlength
+encryptionbuffer   new byte
+system arraycopy logoutputbuffer getbytearray    0
+encryptionbuffer  0  completelength
+// do not bother to clear out the padding area
+int len
+logfactory encrypt encryptionbuffer  0  encryptedlength
+encryptionbuffer  0
+if  sanitymanager debug
+sanitymanager assert len    encryptedlength
+instant   logfactory
+appendlogrecord encryptionbuffer
+0  encryptedlength  null  0  0
+else
+instant   logfactory
+appendlogrecord logoutputbuffer getbytearray
+0  completelength  null  0  0
+loginstant loginstant   new logcounter instant
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag
+transactionid tostring
+loginstant tostring
+undoinstant
+try
+// in and datalength contains optional data that was written
+// to the log during a previous call to loganddo.
+compensation dome xact  loginstant  in
+catch  standardexception se
+throw logfactory markcorrupt
+standardexception newexception
+sqlstate log_do_me_fail  se  compensation
+catch  ioexception ioe
+throw logfactory markcorrupt
+standardexception newexception
+sqlstate log_do_me_fail  ioe  compensation
+return loginstant
+catch  ioexception ioe
+if  inusercode
+throw standardexception newexception
+sqlstate log_write_log_record  ioe  compensation
+else
+throw standardexception newexception
+sqlstate log_buffer_full  ioe  compensation
+/**
+flush the log up to the given log instant.
+<p>mt - not needed, wrapper method
+@exception standardexception cannot sync log file
+*/
+public void flush loginstant where
+throws standardexception
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag      where tostring
+logfactory flush where
+/**
+flush all outstanding log to disk.
+<p>mt - not needed, wrapper method
+@exception standardexception cannot sync log file
+*/
+public void flushall    throws standardexception
+logfactory flushall
+/**
+* during recovery re-prepare a transaction.
+* <p>
+* after redo() and undo(), this routine is called on all outstanding
+* in-doubt (prepared) transactions.  this routine re-acquires all
+* logical write locks for operations in the xact, and then modifies
+* the transaction table entry to make the transaction look as if it
+* had just been prepared following startup after recovery.
+* <p>
+*
+* @param t                 is the transaction performing the re-prepare
+* @param prepareid         is the transaction id to be re-prepared
+* @param preparestopat     is where the log instant (inclusive) where the
+*                          re-prepare should stop.
+* @param preparestartat    is the log instant (inclusive) where re-prepare
+*                          should begin, this is normally the log instant
+*                          of the last log record of the transaction that
+*                          is to be re-prepare.  if null, then re-prepare
+*                          starts from the end of the log.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void reprepare
+rawtransaction  t
+transactionid   prepareid
+loginstant      preparestopat
+loginstant      preparestartat
+throws standardexception
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+if  preparestartat    null
+sanitymanager debug
+logtofile dbg_flag
+prepareid tostring
+preparestartat tostring
+preparestopat tostring
+else
+sanitymanager debug
+logtofile dbg_flag
+prepareid tostring
+preparestopat tostring
+// statistics
+int clrskipped        0
+int logrecordseen     0
+repreparable lop            null
+// stream to read the log record - initial size 4096, scanlog needs
+// to resize if the log record is larger than that.
+arrayinputstream    rawinput      null
+try
+streamlogscan scanlog
+if  preparestartat    null
+// don't know where to start, scan from end of log
+scanlog
+streamlogscan  logfactory openbackwardsscan preparestopat
+else
+if  preparestartat lessthan preparestopat
+// nothing to prepare!
+return
+scanlog    streamlogscan
+logfactory openbackwardsscan
+logcounter  preparestartat  getvalueaslong
+preparestopat
+if  sanitymanager debug
+sanitymanager assert
+scanlog    null
+rawinput      new arrayinputstream new byte
+logrecord record
+while   record
+scanlog getnextrecord rawinput  prepareid  0
+
+if  sanitymanager debug
+sanitymanager assert
+record gettransactionid   equals prepareid
+logrecordseen
+if  record isclr
+clrskipped
+// the loggable is still in the input stream, get rid of it
+record skiploggable
+// read the prepareinstant
+long prepareinstant   rawinput readlong
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag
+logcounter todebugstring prepareinstant
+scanlog resetposition new logcounter prepareinstant
+// scanlog now positioned at the beginning of the log
+// record that was rolled back by this clr.
+// the scan is a backward one so getnextrecord will skip
+// over the record that was rolled back and go to the one
+// previous to it
+continue
+if  record requirespreparelocks
+lop   record getrepreparable
+else
+continue
+if  lop    null
+// reget locks based on log record.  reclaim all locks with
+// a serializable locking policy, since we are only
+// reclaiming write locks, isolation level does not matter
+// much.
+lop reclaimpreparelocks
+t
+t newlockingpolicy
+lockingpolicy mode_record
+transactioncontroller isolation_repeatable_read
+true
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag
+scanlog getinstant         lop
+catch  classnotfoundexception cnfe
+throw logfactory markcorrupt
+standardexception newexception sqlstate log_corrupted  cnfe
+catch  ioexception ioe
+throw logfactory markcorrupt
+standardexception newexception
+sqlstate log_read_log_for_undo  ioe
+catch  standardexception se
+throw
+logfactory markcorrupt
+standardexception newexception
+sqlstate log_undo_failed  se
+prepareid  lop   object  null
+finally
+if  rawinput    null
+try
+rawinput close
+catch  ioexception ioe
+throw logfactory markcorrupt
+standardexception newexception
+sqlstate log_read_log_for_undo  ioe  prepareid
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+clrskipped
+logrecordseen
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag
+clrskipped
+logrecordseen
+/**
+undo a part of or the entire transaction.  begin rolling back the log
+record at undostartat and stopping at (inclusive) the log record at
+undostopat.
+<p>mt - not needed. a transaction must be single threaded thru undo,
+each rawtransaction has its own logger, therefore no need to
+synchronize.  the rawtransaction must handle synchronizing with
+multiple threads during rollback.
+@param t 			the transaction that needs to be rolled back
+@param undoid 		the transaction id
+@param undostopat	the last log record that should be rolled back
+@param undostartat	the first log record that should be rolled back
+@exception standardexception	standard cloudscape error policy
+@see logger#undo
+*/
+public void undo
+rawtransaction  t
+transactionid   undoid
+loginstant      undostopat
+loginstant      undostartat
+throws standardexception
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+if  undostartat    null
+sanitymanager debug
+logtofile dbg_flag
+undoid tostring
+undostartat tostring
+undostopat tostring
+else
+sanitymanager debug
+logtofile dbg_flag
+undoid tostring
+undostopat tostring
+// statistics
+int clrgenerated    0
+int clrskipped      0
+int logrecordseen   0
+streamlogscan scanlog
+compensation  compensation   null
+undoable      lop            null
+// stream to read the log record - initial size 4096, scanlog needs
+// to resize if the log record is larget than that.
+arrayinputstream    rawinput     null
+try
+if  undostartat    null
+// don't know where to start, rollback from end of log
+scanlog    streamlogscan
+logfactory openbackwardsscan undostopat
+else
+if  undostartat lessthan undostopat
+// nothing to undo!
+return
+long undostartinstant
+logcounter  undostartat  getvalueaslong
+scanlog    streamlogscan
+logfactory openbackwardsscan undostartinstant  undostopat
+if  sanitymanager debug
+sanitymanager assert
+scanlog    null
+rawinput     new arrayinputstream new byte
+logrecord record
+while   record
+scanlog getnextrecord rawinput  undoid  0
+
+if  sanitymanager debug
+sanitymanager assert
+record gettransactionid   equals undoid
+logrecordseen
+if  record isclr
+clrskipped
+// the loggable is still in the input stream, get rid of it
+record skiploggable
+// read the undoinstant
+long undoinstant   rawinput readlong
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag
+logcounter todebugstring undoinstant
+scanlog resetposition new logcounter undoinstant
+// scanlog now positioned at the beginning of the log
+// record that was rolled back by this clr.
+// the scan is a backward one so getnextrecord will skip
+// over the record that was rolled back and go to the one
+// previous to it
+continue
+lop   record getundoable
+if  lop    null
+int optionaldatalength   rawinput readint
+int saveposition   rawinput getposition
+rawinput setlimit saveposition  optionaldatalength
+compensation   lop generateundo t  rawinput
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag
+logcounter todebugstring scanlog getinstant
+lop
+clrgenerated
+if  compensation    null
+// generateundo may have read stuff off the
+// stream, reset it for the undo operation.
+rawinput setlimit saveposition  optionaldatalength
+// log the compensation op that rolls back the
+// operation at this instant
+t logandundo
+compensation  new logcounter scanlog getinstant
+rawinput
+compensation releaseresource t
+compensation   null
+// if compensation is null, log operation is redo only
+// if this is not an undoable operation, continue with next log
+// record
+catch  classnotfoundexception cnfe
+throw logfactory markcorrupt
+standardexception newexception sqlstate log_corrupted  cnfe
+catch  ioexception ioe
+throw logfactory markcorrupt
+standardexception newexception
+sqlstate log_read_log_for_undo  ioe
+catch  standardexception se
+// todo (4327) - exceptions caught here are nested in the exception
+// below but for some reason the nested exceptions are not logged
+// or reported in any way.
+throw logfactory markcorrupt
+standardexception newexception
+sqlstate log_undo_failed  se  undoid  lop  compensation
+finally
+if  compensation    null
+// errored out
+compensation releaseresource t
+if  rawinput    null
+try
+rawinput close
+catch  ioexception ioe
+throw logfactory markcorrupt
+standardexception newexception
+sqlstate log_read_log_for_undo  ioe  undoid
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag
+clrgenerated
+clrskipped
+logrecordseen
+/**
+recovery redo loop.
+<p> the log stream is scanned from the beginning (or
+from the undo low water mark of a checkpoint) forward until the end.
+the purpose of the redo pass is to repeat history, i.e, to repeat
+exactly the same set of changes the rawstore went thru right before it
+stopped.   with each log record that is encountered in the redo pass:
+<ol>
+<li>if it isfirst(), then the transaction factory is called upon to
+create a new transaction object.
+<li>if it needsredo(), its dome() is called (if it is a compensation
+operation, then the undoable operation needs to be created first
+before the dome is called).
+<li>if it iscomplete(), then the transaction object is closed.
+</ol>
+<p> mt - caller provides synchronization
+@param transfactory     - the transaction factory
+@param redolwm          - if checkpoint seen, starting from this point
+on, apply redo if necessary
+@return the log instant of the next log record (or the instant just
+after the last log record).  this is used to determine where the log
+truly ends
+@exception standardexception standard cloudscape error policy
+@exception ioexception error reading log file
+@exception classnotfoundexception log file corrupted
+@see logtofile#recover
+*/
+protected long redo
+rawtransaction      recoverytransaction
+transactionfactory  transfactory
+streamlogscan       redoscan
+long                redolwm
+long                ttabinstant
+throws ioexception  standardexception  classnotfoundexception
+// begin debug info
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag
+redolwm
+int scancount      0
+int redocount      0
+int preparecount   0
+int clrcount       0
+int btrancount     0
+int etrancount     0
+// end debug info
+transactionid tranid   null
+// the current log instant
+long instant   logcounter invalid_log_instant
+//////////////////////////////////////////////////////////////////////
+// during redo time, the byte array in the logoutputbuffer is not used.
+// use it to read the log record - if it is not big enough, scan
+// will resize it.  we could create a brand new log input stream that
+// has nothing to do with login or logoutputbuffer but that seem like
+// a waste of memory.
+//////////////////////////////////////////////////////////////////////
+login setdata logoutputbuffer getbytearray
+// use this scan to reconstitute operation to be undone
+// when we see a clr in the redo scan
+streamlogscan undoscan    null
+loggable      op          null
+long          logend      0      we need to determine the log's true end
+try
+// scan the log forward in redo pass and go to the end
+logrecord record
+while  record
+redoscan getnextrecord login  null  0
+
+scancount
+long undoinstant   0
+// last known good instant
+instant   redoscan getinstant
+// last known good log end
+logend   redoscan getlogrecordend
+// note note -- be very careful about the undoinstant, it is
+// read off the input stream in this debug section.
+// if we change the log format we will need to change the way
+// the undo instant is gotten.  also, once it is read off, it
+// should not be read from the stream any more
+// note note
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dump_log_only
+sanitymanager debug_on logtofile dbg_flag
+if  sanitymanager debug_on logtofile dump_log_only
+sanitymanager debug_set logtofile dbg_flag
+op   record getloggable
+tranid   record gettransactionid
+if  record isclr
+// !!!!!!! this moves the file pointer
+undoinstant   login readlong
+sanitymanager debug
+logtofile dbg_flag
+tranid       op
+logcounter todebugstring instant
+logcounter todebugstring undoinstant
+else
+sanitymanager debug
+logtofile dbg_flag
+tranid       op
+logcounter todebugstring instant
+logcounter todebugstring logend
+login getposition
+login available
+// we only want to dump the log, don't touch it
+if  sanitymanager debug_on logtofile dump_log_only
+continue
+// if the redo scan is between the undolwm and redolwm, we only
+// need to redo begin and end tran.  everything else has
+// already been flushed by checkpoint
+if  redolwm
+logcounter invalid_log_instant    instant < redolwm
+if    record isfirst
+record iscomplete
+record isprepare
+continue
+// get the transaction
+tranid   record gettransactionid
+// if this transaction is known to the transaction factory, make
+// the recoverytransaction assume its identitiy and properties
+// otherwise, make it known to the transaction factory
+if   transfactory findtransaction tranid  recoverytransaction
+// transaction not found
+if  redolwm    logcounter invalid_log_instant
+instant < redolwm
+record isprepare      record iscomplete
+// what is happening here is that a transaction that
+// started before the undolwm has commited by the time
+// the checkpoint undolwm was taken.  hence, we only
+// see the tail end of its log record and its endxact
+// record.
+//
+// note:
+// since we didn't see its beginxact, we cannot do the
+// endxact's dome either.  also if the endxact, is
+// actually just a prepare, we don't need to do
+// anything as the transaction will commit or abort
+// prior to point we are recovering to.
+// if it is deemed necessary to do the endxact's dome,
+// then we should start the transaction right here.
+// for now, just completely ignore this transaction
+//
+etrancount
+continue
+if   ttabinstant    logcounter invalid_log_instant
+record isfirst
+throw standardexception newexception
+sqlstate log_unexpected_recovery_problem
+messageservice gettextmessage messageid log_record_not_first tranid
+if  sanitymanager debug
+// if we dumped the transaction table but see a non
+// beginxact record after the transaction table dump
+// instant, error.
+if  ttabinstant    logcounter invalid_log_instant
+if  instant > ttabinstant     record isfirst
+sanitymanager throwassert
+tranid
+// if we dump the transaction table and the table
+// does not have the transaction, and we see this
+// beginxact before the ttab instant, we could have
+// igored it because we "know" that we should see
+// the endxact before the ttab instant also.
+// leave it in just in case.
+btrancount
+// the long transaction id is embedded in the beginxact log
+// record.  the short id is stored in the log record.
+recoverytransaction settransactionid
+record getloggable    tranid
+else
+// recoverytransaction found
+if   ttabinstant    logcounter invalid_log_instant
+record isfirst
+throw standardexception newexception
+sqlstate log_unexpected_recovery_problem
+messageservice gettextmessage messageid log_record_first
+tranid
+if  sanitymanager debug
+if  ttabinstant    logcounter invalid_log_instant
+instant > ttabinstant
+record isfirst
+sanitymanager throwassert
+tranid
+if  record isprepare
+preparecount
+// if we have a transaction table dumped with the
+// checkpoint log record, then during the redo scan we may
+// see the beginxact of a transaction which is already in
+// the transaction table, just ignore it if it is after the
+// redolwm but before the transaction table instant.  we
+// still need to redo any database changes but since the
+// transaction is already recorded in the transaction
+// table, ignore it.
+//
+if  record isfirst
+btrancount
+continue
+op   record getloggable
+if  sanitymanager debug
+if   record isclr
+if  login available   < 4
+sanitymanager throwassert
+login available
+op
+logcounter todebugstring instant
+if  sanitymanager debug
+sanitymanager assert
+recoverytransaction handlespostterminationwork
+if  op needsredo recoverytransaction
+redocount
+if  record isclr
+clrcount
+// the log operation is not complete, the operation to
+// undo is stashed away at the undoinstant.
+// reconstitute that first.
+if  sanitymanager debug
+sanitymanager assert op instanceof compensation
+// this value may be set by sanity xxxx
+if  undoinstant    0
+undoinstant   login readlong
+if  undoscan    null
+undoscan    streamlogscan
+logfactory openforwardsscan
+undoinstant  loginstant null
+else
+undoscan resetposition new logcounter undoinstant
+// undoscan now positioned at the beginning of the log
+// record was rolled back by this clr.
+// the scan is a forward one so getnextrecord will get
+// the log record that needs to be rolled back.
+// reuse the buffer in login and login since clr
+// has no optional data and has no use for them anymore
+login clearlimit
+logrecord undorecord
+undoscan getnextrecord login  null  0
+undoable undoop   undorecord getundoable
+if  sanitymanager debug
+sanitymanager debug
+logtofile dbg_flag
+logcounter todebugstring undoinstant
+logcounter todebugstring instant
+sanitymanager assert
+undorecord gettransactionid   equals tranid
+sanitymanager assert undoop    null
+compensation op  setundoop undoop
+// at this point, login points to the optional
+// data of the loggable that is to be redone or to be
+// rolled back
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag
+op
+logcounter todebugstring instant
+int datalength   login readint
+login setlimit login getposition    datalength
+// even though the log has already been written, we need to
+// tie the page to the log stream so that if redo failed
+// for some reasons, the log factory's corruption will stop
+// the corrupt page from flushing to disk.
+op dome
+recoverytransaction
+new logcounter instant   login
+op releaseresource recoverytransaction
+op   null
+// resolve: to speed up undo, may want to update the
+// lastloginstant in the transaction table.
+// right now, undo always start from the end of the log.
+// one last thing, if this is the last log record of the
+// transaction, then commit the transaction and clean up
+//
+// 'commit' even though the transaction maybe a rollback
+// because we already did all the rollback work when redoing
+// the clrs.  commit will only flush the log if this session
+// has written any transaction, so in this case, it is a noop.
+if  record iscomplete
+etrancount
+if  sanitymanager debug
+sanitymanager assert
+recoverytransaction handlespostterminationwork
+recoverytransaction commit
+while redoscan getnextrecord      null
+// if the scan ended in an empty file, update logend to reflect that
+// in order to avoid to continue logging to an older file
+long end   redoscan getlogrecordend
+if  end    logcounter invalid_log_instant
+logcounter getlogfilenumber logend
+< logcounter getlogfilenumber end
+logend   end
+catch  standardexception se
+throw standardexception newexception
+sqlstate log_redo_failed  se  op
+finally
+// close all the io streams
+redoscan close
+redoscan   null
+if  undoscan    null
+undoscan close
+undoscan   null
+if  op    null
+op releaseresource recoverytransaction
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag
+scancount
+redocount
+clrcount
+btrancount
+etrancount
+preparecount
+logcounter todebugstring logend
+if  sanitymanager debug
+// make sure logend and instant is consistent
+if  instant    logcounter invalid_log_instant
+sanitymanager assert
+logcounter getlogfilenumber instant  <
+logcounter getlogfilenumber logend
+logcounter getlogfilenumber instant
+logcounter getlogfilenumber logend
+logcounter getlogfileposition instant  <
+logcounter getlogfileposition logend
+else
+sanitymanager assert logend    logcounter invalid_log_instant
+// logend is the last good log record position in the log
+return logend
+/**
+read the next log record from the scan.
+<p>mt - caller must provide synchronization (right now, it is only
+called in recovery to find the checkpoint log record.  when this method
+is called by a more general audience, mt must be revisited).
+@param scan an opened log scan
+@param size estimated size of the log record
+@return the log operation that is the next in the scan, or null if no
+more log operation in the log scan
+@exception ioexception	error reading the log file
+@exception standardexception standard cloudscape error policy
+@exception classnotfoundexception log corrupted
+*/
+protected loggable readlogrecord streamlogscan scan  int size
+throws ioexception  standardexception  classnotfoundexception
+loggable lop   null
+arrayinputstream loginputbuffer   new arrayinputstream new byte
+logrecord record   scan getnextrecord loginputbuffer  null  0
+if  record    null
+lop   record getloggable
+return lop

@@ -1,0 +1,388 @@
+/*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase ipc
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop hbase security hbasesaslrpcclient
+import org apache hadoop hbase security hbasesaslrpcserver authmethod
+import org apache hadoop hbase security kerberosinfo
+import org apache hadoop hbase security tokeninfo
+import org apache hadoop hbase security user
+import org apache hadoop hbase security token authenticationtokenidentifier
+import org apache hadoop hbase security token authenticationtokenselector
+import org apache hadoop hbase util poolmap
+import org apache hadoop io
+import org apache hadoop ipc remoteexception
+import org apache hadoop net netutils
+import org apache hadoop security securityutil
+import org apache hadoop security usergroupinformation
+import org apache hadoop security token token
+import org apache hadoop security token tokenidentifier
+import org apache hadoop security token tokenselector
+import org apache hadoop util reflectionutils
+import javax net socketfactory
+import java io
+import java net
+import java security privilegedexceptionaction
+import java util hashmap
+import java util hashtable
+import java util iterator
+import java util map
+import java util map entry
+import java util random
+import java util concurrent concurrentskiplistmap
+import java util concurrent atomic atomicboolean
+import java util concurrent atomic atomiclong
+/**
+* a client for an ipc service, which support sasl authentication of connections
+* using either gssapi for kerberos authentication or digest-md5 for
+* authentication using signed tokens.
+*
+* <p>
+* this is a copy of org.apache.hadoop.ipc.client from secure hadoop,
+* reworked to remove code duplicated with
+* {@link org.apache.hadoop.hbase.hbaseclient}.  this is part of the loadable
+* {@link securerpcengine}, and only functions in connection with a
+* {@link secureserver} instance.
+* </p>
+*/
+public class secureclient extends hbaseclient
+private static final log log
+logfactory getlog
+protected static map<string tokenselector<? extends tokenidentifier>> tokenhandlers
+new hashmap<string tokenselector<? extends tokenidentifier>>
+static
+tokenhandlers put authenticationtokenidentifier auth_token_type tostring
+new authenticationtokenselector
+/** thread that reads responses and notifies callers.  each connection owns a
+* socket connected to a remote address.  calls are multiplexed through this
+* socket: responses may be delivered out of order. */
+protected class secureconnection extends connection
+private inetsocketaddress server                 server ip port
+private string serverprincipal      server's krb5 principal name
+private secureconnectionheader header                  connection header
+private authmethod authmethod     authentication method
+private boolean usesasl
+private token<? extends tokenidentifier> token
+private hbasesaslrpcclient saslrpcclient
+private int reloginmaxbackoff     max pause before relogin on sasl failure
+public secureconnection connectionid remoteid  throws ioexception
+super remoteid
+this server   remoteid getaddress
+user ticket   remoteid getticket
+class<?> protocol   remoteid getprotocol
+this usesasl   user issecurityenabled
+if  usesasl    protocol    null
+tokeninfo tokeninfo   protocol getannotation tokeninfo class
+if  tokeninfo    null
+tokenselector<? extends tokenidentifier> tokenselector
+tokenhandlers get tokeninfo value
+if  tokenselector    null
+token   tokenselector selecttoken new text clusterid
+ticket getugi   gettokens
+else if  log isdebugenabled
+log debug   tokeninfo value
+kerberosinfo krbinfo   protocol getannotation kerberosinfo class
+if  krbinfo    null
+string serverkey   krbinfo serverprincipal
+if  serverkey    null
+throw new ioexception
+serverprincipal   securityutil getserverprincipal
+conf get serverkey   server getaddress   getcanonicalhostname   tolowercase
+if  log isdebugenabled
+log debug
+protocol getcanonicalname         serverprincipal
+if   usesasl
+authmethod   authmethod simple
+else if  token    null
+authmethod   authmethod digest
+else
+authmethod   authmethod kerberos
+header   new secureconnectionheader
+protocol    null ? null   protocol getname    ticket  authmethod
+if  log isdebugenabled
+log debug     authmethod
+protocol getsimplename
+reloginmaxbackoff   conf getint    5000
+private synchronized void disposesasl
+if  saslrpcclient    null
+try
+saslrpcclient dispose
+saslrpcclient   null
+catch  ioexception ioe
+log info    ioe
+private synchronized boolean shouldauthenticateoverkrb   throws ioexception
+usergroupinformation loginuser   usergroupinformation getloginuser
+usergroupinformation currentuser
+usergroupinformation getcurrentuser
+usergroupinformation realuser   currentuser getrealuser
+return authmethod    authmethod kerberos
+loginuser    null
+//make sure user logged in using kerberos either keytab or tgt
+loginuser haskerberoscredentials
+// relogin only in case it is the login user (e.g. jt)
+// or superuser (like oozie).
+loginuser equals currentuser     loginuser equals realuser
+private synchronized boolean setupsaslconnection final inputstream in2
+final outputstream out2
+throws ioexception
+saslrpcclient   new hbasesaslrpcclient authmethod  token  serverprincipal
+return saslrpcclient saslconnect in2  out2
+/**
+* if multiple clients with the same principal try to connect
+* to the same server at the same time, the server assumes a
+* replay attack is in progress. this is a feature of kerberos.
+* in order to work around this, what is done is that the client
+* backs off randomly and tries to initiate the connection
+* again.
+* the other problem is to do with ticket expiry. to handle that,
+* a relogin is attempted.
+*/
+private synchronized void handlesaslconnectionfailure
+final int currretries
+final int maxretries  final exception ex  final random rand
+final user user
+throws ioexception  interruptedexception
+user runas new privilegedexceptionaction<object>
+public object run   throws ioexception  interruptedexception
+closeconnection
+if  shouldauthenticateoverkrb
+if  currretries < maxretries
+log debug
+ex
+//try re-login
+if  usergroupinformation isloginkeytabbased
+usergroupinformation getloginuser   reloginfromkeytab
+else
+usergroupinformation getloginuser   reloginfromticketcache
+disposesasl
+//have granularity of milliseconds
+//we are sleeping with the connection lock held but since this
+//connection instance is being used for connecting to the server
+//in question, it is okay
+thread sleep  rand nextint reloginmaxbackoff    1
+return null
+else
+string msg
+usergroupinformation getloginuser   getusername
+serverprincipal
+log warn msg
+throw  ioexception  new ioexception msg  initcause ex
+else
+log warn
+ex
+if  ex instanceof remoteexception
+throw  remoteexception ex
+throw new ioexception ex
+@override
+protected synchronized void setupiostreams
+throws ioexception  interruptedexception
+if  socket    null    shouldcloseconnection get
+return
+try
+if  log isdebugenabled
+log debug   server
+short numretries   0
+final short max_retries   5
+random rand   null
+while  true
+setupconnection
+inputstream instream   netutils getinputstream socket
+outputstream outstream   netutils getoutputstream socket
+writerpcheader outstream
+if  usesasl
+final inputstream in2   instream
+final outputstream out2   outstream
+user ticket   remoteid getticket
+if  authmethod    authmethod kerberos
+usergroupinformation ugi   ticket getugi
+if  ugi    null    ugi getrealuser      null
+ticket   user create ugi getrealuser
+boolean continuesasl   false
+try
+continuesasl
+ticket runas new privilegedexceptionaction<boolean>
+@override
+public boolean run   throws ioexception
+return setupsaslconnection in2  out2
+catch  exception ex
+if  rand    null
+rand   new random
+handlesaslconnectionfailure numretries    max_retries  ex  rand
+ticket
+continue
+if  continuesasl
+// sasl connect is successful. let's set up sasl i/o streams.
+instream   saslrpcclient getinputstream instream
+outstream   saslrpcclient getoutputstream outstream
+else
+// fall back to simple auth because server told us so.
+authmethod   authmethod simple
+header   new secureconnectionheader header getprotocol
+header getuser    authmethod
+usesasl   false
+this in   new datainputstream new bufferedinputstream
+new pinginputstream instream
+this out   new dataoutputstream
+new bufferedoutputstream outstream
+writeheader
+// update last activity time
+touch
+// start the receiver thread after the socket connection has been set up
+start
+return
+catch  ioexception e
+markclosed e
+close
+throw e
+/* write the rpc header */
+private void writerpcheader outputstream outstream  throws ioexception
+dataoutputstream out   new dataoutputstream new bufferedoutputstream outstream
+// write out the header, version and authentication method
+out write secureserver header array
+out write secureserver current_version
+authmethod write out
+out flush
+/**
+* write the protocol header for each connection
+* out is not synchronized because only the first thread does this.
+*/
+private void writeheader   throws ioexception
+// write out the connectionheader
+dataoutputbuffer buf   new dataoutputbuffer
+header write buf
+// write out the payload length
+int buflen   buf getlength
+out writeint buflen
+out write buf getdata    0  buflen
+@override
+protected void receiveresponse
+if  shouldcloseconnection get
+return
+touch
+try
+int id   in readint                          try to read an id
+if  log isdebugenabled
+log debug getname         id
+call call   calls remove id
+int state   in readint           read call status
+if  log isdebugenabled
+log debug   id     state
+if  state    status success state
+writable value   reflectionutils newinstance valueclass  conf
+value readfields in                      read value
+if  log isdebugenabled
+log debug   id   value tostring
+call setvalue value
+else if  state    status error state
+call setexception new remoteexception writableutils readstring in
+writableutils readstring in
+else if  state    status fatal state
+// close the connection
+markclosed new remoteexception writableutils readstring in
+writableutils readstring in
+catch  ioexception e
+if  e instanceof sockettimeoutexception    remoteid rpctimeout > 0
+// clean up open calls but don't treat this as a fatal condition,
+// since we expect certain responses to not make it by the specified
+// {@link connectionid#rpctimeout}.
+closeexception   e
+else
+// since the server did not respond within the default ping interval
+// time, treat this as a fatal condition and close this connection
+markclosed e
+finally
+if  remoteid rpctimeout > 0
+cleanupcalls remoteid rpctimeout
+/** close the connection. */
+protected synchronized void close
+if   shouldcloseconnection get
+log error
+return
+// release the resources
+// first thing to do;take the connection out of the connection list
+synchronized  connections
+if  connections get remoteid     this
+connections remove remoteid
+// close the streams and therefore the socket
+ioutils closestream out
+ioutils closestream in
+disposesasl
+// clean up all calls
+if  closeexception    null
+if   calls isempty
+log warn
+// clean up calls anyway
+closeexception   new ioexception
+cleanupcalls
+else
+// log the info
+if  log isdebugenabled
+log debug     server
+closeexception getmessage   closeexception
+// cleanup calls
+cleanupcalls
+if  log isdebugenabled
+log debug getname
+/**
+* construct an ipc client whose values are of the given {@link org.apache.hadoop.io.writable}
+* class.
+* @param valueclass value class
+* @param conf configuration
+* @param factory socket factory
+*/
+public secureclient class<? extends writable> valueclass  configuration conf
+socketfactory factory
+super valueclass  conf  factory
+/**
+* construct an ipc client with the default socketfactory
+* @param valueclass value class
+* @param conf configuration
+*/
+public secureclient class<? extends writable> valueclass  configuration conf
+this valueclass  conf  netutils getdefaultsocketfactory conf
+@override
+protected secureconnection getconnection inetsocketaddress addr
+class<? extends versionedprotocol> protocol
+user ticket
+int rpctimeout
+call call
+throws ioexception  interruptedexception
+if   running get
+// the client is stopped
+throw new ioexception
+secureconnection connection
+/* we could avoid this allocation for each rpc by having a
+* connectionsid object and with set() method. we need to manage the
+* refs for keys in hashmap properly. for now its ok.
+*/
+connectionid remoteid   new connectionid addr  protocol  ticket  rpctimeout
+do
+synchronized  connections
+connection    secureconnection connections get remoteid
+if  connection    null
+connection   new secureconnection remoteid
+connections put remoteid  connection
+while   connection addcall call
+//we don't invoke the method below inside "synchronized (connections)"
+//block above. the reason for that is if the server happens to be slow,
+//it will take longer to establish a connection and that will slow the
+//entire system down.
+connection setupiostreams
+return connection

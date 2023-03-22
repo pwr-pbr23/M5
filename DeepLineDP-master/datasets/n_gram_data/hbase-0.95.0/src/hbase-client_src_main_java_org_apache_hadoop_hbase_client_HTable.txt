@@ -1,0 +1,1128 @@
+/**
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase client
+import com google protobuf service
+import com google protobuf serviceexception
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop classification interfacestability
+import org apache hadoop conf configuration
+import org apache hadoop hbase cell
+import org apache hadoop hbase hbaseconfiguration
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase hregionlocation
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase keyvalueutil
+import org apache hadoop hbase servername
+import org apache hadoop hbase client hconnectionmanager hconnectable
+import org apache hadoop hbase client coprocessor batch
+import org apache hadoop hbase filter binarycomparator
+import org apache hadoop hbase ipc coprocessorrpcchannel
+import org apache hadoop hbase ipc payloadcarryingrpccontroller
+import org apache hadoop hbase ipc regioncoprocessorrpcchannel
+import org apache hadoop hbase protobuf protobufutil
+import org apache hadoop hbase protobuf requestconverter
+import org apache hadoop hbase protobuf generated clientprotos getrequest
+import org apache hadoop hbase protobuf generated clientprotos getresponse
+import org apache hadoop hbase protobuf generated clientprotos multigetrequest
+import org apache hadoop hbase protobuf generated clientprotos multigetresponse
+import org apache hadoop hbase protobuf generated clientprotos multirequest
+import org apache hadoop hbase protobuf generated clientprotos mutaterequest
+import org apache hadoop hbase protobuf generated clientprotos mutateresponse
+import org apache hadoop hbase protobuf generated hbaseprotos comparetype
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util pair
+import org apache hadoop hbase util threads
+import java io closeable
+import java io ioexception
+import java io interruptedioexception
+import java util arraylist
+import java util collections
+import java util hashmap
+import java util list
+import java util map
+import java util navigablemap
+import java util treemap
+import java util concurrent callable
+import java util concurrent executionexception
+import java util concurrent executorservice
+import java util concurrent future
+import java util concurrent synchronousqueue
+import java util concurrent threadpoolexecutor
+import java util concurrent timeunit
+/**
+* <p>used to communicate with a single hbase table.
+*
+* <p>this class is not thread safe for reads nor write.
+*
+* <p>in case of writes (put, delete), the underlying write buffer can
+* be corrupted if multiple threads contend over a single htable instance.
+*
+* <p>in case of reads, some fields used by a scan are shared among all threads.
+* the htable implementation can either not contract to be safe in case of a get
+*
+* <p>to access a table in a multi threaded environment, please consider
+* using the {@link htablepool} class to create your htable instances.
+*
+* <p>instances of htable passed the same {@link configuration} instance will
+* share connections to servers out on the cluster and to the zookeeper ensemble
+* as well as caches of region locations.  this is usually a *good* thing and it
+* is recommended to reuse the same configuration object for all your tables.
+* this happens because they will all share the same underlying
+* {@link hconnection} instance. see {@link hconnectionmanager} for more on
+* how this mechanism works.
+*
+* <p>{@link hconnection} will read most of the
+* configuration it needs from the passed {@link configuration} on initial
+* construction.  thereafter, for settings such as
+* <code>hbase.client.pause</code>, <code>hbase.client.retries.number</code>,
+* and <code>hbase.client.rpc.maxattempts</code> updating their values in the
+* passed {@link configuration} subsequent to {@link hconnection} construction
+* will go unnoticed.  to run with changed values, make a new
+* {@link htable} passing a new {@link configuration} instance that has the
+* new configuration.
+*
+* <p>note that this class implements the {@link closeable} interface. when a
+* htable instance is no longer required, it *should* be closed in order to ensure
+* that the underlying resources are promptly released. please note that the close
+* method can throw java.io.ioexception that must be handled.
+*
+* @see hbaseadmin for create, drop, list, enable and disable of tables.
+* @see hconnection
+* @see hconnectionmanager
+*/
+@interfaceaudience public
+@interfacestability stable
+public class htable implements htableinterface
+private static final log log   logfactory getlog htable class
+private hconnection connection
+private final byte  tablename
+private volatile configuration configuration
+private final arraylist<put> writebuffer   new arraylist<put>
+private long writebuffersize
+private boolean clearbufferonfail
+private boolean autoflush
+private long currentwritebuffersize
+protected int scannercaching
+private int maxkeyvaluesize
+private executorservice pool      for multi
+private boolean closed
+private int operationtimeout
+private final boolean cleanuppoolonclose     shutdown the pool in close
+private final boolean cleanupconnectiononclose     close the connection in close
+/**
+* creates an object to access a hbase table.
+* shares zookeeper connection and other resources with other htable instances
+* created with the same <code>conf</code> instance.  uses already-populated
+* region cache if one is available, populated by any other htable instances
+* sharing this <code>conf</code> instance.  recommended.
+* @param conf configuration object to use.
+* @param tablename name of the table.
+* @throws ioexception if a remote or network exception occurs
+*/
+public htable configuration conf  final string tablename
+throws ioexception
+this conf  bytes tobytes tablename
+/**
+* creates an object to access a hbase table.
+* shares zookeeper connection and other resources with other htable instances
+* created with the same <code>conf</code> instance.  uses already-populated
+* region cache if one is available, populated by any other htable instances
+* sharing this <code>conf</code> instance.  recommended.
+* @param conf configuration object to use.
+* @param tablename name of the table.
+* @throws ioexception if a remote or network exception occurs
+*/
+public htable configuration conf  final byte  tablename
+throws ioexception
+this tablename   tablename
+this cleanuppoolonclose   this cleanupconnectiononclose   true
+if  conf    null
+this connection   null
+return
+this connection   hconnectionmanager getconnection conf
+this configuration   conf
+int maxthreads   conf getint    integer max_value
+if  maxthreads    0
+maxthreads   1     is there a better default?
+long keepalivetime   conf getlong    60
+// using the "direct handoff" approach, new threads will only be created
+// if it is necessary and will grow unbounded. this could be bad but in hcm
+// we only create as many runnables as there are region servers. it means
+// it also scales when new region servers are added.
+this pool   new threadpoolexecutor 1  maxthreads  keepalivetime  timeunit seconds
+new synchronousqueue<runnable>    threads newdaemonthreadfactory
+threadpoolexecutor  this pool  allowcorethreadtimeout true
+this finishsetup
+/**
+* creates an object to access a hbase table.
+* shares zookeeper connection and other resources with other htable instances
+* created with the same <code>conf</code> instance.  uses already-populated
+* region cache if one is available, populated by any other htable instances
+* sharing this <code>conf</code> instance.
+* use this constructor when the executorservice is externally managed.
+* @param conf configuration object to use.
+* @param tablename name of the table.
+* @param pool executorservice to be used.
+* @throws ioexception if a remote or network exception occurs
+*/
+public htable configuration conf  final byte tablename  final executorservice pool
+throws ioexception
+this connection   hconnectionmanager getconnection conf
+this configuration   conf
+this pool   pool
+this tablename   tablename
+this cleanuppoolonclose   false
+this cleanupconnectiononclose   true
+this finishsetup
+/**
+* creates an object to access a hbase table.
+* shares zookeeper connection and other resources with other htable instances
+* created with the same <code>connection</code> instance.
+* use this constructor when the executorservice and hconnection instance are
+* externally managed.
+* @param tablename name of the table.
+* @param connection hconnection to be used.
+* @param pool executorservice to be used.
+* @throws ioexception if a remote or network exception occurs
+*/
+public htable final byte tablename  final hconnection connection
+final executorservice pool  throws ioexception
+if  pool    null    pool isshutdown
+throw new illegalargumentexception
+if  connection    null    connection isclosed
+throw new illegalargumentexception
+this tablename   tablename
+this cleanuppoolonclose   this cleanupconnectiononclose   false
+this connection   connection
+this configuration   connection getconfiguration
+this pool   pool
+this finishsetup
+/**
+* setup this htable's parameter based on the passed configuration
+*/
+private void finishsetup   throws ioexception
+this connection locateregion tablename  hconstants empty_start_row
+this operationtimeout   htabledescriptor ismetatable tablename  ? hconstants default_hbase_client_operation_timeout
+this configuration getint hconstants hbase_client_operation_timeout
+hconstants default_hbase_client_operation_timeout
+this writebuffersize   this configuration getlong
+2097152
+this clearbufferonfail   true
+this autoflush   true
+this currentwritebuffersize   0
+this scannercaching   this configuration getint
+hconstants hbase_client_scanner_caching
+hconstants default_hbase_client_scanner_caching
+this maxkeyvaluesize   this configuration getint
+1
+this closed   false
+/**
+* {@inheritdoc}
+*/
+@override
+public configuration getconfiguration
+return configuration
+/**
+* tells whether or not a table is enabled or not. this method creates a
+* new hbase configuration, so it might make your unit tests fail due to
+* incorrect zk client port.
+* @param tablename name of table to check.
+* @return {@code true} if table is online.
+* @throws ioexception if a remote or network exception occurs
+* @deprecated use {@link hbaseadmin#istableenabled(byte[])}
+*/
+@deprecated
+public static boolean istableenabled string tablename  throws ioexception
+return istableenabled bytes tobytes tablename
+/**
+* tells whether or not a table is enabled or not. this method creates a
+* new hbase configuration, so it might make your unit tests fail due to
+* incorrect zk client port.
+* @param tablename name of table to check.
+* @return {@code true} if table is online.
+* @throws ioexception if a remote or network exception occurs
+* @deprecated use {@link hbaseadmin#istableenabled(byte[])}
+*/
+@deprecated
+public static boolean istableenabled byte tablename  throws ioexception
+return istableenabled hbaseconfiguration create    tablename
+/**
+* tells whether or not a table is enabled or not.
+* @param conf the configuration object to use.
+* @param tablename name of table to check.
+* @return {@code true} if table is online.
+* @throws ioexception if a remote or network exception occurs
+* @deprecated use {@link hbaseadmin#istableenabled(byte[])}
+*/
+@deprecated
+public static boolean istableenabled configuration conf  string tablename
+throws ioexception
+return istableenabled conf  bytes tobytes tablename
+/**
+* tells whether or not a table is enabled or not.
+* @param conf the configuration object to use.
+* @param tablename name of table to check.
+* @return {@code true} if table is online.
+* @throws ioexception if a remote or network exception occurs
+* @deprecated use {@link hbaseadmin#istableenabled(byte[] tablename)}
+*/
+@deprecated
+public static boolean istableenabled configuration conf
+final byte tablename  throws ioexception
+return hconnectionmanager execute new hconnectable<boolean> conf
+@override
+public boolean connect hconnection connection  throws ioexception
+return connection istableenabled tablename
+/**
+* find region location hosting passed row using cached info
+* @param row row to find.
+* @return the location of the given row.
+* @throws ioexception if a remote or network exception occurs
+*/
+public hregionlocation getregionlocation final string row
+throws ioexception
+return connection getregionlocation tablename  bytes tobytes row   false
+/**
+* finds the region on which the given row is being served. does not reload the cache.
+* @param row row to find.
+* @return location of the row.
+* @throws ioexception if a remote or network exception occurs
+*/
+public hregionlocation getregionlocation final byte  row
+throws ioexception
+return connection getregionlocation tablename  row  false
+/**
+* finds the region on which the given row is being served.
+* @param row row to find.
+* @param reload true to reload information or false to use cached information
+* @return location of the row.
+* @throws ioexception if a remote or network exception occurs
+*/
+public hregionlocation getregionlocation final byte  row  boolean reload
+throws ioexception
+return connection getregionlocation tablename  row  reload
+/**
+* {@inheritdoc}
+*/
+@override
+public byte  gettablename
+return this tablename
+/**
+* <em>internal</em> used by unit tests and tools to do low-level
+* manipulations.
+* @return an hconnection instance.
+* @deprecated this method will be changed from public to package protected.
+*/
+// todo(tsuna): remove this.  unit tests shouldn't require public helpers.
+@deprecated
+public hconnection getconnection
+return this connection
+/**
+* gets the number of rows that a scanner will fetch at once.
+* <p>
+* the default value comes from {@code hbase.client.scanner.caching}.
+* @deprecated use {@link scan#setcaching(int)} and {@link scan#getcaching()}
+*/
+@deprecated
+public int getscannercaching
+return scannercaching
+/**
+* sets the number of rows that a scanner will fetch at once.
+* <p>
+* this will override the value specified by
+* {@code hbase.client.scanner.caching}.
+* increasing this value will reduce the amount of work needed each time
+* {@code next()} is called on a scanner, at the expense of memory use
+* (since more rows will need to be maintained in memory by the scanners).
+* @param scannercaching the number of rows a scanner will fetch at once.
+* @deprecated use {@link scan#setcaching(int)}
+*/
+@deprecated
+public void setscannercaching int scannercaching
+this scannercaching   scannercaching
+/**
+* {@inheritdoc}
+*/
+@override
+public htabledescriptor gettabledescriptor   throws ioexception
+return new unmodifyablehtabledescriptor
+this connection gethtabledescriptor this tablename
+/**
+* gets the starting row key for every region in the currently open table.
+* <p>
+* this is mainly useful for the mapreduce integration.
+* @return array of region starting row keys
+* @throws ioexception if a remote or network exception occurs
+*/
+public byte  getstartkeys   throws ioexception
+return getstartendkeys   getfirst
+/**
+* gets the ending row key for every region in the currently open table.
+* <p>
+* this is mainly useful for the mapreduce integration.
+* @return array of region ending row keys
+* @throws ioexception if a remote or network exception occurs
+*/
+public byte getendkeys   throws ioexception
+return getstartendkeys   getsecond
+/**
+* gets the starting and ending row keys for every region in the currently
+* open table.
+* <p>
+* this is mainly useful for the mapreduce integration.
+* @return pair of arrays of region starting and ending row keys
+* @throws ioexception if a remote or network exception occurs
+*/
+public pair<byte byte> getstartendkeys   throws ioexception
+navigablemap<hregioninfo  servername> regions   getregionlocations
+final list<byte> startkeylist   new arraylist<byte> regions size
+final list<byte> endkeylist   new arraylist<byte> regions size
+for  hregioninfo region   regions keyset
+startkeylist add region getstartkey
+endkeylist add region getendkey
+return new pair<byte   byte >
+startkeylist toarray new byte
+endkeylist toarray new byte
+/**
+* gets all the regions and their address for this table.
+* <p>
+* this is mainly useful for the mapreduce integration.
+* @return a map of hregioninfo with it's server address
+* @throws ioexception if a remote or network exception occurs
+*/
+public navigablemap<hregioninfo  servername> getregionlocations   throws ioexception
+// todo: odd that this returns a map of hri to sn whereas getregionlocation, singular, returns an hregionlocation.
+return metascanner alltableregions getconfiguration    gettablename    false
+/**
+* get the corresponding regions for an arbitrary range of keys.
+* <p>
+* @param startkey starting row in range, inclusive
+* @param endkey ending row in range, exclusive
+* @return a list of hregionlocations corresponding to the regions that
+* contain the specified range
+* @throws ioexception if a remote or network exception occurs
+*/
+public list<hregionlocation> getregionsinrange final byte  startkey
+final byte  endkey  throws ioexception
+final boolean endkeyisendoftable   bytes equals endkey
+hconstants empty_end_row
+if   bytes compareto startkey  endkey  > 0      endkeyisendoftable
+throw new illegalargumentexception
+bytes tostringbinary startkey
+bytes tostringbinary endkey
+final list<hregionlocation> regionlist   new arraylist<hregionlocation>
+byte  currentkey   startkey
+do
+hregionlocation regionlocation   getregionlocation currentkey  false
+regionlist add regionlocation
+currentkey   regionlocation getregioninfo   getendkey
+while   bytes equals currentkey  hconstants empty_end_row
+endkeyisendoftable    bytes compareto currentkey  endkey  < 0
+return regionlist
+/**
+* {@inheritdoc}
+*/
+@override
+public result getroworbefore final byte row  final byte family
+throws ioexception
+return new servercallable<result> connection  tablename  row  operationtimeout
+public result call   throws ioexception
+return protobufutil getroworbefore server
+location getregioninfo   getregionname    row  family
+withretries
+/**
+* {@inheritdoc}
+*/
+@override
+public resultscanner getscanner final scan scan  throws ioexception
+if  scan getcaching   <  0
+scan setcaching getscannercaching
+return new clientscanner getconfiguration    scan  gettablename
+this connection
+/**
+* {@inheritdoc}
+*/
+@override
+public resultscanner getscanner byte  family  throws ioexception
+scan scan   new scan
+scan addfamily family
+return getscanner scan
+/**
+* {@inheritdoc}
+*/
+@override
+public resultscanner getscanner byte  family  byte  qualifier
+throws ioexception
+scan scan   new scan
+scan addcolumn family  qualifier
+return getscanner scan
+/**
+* {@inheritdoc}
+*/
+@override
+public result get final get get  throws ioexception
+return new servercallable<result> connection  tablename  get getrow    operationtimeout
+public result call   throws ioexception
+return protobufutil get server
+location getregioninfo   getregionname    get
+withretries
+/**
+* {@inheritdoc}
+*/
+@override
+public result get list<get> gets  throws ioexception
+try
+object  r1   batch  list gets
+// translate.
+result  results   new result
+int i 0
+for  object o   r1
+// batch ensures if there is a failure we get an exception instead
+results    result  o
+return results
+catch  interruptedexception e
+throw new ioexception e
+@override
+public void batch final list<?extends row> actions  final object results
+throws interruptedexception  ioexception
+connection processbatchcallback actions  tablename  pool  results  null
+@override
+public object batch final list<? extends row> actions
+throws interruptedexception  ioexception
+object results   new object
+connection processbatchcallback actions  tablename  pool  results  null
+return results
+@override
+public <r> void batchcallback
+final list<? extends row> actions  final object results  final batch callback<r> callback
+throws ioexception  interruptedexception
+connection processbatchcallback actions  tablename  pool  results  callback
+@override
+public <r> object batchcallback
+final list<? extends row> actions  final batch callback<r> callback  throws ioexception
+interruptedexception
+object results   new object
+connection processbatchcallback actions  tablename  pool  results  callback
+return results
+/**
+* {@inheritdoc}
+*/
+@override
+public void delete final delete delete
+throws ioexception
+new servercallable<boolean> connection  tablename  delete getrow    operationtimeout
+public boolean call   throws ioexception
+try
+mutaterequest request   requestconverter buildmutaterequest
+location getregioninfo   getregionname    delete
+mutateresponse response   server mutate null  request
+return boolean valueof response getprocessed
+catch  serviceexception se
+throw protobufutil getremoteexception se
+withretries
+/**
+* {@inheritdoc}
+*/
+@override
+public void delete final list<delete> deletes
+throws ioexception
+object results   new object
+try
+connection processbatch  list  deletes  tablename  pool  results
+catch  interruptedexception e
+throw new ioexception e
+finally
+// mutate list so that it is empty for complete success, or contains only failed records
+// results are returned in the same order as the requests in list
+// walk the list backwards, so we can remove from list without impacting the indexes of earlier members
+for  int i   results length   1  i> 0  i
+// if result is not null, it succeeded
+if  results instanceof result
+deletes remove i
+/**
+* {@inheritdoc}
+*/
+@override
+public void put final put put  throws ioexception
+doput put
+if  autoflush
+flushcommits
+/**
+* {@inheritdoc}
+*/
+@override
+public void put final list<put> puts  throws ioexception
+for  put put   puts
+doput put
+if  autoflush
+flushcommits
+private void doput put put  throws ioexception
+validateput put
+writebuffer add put
+currentwritebuffersize    put heapsize
+if  currentwritebuffersize > writebuffersize
+flushcommits
+/**
+* {@inheritdoc}
+*/
+@override
+public void mutaterow final rowmutations rm  throws ioexception
+new servercallable<void> connection  tablename  rm getrow
+operationtimeout
+public void call   throws ioexception
+try
+multirequest request   requestconverter buildmultirequest
+location getregioninfo   getregionname    rm
+server multi null  request
+catch  serviceexception se
+throw protobufutil getremoteexception se
+return null
+withretries
+/**
+* {@inheritdoc}
+*/
+@override
+public result append final append append  throws ioexception
+if  append numfamilies      0
+throw new ioexception
+return new servercallable<result> connection  tablename  append getrow    operationtimeout
+public result call   throws ioexception
+try
+mutaterequest request   requestconverter buildmutaterequest
+location getregioninfo   getregionname    append
+payloadcarryingrpccontroller rpccontroller
+new payloadcarryingrpccontroller
+mutateresponse response   server mutate rpccontroller  request
+if   response hasresult    return null
+return protobufutil toresult response getresult    rpccontroller cellscanner
+catch  serviceexception se
+throw protobufutil getremoteexception se
+withretries
+/**
+* {@inheritdoc}
+*/
+@override
+public result increment final increment increment  throws ioexception
+if   increment hasfamilies
+throw new ioexception
+return new servercallable<result> connection  tablename  increment getrow    operationtimeout
+public result call   throws ioexception
+try
+mutaterequest request   requestconverter buildmutaterequest
+location getregioninfo   getregionname    increment
+payloadcarryingrpccontroller rpccontoller   new payloadcarryingrpccontroller
+mutateresponse response   server mutate rpccontoller  request
+return protobufutil toresult response getresult    rpccontoller cellscanner
+catch  serviceexception se
+throw protobufutil getremoteexception se
+withretries
+/**
+* {@inheritdoc}
+*/
+@override
+public long incrementcolumnvalue final byte  row  final byte  family
+final byte  qualifier  final long amount
+throws ioexception
+return incrementcolumnvalue row  family  qualifier  amount  true
+/**
+* {@inheritdoc}
+*/
+@override
+public long incrementcolumnvalue final byte  row  final byte  family
+final byte  qualifier  final long amount  final boolean writetowal
+throws ioexception
+nullpointerexception npe   null
+if  row    null
+npe   new nullpointerexception
+else if  family    null
+npe   new nullpointerexception
+else if  qualifier    null
+npe   new nullpointerexception
+if  npe    null
+throw new ioexception
+npe
+return new servercallable<long> connection  tablename  row  operationtimeout
+public long call   throws ioexception
+try
+mutaterequest request   requestconverter buildmutaterequest
+location getregioninfo   getregionname    row  family
+qualifier  amount  writetowal
+payloadcarryingrpccontroller rpccontroller   new payloadcarryingrpccontroller
+mutateresponse response   server mutate rpccontroller  request
+result result
+protobufutil toresult response getresult    rpccontroller cellscanner
+return long valueof bytes tolong result getvalue family  qualifier
+catch  serviceexception se
+throw protobufutil getremoteexception se
+withretries
+/**
+* {@inheritdoc}
+*/
+@override
+public boolean checkandput final byte  row
+final byte  family  final byte  qualifier  final byte  value
+final put put
+throws ioexception
+return new servercallable<boolean> connection  tablename  row  operationtimeout
+public boolean call   throws ioexception
+try
+mutaterequest request   requestconverter buildmutaterequest
+location getregioninfo   getregionname    row  family  qualifier
+new binarycomparator value   comparetype equal  put
+mutateresponse response   server mutate null  request
+return boolean valueof response getprocessed
+catch  serviceexception se
+throw protobufutil getremoteexception se
+withretries
+/**
+* {@inheritdoc}
+*/
+@override
+public boolean checkanddelete final byte  row
+final byte  family  final byte  qualifier  final byte  value
+final delete delete
+throws ioexception
+return new servercallable<boolean> connection  tablename  row  operationtimeout
+public boolean call   throws ioexception
+try
+mutaterequest request   requestconverter buildmutaterequest
+location getregioninfo   getregionname    row  family  qualifier
+new binarycomparator value   comparetype equal  delete
+mutateresponse response   server mutate null  request
+return boolean valueof response getprocessed
+catch  serviceexception se
+throw protobufutil getremoteexception se
+withretries
+/**
+* {@inheritdoc}
+*/
+@override
+public boolean exists final get get  throws ioexception
+return new servercallable<boolean> connection  tablename  get getrow    operationtimeout
+public boolean call   throws ioexception
+try
+getrequest request   requestconverter buildgetrequest
+location getregioninfo   getregionname    get  true
+getresponse response   server get null  request
+return response getexists
+catch  serviceexception se
+throw protobufutil getremoteexception se
+withretries
+/**
+* goal of this inner class is to keep track of the initial position of a get in a list before
+* sorting it. this is used to send back results in the same orders we got the gets before we sort
+* them.
+*/
+private static class sortedget implements comparable<sortedget>
+protected int initialindex    1     used to store the get initial index in a list
+protected get get     encapsulated get instance
+public sortedget  get get  int initialindex
+this get   get
+this initialindex   initialindex
+public int getinitialindex
+return initialindex
+@override
+public int compareto sortedget o
+return get compareto o get
+public get getget
+return get
+@override
+public int hashcode
+return get hashcode
+@override
+public boolean equals object obj
+if  obj instanceof sortedget
+return get equals   sortedget obj  get
+else
+return false
+/**
+* {@inheritdoc}
+*/
+@override
+public boolean exists final list<get> gets  throws ioexception
+// prepare the sorted list of gets. take the list of gets received, and encapsulate them into
+// a list of sortedget instances. simple list parsing, so complexity here is o(n)
+// the list is later used to recreate the response order based on the order the gets
+// got received.
+arraylist<sortedget> sortedgetslist   new arraylist<htable sortedget>
+for  int indexget   0  indexget < gets size    indexget
+sortedgetslist add new sortedget  gets get indexget   indexget
+// sorting the list to get the gets ordered based on the key.
+collections sort sortedgetslist      o n log n
+// step 1: sort the requests by regions to send them bundled.
+// map key is startkey index. map value is the list of gets related to the region starting
+// with the startkey.
+map<integer  list<get>> getsbyregion   new hashmap<integer  list<get>>
+// reference map to quickly find back in which region a get belongs.
+map<get  integer> gettoregionindexmap   new hashmap<get  integer>
+pair<byte  byte> startendkeys   getstartendkeys
+int regionindex   0
+for  final sortedget get   sortedgetslist
+// progress on the regions until we find the one the current get resides in.
+while   regionindex < startendkeys getsecond   length       bytes compareto startendkeys getsecond    get getget   getrow    <  0
+regionindex
+list<get> regiongets   getsbyregion get regionindex
+if  regiongets    null
+regiongets   new arraylist<get>
+getsbyregion put regionindex  regiongets
+regiongets add get getget
+gettoregionindexmap put get getget    regionindex
+// step 2: make the requests
+map<integer  future<list<boolean>>> futures
+new hashmap<integer  future<list<boolean>>> sortedgetslist size
+for  final map entry<integer  list<get>> getsbyregionentry   getsbyregion entryset
+callable<list<boolean>> callable   new callable<list<boolean>>
+public list<boolean> call   throws exception
+return new servercallable<list<boolean>> connection  tablename  getsbyregionentry getvalue
+get 0  getrow    operationtimeout
+public list<boolean> call   throws ioexception
+try
+multigetrequest requests   requestconverter buildmultigetrequest location
+getregioninfo   getregionname    getsbyregionentry getvalue    true  false
+multigetresponse responses   server multiget null  requests
+return responses getexistslist
+catch  serviceexception se
+throw protobufutil getremoteexception se
+withretries
+futures put getsbyregionentry getkey    pool submit callable
+// step 3: collect the failures and successes
+map<integer  list<boolean>> responses   new hashmap<integer  list<boolean>>
+for  final map entry<integer  list<get>> sortedgetentry   getsbyregion entryset
+try
+future<list<boolean>> future   futures get sortedgetentry getkey
+list<boolean> resp   future get
+if  resp    null
+log warn     sortedgetentry getkey
+responses put sortedgetentry getkey    resp
+catch  executionexception e
+log warn     sortedgetentry getkey
+catch  interruptedexception e
+log warn     sortedgetentry getkey
+thread currentthread   interrupt
+boolean results   new boolean
+// step 4: build the response.
+map<integer  integer> indexes   new hashmap<integer  integer>
+for  int i   0  i < sortedgetslist size    i
+integer regioninfoindex   gettoregionindexmap get sortedgetslist get i  getget
+integer index   indexes get regioninfoindex
+if  index    null
+index   0
+results   responses get regioninfoindex  get index
+indexes put regioninfoindex  index   1
+return results
+/**
+* {@inheritdoc}
+*/
+@override
+public void flushcommits   throws ioexception
+if  writebuffer isempty
+// early exit: we can be called on empty buffers.
+return
+object results   new object
+boolean success   false
+try
+this connection processbatch writebuffer  tablename  pool  results
+success   true
+catch  interruptedexception e
+throw new interruptedioexception e getmessage
+finally
+// mutate list so that it is empty for complete success, or contains
+// only failed records. results are returned in the same order as the
+// requests in list. walk the list backwards, so we can remove from list
+// without impacting the indexes of earlier members
+currentwritebuffersize   0
+if  success    clearbufferonfail
+writebuffer clear
+else
+for  int i   results length   1  i >  0  i
+if  results instanceof result
+writebuffer remove i
+else
+currentwritebuffersize    writebuffer get i  heapsize
+/**
+* process a mixed batch of get, put and delete actions. all actions for a
+* regionserver are forwarded in one rpc call. queries are executed in parallel.
+*
+* @param list the collection of actions.
+* @param results an empty array, same size as list. if an exception is thrown,
+* you can test here for partial results, and to determine which actions
+* processed successfully.
+* @throws ioexception if there are problems talking to meta. per-item
+* exceptions are stored in the results array.
+*/
+public <r> void processbatchcallback
+final list<? extends row> list  final object results  final batch callback<r> callback
+throws ioexception  interruptedexception
+connection processbatchcallback list  tablename  pool  results  callback
+/**
+* parameterized batch processing, allowing varying return types for different
+* {@link row} implementations.
+*/
+public void processbatch final list<? extends row> list  final object results
+throws ioexception  interruptedexception
+this processbatchcallback list  results  null
+@override
+public void close   throws ioexception
+if  this closed
+return
+flushcommits
+if  cleanuppoolonclose
+this pool shutdown
+if  cleanupconnectiononclose
+if  this connection    null
+this connection close
+this closed   true
+// validate for well-formedness
+public void validateput final put put  throws illegalargumentexception
+if  put isempty
+throw new illegalargumentexception
+if  maxkeyvaluesize > 0
+for  list<? extends cell> list   put getfamilymap   values
+for  cell cell   list
+// keyvalue v1 expectation.  cast for now.
+keyvalue kv   keyvalueutil ensurekeyvalue cell
+if  kv getlength   > maxkeyvaluesize
+throw new illegalargumentexception
+/**
+* {@inheritdoc}
+*/
+@override
+public boolean isautoflush
+return autoflush
+/**
+* see {@link #setautoflush(boolean, boolean)}
+*
+* @param autoflush
+*          whether or not to enable 'auto-flush'.
+*/
+public void setautoflush boolean autoflush
+setautoflush autoflush  autoflush
+/**
+* turns 'auto-flush' on or off.
+* <p>
+* when enabled (default), {@link put} operations don't get buffered/delayed
+* and are immediately executed. failed operations are not retried. this is
+* slower but safer.
+* <p>
+* turning off {@link #autoflush} means that multiple {@link put}s will be
+* accepted before any rpc is actually sent to do the write operations. if the
+* application dies before pending writes get flushed to hbase, data will be
+* lost.
+* <p>
+* when you turn {@link #autoflush} off, you should also consider the
+* {@link #clearbufferonfail} option. by default, asynchronous {@link put}
+* requests will be retried on failure until successful. however, this can
+* pollute the writebuffer and slow down batching performance. additionally,
+* you may want to issue a number of put requests and call
+* {@link #flushcommits()} as a barrier. in both use cases, consider setting
+* clearbufferonfail to true to erase the buffer after {@link #flushcommits()}
+* has been called, regardless of success.
+*
+* @param autoflush
+*          whether or not to enable 'auto-flush'.
+* @param clearbufferonfail
+*          whether to keep put failures in the writebuffer
+* @see #flushcommits
+*/
+public void setautoflush boolean autoflush  boolean clearbufferonfail
+this autoflush   autoflush
+this clearbufferonfail   autoflush    clearbufferonfail
+/**
+* returns the maximum size in bytes of the write buffer for this htable.
+* <p>
+* the default value comes from the configuration parameter
+* {@code hbase.client.write.buffer}.
+* @return the size of the write buffer in bytes.
+*/
+public long getwritebuffersize
+return writebuffersize
+/**
+* sets the size of the buffer in bytes.
+* <p>
+* if the new size is less than the current amount of data in the
+* write buffer, the buffer gets flushed.
+* @param writebuffersize the new write buffer size, in bytes.
+* @throws ioexception if a remote or network exception occurs.
+*/
+public void setwritebuffersize long writebuffersize  throws ioexception
+this writebuffersize   writebuffersize
+if currentwritebuffersize > writebuffersize
+flushcommits
+/**
+* returns the write buffer.
+* @return the current write buffer.
+*/
+public arraylist<put> getwritebuffer
+return writebuffer
+/**
+* the pool is used for mutli requests for this htable
+* @return the pool used for mutli
+*/
+executorservice getpool
+return this pool
+/**
+* enable or disable region cache prefetch for the table. it will be
+* applied for the given table's all htable instances who share the same
+* connection. by default, the cache prefetch is enabled.
+* @param tablename name of table to configure.
+* @param enable set to true to enable region cache prefetch. or set to
+* false to disable it.
+* @throws ioexception
+*/
+public static void setregioncacheprefetch final byte tablename
+final boolean enable  throws ioexception
+hconnectionmanager execute new hconnectable<void> hbaseconfiguration
+create
+@override
+public void connect hconnection connection  throws ioexception
+connection setregioncacheprefetch tablename  enable
+return null
+/**
+* enable or disable region cache prefetch for the table. it will be
+* applied for the given table's all htable instances who share the same
+* connection. by default, the cache prefetch is enabled.
+* @param conf the configuration object to use.
+* @param tablename name of table to configure.
+* @param enable set to true to enable region cache prefetch. or set to
+* false to disable it.
+* @throws ioexception
+*/
+public static void setregioncacheprefetch final configuration conf
+final byte tablename  final boolean enable  throws ioexception
+hconnectionmanager execute new hconnectable<void> conf
+@override
+public void connect hconnection connection  throws ioexception
+connection setregioncacheprefetch tablename  enable
+return null
+/**
+* check whether region cache prefetch is enabled or not for the table.
+* @param conf the configuration object to use.
+* @param tablename name of table to check
+* @return true if table's region cache prefecth is enabled. otherwise
+* it is disabled.
+* @throws ioexception
+*/
+public static boolean getregioncacheprefetch final configuration conf
+final byte tablename  throws ioexception
+return hconnectionmanager execute new hconnectable<boolean> conf
+@override
+public boolean connect hconnection connection  throws ioexception
+return connection getregioncacheprefetch tablename
+/**
+* check whether region cache prefetch is enabled or not for the table.
+* @param tablename name of table to check
+* @return true if table's region cache prefecth is enabled. otherwise
+* it is disabled.
+* @throws ioexception
+*/
+public static boolean getregioncacheprefetch final byte tablename  throws ioexception
+return hconnectionmanager execute new hconnectable<boolean>
+hbaseconfiguration create
+@override
+public boolean connect hconnection connection  throws ioexception
+return connection getregioncacheprefetch tablename
+/**
+* explicitly clears the region cache to fetch the latest value from meta.
+* this is a power user function: avoid unless you know the ramifications.
+*/
+public void clearregioncache
+this connection clearregioncache
+/**
+* {@inheritdoc}
+*/
+public coprocessorrpcchannel coprocessorservice byte row
+return new regioncoprocessorrpcchannel connection  tablename  row
+/**
+* {@inheritdoc}
+*/
+@override
+public <t extends service  r> map<byte r> coprocessorservice final class<t> service
+byte startkey  byte endkey  final batch call<t r> callable
+throws serviceexception  throwable
+final map<byte r> results    collections synchronizedmap
+new treemap<byte  r> bytes bytes_comparator
+coprocessorservice service  startkey  endkey  callable  new batch callback<r>
+public void update byte region  byte row  r value
+results put region  value
+return results
+/**
+* {@inheritdoc}
+*/
+@override
+public <t extends service  r> void coprocessorservice final class<t> service
+byte startkey  byte endkey  final batch call<t r> callable
+final batch callback<r> callback  throws serviceexception  throwable
+// get regions covered by the row range
+list<byte> keys   getstartkeysinrange startkey  endkey
+map<byte future<r>> futures
+new treemap<byte future<r>> bytes bytes_comparator
+for  final byte r   keys
+final regioncoprocessorrpcchannel channel
+new regioncoprocessorrpcchannel connection  tablename  r
+future<r> future   pool submit
+new callable<r>
+public r call   throws exception
+t instance   protobufutil newservicestub service  channel
+r result   callable call instance
+byte region   channel getlastregion
+if  callback    null
+callback update region  r  result
+return result
+futures put r  future
+for  map entry<byte future<r>> e   futures entryset
+try
+e getvalue   get
+catch  executionexception ee
+log warn     service getname
+bytes tostringbinary e getkey     ee
+throw ee getcause
+catch  interruptedexception ie
+thread currentthread   interrupt
+throw new interruptedioexception     service getname
+bytes tostringbinary e getkey
+initcause ie
+private list<byte> getstartkeysinrange byte start  byte end
+throws ioexception
+pair<byte byte> startendkeys   getstartendkeys
+byte startkeys   startendkeys getfirst
+byte endkeys   startendkeys getsecond
+if  start    null
+start   hconstants empty_start_row
+if  end    null
+end   hconstants empty_end_row
+list<byte> rangekeys   new arraylist<byte>
+for  int i 0  i<startkeys length  i
+if  bytes compareto start  startkeys  >  0
+if  bytes equals endkeys  hconstants empty_end_row
+bytes compareto start  endkeys  < 0
+rangekeys add start
+else if  bytes equals end  hconstants empty_end_row
+bytes compareto startkeys  end  <  0
+rangekeys add startkeys
+else
+break     past stop
+return rangekeys
+public void setoperationtimeout int operationtimeout
+this operationtimeout   operationtimeout
+public int getoperationtimeout
+return operationtimeout

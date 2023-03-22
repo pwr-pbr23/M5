@@ -1,0 +1,846 @@
+/*
+derby - class org.apache.derby.impl.store.raw.log.scan
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store raw log
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services io arrayinputstream
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby iapi store raw log loginstant
+import org apache derby iapi store raw xact transactionid
+import org apache derby impl store raw log logcounter
+import org apache derby impl store raw log logrecord
+import org apache derby impl store raw log streamlogscan
+import org apache derby io storagerandomaccessfile
+import java io ioexception
+import org apache derby iapi store raw loggable
+/**
+scan the the log which is implemented by a series of log files.n
+this log scan knows how to move across log file if it is positioned at
+the boundary of a log file and needs to getnextrecord.
+<pre>
+4 bytes - length of user data, i.e. n
+8 bytes - long representing log instant
+n bytes of supplied data
+4 bytes - length of user data, i.e. n
+</pre>
+*/
+public class scan implements streamlogscan
+// value for scandirection
+public static final byte forward   1
+public static final byte backward   2
+public static final byte backward_from_log_end   4
+private storagerandomaccessfile scan 		   an output stream to the log file
+private logtofile logfactory  		   log factory knows how to to skip
+// from log file to log file
+private long currentlogfilenumber  	   the log file the scan is currently on
+private long currentlogfilelength 	   the size of the current log file
+// used only for forward scan to determine when
+// to switch the next log file
+private long knowngoodlogend     for forward scan only
+// during recovery, we need to determine the end
+// of the log.  everytime a complete log record
+// is read in, knowngoodlogend is set to the
+// log instant of the next log record if it is
+// on the same log file.
+//
+// only valid afer a successfull getnextrecord
+// on a foward scan.
+private long currentinstant 		   the log instant the scan is
+// currently on - only valid after a
+// successful getnextrecord
+private long stopat 				   scan until we find a log record whose
+// log instance < stopat if we scan backward
+// log instance > stopat if we scan forward
+// log instance >= stopat if we scan forward_flushed
+private byte scandirection  		   backward or forward
+private boolean fuzzylogend   false      get sets to true during forward scan
+//for recovery, if there were
+//partial writes at the end of the log before crash;
+//during forward scan for recovery.
+/**
+for backward scan, we expect a scan positioned at the end of the next log record.
+for forward scan, we expect a scan positioned at the beginning of the next log record.
+for forward flushed scan, we expect stopat to be the instant for the
+first not-flushed log record. like any forward scan, we expect a scan
+positioned at the beginning of the next log record.
+@exception standardexception standard cloudscape error policy
+@exception ioexception cannot access the log at the new position.
+*/
+public scan logtofile logfactory  long startat  loginstant stopat  byte direction
+throws ioexception  standardexception
+if  sanitymanager debug
+sanitymanager assert startat    logcounter invalid_log_instant
+this logfactory   logfactory
+currentlogfilenumber   logcounter getlogfilenumber startat
+currentlogfilelength    1
+knowngoodlogend   logcounter invalid_log_instant    set at getnextrecord for forward scan
+currentinstant   logcounter invalid_log_instant     set at getnextrecord
+if  stopat    null
+this stopat     logcounter  stopat  getvalueaslong
+else
+this stopat   logcounter invalid_log_instant
+switch direction
+case forward
+scan    logfactory getlogfileatposition startat
+scandirection   forward
+if  sanitymanager debug
+if  scan    null
+sanitymanager throwassert
+logcounter todebugstring startat
+// note: just get the length of the file without syncing.
+// this only works because the only place forward scan is used
+// right now is on recovery redo and nothing is being added to
+// the current log file.  when the forward scan is used for some
+// other purpose, need to sync access to the end of the log
+currentlogfilelength   scan length
+break
+case backward
+// startat is at the front of the log record, for backward
+// scan we need to be positioned at the end of the log record
+scan    logfactory getlogfileatposition startat
+int logsize   scan readint
+// skip forward over the log record and all the overhead, but remember
+// we just read an int off the overhead
+scan seek scan getfilepointer     logsize   logtofile log_record_overhead   4
+scandirection   backward
+break
+case backward_from_log_end
+// startat is at the end of the log, no need to skip the log record
+scan    logfactory getlogfileatposition startat
+scandirection   backward
+break
+/*
+** methods of streamlogscan
+*/
+/**
+read the next log record.
+switching log to a previous log file if necessary,
+resize the input stream byte array if necessary.
+@see streamlogscan#getnextrecord
+@return the next logrecord, or null if the end of the
+scan has been reached.
+@exception standardexception standard cloudscape error policy
+*/
+public logrecord getnextrecord arrayinputstream input
+transactionid tranid
+int groupmask
+throws standardexception
+if  scan    null
+return null
+if  sanitymanager debug
+sanitymanager assert scandirection    0
+logrecord lr   null
+try
+if  scandirection    backward
+lr   getnextrecordbackward input  tranid  groupmask
+else if  scandirection    forward
+lr   getnextrecordforward input  tranid  groupmask
+return lr
+catch  ioexception ioe
+if  sanitymanager debug
+ioe printstacktrace
+throw logfactory markcorrupt
+standardexception newexception sqlstate log_corrupted  ioe
+catch  classnotfoundexception cnfe
+if  sanitymanager debug
+cnfe printstacktrace
+throw logfactory markcorrupt
+standardexception newexception sqlstate log_corrupted  cnfe
+finally
+if  lr    null
+close   		   no more log record  close the scan
+/**
+read the previous log record.
+switching log to a previous log file if necessary,
+resize the input stream byte array if necessary.
+@see streamlogscan#getnextrecord
+side effects include:
+on a successful read, setting currentinstant.
+on a log file switch, setting currentlogfilenumber.
+@return the previous logrecord, or null if the end of the
+scan has been reached.
+*/
+private logrecord getnextrecordbackward arrayinputstream input
+transactionid tranid
+int groupmask
+throws standardexception  ioexception  classnotfoundexception
+if  sanitymanager debug
+sanitymanager assert scandirection    backward
+// scan is positioned just past the last byte of the record, or
+// right at the beginning of the file (end of the file header)
+// may need to switch log file
+boolean candidate
+// if we have filtering, peek at the group and/or the transaction id,
+// do them in one read rather than 2 reads.
+int peekamount   logrecord formatoverhead     logrecord maxgroupstoredsize
+if  tranid    null
+peekamount    logrecord maxtransactionidstoredsize tranid
+int readamount 			   the number of bytes actually read
+logrecord lr
+long curpos   scan getfilepointer
+do
+// this log record is a candidate unless proven otherwise
+candidate   true
+lr   null
+readamount    1
+if  curpos    logtofile log_file_header_size
+// don't go thru the trouble of switching log file if we
+// will have gone past stopat
+if  stopat    logcounter invalid_log_instant
+logcounter getlogfilenumber stopat     currentlogfilenumber
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+currentlogfilenumber
+return null      no more log record
+// figure out where the last log record is in the previous
+// log file
+scan seek logtofile log_file_header_previous_log_instant_offset
+long previousloginstant   scan readlong
+scan close
+if  sanitymanager debug
+sanitymanager assert previousloginstant    logcounter invalid_log_instant
+if  currentlogfilenumber
+logcounter getlogfilenumber previousloginstant    1
+sanitymanager throwassert
+currentlogfilenumber  1
+logcounter getlogfilenumber previousloginstant
+sanitymanager assert logcounter getlogfileposition previousloginstant  >
+logtofile log_file_header_size
+sanitymanager debug logtofile dbg_flag
+currentlogfilenumber
+logcounter getlogfilenumber previousloginstant
+logcounter getlogfileposition previousloginstant
+// log file switch, set this.currentlogfilenumber
+currentlogfilenumber   logcounter getlogfilenumber previousloginstant
+scan   logfactory getlogfileatposition previousloginstant
+// scan is located right past the last byte of the last log
+// record in the previous log file.  currentlogfilenumber is
+// set.  we asserted that the scan is not located right at the
+// end of the file header, in other words, there is at least
+// one log record in this log file.
+curpos   scan getfilepointer
+// if the log file happens to be empty skip and proceed.
+// ideally this case should never occur because log switch is
+// not suppose to happen on an empty log file.
+// but it is safer to put following check incase if it ever
+// happens to avoid any recovery issues.
+if  curpos    logtofile log_file_header_size
+continue
+scan seek curpos   4
+int recordlength   scan readint       get the length after the log record
+// calculate where this log record started.
+// include the eight bytes for the long log instant at the front
+// the four bytes of length in the front and the four bytes we just read
+long recordstartposition   curpos   recordlength
+logtofile log_record_overhead
+if  sanitymanager debug
+if  recordstartposition < logtofile log_file_header_size
+sanitymanager throwassert
+recordstartposition
+recordlength
+scan getfilepointer
+scan seek recordstartposition
+// read the length before the log record and check it against the
+// length after the log record
+int checklength   scan readint
+if  checklength    recordlength
+long inst   logcounter makeloginstantaslong currentlogfilenumber  recordstartposition
+throw logfactory markcorrupt
+standardexception newexception
+sqlstate log_record_corrupted
+new long checklength
+new long recordlength
+new long inst
+new long currentlogfilenumber
+else
+// skip over the length in insane
+scan seek recordstartposition 4
+// scan is positioned just before the log instant
+// read the current log instant - this is the currentinstant if we have not
+// exceeded the scan limit
+currentinstant   scan readlong
+if  sanitymanager debug
+// sanity check the current instant against the scan position
+if  logcounter getlogfilenumber currentinstant
+currentlogfilenumber
+logcounter getlogfileposition currentinstant
+recordstartposition
+sanitymanager throwassert
+logcounter todebugstring currentinstant
+currentlogfilenumber
+recordstartposition
+// if stopat == invalid_log_instant, no stop instant, read till
+// nothing more can be read.  else check scan limit
+if  currentinstant < stopat    stopat    logcounter invalid_log_instant
+currentinstant   logcounter invalid_log_instant
+return null 	   we went past the stopat
+byte data   input getdata
+if  data length < recordlength
+// make a new array of sufficient size and reset the arrary
+// in the input stream
+data   new byte
+input setdata data
+// if the log is encrypted, we must do the filtering after reading
+// and decrypting the record.
+if  logfactory databaseencrypted
+scan readfully data  0  recordlength
+int len   logfactory decrypt data  0  recordlength  data  0
+if  sanitymanager debug
+sanitymanager assert len    recordlength
+input setlimit 0  recordlength
+else    no need to decrypt  only get the group and tid if we filter
+if  groupmask    0    tranid    null
+// no filter, get the whole thing
+scan readfully data  0  recordlength
+input setlimit 0  recordlength
+else
+// read only enough so that group and the tran id is in
+// the data buffer.  group is stored as compressed int
+// and tran id is stored as who knows what.  read min
+// of peekamount or recordlength
+readamount    recordlength > peekamount  ?
+peekamount   recordlength
+// in the data buffer, we now have enough to peek
+scan readfully data  0  readamount
+input setlimit 0  readamount
+lr    logrecord  input readobject
+// skip the checksum log records, there is no need to look at them
+// during backward scans. they are used only in forwardscan during recovery.
+if lr ischecksum
+candidate   false
+else if  groupmask    0    tranid    null
+// skip the checksum log records
+if lr ischecksum
+candidate   false
+if  candidate    groupmask    0     groupmask   lr group       0
+candidate   false     no match  throw this log record out
+if  candidate    tranid    null
+transactionid tid   lr gettransactionid
+if   tid equals tranid      nomatch
+candidate   false     throw this log record out
+// if this log record is not filtered out, we need to read
+// in the rest of the log record to the input buffer.
+// except if it is an encrypted database, in which case the
+// entire log record have already be read in for
+// decryption.
+if  candidate     logfactory databaseencrypted
+// read the rest of the log into the buffer
+if  sanitymanager debug
+sanitymanager assert readamount > 0
+if  readamount < recordlength
+// need to remember where we are because the log
+// record may have read part of it off the input
+// stream already and that position is lost when we
+// set limit again.
+int inputposition   input getposition
+scan readfully data  readamount
+recordlength readamount
+input setlimit 0  recordlength
+input setposition inputposition
+// go back to the start of the log record so that the next time
+// this method is called, it is positioned right past the last byte
+// of the record.
+curpos   recordstartposition
+scan seek curpos
+while  candidate    false
+return lr
+/**
+read the next log record.
+switching log to a previous log file if necessary,
+resize the input stream byte array if necessary.
+@see streamlogscan#getnextrecord
+side effects include:
+on a successful read, setting currentinstant, knowngoodlogend
+on a log file switch, setting currentlogfilenumber, currentlogfilelength.
+on detecting a fuzzy log end that needs clearing, it will call
+logfactory to clear the fuzzy log end.
+@return the next logrecord, or null if the end of the
+scan has been reached.
+*/
+private logrecord getnextrecordforward arrayinputstream input
+transactionid tranid
+int groupmask
+throws standardexception   ioexception  classnotfoundexception
+if  sanitymanager debug
+sanitymanager assert scandirection    forward
+// note:
+//
+// if forward scan, scan is positioned at the first byte of the
+// next record, or the end of file - note the the 'end of file'
+// is defined at the time the scan is initialized.  if we are
+// on the current log file, it may well have grown by now...
+//
+// this is not a problem in reality because the only forward
+// scan on the log now is recovery redo and the log does not
+// grow.  if in the future, a foward scan of the log is used
+// for some other reasons, need to keep this in mind.
+//
+// first we need to make sure the entire log record is on the
+// log, or else this is a fuzzy log end.
+// resolve: can get this from knowngoodlogend if this is not the first
+// time getnext is called.  probably just as fast to call
+// scan.getfilepointer though...
+long recordstartposition   scan getfilepointer
+boolean candidate
+// if we have filtering, peek at the group and/or the transaction id,
+// do them in one read rather than 2 reads.
+int peekamount   logrecord formatoverhead     logrecord maxgroupstoredsize
+if  tranid    null
+peekamount    logrecord maxtransactionidstoredsize tranid
+int readamount 			   the number of bytes actually read
+logrecord lr
+do
+// this log record is a candidate unless proven otherwise
+candidate   true
+lr   null
+readamount    1
+// if we are not right at the end but this position + 4 is at
+// or exceeds the end, we know we don't have a complete log
+// record.  this is the log file and chalk it up as the fuzzy
+// end.
+if  recordstartposition   4 > currentlogfilelength
+// since there is no end of log file marker, we are at the
+// end of the log.
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+currentlogfilenumber
+recordstartposition
+currentlogfilelength
+//if  recordstartposition == currentlogfilelength
+//there is no fuzz, it just a properly ended log
+//without the end marker.
+if recordstartposition    currentlogfilelength
+fuzzylogend   true
+// don't bother to write the end of log file marker because
+// if it is not overwritten by the next log record then
+// the next time the database is recovered it will come
+// back right here
+return null
+// read in the length before the log record
+int recordlength   scan readint
+while  recordlength    0    recordstartposition   recordlength
+logtofile log_record_overhead > currentlogfilelength
+// if recordlength is zero or the log record goes beyond the
+// current file, then we have detected the end of a log file.
+//
+// if recordlength == 0 then we know that this log file has either
+// been properly switched or it had a 1/2 written log record which
+// was subsequently cleared by clearfuzzyend.
+//
+// if recordlength != 0 but log record goes beyond the current log
+// file, we have detected a fuzzy end.  this is the last log file
+// since we will clear it by clearfuzzyend.
+if  recordlength    0     this is a fuzzy log end
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag
+currentlogfilenumber
+recordstartposition
+currentlogfilelength
+recordlength
+fuzzylogend   true
+scan close
+scan   null
+return null
+// recordlength == 0
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+if  recordstartposition   4    currentlogfilelength
+sanitymanager debug logtofile dbg_flag
+currentlogfilenumber
+else
+sanitymanager debug logtofile dbg_flag
+currentlogfilenumber
+recordstartposition
+currentlogfilelength
+// don't go thru the trouble of switching log file if we
+// have will have gone past stopat if we want to stop here
+if  stopat    logcounter invalid_log_instant
+logcounter getlogfilenumber stopat     currentlogfilenumber
+return null
+//
+// we have a log end marker and we don't want to stop yet, switch
+// log file
+//
+scan close
+// set this.currentlogfilenumber
+scan   logfactory getlogfileatbeginning   currentlogfilenumber
+if  scan    null     we have seen the last log file
+return null
+// scan is position just past the log header
+recordstartposition   scan getfilepointer
+// verify that the header of the new log file refers
+// to the end of the log record of the previous file
+// (rest of header has been verified by getlogfileatbeginning)
+scan seek logtofile
+log_file_header_previous_log_instant_offset
+long previousloginstant   scan readlong
+if  previousloginstant    knowngoodlogend
+// if there is a mismatch, something is wrong and
+// we return null to stop the scan.  the same
+// behavior occurs when getlogfileatbeginning
+// detects an error in the other fields of the header.
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+currentlogfilenumber
+previousloginstant
+knowngoodlogend
+return null
+scan seek recordstartposition
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+currentlogfilenumber
+// advance knowngoodlogend to make sure that if this
+// log file is the last log file and empty, logging
+// continues in this file, not the old file.
+knowngoodlogend   logcounter makeloginstantaslong
+currentlogfilenumber  recordstartposition
+// set this.currentlogfilelength
+currentlogfilelength   scan length
+if  recordstartposition 4 >  currentlogfilelength     empty log file
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+currentlogfilenumber
+return null
+// we have successfully switched to the next log file.
+// scan is positioned just before the next log record
+// see if this one is written in entirety
+recordlength   scan readint
+// we know the entire log record is on this log file
+// read the current log instant
+currentinstant   scan readlong
+/*check if the current instant happens is less than the last one.
+*this can happen if system crashed before writing the log instant
+*completely. if the instant is partially written it will be less
+*than the last one and should be the last record that was suppose to
+*get written. currentlt preallocated files are filled with zeros,
+*this should hold good.
+*note: in case of non-preallocated files earlier check with log
+* file lengths should have found the end. but in prellocated files, log file
+*length is not sufficiant to find the log end. this check
+*is must to find the end in preallocated log files.
+*/
+if currentinstant < knowngoodlogend
+fuzzylogend   true
+return null
+// sanity check it
+if  sanitymanager debug
+if  logcounter getlogfilenumber currentinstant
+currentlogfilenumber
+logcounter getlogfileposition currentinstant
+recordstartposition
+sanitymanager throwassert
+logcounter todebugstring currentinstant
+currentlogfilenumber
+recordstartposition
+// if stopat == invalid_log_instant, no stop instant, read till
+// nothing more can be read.  else check scan limit
+if  stopat    logcounter invalid_log_instant    currentinstant > stopat
+currentinstant   logcounter invalid_log_instant
+return null 			   we went past the stopat
+// read in the log record
+byte data   input getdata
+if  data length < recordlength
+// make a new array of sufficient size and reset the arrary
+// in the input stream
+data   new byte
+input setdata data
+// if the log is encrypted, we must do the filtering after
+// reading and decryptiong the record.
+if  logfactory databaseencrypted
+scan readfully data  0  recordlength
+int len   logfactory decrypt data  0  recordlength  data  0
+if  sanitymanager debug
+sanitymanager assert len    recordlength
+input setlimit 0  len
+else    no need to decrypt  only get the group and tid if we filter
+if  groupmask    0    tranid    null
+// no filter, get the whole thing
+scan readfully data  0  recordlength
+input setlimit 0  recordlength
+else
+// read only enough so that group and the tran id is in
+// the data buffer.  group is stored as compressed int
+// and tran id is stored as who knows what.  read min
+// of peekamount or recordlength
+readamount    recordlength > peekamount  ?
+peekamount   recordlength
+// in the data buffer, we now have enough to peek
+scan readfully data  0  readamount
+input setlimit 0  readamount
+lr    logrecord  input readobject
+if  groupmask    0    tranid    null
+if  groupmask    0     groupmask   lr group       0
+candidate   false     no match  throw this log record out
+if  candidate    tranid    null
+transactionid tid   lr gettransactionid
+if   tid equals tranid      nomatch
+candidate   false     throw this log record out
+// if this log record is not filtered out, we need to read
+// in the rest of the log record to the input buffer.
+// except if it is an encrypted database, in which case the
+// entire log record have already be read in for
+// decryption.
+if  candidate     logfactory databaseencrypted
+// read the rest of the log into the buffer
+if  sanitymanager debug
+sanitymanager assert readamount > 0
+if  readamount < recordlength
+// need to remember where we are because the log
+// record may have read part of it off the input
+// stream already and that position is lost when we
+// set limit again.
+int inputposition   input getposition
+scan readfully data  readamount
+recordlength readamount
+input setlimit 0  recordlength
+input setposition inputposition
+/*check if the logrecord length written before and after the
+*log record are equal, if not the end of of the log is reached.
+*this can happen if system crashed before writing the length field
+*in the end of the records completely. if the length is partially
+*written or not written at all  it will not match with length written
+*in the beginning of the log record. currentlt preallocated files
+*are filled with zeros, log record length can never be zero;
+*if the lengths are not matching, end of the properly written log
+*is reached.
+*note: in case of non-preallocated files earlier fuzzy case check with log
+* file lengths should have found the end. but in prellocated files, log file
+*length is not sufficiant to find the log end. this check
+*is must to find the end in preallocated log files.
+*/
+// read the length after the log record and check it against the
+// length before the log record, make sure we go to the correct
+// place for skipped log record.
+if   candidate
+scan seek recordstartposition   4
+int checklength   scan readint
+if  checklength    recordlength    checklength < recordlength
+//lengh written in the end of the log record should be always
+//less then the length written in the beginning if the log
+//record was half written before the crash.
+if checklength < recordlength
+fuzzylogend   true
+return null
+else
+//if checklength > recordlength then it can be not be a partial write
+//probablly it is corrupted for some reason , this should never
+//happen throw error in debug mode. in non debug case , let's
+//hope it's only is wrong and system can proceed.
+if  sanitymanager debug
+throw logfactory markcorrupt
+standardexception newexception
+sqlstate log_record_corrupted
+new long checklength
+new long recordlength
+new long currentinstant
+new long currentlogfilenumber
+//in non debug case, do nothing , let's hope it's only
+//length part that is incorrect and system can proceed.
+// next record start position is right after this record
+recordstartposition    recordlength   logtofile log_record_overhead
+knowngoodlogend   logcounter makeloginstantaslong
+currentlogfilenumber  recordstartposition
+if  sanitymanager debug
+if  recordstartposition    scan getfilepointer
+sanitymanager throwassert
+recordstartposition
+scan getfilepointer
+else
+// seek to the start of the next log record
+scan seek recordstartposition
+// the scan is now positioned just past this log record and right
+// at the beginning of the next log record
+/** if the current log record is a checksum log record then
+* using the information available in this record validate
+* that data in the log file by matching the checksum in
+* checksum log record and by recalculating the checksum for the
+* specified length of the data in the log file. cheksum values
+* should match unless the right was incomplete before the crash.
+*/
+if lr ischecksum
+// checksum log record should not be returned to the logger recovery redo
+// routines, it is just used to identify the incomplete log writes.
+candidate   false
+loggable op   lr getloggable
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dump_log_only
+sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+op
+logcounter todebugstring currentinstant
+logcounter todebugstring knowngoodlogend
+checksumoperation clop    checksumoperation  op
+int ckdatalength    clop getdatalength
+// resize the buffer to be size of checksum data length if required.
+if  data length < ckdatalength
+// make a new array of sufficient size and reset the arrary
+// in the input stream
+data   new byte
+input setdata data
+input setlimit 0  ckdatalength
+boolean validchecksum   false
+// check if the expected number of bytes by the checksum log
+// record actually exist in the file and then verify if checksum
+// is valid to identify any incomplete out of order writes.
+if  recordstartposition   ckdatalength  <  currentlogfilelength
+// read the data into the buffer
+scan readfully data  0  ckdatalength
+// verify the checksum
+if clop ischecksumvalid data  0   ckdatalength
+validchecksum   true
+if  validchecksum
+// declare that the end of the transaction log is fuzzy, checksum is invalid
+// only when the writes are incomplete; this can happen
+// only when writes at the end of the log were partially
+// written before the crash.
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag
+currentlogfilenumber
+recordstartposition
+currentlogfilelength
+ckdatalength
+fuzzylogend   true
+scan close
+scan   null
+return null
+// reset the scan to the start of the next log record
+scan seek recordstartposition
+while  candidate    false
+return lr
+/**
+reset the scan to the given loginstant.
+@param instant the position to reset to
+@exception ioexception scan cannot access the log at the new position.
+@exception standardexception cloudscape standard error policy
+*/
+public void resetposition loginstant instant
+throws ioexception  standardexception
+if  sanitymanager debug
+sanitymanager assert instant    null
+long instant_long     logcounter instant  getvalueaslong
+if   instant_long    logcounter invalid_log_instant
+stopat    logcounter invalid_log_instant
+scandirection    forward    instant_long > stopat
+scandirection    forward    instant_long < stopat
+close
+throw standardexception newexception
+sqlstate log_reset_beyond_scan_limit
+instant  new logcounter stopat
+else
+long fnum     logcounter instant  getlogfilenumber
+if  fnum    currentlogfilenumber
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+scandirection
+instant
+currentlogfilenumber       fnum
+scan close
+scan   logfactory getlogfileatposition instant_long
+currentlogfilenumber  fnum
+if  scandirection    forward
+// note:
+//
+// just get the length of the file without syncing.
+// this only works because the only place forward scan is used
+// right now is on recovery redo and nothing is being added to
+// the current log file.  when the forward scan is used for some
+// other purpose, need to sync access to the end of the log
+//
+currentlogfilelength   scan length
+else
+long fpos     logcounter instant  getlogfileposition
+scan seek fpos
+//
+//resolve: can this be optimized? does it belong here.
+currentlogfilelength   scan length
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+instant
+currentinstant   instant_long
+//scan is being reset, it is possibly that, scan is doing a random
+//access of the log file. set the knowngoodlogend to  the instant
+//scan 	is being reset to.
+//note: reset gets called with undo forward scan for clr processing during
+//recovery, if this value is not reset checks to find the end of log
+//getnextrecordforward() will fail because undoscan scans log file
+//back & forth to redo clr's.
+knowngoodlogend   currentinstant
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+currentinstant
+logcounter todebugstring currentinstant
+/**
+return the log instant (as an integer) the scan is currently on - this is the log
+instant of the log record that was returned by getnextrecord.
+*/
+public long getinstant
+return currentinstant
+/**
+return the log instant at the end of the log record on the current
+logfile in the form of a log instant.
+after the scan has been closed, the end of the last log record will be
+returned except when the scan ended in an empty log file.  in that
+case, the start of this empty log file will be returned.  (this is
+done to make sure new log records are inserted into the newest log
+file.)
+*/
+public long getlogrecordend
+return knowngoodlogend
+/**
+returns true if there is partially writen log records before the crash
+in the last log file. partiall wrires are identified during forward
+redo scans for log recovery.
+*/
+public boolean islogendfuzzy
+return fuzzylogend
+/**
+return the log instant the scan is currently on - this is the log
+instant of the log record that was returned by getnextrecord.
+*/
+public loginstant getloginstant
+if  currentinstant    logcounter invalid_log_instant
+return null
+else
+return new logcounter currentinstant
+/**
+close the scan.
+*/
+public void close
+if  scan    null
+try
+scan close
+catch  ioexception ioe
+scan   null
+logfactory   null
+currentlogfilenumber    1
+currentlogfilelength    1
+// do not reset knowngoodlogend, it needs to be available after the
+// scan has closed.
+currentinstant   logcounter invalid_log_instant
+stopat   logcounter invalid_log_instant
+scandirection   0

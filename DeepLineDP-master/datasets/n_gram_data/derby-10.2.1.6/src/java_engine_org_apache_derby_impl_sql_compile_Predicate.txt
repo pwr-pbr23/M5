@@ -1,0 +1,953 @@
+/*
+derby - class org.apache.derby.impl.sql.compile.predicate
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package	org apache derby impl sql compile
+import org apache derby impl sql compile expressionclassbuilder
+import org apache derby impl sql compile activationclassbuilder
+import org apache derby iapi sql compile c_nodetypes
+import org apache derby iapi sql compile visitable
+import org apache derby iapi sql compile visitor
+import org apache derby iapi sql compile optimizablepredicate
+import org apache derby iapi sql compile optimizable
+import org apache derby iapi sql dictionary datadictionary
+import org apache derby iapi store access scancontroller
+import org apache derby iapi error standardexception
+import org apache derby iapi services compiler methodbuilder
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi util jbitset
+import java util arraylist
+import java util hashtable
+/**
+* a predicate represents a top level predicate.
+*
+* @author jerry brenner
+*/
+public final class predicate extends querytreenode implements optimizablepredicate
+comparable
+/* top of the predicate */
+andnode		andnode
+boolean		pushable
+/* bit map of referenced tables */
+jbitset		referencedset
+/* join clauses are placed into equivalence classes when applying transitive
+* closure for join clauses.  this is useful for eliminating redundant predicates.
+*/
+int			equivalenceclass    1
+int			indexposition
+protected boolean startkey
+protected boolean stopkey
+protected boolean isqualifier
+/* hashtable used for tracking the search clause types that have been
+* pushed through this predicate (if an equijoin) via transitive closure.
+*/
+private hashtable searchclauseht
+// whether or not this predicate has been scoped; see the
+// getpredscopedforresultset() method of this class for more.
+private boolean scoped
+/**
+* initializer.
+*
+* @param andnode		the top of the predicate
+* @param referencedset	bit map of referenced tables
+*/
+public void init object andnode  object referencedset
+this andnode    andnode  andnode
+pushable   false
+this referencedset    jbitset  referencedset
+scoped   false
+/*
+*  optimizable interface
+*/
+/**
+* @see org.apache.derby.iapi.sql.compile.optimizablepredicate#getreferencedmap
+*/
+public jbitset getreferencedmap
+return referencedset
+/**
+* @see org.apache.derby.iapi.sql.compile.optimizablepredicate#hassubquery
+*/
+public boolean hassubquery
+/* resolve - currently, we record whether or not a predicate is pushable based
+* on whether or not it contains a subquery or method call, but we do not
+* record the underlying info.
+*/
+return   pushable
+/**
+* @see org.apache.derby.iapi.sql.compile.optimizablepredicate#hasmethodcall
+*/
+public boolean hasmethodcall
+/* resolve - currently, we record whether or not a predicate is pushable based
+* on whether or not it contains a subquery or method call, but we do not
+* record the underlying info.
+*/
+return   pushable
+/** @see optimizablepredicate#markstartkey */
+public void markstartkey
+startkey   true
+/** @see optimizablepredicate#isstartkey */
+public boolean isstartkey
+return startkey
+/** @see optimizablepredicate#markstopkey */
+public void markstopkey
+stopkey   true
+/** @see optimizablepredicate#isstopkey */
+public boolean isstopkey
+return stopkey
+/** @see optimizablepredicate#markqualifier */
+public void markqualifier
+isqualifier   true
+/** @see optimizablepredicate#isqualifier */
+public boolean isqualifier
+return isqualifier
+/** @see optimizablepredicate#comparewithknownconstant */
+public boolean comparewithknownconstant optimizable opttable  boolean considerparameters
+boolean retval   false
+relationaloperator relop   getrelop
+/* if this is for "in" operator node's dynamic start/stop key, relop is
+* null, and it's not comparing with constant, beetle 3858
+*/
+if  relop    null
+return false
+if  relop comparewithknownconstant opttable  considerparameters
+retval   true
+return retval
+public int hasequaloncolumnlist int basecolumnpositions
+optimizable opttable
+throws standardexception
+relationaloperator relop   getrelop
+if  relop    null
+return  1
+if    relop getoperator      relationaloperator equals_relop
+return  1
+for  int i   0  i < basecolumnpositions length  i
+columnreference cr   relop getcolumnoperand opttable
+basecolumnpositions
+if  cr    null
+continue
+if  relop selfcomparison cr
+continue
+// if i made it thus far in the loop, we've found
+// something.
+return i
+return  1
+/**
+* @see optimizablepredicate#getcomparevalue
+*
+* @exception standardexception		thrown on error
+*/
+public datavaluedescriptor getcomparevalue optimizable opttable
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert comparewithknownconstant opttable  true
+relationaloperator relop   getrelop
+return relop getcomparevalue opttable
+/** @see optimizablepredicate#equalscomparisonwithconstantexpression */
+public boolean equalscomparisonwithconstantexpression optimizable opttable
+relationaloperator relop   getrelop
+boolean retval   false
+if  relop    null
+retval   relop equalscomparisonwithconstantexpression opttable
+return retval
+/** @see optimizablepredicate#selectivity */
+public double selectivity optimizable opttable
+throws standardexception
+return andnode getleftoperand   selectivity opttable
+/** @see optimizablepredicate#getindexposition */
+public int getindexposition
+return indexposition
+/* comparable interface */
+public int compareto object other
+predicate	otherpred    predicate  other
+/* not all operators are "equal". if the predicates are on the
+* same key column, then a "=" opertor takes precedence over all
+* other operators.  this ensures that the "=" will be both the start
+* and stop predicates.  otherwise, we could end up with it being one
+* but not the other and get incorrect results.
+*
+* also, we want "<>" to come after all the other operators.
+* other parts of the optimizer use the first predicate on an index
+* column to determine the cost of using the index, so we want the
+* "<>" to come last because it's not useful for limiting the scan.
+*
+* in other words, p1 is before() p2 if:
+*		o  the p1.indexposition < p2.indexposition
+*	or  o  p1.indexposition == p2.indexposition and
+*		   p1's operator is ("=" or is null) and
+*		   p2's operator is not ("=" or is null)
+* or	o  p1.indexposition == p2.indexposition and
+*		   p1's operator is not ("<>" or is not null) and
+*		   p2's operator is ("<>" or is not null)
+*
+* (we have to impose an arbitrary, but reproducible ordering
+* on the the "=" predicates on the same column, otherwise an
+* assertion, that after the predicates are order, pn+1 is not
+* before() pn, will be violated.
+*/
+int otherindexposition   otherpred getindexposition
+if  indexposition < otherindexposition
+return  1
+if  indexposition > otherindexposition
+return 1
+// initialize these flags as if they are for "in" operator, then
+// change them if they are not
+//
+boolean thisisequals   false  otherisequals   false
+boolean thisisnotequals   true  otherisnotequals   true
+if  getrelop      null 		   this is not
+int thisoperator     relationaloperator andnode getleftoperand    getoperator
+thisisequals    thisoperator    relationaloperator equals_relop
+thisoperator    relationaloperator is_null_relop
+thisisnotequals    thisoperator    relationaloperator not_equals_relop
+thisoperator    relationaloperator is_not_null_relop
+if  otherpred getrelop      null 		   other is not
+int	otheroperator     relationaloperator  otherpred getandnode   getleftoperand     getoperator
+otherisequals    otheroperator    relationaloperator equals_relop
+otheroperator    relationaloperator is_null_relop
+otherisnotequals    otheroperator    relationaloperator not_equals_relop
+otheroperator    relationaloperator is_not_null_relop
+boolean thisisbefore    thisisequals      otherisequals         thisisnotequals    otherisnotequals
+if  thisisbefore
+return  1
+boolean otherisbefore    otherisequals      thisisequals         otherisnotequals    thisisnotequals
+if  otherisbefore
+return 1
+return 0
+/**
+* return the andnode.
+*
+* @return andnode	the andnode.
+*/
+public andnode getandnode
+return andnode
+/**
+* set the andnode.
+*
+* @param andnode	the new andnode.
+*/
+public void setandnode andnode andnode
+this andnode   andnode
+/**
+* return the pushable.
+*
+* @return boolean	whether or not the predicate is pushable.
+*/
+public boolean getpushable
+return pushable
+/**
+* set whether or not this predicate is pushable.  this method
+* is intended for use when creating a copy of the predicate, ex
+* for predicate pushdown.  we choose not to add this assignment
+* to copyfields() because the comments for that method say that
+* it should copy all fields _except_ the two specified at init
+* time; "pushable" is one of the two specified at init time.
+*
+* @param pushable whether or not the predicate is pushable.
+*/
+public void setpushable boolean pushable
+this pushable   pushable
+/**
+* return the referencedset.
+*
+* @return jbitset	the referencedset.
+*/
+public jbitset getreferencedset
+return referencedset
+/**
+* set the equivalence class, if any, for this predicate.
+*
+* @param equivalenceclass	the equivalence class for this predicate.
+*/
+void setequivalenceclass int equivalenceclass
+this equivalenceclass   equivalenceclass
+/**
+* get the equivalenceclass for this predicate.
+*
+* @return the equivalenceclass for this predicate.
+*/
+int getequivalenceclass
+return equivalenceclass
+/**
+* categorize this predicate.  initially, this means
+* building a bit map of the referenced tables for each predicate.
+*
+* @exception standardexception		thrown on error
+*/
+public void categorize   throws standardexception
+pushable   andnode categorize referencedset  false
+/**
+* get the relationaloperator on the left side of the and node, if
+* there is one.  if the left side is not a relationaloperator, return
+* null.
+*
+* @return	the relationaloperator on the left side of the and node,
+*			if any.
+*/
+public relationaloperator getrelop
+if  andnode getleftoperand   instanceof relationaloperator
+return  relationaloperator  andnode getleftoperand
+else
+return null
+public final boolean isorlist
+return andnode getleftoperand   instanceof ornode
+/**
+* is this predicate a possible qualifier for store?
+* <p>
+* current 2 types of predicates can be pushed to store:
+*   1) relationaloperator -
+*      represented with by left operand as instance of relationaloperator.
+*   2) a single and'd term of a list of or terms
+*      represented by left operand as instance of ornode.
+*
+* more checking specific operator's terms to see if they are finally
+* pushable to store.  in the final push at execution each term of the and
+* or or must be a relational operator with a column reference on one side
+* and a constant on the other.
+*
+*
+* @return true if term is wither a and of a relationaloperator, or an
+*              or of one or more relational operators.
+*
+*
+* @exception  standardexception  standard exception policy.
+**/
+public final boolean isstorequalifier
+if   andnode getleftoperand   instanceof relationaloperator
+andnode getleftoperand   instanceof ornode
+return true
+else
+return false
+/**
+* is this predicate an pushable or list?
+* <p>
+* does the predicate represent a and'd list of or term's, all of which
+* are pushable.  to be pushable each of or terms must be a legal
+* qualifier, which is a column reference on one side of a relational
+* operator and a constant on the other.
+*
+* @return true if the predicate is a pushable set of or clauses.
+*
+*
+* @exception  standardexception  standard exception policy.
+**/
+public final boolean ispushableorclause optimizable opttable
+throws standardexception
+boolean ret_val   true
+if  andnode getleftoperand   instanceof ornode
+querytreenode node   andnode getleftoperand
+while  node instanceof ornode
+ornode or_node    ornode  node
+if  or_node getleftoperand   instanceof relationaloperator
+// if any term of the or clause is not a qualifier, then
+// reject the entire or clause.
+if     relationaloperator  or_node getleftoperand
+isqualifier opttable  true
+// one of the terms is not a pushable qualifier.
+return false
+node   or_node getrightoperand
+else
+// one of the terms is not a relationaloperator
+return false
+return true
+else
+// not an or list
+return false
+/**
+* return whether or not this predicate has been used
+* to add a new search clause of the specified type via transitive closure.
+* note: this can only be true if this is an equijoin
+* between 2 column references.
+*
+* @param ro	the search clause that we are currently considering
+*				as the source for transitive closure
+*
+* @return	whether or not this predicate has been used
+*			to add a new search clause of the specified type via transitive
+*			closure.
+*/
+boolean transitivesearchclauseadded relationaloperator ro
+if  searchclauseht    null
+searchclauseht get new integer ro getoperator        null
+return false
+else
+return true
+/**
+* mark this predicate as having been used to add a new predicate
+* of the specified type via transitive closure on search clauses.
+*
+* @param ro	the search clause that we are currently considering
+*				as the source for transitive closure
+*
+*/
+void settransitivesearchclauseadded relationaloperator ro
+if  searchclauseht    null
+searchclauseht   new hashtable
+/* i have to remember that this ro has been added to this predicate as a
+* transitive search clause.
+*/
+integer i   new integer ro getoperator
+searchclauseht put i  i
+/**
+* get the start operator for this predicate for a scan.
+*
+* @param opttable	the optimizable table, so we can tell which side of
+*					the operator the search column is on.
+*
+* @return	the start operator for a start key on this column.
+*/
+int getstartoperator optimizable opttable
+if  sanitymanager debug
+sanitymanager assert startkey
+/* if it's for "in" operator's dynamic start key, operator is ge,
+* beetle 3858
+*/
+if  andnode getleftoperand   instanceof inlistoperatornode
+return scancontroller ge
+return getrelop   getstartoperator opttable
+int getstopoperator optimizable opttable
+if  sanitymanager debug
+sanitymanager assert stopkey
+/* if it's for "in" operator's dynamic stop key, operator is gt,
+* beetle 3858
+*/
+if  andnode getleftoperand   instanceof inlistoperatornode
+return scancontroller gt
+return getrelop   getstopoperator opttable
+/**
+* set the position of the index column that this predicate restricts
+*
+* @param indexposition	the position of the index column that this
+*						predicate restricts.
+*/
+void setindexposition int indexposition
+this indexposition   indexposition
+/**
+* clear the start/stop position and qualifier flags
+*/
+void clearscanflags
+startkey   false
+stopkey   false
+isqualifier   false
+/**
+* clear the qualifier flag.
+*/
+void clearqualifierflag
+isqualifier   false
+void generateexpressionoperand optimizable opttable
+int columnposition
+expressionclassbuilder acb
+methodbuilder mb
+throws standardexception
+getrelop   generateexpressionoperand opttable
+columnposition
+acb
+mb
+void generateabsolutecolumnid methodbuilder mb
+optimizable opttable
+getrelop   generateabsolutecolumnid mb  opttable
+void generaterelativecolumnid methodbuilder mb
+optimizable opttable
+getrelop   generaterelativecolumnid mb  opttable
+void generateoperator methodbuilder mb
+optimizable opttable
+getrelop   generateoperator mb  opttable
+void generatequalmethod expressionclassbuilder acb
+methodbuilder mb
+optimizable opttable
+throws standardexception
+getrelop   generatequalmethod acb  mb  opttable
+void generateorderednulls methodbuilder mb
+getrelop   generateorderednulls mb
+void generatenegate methodbuilder mb
+optimizable opttable
+getrelop   generatenegate mb  opttable
+void generateorderablevarianttype methodbuilder mb
+optimizable opttable
+throws standardexception
+int varianttype   getrelop   getorderablevarianttype opttable
+mb push varianttype
+/**
+* convert this object to a string.  see comments in querytreenode.java
+* for how this should be done for tree printing.
+*
+* @return	this object as a string
+*/
+public string tostring
+if  sanitymanager debug
+return binaryrelopcolrefstostring
+referencedset            pushable
+super tostring
+else
+return
+/**
+* get a string version of the column references for this predicate
+* if it's a binary relational operator.  we only print out the
+* names of the operands if they are column references; otherwise
+* we just print a dummy value.  this is for debugging purposes
+* only--it's a convenient way to see what columns the predicate
+* is referencing, especially when tracing through code and printing
+* assert failure.
+*/
+public string binaryrelopcolrefstostring
+// we only consider binary relational operators here.
+if    getandnode   getleftoperand
+instanceof binaryrelationaloperatornode
+return
+final string dummy_val
+java lang stringbuffer sbuf   new java lang stringbuffer
+binaryrelationaloperatornode opnode
+binaryrelationaloperatornode getandnode   getleftoperand
+// get left operand's name.
+if  opnode getleftoperand   instanceof columnreference
+sbuf append
+columnreference opnode getleftoperand    gettablename
+columnreference opnode getleftoperand    getcolumnname
+else
+sbuf append dummy_val
+// get the operator type.
+sbuf append     opnode operator
+// get right operand's name.
+if  opnode getrightoperand   instanceof columnreference
+sbuf append
+columnreference opnode getrightoperand    gettablename
+columnreference opnode getrightoperand    getcolumnname
+else
+sbuf append dummy_val
+return sbuf tostring
+/**
+* prints the sub-nodes of this object.  see querytreenode.java for
+* how tree printing is supposed to work.
+*
+* @param depth		the depth of this node in the tree
+*/
+public void printsubnodes int depth
+if  sanitymanager debug
+printlabel depth
+andnode treeprint depth   1
+super printsubnodes depth
+/**
+* accept a visitor, and call v.visit()
+* on child nodes as necessary.
+*
+* @param v the visitor
+*
+* @exception standardexception on error
+*/
+public visitable accept visitor v
+throws standardexception
+if  v skipchildren this
+return v visit this
+visitable returnnode   super accept v
+if  andnode    null     v stoptraversal
+andnode    andnode andnode accept v
+return returnnode
+/**
+* copy all fields of this predicate (except the two that
+* are set from 'init').
+*
+*/
+public void copyfields predicate otherpred
+this equivalenceclass   otherpred getequivalenceclass
+this indexposition   otherpred getindexposition
+this startkey   otherpred isstartkey
+this stopkey   otherpred isstopkey
+this isqualifier   otherpred isqualifier
+this searchclauseht   otherpred getsearchclauseht
+/**
+* get the search clause hash table.
+*/
+public hashtable getsearchclauseht
+return searchclauseht
+/**
+* determine whether or not this predicate is eligible for
+* push-down into subqueries.  right now the only predicates
+* we consider to be eligible are those which 1) are binary
+* relational operator nodes and 2) have a column reference
+* on both sides, each of which has a reference to a base
+* table somewhere beneath it.
+*
+* @return whether or not this predicate is eligible to be
+*  pushed into subqueries.
+*/
+protected boolean pushabletosubqueries
+throws standardexception
+if   isjoinpredicate
+return false
+// make sure both column references ultimately point to base
+// tables.  if, for example, either column reference points to a
+// a literal or an aggregate, then we do not push the predicate.
+// this is because pushing involves remapping the references--
+// but if the reference doesn't have a base table beneath it,
+// the notion of "remapping" it doesn't (seem to) apply.  resolve:
+// it might be okay to make the "remap" operation a no-op for
+// such column references, but it's not clear whether that's
+// always a safe option; further investigation required.
+binaryrelationaloperatornode opnode
+binaryrelationaloperatornode getandnode   getleftoperand
+jbitset tnums   new jbitset getreferencedset   size
+basetablenumbersvisitor btnvis   new basetablenumbersvisitor tnums
+opnode getleftoperand   accept btnvis
+if  tnums getfirstsetbit       1
+return false
+tnums clearall
+opnode getrightoperand   accept btnvis
+if  tnums getfirstsetbit       1
+return false
+return true
+/**
+* is this predicate a join predicate?  in order to be so,
+* it must be a binary relational operator node that has
+* a column reference on both sides.
+*
+* @return whether or not this is a join predicate.
+*/
+protected boolean isjoinpredicate
+// if the predicate isn't a binary relational operator,
+// then it's not a join predicate.
+if    getandnode   getleftoperand
+instanceof binaryrelationaloperatornode
+return false
+binaryrelationaloperatornode opnode
+binaryrelationaloperatornode getandnode   getleftoperand
+// if both sides are column references and they point to different
+// tables, then this is a join pred.
+return   opnode getleftoperand   instanceof columnreference
+opnode getrightoperand   instanceof columnreference
+columnreference opnode getleftoperand    gettablenumber
+columnreference opnode getrightoperand    gettablenumber
+/**
+* if this predicate's operator is a binaryrelationaloperatornode,
+* then look at the operands and return a new, equivalent predicate
+* that is "scoped" to the received resultsetnode.  by "scoped" we
+* mean that the operands, which shold be column references, have been
+* mapped to the appropriate result columns in the received rsn.
+* this is useful for pushing predicates from outer queries down
+* into inner queries, in which case the column references need
+* to be remapped.
+*
+* for example, let v1 represent
+*
+*    select i,j from t1 union select i,j from t2
+*
+* and v2 represent
+*
+*    select a,b from t3 union select a,b from t4
+*
+* then assume we have the following query:
+*
+*    select * from v1, v2 where v1.j = v2.b
+*
+* let's further assume that this predicate object represents the
+* "v1.j = v2.b" operator and that the childrsn we received
+* as a parameter represents one of the subqueries to which we
+* want to push the predicate; let's say it's:
+*
+*    select i,j from t1
+*
+* then this method will return a new predicate whose binary
+* operator represents the expression "t1.j = v2.b" (that is, v1.j
+* will be mapped to the corresponding column in t1).  for more on
+* how that mapping is made, see the "getscopedoperand()" method
+* in binaryrelationaloperatornode.java.
+*
+* assumption: we should only get to this method if we know that
+* at least one operand in this predicate can and should be mapped
+* to the received childrsn.  for an example of where that check is
+* made, see the pushoptpredicate() method in setoperatornode.java.
+*
+* @param parentrsnstables set of all table numbers referenced by
+*  the resultsetnode that is _parent_ to the received childrsn.
+*  we need this to make sure we don't scope the operands to a
+*  resultsetnode to which they don't apply.
+* @param childrsn the result set node for which we want to create
+*  a scoped predicate.
+* @param whichrc if not -1 then this tells us which resultcolumn
+*  in the received childrsn we need to use for the scoped predicate;
+*  if -1 then the column position of the scoped column reference
+*  will be stored in this array and passed back to the caller.
+* @return a new predicate whose operands have been scoped to the
+*  received childrsn.
+*/
+protected predicate getpredscopedforresultset
+jbitset parentrsnstables  resultsetnode childrsn
+int  whichrc  throws standardexception
+// we only deal with binary relational operators here.
+if    getandnode   getleftoperand
+instanceof binaryrelationaloperatornode
+return this
+// the predicate must have an andnode in cnf, so we
+// need to create an andnode representing:
+//    <scoped_bin_rel_op> and true
+// first create the boolean constant for true.
+valuenode truenode    valuenode  getnodefactory   getnode
+c_nodetypes boolean_constant_node
+boolean true
+getcontextmanager
+binaryrelationaloperatornode opnode
+binaryrelationaloperatornode getandnode   getleftoperand
+// create a new op node with left and right operands that point
+// to the received result set's columns as appropriate.
+binaryrelationaloperatornode newopnode
+binaryrelationaloperatornode  getnodefactory   getnode
+opnode getnodetype
+opnode getscopedoperand
+binaryrelationaloperatornode left
+parentrsnstables
+childrsn
+whichrc
+opnode getscopedoperand
+binaryrelationaloperatornode right
+parentrsnstables
+childrsn
+whichrc
+getcontextmanager
+// bind the new op node.
+newopnode bindcomparisonoperator
+// create and bind a new and node in cnf form,
+// i.e. "<newopnode> and true".
+andnode newand    andnode  getnodefactory   getnode
+c_nodetypes and_node
+newopnode
+truenode
+getcontextmanager
+newand postbindfixup
+// categorize the new and node; among other things, this
+// call sets up the new operators's referenced table map,
+// which is important for correct pushing of the new
+// predicate.
+jbitset tablemap   new jbitset
+childrsn getreferencedtablemap   size
+newand categorize tablemap  false
+// now put the pieces together to get a new predicate.
+predicate newpred    predicate  getnodefactory   getnode
+c_nodetypes predicate
+newand
+tablemap
+getcontextmanager
+// copy all of this predicates other fields into the new predicate.
+newpred clearscanflags
+newpred copyfields this
+newpred setpushable getpushable
+// take note of the fact that the new predicate is scoped for
+// the sake of pushing; we need this information during optimization
+// to figure out what we should and should not "pull" back up.
+newpred markasscopedforpush
+return newpred
+/**
+* indicate that this predicate is a scoped copy of some other
+* predicate (i.e. it was created as the result of a call to
+* getpredscopedforresultset() on some other predicate).
+*/
+protected void markasscopedforpush
+this scoped   true
+/**
+* return whether or not this predicate is a scoped copy of
+* another predicate.
+*/
+protected boolean isscopedforpush
+return scoped
+/**
+* when remapping a "normal" (i.e. non-scoped) predicate both
+* of the predicate's operands are remapped and that's it.
+* but when remapping a scoped predicate, things are slightly
+* different.  this method handles remapping of scoped predicates.
+*
+* we know that, for a scoped predicate, exactly one operand has
+* been scoped for a specific target result set; the other operand
+* is pointing to some other instance of fromtable with which the
+* target result set is to be joined (see getscopedoperand() in
+* binaryrelationaloperatornode.java).  for every level of the
+* query through which the scoped predicate is pushed, we have
+* to perform a remap operation of the scoped operand.  we do
+* *not*, however, remap the non-scoped operand.  the reason
+* is that the non-scoped operand is already pointing to the
+* result set against which it must be evaluated.  as the scoped
+* predicate is pushed down the query tree, the non-scoped
+* operand should not change where it's pointing and thus should
+* not be remapped.  for example, assume we have a query whose
+* tree has the following form:
+*
+*               select[0]
+*                /     \
+*              prn      prn
+*               |        |
+*          select[4]   union
+*           |           /   \
+*          prn     select[1]  select[2]
+*           |         |          |
+*       <fbt:t1>     prn        prn
+*                     |          |
+*                select[3]  <frombasetable:t2>
+*                     |
+*                    prn
+*                     |
+*             <frombasetable:t3>
+*
+* assume also that we have some predicate "select[4].i = <union>.j".
+* if the optimizer decides to push the predicate to the union
+* node, it (the predicate) will be scoped to the union's children,
+* yielding something like "select[4].i = select[1].j" for the
+* left child and "select[4].i = select[2].j" for the right child.
+* these scoped predicates will then be pushed to the prns above
+* select[3] and t2, respectively.  as part of that pushing
+* process a call to prn.pushoptpredicate() will occur, which
+* brings us to this method.  so let's assume we're here for
+* the scoped predicate "select[4].i = select[1].j".  then we want
+* to remap the scoped operand, "select[1].j", so that it will
+* point to the correct column in "select[3]".  we do not, however,
+* want to remap the non-scoped operand "select[4].i" because that
+* operand is already pointing to the correct result set--namely,
+* to a column in select[4].  that non-scoped operand should not
+* change regardless of how far down the union subtree the scoped
+* predicate is pushed.
+*
+* if we did try to remap the non-scoped operand, it would end up
+* pointing to result sets too low in the tree, which could lead to
+* execution-time errors.  so when we remap a scoped predicate, we
+* have to make sure we only remap the scoped operand.  that's what
+* this method does.
+*
+* @return true if this predicate is a scoped predicate, in which
+*  case we performed a one-sided remap.  false if the predicate is
+*  not scoped; the caller can then make the calls to perform a
+*  "normal" remap on this predicate.
+*/
+protected boolean remapscopedpred
+if   scoped
+return false
+/* note: right now the only predicates we scope are those
+* which are join predicates and all scoped predicates will
+* have the same relational operator as the predicates from
+* which they were scoped.  thus if we get here, we know
+* that andnode's leftoperand must be an instance of
+* binaryrelationaloperatornode (and therefore the following
+* cast is safe).
+*/
+binaryrelationaloperatornode binrelop
+binaryrelationaloperatornode andnode getleftoperand
+valuenode operand   null
+if  sanitymanager debug
+/* if this predicate is scoped then one (and only one) of
+* its operands should be scoped.  note that it's possible
+* for an operand to be scoped to a non-columnreference
+* value; if either operand is not a columnreference, then
+* that operand must be the scoped operand.
+*/
+operand   binrelop getleftoperand
+boolean leftisscoped
+operand instanceof columnreference
+columnreference operand  isscoped
+operand   binrelop getrightoperand
+boolean rightisscoped
+operand instanceof columnreference
+columnreference operand  isscoped
+sanitymanager assert leftisscoped ^ rightisscoped
+binaryrelopcolrefstostring
+leftisscoped ?
+// find the scoped operand and remap it.
+operand   binrelop getleftoperand
+if   operand instanceof columnreference
+columnreference operand  isscoped
+// left operand is the scoped operand.
+columnreference operand  remapcolumnreferences
+else
+operand   binrelop getrightoperand
+if   operand instanceof columnreference
+columnreference operand  isscoped
+// right operand is the scoped operand.
+columnreference operand  remapcolumnreferences
+// else scoped operand is not a columnreference, which
+// means it can't (and doesn't need to) be remapped. so
+// just fall through and return.
+return true
+/**
+* return true if this predicate is scoped and the scoped
+* operand is a columnreference that points to a source result
+* set.  if the scoped operand is not a columnreference that
+* points to a source result set then it must be pointing to
+* some kind of expression, such as a literal (ex. 'strlit'),
+* an aggregate value (ex. "count(*)"), or the result of a
+* function (ex. "sin(i)") or operator (ex. "i+1").
+*
+* this method is used when pushing predicates to determine how
+* far down the query tree a scoped predicate needs to be pushed
+* to allow for successful evaluation of the scoped operand.  if
+* the scoped operand is not pointing to a source result set
+* then it should not be pushed any further down tree.  the reason
+* is that evaluation of the expression to which the operand is
+* pointing may depend on other values from the current level
+* in the tree (ex. "sin(i)" depends on the value of "i", which
+* could be a column at the predicate's current level).  if we
+* pushed the predicate further down, those values could become
+* inaccessible, leading to execution-time errors.
+*
+* if, on the other hand, the scoped operand *is* pointing to
+* a source result set, then we want to push it further down
+* the tree until it reaches that result set, which allows
+* evaluation of this predicate to occur as close to store as
+* possible.  this method doesn't actually do the push, it just
+* returns "true" and then the caller can push as appropriate.
+*/
+protected boolean isscopedtosourceresultset
+throws standardexception
+if   scoped
+return false
+/* note: right now the only predicates we scope are those
+* which are join predicates and all scoped predicates will
+* have the same relational operator as the predicates from
+* which they were scoped.  thus if we get here, we know
+* that andnode's leftoperand must be an instance of
+* binaryrelationaloperatornode (and therefore the following
+* cast is safe).
+*/
+binaryrelationaloperatornode binrelop
+binaryrelationaloperatornode andnode getleftoperand
+valuenode operand   binrelop getleftoperand
+/* if operand isn't a columnreference then is must be the
+* scoped operand.  this is because both operands have to
+* be column references in order for scoping to occur (as
+* per pushabletosubqueries()) and only the scoped operand
+* can change (esp. can become a non-columnreference) as
+* part of the scoping process.  and since it's not a
+* columnreference it can't be "a columnreference that
+* points to a source result set", so return false.
+*/
+if    operand instanceof columnreference
+return false
+/* if the operand is a columnreference and is scoped,
+* then see if it is pointing to a resultcolumn whose
+* expression is either another a cr or a virtual
+* columnnode.  if it is then that operand applies
+* to a source result set further down the tree and
+* thus we return true.
+*/
+valuenode exp   null
+columnreference cref    columnreference operand
+if  cref isscoped
+exp   cref getsource   getexpression
+return   exp instanceof virtualcolumnnode
+exp instanceof columnreference
+operand   binrelop getrightoperand
+if    operand instanceof columnreference
+return false
+cref    columnreference operand
+if  sanitymanager debug
+// if we got here then the left operand was not the scoped
+// operand; make sure the right one is scoped, then.
+sanitymanager assert cref isscoped
+binaryrelopcolrefstostring
+exp   cref getsource   getexpression
+return   exp instanceof virtualcolumnnode
+exp instanceof columnreference

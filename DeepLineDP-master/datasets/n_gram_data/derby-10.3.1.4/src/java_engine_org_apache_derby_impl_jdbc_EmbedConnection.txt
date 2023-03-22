@@ -1,0 +1,1819 @@
+/*
+derby - class org.apache.derby.impl.jdbc.embedconnection
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl jdbc
+import org apache derby iapi error exceptionseverity
+import org apache derby jdbc internaldriver
+import org apache derby iapi reference attribute
+import org apache derby iapi reference jdbc20translation
+import org apache derby iapi reference jdbc30translation
+import org apache derby iapi reference messageid
+import org apache derby iapi reference property
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services context contextmanager
+import org apache derby iapi services memory lowmemory
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi jdbc authenticationservice
+import org apache derby iapi jdbc engineconnection
+import org apache derby iapi db database
+import org apache derby iapi error exceptionseverity
+import org apache derby iapi error standardexception
+import org apache derby iapi services i18n messageservice
+import org apache derby iapi sql conn languageconnectioncontext
+import org apache derby iapi sql execute executioncontext
+import org apache derby iapi sql dictionary datadictionary
+import org apache derby iapi store access xatransactioncontroller
+/* can't import due to name overlap:
+import java.sql.connection;
+import java.sql.resultset;
+*/
+import java sql preparedstatement
+import java sql callablestatement
+import java sql blob
+import java sql clob
+import java sql databasemetadata
+import java sql sqlexception
+import java sql sqlwarning
+import java sql statement
+import java util hashmap
+import java util properties
+import java util iterator
+import org apache derby impl jdbc authentication noneauthenticationserviceimpl
+/**
+* local implementation of connection for a jdbc driver in
+* the same process as the database.
+* <p>
+* there is always a single root (parent) connection.  the
+* initial jdbc connection is the root connection. a
+* call to <i>getcurrentconnection()</i> or with the url
+* <i>jdbc:default:connection</i> yields a nested connection that shares
+* the same root connection as the parent.  a nested connection
+* is implemented using this class.  the nested connection copies the
+* state of the parent connection and shares some of the same
+* objects (e.g. contextmanager) that are shared across all
+* nesting levels.  the proxy also maintains its own
+* state that is distinct from its parent connection (e.g.
+* autocommit or warnings).
+* <p>
+* <b>synchronization</b>: just about all jdbc actions are
+* synchronized across all connections stemming from the
+* same root connection.  the synchronization is upon
+* the a synchronized object return by the rootconnection.
+<p><b>supports</b>
+<ul>
+<li> jdbc 2.0
+</ul>
+*
+*
+* @see transactionresourceimpl
+*
+*/
+public abstract class embedconnection implements engineconnection
+private static final standardexception exceptionclose   standardexception closeexception
+/**
+* static exception to be thrown when a connection request can not
+* be fulfilled due to lack of memory. a static exception as the lack
+* of memory would most likely cause another outofmemoryexception and
+* if there is not enough memory to create the oome exception then something
+* like the vm dying could occur. simpler just to throw a static.
+*/
+public static final sqlexception no_mem
+util generatecssqlexception sqlstate login_failed
+/**
+* low memory state object for connection requests.
+*/
+public static final lowmemory memorystate   new lowmemory
+//////////////////////////////////////////////////////////
+// objects shared across connection nesting
+//////////////////////////////////////////////////////////
+databasemetadata dbmetadata
+transactionresourceimpl tr     always access tr thru gettr
+private hashmap lobhashmap   null
+private int lobhmkey   0
+//////////////////////////////////////////////////////////
+// state (copied to new nested connections, but nesting
+// specific)
+//////////////////////////////////////////////////////////
+private boolean	active
+boolean	autocommit   true
+boolean	needcommit
+// set to true if none authentication is being used
+private boolean usingnoneauth
+/*
+following is a new feature in jdbc3.0 where you can specify the holdability
+of a resultset at the end of the transaction. this gets set by the
+new method setholdability(int) in jdbc3.0
+*
+*/
+private int	connectionholdability   jdbc30translation hold_cursors_over_commit
+//////////////////////////////////////////////////////////
+// nesting specific objects
+//////////////////////////////////////////////////////////
+/*
+** the root connection is the base connection upon
+** which all actions are synchronized.  by default,
+** we are the root connection unless we are created
+** by copying the state from another connection.
+*/
+final embedconnection rootconnection
+private sqlwarning 		topwarning
+/**
+factory for jdbc objects to be created.
+*/
+private internaldriver factory
+/**
+the connection object the application is using when accessing the
+database through this connection. in most cases this will be equal
+to this. when connection pooling is being used, then it will
+be set to the connection object handed to the application.
+it is used for the getconnection() methods of various jdbc objects.
+*/
+private java sql connection applicationconnection
+/**
+an increasing counter to assign to a resultset on its creation.
+used for ordering resultsets returned from a procedure, always
+returned in order of their creation. is maintained at the root connection.
+*/
+private int resultsetid
+/** cached string representation of the connection id */
+private string connstring
+//////////////////////////////////////////////////////////
+// constructors
+//////////////////////////////////////////////////////////
+// create a new local connection, using a new context manager
+//
+public embedconnection internaldriver driver  string url  properties info
+throws sqlexception
+// create a root connection.
+applicationconnection   rootconnection   this
+factory   driver
+tr   new transactionresourceimpl driver  url  info
+active   true
+// register this thread and its context manager with
+// the global context service
+setupcontextstack
+try
+// stick my context into the context manager
+embedconnectioncontext context   pushconnectioncontext tr getcontextmanager
+// if we are shutting down don't attempt to boot or create the database
+boolean shutdown   boolean valueof info getproperty attribute shutdown_attr   booleanvalue
+// see if database is already booted
+database database    database  monitor findservice property database_module  tr getdbname
+// see if user wants to create a new database.
+boolean	createboot   createboot info
+// derby-2264: keeps track of whether we do a plain boot before an
+// (re)encryption or hard upgrade boot to (possibly) authenticate
+// first. we can not authenticate before we have booted, so in
+// order to enforce data base owner powers over encryption or
+// upgrade, we need a plain boot, then authenticate, then, if all
+// is well, boot with (re)encryption or upgrade.  encryption at
+// create time is not checked.
+boolean istwophaseencryptionboot     createboot
+isencryptionboot info
+boolean istwophaseupgradeboot     createboot
+ishardupgradeboot info
+// save original properties if we modified them for
+// two phase encryption or upgrade boot.
+properties savedinfo   null
+if  database    null
+// database already booted by someone else
+tr setdatabase database
+istwophaseencryptionboot   false
+istwophaseupgradeboot   false
+else if   shutdown
+if  istwophaseencryptionboot    istwophaseupgradeboot
+savedinfo   info
+info   removephasetwoprops  properties info clone
+// return false iff the monitor cannot handle a service of the
+// type indicated by the proptocol within the name.  if that's
+// the case then we are the wrong driver.
+if   bootdatabase info  istwophaseupgradeboot
+tr clearcontextinerror
+setinactive
+return
+if  createboot     shutdown
+// if we are shutting down don't attempt to boot or create the
+// database
+if  tr getdatabase      null
+addwarning embedsqlwarning newembedsqlwarning sqlstate database_exists  getdbname
+else
+// check for user's credential and authenticate the user
+// with system level authentication service.
+// fixme: we should also check for create database operation
+//		  authorization for the user if authorization was
+//		  set at the system level.
+//		  right now, the authorization service does not
+//		  restrict/account for create database op.
+checkusercredentials null  info
+// process with database creation
+database   createdatabase tr getdbname    info
+tr setdatabase database
+if  tr getdatabase      null
+string dbname   tr getdbname
+// do not clear the transactionresource context. it will be restored
+// as part of the finally clause below.
+this setinactive
+throw newsqlexception sqlstate database_not_found  dbname
+// check user's credentials and if it is a valid user of
+// the database
+//
+checkusercredentials tr getdbname    info
+// make a real connection into the database, setup lcc, tc and all
+// the rest.
+tr starttransaction
+if  istwophaseencryptionboot    istwophaseupgradeboot
+// derby-2264: shutdown and boot again with encryption or
+// upgrade attributes active. this is restricted to the
+// database owner if authentication and sqlauthorization is on.
+if   usingnoneauth
+getlanguageconnection   usessqlauthorization
+// a failure here leaves database booted, but no
+// (re)encryption has taken place and the connection is
+// rejected.
+checkisdbowner istwophaseencryptionboot? op_encrypt
+op_hard_upgrade
+// shutdown and reboot using saved properties which
+// include the (re)encyption or upgrade attribute(s)
+info   savedinfo
+handleexception tr shutdowndatabaseexception
+restorecontextstack
+tr   new transactionresourceimpl driver  url  info
+active   true
+setupcontextstack
+if   bootdatabase info  false
+if  sanitymanager debug
+sanitymanager throwassert
+tr clearcontextinerror
+setinactive
+return
+// don't need to check user credentials again, did
+// that on first plain boot, so just start
+tr starttransaction
+// now we have the database connection, we can shut down
+if  shutdown
+if   usingnoneauth
+getlanguageconnection   usessqlauthorization
+// derby-2264: only allow database owner to shut down if
+// authentication and sqlauthorization is on.
+checkisdbowner op_shutdown
+throw tr shutdowndatabaseexception
+// raise a warning in sqlauthorization mode if authentication is not on
+if  usingnoneauth    getlanguageconnection   usessqlauthorization
+addwarning embedsqlwarning newembedsqlwarning sqlstate sql_authorization_with_no_authentication
+catch  outofmemoryerror nomemory
+//system.out.println("freea");
+restorecontextstack
+tr lcc   null
+tr cm   null
+//system.out.println("free");
+//system.out.println(runtime.getruntime().freememory());
+memorystate setlowmemory
+//nomemory.printstacktrace();
+// throw util.generatecssqlexception(sqlstate.login_failed, nomemory.getmessage(), nomemory);
+throw no_mem
+catch  throwable t
+if  t instanceof standardexception
+standardexception se    standardexception  t
+if  se getseverity   < exceptionseverity session_severity
+se setseverity exceptionseverity session_severity
+tr cleanuponerror t
+throw handleexception t
+finally
+restorecontextstack
+/**
+examine the attributes set provided for illegal boot
+combinations and determine if this is a create boot.
+@return true iff the attribute <em>create=true</em> is provided. this
+means create a standard database.  in other cases, returns
+false.
+@param p the attribute set.
+@exception sqlexception throw if more than one of
+<em>create</em>, <em>createfrom</em>, <em>restorefrom</em> and
+<em>rollforwardrecoveryfrom</em> is used simultaneously. <br>
+also, throw if (re)encryption is attempted with one of
+<em>createfrom</em>, <em>restorefrom</em> and
+<em>rollforwardrecoveryfrom</em>.
+*/
+private boolean createboot properties p  throws sqlexception
+int createcount   0
+if  boolean valueof p getproperty attribute create_attr   booleanvalue
+createcount
+int restorecount 0
+//check if the user has specified any /create/restore/recover from backup attributes.
+if  p getproperty attribute create_from     null
+restorecount
+if  p getproperty attribute restore_from     null
+restorecount
+if  p getproperty attribute roll_forward_recovery_from   null
+restorecount
+if restorecount > 1
+throw newsqlexception sqlstate conflicting_restore_attributes
+// check if user has specified re-encryption attributes in
+// combination with createfrom/restorefrom/rollforwardrecoveryfrom
+// attributes.  re-encryption is not
+// allowed when restoring from backup.
+if  restorecount    0    isencryptionboot p
+throw newsqlexception sqlstate conflicting_restore_attributes
+//add the restore count to create count to make sure
+//user has not specified and restore together by mistake.
+createcount   createcount   restorecount
+//
+if  createcount > 1  throw newsqlexception sqlstate conflicting_create_attributes
+//retuns true only for the  create flag not for restore flags
+return  createcount   restorecount     1
+/**
+* examine boot properties and determine if a boot with the given
+* attributes would entail an encryption operation.
+*
+* @param p the attribute set
+* @return true if a boot will encrypt or re-encrypt the database
+*/
+private boolean isencryptionboot properties p
+return   boolean valueof
+p getproperty attribute data_encryption   booleanvalue
+p getproperty attribute new_boot_password     null
+p getproperty attribute new_crypto_external_key     null
+/**
+* examine boot properties and determine if a boot with the given
+* attributes would entail a hard upgrade.
+*
+* @param p the attribute set
+* @return true if a boot will hard upgrade the database
+*/
+private boolean ishardupgradeboot properties p
+return boolean valueof
+p getproperty attribute upgrade_attr   booleanvalue
+/**
+* remove any encryption or upgarde properties from the given properties
+*
+* @param p the attribute set
+* @return clone sans encryption properties
+*/
+private properties removephasetwoprops properties p
+p remove attribute data_encryption
+p remove attribute new_boot_password
+p remove attribute new_crypto_external_key
+p remove attribute upgrade_attr
+return p
+/**
+* create a new connection based off of the
+* connection passed in.  initializes state
+* based on input connection, and copies
+* appropriate object pointers. this is only used
+for nested connections.
+*
+* @param inputconnection the input connection
+*/
+public embedconnection embedconnection inputconnection
+if  sanitymanager debug
+sanitymanager assert inputconnection active
+// proxy connections are always autocommit false
+// thus needcommit is irrelavent.
+autocommit   false
+/*
+** nesting specific state we are copying from
+** the inputconnection
+*/
+/*
+** objects we are sharing across nestings
+*/
+// set it to null to allow it to be final.
+tr   null 			   a proxy connection has no direct
+// pointer to the tr.  every call has to go
+// thru the rootconnection's tr.
+active   true
+this rootconnection   inputconnection rootconnection
+this applicationconnection   this
+this factory   inputconnection factory
+//if no holdability specified for the resultset, use the holability
+//defined for the connection
+this connectionholdability   inputconnection connectionholdability
+//resolve: although it looks like the right
+// thing to share the metadata object, if
+// we do we'll get the wrong behavior on
+// getcurrentconnection().getmetadata().isreadonly()
+// so don't try to be smart and uncomment the
+// following.  ultimately, the metadata should
+// be shared by all connections anyway.
+//dbmetadata = inputconnection.dbmetadata;
+//
+// check passed-in user's credentials.
+//
+private void checkusercredentials string dbname
+properties userinfo
+throws sqlexception
+if  sanitymanager debug
+sanitymanager assert  isclosed
+// if a database name was passed-in then check user's credential
+// in that database using the database's authentication service,
+// otherwise check if it is a valid user in the jbms system.
+//
+// note: we always expect an authentication service per database
+// and one at the system level.
+//
+authenticationservice authenticationservice   null
+// retrieve appropriate authentication service handle
+if  dbname    null
+authenticationservice   getlocaldriver   getauthenticationservice
+else
+authenticationservice   gettr   getdatabase   getauthenticationservice
+// check that we do have a authentication service
+// it is _always_ expected.
+if  authenticationservice    null
+string failedstring   messageservice gettextmessage
+dbname    null  ? messageid auth_no_service_for_system   messageid auth_no_service_for_db
+throw newsqlexception sqlstate login_failed  failedstring
+// let's authenticate now
+if   authenticationservice authenticate
+dbname
+userinfo
+throw newsqlexception sqlstate login_failed  messageservice gettextmessage messageid auth_invalid
+// if authentication is not on, we have to raise a warning if sqlauthorization is on
+// since noneauthenticationservice is the default for derby, it should be ok to refer
+// to its implementation here, since it will always be present.
+if  authenticationservice instanceof noneauthenticationserviceimpl
+usingnoneauth   true
+/* enumerate operations controlled by database owner powers */
+private static final int op_encrypt   0
+private static final int op_shutdown   1
+private static final int op_hard_upgrade   2
+/**
+* check if actual authenticationid is equal to the database owner's.
+*
+* @param operation attempted operation which needs database owner powers
+* @throws sqlexception if actual authenticationid is different
+* from authenticationid of database owner.
+*/
+private void checkisdbowner int operation  throws sqlexception
+final languageconnectioncontext lcc   getlanguageconnection
+final string actualid   lcc getauthorizationid
+final string dbownerid   lcc getdatadictionary
+getauthorizationdatabaseowner
+if   actualid equals dbownerid
+switch  operation
+case op_encrypt
+throw newsqlexception sqlstate auth_encrypt_not_db_owner
+actualid  tr getdbname
+case op_shutdown
+throw newsqlexception sqlstate auth_shutdown_not_db_owner
+actualid  tr getdbname
+case op_hard_upgrade
+throw newsqlexception sqlstate auth_hard_upgrade_not_db_owner
+actualid  tr getdbname
+default
+if  sanitymanager debug
+sanitymanager throwassert
+throw newsqlexception
+sqlstate auth_database_connection_refused
+/**
+* gets the enginetype of the connected database.
+*
+* @return 0 if there is no database, the engine type otherwise. @see org.apache.derby.iapi.reference.enginetype
+*/
+public int getenginetype
+database db   getdatabase
+if  null    db
+return 0
+return db getenginetype
+/*
+** methods from java.sql.connection
+*/
+/**
+* sql statements without parameters are normally
+* executed using statement objects. if the same sql statement
+* is executed many times, it is more efficient to use a
+* preparedstatement
+*
+* jdbc 2.0
+*
+* result sets created using the returned statement will have
+* forward-only type, and read-only concurrency, by default.
+*
+* @return a new statement object
+* @exception sqlexception if a database-access error occurs.
+*/
+public final statement createstatement   throws sqlexception
+return createstatement jdbc20translation type_forward_only
+jdbc20translation concur_read_only
+connectionholdability
+/**
+* jdbc 2.0
+*
+* same as createstatement() above, but allows the default result set
+* type and result set concurrency type to be overridden.
+*
+* @param resultsettype a result set type, see resultset.type_xxx
+* @param resultsetconcurrency a concurrency type, see resultset.concur_xxx
+* @return a new statement object
+* @exception sqlexception if a database-access error occurs.
+*/
+public final statement createstatement int resultsettype
+int resultsetconcurrency
+throws sqlexception
+return createstatement resultsettype  resultsetconcurrency
+connectionholdability
+/**
+* jdbc 3.0
+*
+* same as createstatement() above, but allows the default result set
+* type, result set concurrency type and result set holdability type to
+* be overridden.
+*
+* @param resultsettype a result set type, see resultset.type_xxx
+* @param resultsetconcurrency a concurrency type, see resultset.concur_xxx
+* @param resultsetholdability a holdability type,
+*  resultset.hold_cursors_over_commit or resultset.close_cursors_at_commit
+* @return a new statement object
+* @exception sqlexception if a database-access error occurs.
+*/
+public final statement createstatement int resultsettype
+int resultsetconcurrency
+int resultsetholdability
+throws sqlexception
+checkifclosed
+return factory newembedstatement this  false
+setresultsettype resultsettype   resultsetconcurrency
+resultsetholdability
+/**
+* a sql statement with or without in parameters can be
+* pre-compiled and stored in a preparedstatement object. this
+* object can then be used to efficiently execute this statement
+* multiple times.
+*
+* <p><b>note:</b> this method is optimized for handling
+* parametric sql statements that benefit from precompilation. if
+* the driver supports precompilation, preparestatement will send
+* the statement to the database for precompilation. some drivers
+* may not support precompilation. in this case, the statement may
+* not be sent to the database until the preparedstatement is
+* executed.  this has no direct affect on users; however, it does
+* affect which method throws certain sqlexceptions.
+*
+* jdbc 2.0
+*
+* result sets created using the returned preparedstatement will have
+* forward-only type, and read-only concurrency, by default.
+*
+* @param sql a sql statement that may contain one or more '?' in
+* parameter placeholders
+* @return a new preparedstatement object containing the
+* pre-compiled statement
+* @exception sqlexception if a database-access error occurs.
+*/
+public final preparedstatement preparestatement string sql
+throws sqlexception
+return preparestatement sql jdbc20translation type_forward_only
+jdbc20translation concur_read_only
+connectionholdability
+jdbc30translation no_generated_keys
+
+
+/**
+* jdbc 2.0
+*
+* same as preparestatement() above, but allows the default result set
+* type and result set concurrency type to be overridden.
+*
+* @param resultsettype a result set type, see resultset.type_xxx
+* @param resultsetconcurrency a concurrency type, see resultset.concur_xxx
+* @return a new preparedstatement object containing the
+* pre-compiled sql statement
+* @exception sqlexception if a database-access error occurs.
+*/
+public final preparedstatement preparestatement string sql  int resultsettype
+int resultsetconcurrency
+throws sqlexception
+return preparestatement sql
+resultsettype
+resultsetconcurrency
+connectionholdability
+jdbc30translation no_generated_keys
+
+
+/**
+* jdbc 3.0
+*
+* same as preparestatement() above, but allows the default result set
+* type, result set concurrency type and result set holdability
+* to be overridden.
+*
+* @param resultsettype a result set type, see resultset.type_xxx
+* @param resultsetconcurrency a concurrency type, see resultset.concur_xxx
+* @param resultsetholdability - one of the following resultset constants:
+*  resultset.hold_cursors_over_commit or resultset.close_cursors_at_commit
+* @return a new preparedstatement object containing the
+*  pre-compiled sql statement
+* @exception sqlexception if a database-access error occurs.
+*/
+public final preparedstatement preparestatement string sql  int resultsettype
+int resultsetconcurrency  int resultsetholdability
+throws sqlexception
+return preparestatement sql
+resultsettype
+resultsetconcurrency
+resultsetholdability
+jdbc30translation no_generated_keys
+
+
+/**
+* creates a default preparedstatement object capable of returning
+* the auto-generated keys designated by the given array. this array contains
+* the indexes of the columns in the target table that contain the auto-generated
+* keys that should be made available. this array is ignored if the sql statement
+* is not an insert statement
+jdbc 3.0
+*
+*
+* @param sql  an sql statement that may contain one or more ? in parameter placeholders
+* @param columnindexes  an array of column indexes indicating the columns
+*  that should be returned from the inserted row or rows
+*
+* @return  a new preparedstatement object, containing the pre-compiled
+*  sql statement, that will have the capability of returning auto-generated keys
+*  designated by the given array of column indexes
+*
+* @exception sqlexception  thrown on error.
+*/
+public final preparedstatement preparestatement
+string sql
+int columnindexes
+throws sqlexception
+return preparestatement sql
+jdbc20translation type_forward_only
+jdbc20translation concur_read_only
+connectionholdability
+columnindexes    null
+? jdbc30translation no_generated_keys
+jdbc30translation return_generated_keys
+columnindexes
+
+/**
+* creates a default preparedstatement object capable of returning
+* the auto-generated keys designated by the given array. this array contains
+* the names of the columns in the target table that contain the auto-generated
+* keys that should be returned. this array is ignored if the sql statement
+* is not an insert statement
+*
+jdbc 3.0
+*
+* @param sql  an sql statement that may contain one or more ? in parameter placeholders
+* @param columnnames  an array of column names indicating the columns
+*  that should be returned from the inserted row or rows
+*
+* @return  a new preparedstatement object, containing the pre-compiled
+*  sql statement, that will have the capability of returning auto-generated keys
+*  designated by the given array of column names
+*
+* @exception sqlexception thrown on error.
+*/
+public final preparedstatement preparestatement
+string sql
+string columnnames
+throws sqlexception
+return preparestatement sql
+jdbc20translation type_forward_only
+jdbc20translation concur_read_only
+connectionholdability
+columnnames    null
+? jdbc30translation no_generated_keys
+jdbc30translation return_generated_keys
+
+columnnames
+/**
+* creates a default preparedstatement object that has the capability to
+* retieve auto-generated keys. the given constant tells the driver
+* whether it should make auto-generated keys available for retrieval.
+* this parameter is ignored if the sql statement is not an insert statement.
+* jdbc 3.0
+*
+* @param sql  a sql statement that may contain one or more ? in parameter placeholders
+* @param autogeneratedkeys  a flag indicating whether auto-generated keys
+*  should be returned
+*
+* @return  a new preparedstatement object, containing the pre-compiled
+*  sql statement, that will have the capability of returning auto-generated keys
+*
+* @exception sqlexception  feature not implemented for now.
+*/
+public final preparedstatement preparestatement
+string sql
+int autogeneratedkeys
+throws sqlexception
+return preparestatement sql
+jdbc20translation type_forward_only
+jdbc20translation concur_read_only
+connectionholdability
+autogeneratedkeys
+
+
+private preparedstatement preparestatement string sql  int resultsettype
+int resultsetconcurrency  int resultsetholdability
+int autogeneratedkeys  int columnindexes  string columnnames
+throws sqlexception
+synchronized  getconnectionsynchronization
+setupcontextstack
+try
+return factory newembedpreparedstatement this  sql  false
+setresultsettype resultsettype
+resultsetconcurrency
+resultsetholdability
+autogeneratedkeys
+columnindexes
+columnnames
+finally
+restorecontextstack
+/**
+* a sql stored procedure call statement is handled by creating a
+* callablestatement for it. the callablestatement provides
+* methods for setting up its in and out parameters, and
+* methods for executing it.
+*
+* <p><b>note:</b> this method is optimized for handling stored
+* procedure call statements. some drivers may send the call
+* statement to the database when the preparecall is done; others
+* may wait until the callablestatement is executed. this has no
+* direct affect on users; however, it does affect which method
+* throws certain sqlexceptions.
+*
+* jdbc 2.0
+*
+* result sets created using the returned callablestatement will have
+* forward-only type, and read-only concurrency, by default.
+*
+* @param sql a sql statement that may contain one or more '?'
+* parameter placeholders. typically this  statement is a jdbc
+* function call escape string.
+* @return a new callablestatement object containing the
+* pre-compiled sql statement
+* @exception sqlexception if a database-access error occurs.
+*/
+public final callablestatement preparecall string sql
+throws sqlexception
+return preparecall sql  jdbc20translation type_forward_only
+jdbc20translation concur_read_only
+connectionholdability
+/**
+* jdbc 2.0
+*
+* same as preparecall() above, but allows the default result set
+* type and result set concurrency type to be overridden.
+*
+* @param resultsettype a result set type, see resultset.type_xxx
+* @param resultsetconcurrency a concurrency type, see resultset.concur_xxx
+* @return a new callablestatement object containing the
+* pre-compiled sql statement
+* @exception sqlexception if a database-access error occurs.
+*/
+public final callablestatement preparecall string sql  int resultsettype
+int resultsetconcurrency
+throws sqlexception
+return preparecall sql  resultsettype  resultsetconcurrency
+connectionholdability
+/**
+* jdbc 3.0
+*
+* same as preparecall() above, but allows the default result set
+* type, result set concurrency type and result set holdability
+* to be overridden.
+*
+* @param resultsettype a result set type, see resultset.type_xxx
+* @param resultsetconcurrency a concurrency type, see resultset.concur_xxx
+* @param resultsetholdability - one of the following resultset constants:
+*  resultset.hold_cursors_over_commit or resultset.close_cursors_at_commit
+* @return a new callablestatement object containing the
+* pre-compiled sql statement
+* @exception sqlexception if a database-access error occurs.
+*/
+public final callablestatement preparecall string sql  int resultsettype
+int resultsetconcurrency  int resultsetholdability
+throws sqlexception
+checkifclosed
+synchronized  getconnectionsynchronization
+setupcontextstack
+try
+return factory newembedcallablestatement this  sql
+setresultsettype resultsettype
+resultsetconcurrency
+resultsetholdability
+finally
+restorecontextstack
+/**
+* a driver may convert the jdbc sql grammar into its system's
+* native sql grammar prior to sending it; nativesql returns the
+* native form of the statement that the driver would have sent.
+*
+* @param sql a sql statement that may contain one or more '?'
+* parameter placeholders
+* @return the native form of this statement
+*/
+public string nativesql string sql  throws sqlexception
+checkifclosed
+// we don't massage the strings at all, so this is easy:
+return sql
+/**
+* if a connection is in auto-commit mode, then all its sql
+* statements will be executed and committed as individual
+* transactions.  otherwise, its sql statements are grouped into
+* transactions that are terminated by either commit() or
+* rollback().  by default, new connections are in auto-commit
+* mode.
+*
+* the commit occurs when the statement completes or the next
+* execute occurs, whichever comes first. in the case of
+* statements returning a resultset, the statement completes when
+* the last row of the resultset has been retrieved or the
+* resultset has been closed. in advanced cases, a single
+* statement may return multiple results as well as output
+* parameter values. here the commit occurs when all results and
+* output param values have been retrieved.
+*
+* @param autocommit true enables auto-commit; false disables
+* auto-commit.
+* @exception sqlexception if a database-access error occurs.
+*/
+public void setautocommit boolean autocommit  throws sqlexception
+checkifclosed
+// is this a nested connection
+if  rootconnection    this
+if  autocommit
+throw newsqlexception sqlstate no_auto_commit_on
+if  this autocommit    autocommit
+commit
+this autocommit   autocommit
+/**
+* get the current auto-commit state.
+*
+* @return current state of auto-commit mode.
+* @see #setautocommit
+*/
+public boolean getautocommit   throws sqlexception
+checkifclosed
+return autocommit
+/**
+* commit makes all changes made since the previous
+* commit/rollback permanent and releases any database locks
+* currently held by the connection. this method should only be
+* used when auto commit has been disabled.
+*
+* @exception sqlexception if a database-access error occurs.
+* @see #setautocommit
+*/
+public void commit   throws sqlexception
+synchronized  getconnectionsynchronization
+/*
+** note that the context stack is
+** needed even for rollback & commit
+*/
+setupcontextstack
+try
+gettr   commit
+clearlobmapping
+catch  throwable t
+throw handleexception t
+finally
+restorecontextstack
+needcommit   false
+/**
+* rollback drops all changes made since the previous
+* commit/rollback and releases any database locks currently held
+* by the connection. this method should only be used when auto
+* commit has been disabled.
+*
+* @exception sqlexception if a database-access error occurs.
+* @see #setautocommit
+*/
+public void rollback   throws sqlexception
+synchronized  getconnectionsynchronization
+/*
+** note that the context stack is
+** needed even for rollback & commit
+*/
+setupcontextstack
+try
+gettr   rollback
+clearlobmapping
+catch  throwable t
+throw handleexception t
+finally
+restorecontextstack
+needcommit   false
+/**
+* in some cases, it is desirable to immediately release a
+* connection's database and jdbc resources instead of waiting for
+* them to be automatically released; the close method provides this
+* immediate release.
+*
+* <p><b>note:</b> a connection is automatically closed when it is
+* garbage collected. certain fatal errors also result in a closed
+* connection.
+*
+* @exception sqlexception if a database-access error occurs.
+*/
+public void close   throws sqlexception
+// jdk 1.4 javadoc indicates close on a closed connection is a no-op
+if   isclosed
+rootconnection    this
+autocommit     transactionisidle
+throw newsqlexception
+sqlstate lang_invalid_transaction_state
+close exceptionclose
+// this inner close takes the exception and calls
+// the context manager to make the connection close.
+// the exception must be a session severity exception.
+//
+// note: this method is not part of jdbc specs.
+//
+private void close standardexception e  throws sqlexception
+synchronized getconnectionsynchronization
+if  rootconnection    this
+/*
+* if it isn't active, it's already been closed.
+*/
+if  active
+if  tr isactive
+setupcontextstack
+try
+tr rollback
+// let go of lcc reference so it can be gc'ed after
+// cleanuponerror, the tr will stay around until the
+// rootconnection itself is gc'ed, which is dependent
+// on how long the client program wants to hold on to
+// the connection object.
+tr clearlcc
+tr cleanuponerror e
+catch  throwable t
+throw handleexception t
+finally
+restorecontextstack
+else
+// derby-1947: if another connection has closed down
+// the database, the transaction is not active, but
+// the cleanup has not been done yet.
+tr clearlcc
+tr cleanuponerror e
+if   isclosed
+setinactive
+/**
+* tests to see if a connection is closed.
+*
+* @return true if the connection is closed; false if it's still open
+*/
+public final boolean isclosed
+if  active
+// i am attached, check the database state
+if  gettr   isactive
+return false
+return true
+/**
+* a connection's database is able to provide information
+* describing its tables, its supported sql grammar, its stored
+* procedures, the capabilities of this connection, etc. this
+* information is made available through a databasemetadata
+* object.
+*
+* @return a databasemetadata object for this connection
+* @exception sqlexception if a database-access error occurs.
+*/
+public databasemetadata getmetadata   throws sqlexception
+checkifclosed
+if  dbmetadata    null
+// there is a case where dbname can be null.
+// replication client of this method does not have a
+// jdbc connection; therefore dbname is null and this
+// is expected.
+//
+dbmetadata   factory newembeddatabasemetadata this  gettr   geturl
+return dbmetadata
+/**
+jdbc 3.0
+* retrieves the current holdability of resultset objects created using this
+* connection object.
+*
+*
+* @return  the holdability, one of resultset.hold_cursors_over_commit
+* or resultset.close_cursors_at_commit
+*
+*/
+public final int getholdability   throws sqlexception
+checkifclosed
+return connectionholdability
+/**
+jdbc 3.0
+* changes the holdability of resultset objects created using this
+* connection object to the given holdability.
+*
+*
+* @param holdability  a resultset holdability constant, one of resultset.hold_cursors_over_commit
+* or resultset.close_cursors_at_commit
+*
+*/
+public final void setholdability int holdability  throws sqlexception
+checkifclosed
+connectionholdability   holdability
+/**
+* you can put a connection in read-only mode as a hint to enable
+* database optimizations.
+*
+* <p><b>note:</b> setreadonly cannot be called while in the
+* middle of a transaction.
+*
+* @param readonly true enables read-only mode; false disables
+* read-only mode.
+* @exception sqlexception if a database-access error occurs.
+*/
+public final void setreadonly boolean readonly  throws sqlexception
+synchronized getconnectionsynchronization
+setupcontextstack
+try
+getlanguageconnection   setreadonly readonly
+catch  standardexception e
+throw handleexception e
+finally
+restorecontextstack
+/**
+* tests to see if the connection is in read-only mode.
+*
+* @return true if connection is read-only
+* @exception sqlexception if a database-access error occurs.
+*/
+public final boolean isreadonly   throws sqlexception
+checkifclosed
+return getlanguageconnection   isreadonly
+/**
+* a sub-space of this connection's database may be selected by setting a
+* catalog name. if the driver does not support catalogs it will
+* silently ignore this request.
+*
+* @exception sqlexception if a database-access error occurs.
+*/
+public void setcatalog string catalog  throws sqlexception
+checkifclosed
+// silently ignoring this request like the javadoc said.
+return
+/**
+* return the connection's current catalog name.
+*
+* @return the current catalog name or null
+* @exception sqlexception if a database-access error occurs.
+*/
+public string getcatalog   throws sqlexception
+checkifclosed
+// we do not have support for catalog, just return null as
+// the jdbc specs mentions then.
+return null
+/**
+* you can call this method to try to change the transaction
+* isolation level using one of the transaction_* values.
+*
+* <p><b>note:</b> settransactionisolation causes the current
+* transaction to commit if the isolation level is changed. otherwise, if
+* the requested isolation level is the same as the current isolation
+* level, this method is a no-op.
+*
+* @param level one of the transaction_* isolation values with the
+* exception of transaction_none; some databases may not support
+* other values
+* @exception sqlexception if a database-access error occurs.
+* @see databasemetadata#supportstransactionisolationlevel
+*/
+public void settransactionisolation int level  throws sqlexception
+if  level    gettransactionisolation
+return
+// convert the isolation level to the internal one
+int ilevel
+switch  level
+case java sql connection transaction_read_uncommitted
+ilevel   executioncontext read_uncommitted_isolation_level
+break
+case java sql connection transaction_read_committed
+ilevel   executioncontext read_committed_isolation_level
+break
+case java sql connection transaction_repeatable_read
+ilevel   executioncontext repeatable_read_isolation_level
+break
+case java sql connection transaction_serializable
+ilevel   executioncontext serializable_isolation_level
+break
+default
+throw newsqlexception sqlstate unimplemented_isolation_level  new integer level
+synchronized getconnectionsynchronization
+setupcontextstack
+try
+getlanguageconnection   setisolationlevel ilevel
+catch  standardexception e
+throw handleexception e
+finally
+restorecontextstack
+/**
+* get this connection's current transaction isolation mode.
+*
+* @return the current transaction_* mode value
+* @exception sqlexception if a database-access error occurs.
+*/
+public final int gettransactionisolation   throws sqlexception
+checkifclosed
+return executioncontext cs_to_jdbc_isolation_level_map
+/**
+* the first warning reported by calls on this connection is
+* returned.
+*
+* <p><b>note:</b> subsequent warnings will be chained to this
+* sqlwarning.
+*
+* @return the first sqlwarning or null
+*
+* synchronization note: warnings are synchronized
+* on nesting level
+*/
+public final synchronized sqlwarning getwarnings   throws sqlexception
+checkifclosed
+return topwarning
+/**
+* after this call, getwarnings returns null until a new warning is
+* reported for this connection.
+*
+* synchronization node: warnings are synchonized
+* on nesting level
+*/
+public final synchronized void clearwarnings   throws sqlexception
+checkifclosed
+topwarning   null
+/////////////////////////////////////////////////////////////////////////
+//
+//	jdbc 2.0	-	new public methods
+//
+/////////////////////////////////////////////////////////////////////////
+/**
+*
+* get the type-map object associated with this connection.
+* by default, the map returned is empty.
+* jdbc 2.0 - java.util.map requires jdk 1
+*
+*/
+public java util map gettypemap   throws sqlexception
+checkifclosed
+// just return an immuntable empty map
+return java util collections empty_map
+/**
+* install a type-map object as the default type-map for
+* this connection.
+* jdbc 2.0 - java.util.map requires jdk 1
+*
+* @exception sqlexception feature not implemented for now.
+*/
+public final void settypemap java util map map  throws sqlexception
+checkifclosed
+if  map    null
+throw util generatecssqlexception sqlstate invalid_api_parameter map
+if   map isempty
+throw util notimplemented
+/////////////////////////////////////////////////////////////////////////
+//
+//	implementation specific methods
+//
+/////////////////////////////////////////////////////////////////////////
+/**
+add a warning to the current list of warnings, to follow
+this note from connection.getwarnings.
+note: subsequent warnings will be chained to this sqlwarning.
+@see java.sql.connection#getwarnings
+*/
+public final synchronized void addwarning sqlwarning newwarning
+if  topwarning    null
+topwarning   newwarning
+return
+topwarning setnextwarning newwarning
+/**
+* return the dbname for this connection.
+*
+* @return string	the dbname for this connection.
+*/
+public string getdbname
+if  sanitymanager debug
+sanitymanager assert  isclosed
+return gettr   getdbname
+public final languageconnectioncontext getlanguageconnection
+if  sanitymanager debug
+sanitymanager assert  isclosed
+return gettr   getlcc
+/**
+* raises an exception if the connection is closed.
+*
+* @exception sqlexception if the connection is closed
+*/
+protected final void checkifclosed   throws sqlexception
+if  isclosed
+throw util nocurrentconnection
+//embedconnection30 overrides this method so it can release the savepoints array if
+//the exception severity is transaction level
+sqlexception handleexception throwable thrownexception
+throws sqlexception
+//assume in case of sqlexception cleanup is
+//done already. this assumption is inline with
+//tr's assumption. in case no rollback was
+//called lob objects will remain valid.
+if  thrownexception instanceof standardexception
+if    standardexception  thrownexception
+getseverity
+>  exceptionseverity transaction_severity
+clearlobmapping
+/*
+** by default, rollback the connection on if autocommit
+** is on.
+*/
+return gettr   handleexception thrownexception
+autocommit
+true    rollback xact on auto commit
+/**
+handle any type of exception.
+<ul>
+<li> inform the contexts of the error
+<li> throw an util based upon the thrown exception.
+</ul>
+remind: now that we know all the exceptions from our driver
+are utils, would it make sense to shut down the system
+for unknown sqlexceptions? at present, we do not.
+because this is the last stop for exceptions,
+it will catch anything that occurs in it and try
+to cleanup before re-throwing them.
+@param thrownexception the exception
+@param rollbackonautocommit rollback the xact on if autocommit is
+on, otherwise rollback stmt but leave xact open (and
+continue to hold on to locks).  most of the time, this
+will be true, excepting operations on result sets, like
+getint().
+*/
+final sqlexception handleexception throwable thrownexception
+boolean rollbackonautocommit
+throws sqlexception
+//assume in case of sqlexception cleanup is
+//done already. this assumption is inline with
+//tr's assumption. in case no rollback was
+//called lob objects will remain valid.
+if  thrownexception instanceof standardexception
+if    standardexception  thrownexception
+getseverity
+>  exceptionseverity transaction_severity
+clearlobmapping
+return gettr   handleexception thrownexception  autocommit
+rollbackonautocommit
+/*
+this is called from the embedconnectioncontext to
+close on errors.  we assume all handling of the connectin
+is dealt with via the context stack, and our only role
+is to mark ourself as closed.
+*/
+/**
+close the connection when processing errors, or when
+closing a nested connection.
+<p>
+this only marks it as closed and frees up its resources;
+any closing of the underlying connection or commit work
+is assumed to be done elsewhere.
+called from embedconnectioncontext's cleanup routine,
+and by proxy.close().
+*/
+public final void setinactive
+if  active    false
+return
+// active = false
+// tr = null !-> active = false
+synchronized  getconnectionsynchronization
+active   false
+// tr = null; cleanuponerror sets inactive but still needs tr to
+// restore context later
+dbmetadata   null
+/**
+@exception throwable	standard error policy
+*/
+protected void finalize   throws throwable
+try
+// only close root connections, since for nested
+// connections, it is not strictly necessary and close()
+// synchronizes on the root connection which can cause
+// deadlock with the call to runfinalization from
+// genericpreparedstatement#preparetoinvalidate (see
+// derby-1947) on sun vms.
+if  rootconnection    this
+close exceptionclose
+finally
+super finalize
+/**
+* if auto commit is on, remember that we need to commit
+* the current statement.
+*/
+protected void needcommit
+if   needcommit  needcommit   true
+/**
+* if a commit is needed, perform it.
+*
+* must have connection synchonization and context set up already.
+*
+* @exception sqlexception if commit returns error
+*/
+protected void commitifneeded   throws sqlexception
+if  autocommit    needcommit
+try
+gettr   commit
+clearlobmapping
+catch  throwable t
+throw handleexception t
+needcommit   false
+/**
+* if in autocommit, then commit.
+*
+* used to force a commit after a result set closes in autocommit mode.
+* the needcommit mechanism does not work correctly as there are times
+* with cursors (like a commit, followed by a next, followed by a close)
+* where the system does not think it needs a commit but we need to
+* force the commit on close.  it seemed safer to just force a commit
+* on close rather than count on keeping the needcommit flag correct for
+* all cursor cases.
+*
+* must have connection synchonization and context set up already.
+*
+* @exception sqlexception if commit returns error
+*/
+protected void commitifautocommit   throws sqlexception
+if  autocommit
+try
+gettr   commit
+clearlobmapping
+catch  throwable t
+throw handleexception t
+needcommit   false
+final protected object getconnectionsynchronization
+return rootconnection
+/**
+install the context manager for this thread.  check connection status here.
+@exception sqlexception if fails
+*/
+protected final void  setupcontextstack   throws sqlexception
+/*
+track this entry, then throw an exception
+rather than doing the quiet return.  need the
+track before the throw because the backtrack
+is in a finally block.
+*/
+checkifclosed
+gettr   setupcontextstack
+protected final void restorecontextstack   throws sqlexception
+if  sanitymanager debug
+util assert this   active     gettr   getcsf     null
+transactionresourceimpl tr   gettr
+//remind: someone is leaving an incorrect manager on when they
+// are exiting the system in the nested case.
+if  sanitymanager debug
+if  tr getcsf      null
+contextmanager cm1   tr getcsf   getcurrentcontextmanager
+contextmanager cm2   tr getcontextmanager
+// if the system has been shut down, cm1 can be null.
+// otherwise, cm1 and cm2 should be identical.
+util assert this   cm1    cm2    cm1    null
+cm1       cm2
+tr restorecontextstack
+/*
+** create database methods.
+*/
+/**
+create a new database.
+@param dbname the database name
+@param info the properties
+@return	database the newly created database or null.
+@exception sqlexception if fails to create database
+*/
+private database createdatabase string dbname  properties info
+throws sqlexception
+info   filterproperties info
+try
+if  monitor createpersistentservice property database_module  dbname  info     null
+// service already exists, create a warning
+addwarning embedsqlwarning newembedsqlwarning sqlstate database_exists  dbname
+catch  standardexception mse
+throw util seenextexception sqlstate create_database_failed
+new object   dbname
+handleexception mse
+// clear these values as some modules hang onto
+// the properties set corresponding to service.properties
+// and they shouldn't be interested in these jdbc attributes.
+info clear
+return  database  monitor findservice property database_module  dbname
+/**
+* boot database.
+*
+* @param info boot properties
+*
+* @param softauthenticationboot if true, don't fail soft upgrade due
+* to missing features (phase one of two phased hard upgrade boot).
+*
+* @return false iff the monitor cannot handle a service
+* of the type indicated by the protocol within the name.
+* if that's the case then we are the wrong driver.
+*
+* @throws throwable if anything else is wrong.
+*/
+private boolean bootdatabase properties info
+boolean softauthenticationboot
+throws throwable
+string dbname   tr getdbname
+// boot database now
+try
+info   filterproperties info
+if  softauthenticationboot
+info setproperty attribute soft_upgrade_no_feature_check
+else
+info remove attribute soft_upgrade_no_feature_check
+// try to start the service if it doesn't already exist
+if   monitor startpersistentservice dbname  info
+// a false indicates the monitor cannot handle a service
+// of the type indicated by the protocol within the name.
+// if that's the case then we are the wrong driver
+// so just return null.
+return false
+// clear these values as some modules hang onto
+// the properties set corresponding to service.properties
+// and they shouldn't be interested in these jdbc attributes.
+info clear
+database database    database  monitor findservice property database_module  dbname
+tr setdatabase database
+catch  standardexception mse
+throwable ne   mse getcause
+sqlexception nse
+/*
+if there is a next exception, assume
+that the first one is just a redundant "see the
+next exception" message.
+if it is a bei, treat it as a database exception.
+if there isn't a bei, treat it as a java exception.
+in general we probably want to walk the chain
+and return all of them, but empirically, this
+is all we need to do for now.
+*/
+if  ne instanceof standardexception
+nse   util generatecssqlexception  standardexception ne
+else if  ne    null
+nse   util javaexception ne
+else
+nse   util generatecssqlexception mse
+throw util seenextexception sqlstate boot_database_failed
+new object   dbname    nse
+// if database exists, getdatabase() will return the database object.
+// if any error occured while booting an existing database, an
+// exception would have been thrown already.
+return true
+/*
+* class interface methods used by database metadata to ensure
+* good relations with autocommit.
+*/
+preparedstatement preparemetadatastatement string sql
+throws sqlexception
+synchronized  getconnectionsynchronization
+setupcontextstack
+preparedstatement s   null
+try
+s   factory newembedpreparedstatement this  sql  true
+jdbc20translation type_forward_only
+jdbc20translation concur_read_only
+connectionholdability
+jdbc30translation no_generated_keys
+
+
+finally
+restorecontextstack
+return s
+public final internaldriver getlocaldriver
+if  sanitymanager debug
+sanitymanager assert  isclosed
+return gettr   getdriver
+/**
+return the context manager for this connection.
+*/
+public final contextmanager getcontextmanager
+if  sanitymanager debug
+sanitymanager assert  isclosed
+return gettr   getcontextmanager
+/**
+* filter out properties from the passed in set of jdbc attributes
+* to remove any derby.* properties. this is to ensure that setting
+* derby.* properties does not work this way, it's not a defined way
+* to set such properties and could be a secuirty hole in allowing
+* remote connections to override system, application or database settings.
+*
+* @return a new properties set copied from the parameter but with no
+* derby.* properties.
+*/
+private properties filterproperties properties inputset
+properties limited   new properties
+// filter out any derby.* properties, only
+// jdbc attributes can be set this way
+for  java util enumeration e   inputset propertynames    e hasmoreelements
+string key    string  e nextelement
+// we don't allow properties to be set this way
+if  key startswith
+continue
+limited put key  inputset getproperty key
+return limited
+/*
+** methods to be overridden by subimplementations wishing to insert
+** their classes into the mix.
+*/
+protected database getdatabase
+if  sanitymanager debug
+sanitymanager assert  isclosed
+return gettr   getdatabase
+final protected transactionresourceimpl gettr
+return rootconnection tr
+private embedconnectioncontext pushconnectioncontext contextmanager cm
+return new embedconnectioncontext cm  this
+public final void setapplicationconnection java sql connection applicationconnection
+this applicationconnection   applicationconnection
+public final java sql connection getapplicationconnection
+return applicationconnection
+public void setdrdaid string drdaid
+getlanguageconnection   setdrdaid drdaid
+/**
+reset the connection before it is returned from a pooledconnection
+to a new application request (wrapped by a brokeredconnection).
+examples of reset covered here is dropping session temporary tables
+and reseting identity_val_local.
+most jdbc level reset is handled by calling standard java.sql.connection
+methods from embedpooledconnection.
+*/
+public void resetfrompool   throws sqlexception
+synchronized  getconnectionsynchronization
+setupcontextstack
+try
+getlanguageconnection   resetfrompool
+catch  standardexception t
+throw handleexception t
+finally
+restorecontextstack
+/*
+** methods to be overridden by subimplementations wishing to insert
+** their classes into the mix.
+** the reason we need to override them is because we want to create a
+** local20/localstatment object (etc) rather than a local/localstatment
+** object (etc).
+*/
+/*
+** xa support
+*/
+/**
+* do not use this method directly use xatransactionstate.xa_prepare
+* instead because it also maintains/cancels the timout task which is
+* scheduled to cancel/rollback the global transaction.
+*/
+public final int xa_prepare   throws sqlexception
+synchronized  getconnectionsynchronization
+setupcontextstack
+try
+xatransactioncontroller tc
+xatransactioncontroller  getlanguageconnection   gettransactionexecute
+int ret   tc xa_prepare
+if  ret    xatransactioncontroller xa_rdonly
+// on a prepare call, xa allows an optimization that if the
+// transaction is read only, the rm can just go ahead and
+// commit it.  so if store returns this read only status -
+// meaning store has taken the liberty to commit already - we
+// needs to turn around and call internalcommit (without
+// committing the store again) to make sure the state is
+// consistent.  since the transaction is read only, there is
+// probably not much that needs to be done.
+getlanguageconnection   internalcommit false    don't commitstore again
+return ret
+catch  standardexception t
+throw handleexception t
+finally
+restorecontextstack
+/**
+* do not use this method directly use xatransactionstate.xa_commit
+* instead because it also maintains/cancels the timout task which is
+* scheduled to cancel/rollback the global transaction.
+*/
+public final void xa_commit boolean onephase  throws sqlexception
+synchronized  getconnectionsynchronization
+setupcontextstack
+try
+getlanguageconnection   xacommit onephase
+catch  standardexception t
+throw handleexception t
+finally
+restorecontextstack
+/**
+* do not use this method directly use xatransactionstate.xa_rollback
+* instead because it also maintains/cancels the timout task which is
+* scheduled to cancel/rollback the global transaction.
+*/
+public final void xa_rollback   throws sqlexception
+synchronized  getconnectionsynchronization
+setupcontextstack
+try
+getlanguageconnection   xarollback
+catch  standardexception t
+throw handleexception t
+finally
+restorecontextstack
+/**
+* returns false if there is an underlying transaction and that transaction
+* has done work.  true if there is no underlying transaction or that
+* underlying transaction is idle
+*/
+public final boolean transactionisidle
+return gettr   isidle
+private int setresultsettype int resultsettype
+/* add warning if scroll sensitive cursor
+* and downgrade to scroll insensitive cursor.
+*/
+if  resultsettype    jdbc20translation type_scroll_sensitive
+addwarning embedsqlwarning newembedsqlwarning sqlstate no_scroll_sensitive_cursors
+resultsettype   jdbc20translation type_scroll_insensitive
+return resultsettype
+/**
+* set the transaction isolation level that will be used for the
+* next prepare.  used by network server to implement db2 style
+* isolation levels.
+* @param level isolation level to change to.  level is the db2 level
+*               specified in the package names which happen to correspond
+*               to our internal levels. if
+*               level == executioncontext.unspecified_isolation,
+*               the statement won't be prepared with an isolation level.
+*
+*
+*/
+public void setprepareisolation int level  throws sqlexception
+if  level    getprepareisolation
+return
+switch  level
+case executioncontext read_uncommitted_isolation_level
+case executioncontext repeatable_read_isolation_level
+case executioncontext read_committed_isolation_level
+case executioncontext serializable_isolation_level
+case executioncontext unspecified_isolation_level
+break
+default
+throw util generatecssqlexception
+sqlstate unimplemented_isolation_level  new integer level
+synchronized getconnectionsynchronization
+getlanguageconnection   setprepareisolationlevel level
+/**
+* return prepare isolation
+*/
+public int getprepareisolation
+return getlanguageconnection   getprepareisolationlevel
+/**
+return a unique order number for a result set.
+a unique value is only needed if the result set is
+being created within procedure and thus must be using
+a nested connection.
+*/
+final int getresultsetorderid
+if  this    rootconnection
+return 0
+else
+return rootconnection resultsetid
+protected sqlexception newsqlexception string messageid
+return util generatecssqlexception messageid
+protected sqlexception newsqlexception string messageid  object arg1
+return util generatecssqlexception messageid  arg1
+protected sqlexception newsqlexception string messageid  object arg1  object arg2
+return util generatecssqlexception messageid  arg1  arg2
+/////////////////////////////////////////////////////////////////////////
+//
+//	object overloads
+//
+/////////////////////////////////////////////////////////////////////////
+/**
+* get a string representation that uniquely identifies
+* this connection.  include the same information that is
+* printed in the log for various trace and error messages.
+*
+* in derby the "physical" connection is a languageconnectioncontext,
+* or lcc.
+* the jdbc connection is an jdbc-specific layer on top of this.  rather
+* than create a new id here, we simply use the id of the underlying lcc.
+* note that this is a big aid in debugging, because much of the
+* engine trace and log code prints the lcc id.
+*
+* @return a string representation for this connection
+*/
+public string tostring
+if   connstring    null
+languageconnectioncontext lcc   getlanguageconnection
+connstring
+this getclass   getname         this hashcode
+lcc xidstr
+lcc gettransactionexecute   gettransactionidstring
+lcc lccstr
+integer tostring lcc getinstancenumber
+lcc dbnamestr   lcc getdbname
+lcc drdastr   lcc getdrdaid
+return connstring
+/**
+*
+* constructs an object that implements the <code>clob</code> interface. the object
+* returned initially contains no data.  the <code>setasciistream</code>,
+* <code>setcharacterstream</code> and <code>setstring</code> methods of
+* the <code>clob</code> interface may be used to add data to the <code>clob</code>.
+*
+* @return an object that implements the <code>clob</code> interface
+* @throws sqlexception if an object that implements the
+* <code>clob</code> interface can not be constructed, this method is
+* called on a closed connection or a database access error occurs.
+*
+*/
+public clob createclob   throws sqlexception
+checkifclosed
+return new embedclob this
+/**
+*
+* constructs an object that implements the <code>blob</code> interface. the object
+* returned initially contains no data.  the <code>setbinarystream</code> and
+* <code>setbytes</code> methods of the <code>blob</code> interface may be used to add data to
+* the <code>blob</code>.
+*
+* @return  an object that implements the <code>blob</code> interface
+* @throws sqlexception if an object that implements the
+* <code>blob</code> interface can not be constructed, this method is
+* called on a closed connection or a database access error occurs.
+*
+*/
+public blob createblob   throws sqlexception
+checkifclosed
+return new embedblob new byte  this
+/**
+* add the locator and the corresponding lob object into the
+* hashmap
+*
+* @param lobreference the object which contains the lob object that
+*                     that is added to the hashmap.
+* @return an integer that represents the locator that has been
+*         allocated to this lob.
+*/
+public int addlobmapping object lobreference
+int loc   getinclobkey
+getlobhmobj   put new integer loc   lobreference
+return loc
+/**
+* remove the key(locator) from the hash table.
+* @param key an integer that represents the locator that needs to be
+*            removed from the table.
+*/
+public void removelobmapping int key
+getlobhmobj   remove new integer key
+/**
+* get the lob reference corresponding to the locator.
+* @param key the integer that represents the lob locator value.
+* @return the lob object corresponding to this locator.
+*/
+public object getlobmapping int key
+return getlobhmobj   get new integer key
+/**
+* clear the hashmap of all entries.
+* called when a commit or rollback of the transaction
+* happens.
+*/
+public void clearlobmapping   throws sqlexception
+//free all the lob resources in the hashmap
+//initialize the locator value to 0 and
+//the hash table object to null.
+if  rootconnection lobhashmap    null
+for  iterator e   getlobhmobj   values   iterator
+e hasnext
+object obj   e next
+if  obj instanceof clob
+embedclob temp    embedclob obj
+temp free
+if  obj instanceof blob
+embedblob temp    embedblob obj
+temp free
+getlobhmobj   clear
+/**
+* return the current locator value
+* @return an integer that represents the most recent locator value.
+*/
+private int getinclobkey
+return   rootconnection lobhmkey
+/**
+* return the hash map in the root connection
+* @return the hashmap that contains the locator to lob object mapping
+*/
+public hashmap getlobhmobj
+if  rootconnection lobhashmap    null
+rootconnection lobhashmap   new hashmap
+return rootconnection lobhashmap
+/** cancels the current running statement. */
+public void cancelrunningstatement
+getlanguageconnection   getstatementcontext   cancel
