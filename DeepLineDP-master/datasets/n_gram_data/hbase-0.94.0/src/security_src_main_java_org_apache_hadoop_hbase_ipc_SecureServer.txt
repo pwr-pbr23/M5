@@ -1,0 +1,566 @@
+/*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase ipc
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop hbase io hbaseobjectwritable
+import org apache hadoop hbase io writablewithsize
+import org apache hadoop hbase security hbasesaslrpcserver
+import org apache hadoop hbase security hbasesaslrpcserver authmethod
+import org apache hadoop hbase security hbasesaslrpcserver sasldigestcallbackhandler
+import org apache hadoop hbase security hbasesaslrpcserver saslgsscallbackhandler
+import org apache hadoop hbase security hbasesaslrpcserver saslstatus
+import org apache hadoop hbase security user
+import org apache hadoop hbase util bytebufferoutputstream
+import org apache hadoop hbase util bytes
+import org apache hadoop io byteswritable
+import org apache hadoop io intwritable
+import org apache hadoop io writable
+import org apache hadoop io writableutils
+import org apache hadoop security accesscontrolexception
+import org apache hadoop security usergroupinformation
+import org apache hadoop security usergroupinformation authenticationmethod
+import org apache hadoop security authorize authorizationexception
+import org apache hadoop security authorize proxyusers
+import org apache hadoop security authorize serviceauthorizationmanager
+import org apache hadoop security token secretmanager
+import org apache hadoop security token secretmanager invalidtoken
+import org apache hadoop security token tokenidentifier
+import org apache hadoop util reflectionutils
+import org apache hadoop util stringutils
+import com google common collect immutableset
+import javax security sasl sasl
+import javax security sasl saslexception
+import javax security sasl saslserver
+import java io
+import java net
+import java nio bytebuffer
+import java nio channels
+import java security privilegedexceptionaction
+import java util
+import static org apache hadoop fs commonconfigurationkeys hadoop_security_authorization
+/**
+* an abstract ipc service, supporting sasl authentication of connections,
+* using gssapi for kerberos authentication or digest-md5 for authentication
+* via signed tokens.
+*
+* <p>
+* this is part of the {@link securerpcengine} implementation.
+* </p>
+*
+* @see org.apache.hadoop.hbase.ipc.secureclient
+*/
+public abstract class secureserver extends hbaseserver
+private final boolean authorize
+private boolean issecurityenabled
+/**
+* the first four bytes of secure rpc connections
+*/
+public static final bytebuffer header   bytebuffer wrap   getbytes
+// 1 : introduce ping and server does not throw away rpcs
+// 3 : introduce the protocol into the rpc connection header
+// 4 : introduced sasl security layer
+public static final byte current_version   4
+public static final set<byte> insecure_versions   immutableset of  byte  3
+public static final log log   logfactory getlog
+private static final log auditlog
+logfactory getlog
+private static final string auth_failed_for
+private static final string auth_successful_for
+protected secretmanager<tokenidentifier> secretmanager
+protected serviceauthorizationmanager authmanager
+protected class securecall extends hbaseserver call
+public securecall int id  writable param  connection connection
+responder responder  long size
+super id  param  connection  responder  size
+@override
+protected synchronized void setresponse object value  status status
+string errorclass  string error
+writable result   null
+if  value instanceof writable
+result    writable  value
+else
+/* we might have a null value and errors. avoid creating a
+* hbaseobjectwritable, because the constructor fails on null. */
+if  value    null
+result   new hbaseobjectwritable value
+int size   buffer_initial_size
+if  result instanceof writablewithsize
+// get the size hint.
+writablewithsize ohint    writablewithsize  result
+long hint   ohint getwritablesize     bytes sizeof_int   bytes sizeof_int
+if  hint > integer max_value
+// oops, new problem.
+ioexception ioe
+new ioexception     hint
+errorclass   ioe getclass   getname
+error   stringutils stringifyexception ioe
+else
+size    int hint
+bytebufferoutputstream buf   new bytebufferoutputstream size
+dataoutputstream out   new dataoutputstream buf
+try
+out writeint this id                     write call id
+out writeint status state                write status
+catch  ioexception e
+errorclass   e getclass   getname
+error   stringutils stringifyexception e
+try
+if  status    status success
+result write out
+else
+writableutils writestring out  errorclass
+writableutils writestring out  error
+if    secureconnection connection  usewrap
+wrapwithsasl buf
+catch  ioexception e
+log warn    e
+this response   buf getbytebuffer
+private void wrapwithsasl bytebufferoutputstream response
+throws ioexception
+if    secureconnection connection  usesasl
+// getbytebuffer calls flip()
+bytebuffer buf   response getbytebuffer
+byte token
+// synchronization may be needed since there can be multiple handler
+// threads using saslserver to wrap responses.
+synchronized    secureconnection connection  saslserver
+token     secureconnection connection  saslserver wrap buf array
+buf arrayoffset    buf remaining
+if  log isdebugenabled
+log debug     token length
+buf clear
+dataoutputstream saslout   new dataoutputstream response
+saslout writeint token length
+saslout write token  0  token length
+/** reads calls from a connection and queues them for handling. */
+public class secureconnection extends hbaseserver connection
+private boolean rpcheaderread   false     if initial rpc header is read
+private boolean headerread   false     if the connection header that
+//follows version is read.
+private bytebuffer data
+private bytebuffer datalengthbuffer
+protected final linkedlist<securecall> responsequeue
+private int datalength
+private inetaddress addr
+boolean usesasl
+saslserver saslserver
+private authmethod authmethod
+private boolean saslcontextestablished
+private boolean skipinitialsaslhandshake
+private bytebuffer rpcheaderbuffer
+private bytebuffer unwrappeddata
+private bytebuffer unwrappeddatalengthbuffer
+public usergroupinformation attemptinguser   null     user name before auth
+// fake 'call' for failed authorization response
+private final int authorization_failed_callid    1
+// fake 'call' for sasl context setup
+private static final int sasl_callid    33
+private final securecall saslcall   new securecall sasl_callid  null  this  null  0
+private boolean usewrap   false
+public secureconnection socketchannel channel  long lastcontact
+super channel  lastcontact
+this header   new secureconnectionheader
+this channel   channel
+this data   null
+this datalengthbuffer   bytebuffer allocate 4
+this unwrappeddata   null
+this unwrappeddatalengthbuffer   bytebuffer allocate 4
+this socket   channel socket
+this addr   socket getinetaddress
+this responsequeue   new linkedlist<securecall>
+@override
+public string tostring
+return gethostaddress         remoteport
+public string gethostaddress
+return hostaddress
+public inetaddress gethostinetaddress
+return addr
+private user getauthorizedugi string authorizedid
+throws ioexception
+if  authmethod    authmethod digest
+tokenidentifier tokenid   hbasesaslrpcserver getidentifier authorizedid
+secretmanager
+usergroupinformation ugi   tokenid getuser
+if  ugi    null
+throw new accesscontrolexception
+ugi addtokenidentifier tokenid
+return user create ugi
+else
+return user create usergroupinformation createremoteuser authorizedid
+private void saslreadandprocess byte sasltoken  throws ioexception
+interruptedexception
+if   saslcontextestablished
+byte replytoken   null
+try
+if  saslserver    null
+switch  authmethod
+case digest
+if  secretmanager    null
+throw new accesscontrolexception
+saslserver   sasl createsaslserver authmethod digest
+getmechanismname    null  hbasesaslrpcserver sasl_default_realm
+hbasesaslrpcserver sasl_props  new sasldigestcallbackhandler
+secretmanager  this
+break
+default
+usergroupinformation current   usergroupinformation
+getcurrentuser
+string fullname   current getusername
+if  log isdebugenabled
+log debug     fullname
+final string names   hbasesaslrpcserver splitkerberosname fullname
+if  names length    3
+throw new accesscontrolexception
+fullname
+current doas new privilegedexceptionaction<object>
+@override
+public object run   throws saslexception
+saslserver   sasl createsaslserver authmethod kerberos
+getmechanismname    names  names
+hbasesaslrpcserver sasl_props  new saslgsscallbackhandler
+return null
+if  saslserver    null
+throw new accesscontrolexception
+authmethod getmechanismname
+if  log isdebugenabled
+log debug
+authmethod getmechanismname
+if  log isdebugenabled
+log debug     sasltoken length
+replytoken   saslserver evaluateresponse sasltoken
+catch  ioexception e
+ioexception sendtoclient   e
+throwable cause   e
+while  cause    null
+if  cause instanceof invalidtoken
+sendtoclient    invalidtoken  cause
+break
+cause   cause getcause
+dosaslreply saslstatus error  null  sendtoclient getclass   getname
+sendtoclient getlocalizedmessage
+rpcmetrics authenticationfailures inc
+string clientip   this tostring
+// attempting user could be null
+auditlog warn auth_failed_for   clientip       attemptinguser
+throw e
+if  replytoken    null
+if  log isdebugenabled
+log debug     replytoken length
+dosaslreply saslstatus success  new byteswritable replytoken   null
+
+if  saslserver iscomplete
+log debug
+saslserver getnegotiatedproperty sasl qop
+string qop    string  saslserver getnegotiatedproperty sasl qop
+usewrap   qop    null       equalsignorecase qop
+ticket   getauthorizedugi saslserver getauthorizationid
+log debug     ticket
+rpcmetrics authenticationsuccesses inc
+auditlog trace auth_successful_for   ticket
+saslcontextestablished   true
+else
+if  log isdebugenabled
+log debug     sasltoken length
+if   usewrap
+processonerpc sasltoken
+else
+byte plaintextdata   saslserver unwrap sasltoken  0
+sasltoken length
+processunwrappeddata plaintextdata
+private void dosaslreply saslstatus status  writable rv
+string errorclass  string error  throws ioexception
+saslcall setresponse rv
+status    saslstatus success ? status success   status error
+errorclass  error
+saslcall responder   responder
+saslcall sendresponseifready
+private void disposesasl
+if  saslserver    null
+try
+saslserver dispose
+catch  saslexception ignored
+public int readandprocess   throws ioexception  interruptedexception
+while  true
+/* read at most one rpc. if the header is not read completely yet
+* then iterate until we read first rpc or until there is no data left.
+*/
+int count    1
+if  datalengthbuffer remaining   > 0
+count   channelread channel  datalengthbuffer
+if  count < 0    datalengthbuffer remaining   > 0
+return count
+if   rpcheaderread
+//every connection is expected to send the header.
+if  rpcheaderbuffer    null
+rpcheaderbuffer   bytebuffer allocate 2
+count   channelread channel  rpcheaderbuffer
+if  count < 0    rpcheaderbuffer remaining   > 0
+return count
+int version   rpcheaderbuffer get 0
+byte method   new byte  rpcheaderbuffer get 1
+authmethod   authmethod read new datainputstream
+new bytearrayinputstream method
+datalengthbuffer flip
+if   header equals datalengthbuffer     version    current_version
+//warning is ok since this is not supposed to happen.
+if  insecure_versions contains version
+log warn     version
+current_version
+hostaddress       remoteport
+else
+log warn
+hostaddress       remoteport
+version
+current_version
+return  1
+datalengthbuffer clear
+if  authmethod    null
+throw new ioexception
+if  issecurityenabled    authmethod    authmethod simple
+accesscontrolexception ae   new accesscontrolexception
+securecall failedcall   new securecall authorization_failed_callid  null  this
+null  0
+failedcall setresponse null  status fatal  ae getclass   getname
+ae getmessage
+responder dorespond failedcall
+throw ae
+if   issecurityenabled    authmethod    authmethod simple
+dosaslreply saslstatus success  new intwritable
+hbasesaslrpcserver switch_to_simple_auth   null  null
+authmethod   authmethod simple
+// client has already sent the initial sasl message and we
+// should ignore it. both client and server should fall back
+// to simple auth from now on.
+skipinitialsaslhandshake   true
+if  authmethod    authmethod simple
+usesasl   true
+rpcheaderbuffer   null
+rpcheaderread   true
+continue
+if  data    null
+datalengthbuffer flip
+datalength   datalengthbuffer getint
+if  datalength    hbaseclient ping_call_id
+if  usewrap      covers the  usesasl too
+datalengthbuffer clear
+return 0     ping message
+if  datalength < 0
+log warn     datalength
+gethostaddress
+data   bytebuffer allocate datalength
+incrpccount        increment the rpc count
+count   channelread channel  data
+if  data remaining      0
+datalengthbuffer clear
+data flip
+if  skipinitialsaslhandshake
+data   null
+skipinitialsaslhandshake   false
+continue
+boolean isheaderread   headerread
+if  usesasl
+saslreadandprocess data array
+else
+processonerpc data array
+data   null
+if   isheaderread
+continue
+return count
+/// reads the connection header following version
+private void processheader byte buf  throws ioexception
+datainputstream in
+new datainputstream new bytearrayinputstream buf
+header readfields in
+try
+string protocolclassname   header getprotocol
+if  protocolclassname    null
+protocol   getprotocolclass header getprotocol    conf
+catch  classnotfoundexception cnfe
+throw new ioexception     header getprotocol
+user protocoluser   header getuser
+if   usesasl
+ticket   protocoluser
+if  ticket    null
+ticket getugi   setauthenticationmethod authmethod simple authenticationmethod
+else
+// user is authenticated
+ticket getugi   setauthenticationmethod authmethod authenticationmethod
+//now we check if this is a proxy user case. if the protocol user is
+//different from the 'user', it is a proxy user scenario. however,
+//this is not allowed if user authenticated with digest.
+if   protocoluser    null
+protocoluser getname   equals ticket getname
+if  authmethod    authmethod digest
+// not allowed to doas if token authentication is used
+throw new accesscontrolexception     ticket
+protocoluser
+else
+// effective user can be different from authenticated user
+// for simple auth or kerberos auth
+// the user is the real user. now we create a proxy user
+usergroupinformation realuser   ticket getugi
+ticket   user create
+usergroupinformation createproxyuser protocoluser getname
+realuser
+// now the user is a proxy user, set authentication method proxy.
+ticket getugi   setauthenticationmethod authenticationmethod proxy
+private void processunwrappeddata byte inbuf  throws ioexception
+interruptedexception
+readablebytechannel ch   channels newchannel new bytearrayinputstream
+inbuf
+// read all rpcs contained in the inbuf, even partial ones
+while  true
+int count    1
+if  unwrappeddatalengthbuffer remaining   > 0
+count   channelread ch  unwrappeddatalengthbuffer
+if  count <  0    unwrappeddatalengthbuffer remaining   > 0
+return
+if  unwrappeddata    null
+unwrappeddatalengthbuffer flip
+int unwrappeddatalength   unwrappeddatalengthbuffer getint
+if  unwrappeddatalength    hbaseclient ping_call_id
+if  log isdebugenabled
+log debug
+unwrappeddatalengthbuffer clear
+continue     ping message
+unwrappeddata   bytebuffer allocate unwrappeddatalength
+count   channelread ch  unwrappeddata
+if  count <  0    unwrappeddata remaining   > 0
+return
+if  unwrappeddata remaining      0
+unwrappeddatalengthbuffer clear
+unwrappeddata flip
+processonerpc unwrappeddata array
+unwrappeddata   null
+private void processonerpc byte buf  throws ioexception
+interruptedexception
+if  headerread
+processdata buf
+else
+processheader buf
+headerread   true
+if   authorizeconnection
+throw new accesscontrolexception     this
+header getprotocol
+ticket
+protected void processdata byte buf  throws  ioexception  interruptedexception
+datainputstream dis
+new datainputstream new bytearrayinputstream buf
+int id   dis readint                          try to read an id
+if  log isdebugenabled
+log debug     id
+writable param   reflectionutils newinstance paramclass  conf                read param
+param readfields dis
+securecall call   new securecall id  param  this  responder  buf length
+if  prioritycallqueue    null    getqoslevel param  > highprioritylevel
+prioritycallqueue put call
+else
+callqueue put call                   queue the call  maybe blocked here
+private boolean authorizeconnection   throws ioexception
+try
+// if auth method is digest, the token was obtained by the
+// real user for the effective user, therefore not required to
+// authorize real user. doas is allowed only for simple or kerberos
+// authentication
+if  ticket    null    ticket getugi   getrealuser      null
+authmethod    authmethod digest
+proxyusers authorize ticket getugi    this gethostaddress    conf
+authorize ticket  header  gethostinetaddress
+if  log isdebugenabled
+log debug     header
+rpcmetrics authorizationsuccesses inc
+catch  authorizationexception ae
+log debug   ae getmessage    ae
+rpcmetrics authorizationfailures inc
+securecall failedcall   new securecall authorization_failed_callid  null  this
+null  0
+failedcall setresponse null  status fatal  ae getclass   getname
+ae getmessage
+responder dorespond failedcall
+return false
+return true
+protected synchronized void close
+disposesasl
+data   null
+datalengthbuffer   null
+if   channel isopen
+return
+try  socket shutdownoutput     catch exception ignored        findbugs de_might_ignore
+if  channel isopen
+try  channel close     catch exception ignored
+try  socket close     catch exception ignored
+/** constructs a server listening on the named port and address.  parameters passed must
+* be of the named class.  the <code>handlercount</handlercount> determines
+* the number of handler threads that will be used to process calls.
+*
+*/
+@suppresswarnings
+protected secureserver string bindaddress  int port
+class<? extends writable> paramclass  int handlercount
+int priorityhandlercount  configuration conf  string servername
+int highprioritylevel
+throws ioexception
+super bindaddress  port  paramclass  handlercount  priorityhandlercount
+conf  servername  highprioritylevel
+this authorize
+conf getboolean hadoop_security_authorization  false
+this issecurityenabled   usergroupinformation issecurityenabled
+log debug   issecurityenabled
+if  issecurityenabled
+hbasesaslrpcserver init conf
+@override
+protected connection getconnection socketchannel channel  long time
+return new secureconnection channel  time
+configuration getconf
+return conf
+/** for unit testing only, should be called before server is started */
+void disablesecurity
+this issecurityenabled   false
+/** for unit testing only, should be called before server is started */
+void enablesecurity
+this issecurityenabled   true
+/** stops the service.  no new calls will be handled after this is called. */
+public synchronized void stop
+super stop
+public secretmanager<? extends tokenidentifier> getsecretmanager
+return this secretmanager
+public void setsecretmanager secretmanager<? extends tokenidentifier> secretmanager
+this secretmanager    secretmanager<tokenidentifier>  secretmanager
+/**
+* authorize the incoming client connection.
+*
+* @param user client user
+* @param connection incoming connection
+* @param addr inetaddress of incoming connection
+* @throws org.apache.hadoop.security.authorize.authorizationexception when the client isn't authorized to talk the protocol
+*/
+public void authorize user user
+connectionheader connection
+inetaddress addr
+throws authorizationexception
+if  authorize
+class<?> protocol   null
+try
+protocol   getprotocolclass connection getprotocol    getconf
+catch  classnotfoundexception cfne
+throw new authorizationexception
+connection getprotocol
+authmanager authorize user    null ? user getugi     null
+protocol  getconf    addr

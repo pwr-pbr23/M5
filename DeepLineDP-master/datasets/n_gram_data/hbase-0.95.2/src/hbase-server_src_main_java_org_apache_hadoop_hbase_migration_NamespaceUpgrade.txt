@@ -1,0 +1,375 @@
+/**
+* the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase migration
+import java io ioexception
+import java util arrays
+import java util comparator
+import java util list
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs fsdatainputstream
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop fs pathfilter
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase namespacedescriptor
+import org apache hadoop hbase servername
+import org apache hadoop hbase tablename
+import org apache hadoop hbase catalog metaeditor
+import org apache hadoop hbase exceptions deserializationexception
+import org apache hadoop hbase regionserver hregion
+import org apache hadoop hbase regionserver hregionfilesystem
+import org apache hadoop hbase regionserver wal hlog
+import org apache hadoop hbase regionserver wal hlogfactory
+import org apache hadoop hbase regionserver wal hlogutil
+import org apache hadoop hbase security access accesscontrollists
+import org apache hadoop hbase snapshot snapshotdescriptionutils
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util fstabledescriptors
+import org apache hadoop hbase util fsutils
+import org apache hadoop util tool
+import com google common collect lists
+import com google common primitives ints
+/**
+* upgrades old 0.94 filesystem layout to namespace layout
+* does the following:
+*
+* - creates system namespace directory and move .meta. table there
+* renaming .meta. table to hbase:meta,
+* this in turn would require to re-encode the region directory name
+*
+* <p>the pre-0.96 paths and dir names are hardcoded in here.
+*/
+public class namespaceupgrade implements tool
+private static final log log   logfactory getlog namespaceupgrade class
+private configuration conf
+private filesystem fs
+private path rootdir
+private path sysnsdir
+private path defnsdir
+private path basedirs
+private path backupdir
+// first move everything to this tmp .data dir in case there is a table named 'data'
+private static final string tmp_data_dir
+// old dir names to migrate.
+private static final string dot_logs
+private static final string dot_old_logs
+private static final string dot_corrupt
+private static final string dot_splitlog
+private static final string dot_archive
+private static final string old_acl
+/** directories that are not hbase table directories */
+static final list<string> non_user_table_dirs   arrays aslist new string
+dot_logs
+dot_old_logs
+dot_corrupt
+dot_splitlog
+hconstants hbck_sidelinedir_name
+dot_archive
+hconstants snapshot_dir_name
+hconstants hbase_temp_directory
+tmp_data_dir
+old_acl
+public namespaceupgrade   throws ioexception
+super
+public void init   throws ioexception
+this rootdir   fsutils getrootdir conf
+this fs   filesystem get conf
+path tmpdatadir   new path rootdir  tmp_data_dir
+sysnsdir   new path tmpdatadir  namespacedescriptor system_namespace_name_str
+defnsdir   new path tmpdatadir  namespacedescriptor default_namespace_name_str
+basedirs   new path rootdir
+new path rootdir  hconstants hfile_archive_directory
+new path rootdir  hconstants hbase_temp_directory
+backupdir   new path rootdir  hconstants migration_name
+public void upgradetabledirs   throws ioexception  deserializationexception
+// if new version is written then upgrade is done
+if  verifynsupgrade fs  rootdir
+return
+makenamespacedirs
+migratetables
+migratesnapshots
+migratedotdirs
+migratemeta
+migrateacl
+deleteroot
+fsutils setversion fs  rootdir
+/**
+* remove the -root- dir. no longer of use.
+* @throws ioexception
+*/
+public void deleteroot   throws ioexception
+path rootdir   new path this rootdir
+if  this fs exists rootdir
+if   this fs delete rootdir  true   log info     rootdir
+log info     rootdir
+/**
+* rename all the dot dirs -- .data, .archive, etc. -- as data, archive, etc.; i.e. minus the dot.
+* @throws ioexception
+*/
+public void migratedotdirs   throws ioexception
+// dot dirs to rename.  leave the tmp dir named '.tmp' and snapshots as .hbase-snapshot.
+final path archivedir   new path rootdir  hconstants hfile_archive_directory
+path  dirs   new path
+new path   new path rootdir  dot_corrupt   new path rootdir  hconstants corrupt_dir_name
+new path   new path rootdir  dot_logs   new path rootdir  hconstants hregion_logdir_name
+new path   new path rootdir  dot_old_logs
+new path rootdir  hconstants hregion_oldlogdir_name
+new path   new path rootdir  tmp_data_dir
+new path rootdir  hconstants base_namespace_dir
+for  path  dir  dirs
+path src   dir
+path tgt   dir
+if   this fs exists src
+log info     src
+continue
+rename src  tgt
+// do the .archive dir.  need to move its subdirs to the default ns dir under data dir... so
+// from '.archive/foo', to 'archive/data/default/foo'.
+path oldarchivedir   new path rootdir  dot_archive
+if  this fs exists oldarchivedir
+// this is a pain doing two nn calls but portable over h1 and h2.
+mkdirs archivedir
+path archivedatadir   new path archivedir  hconstants base_namespace_dir
+mkdirs archivedatadir
+rename oldarchivedir  new path archivedatadir
+namespacedescriptor default_namespace_name_str
+// update the system and user namespace dirs removing the dot in front of .data.
+path datadir   new path rootdir  hconstants base_namespace_dir
+sysnsdir   new path datadir  namespacedescriptor system_namespace_name_str
+defnsdir   new path datadir  namespacedescriptor default_namespace_name_str
+private void mkdirs final path p  throws ioexception
+if   this fs mkdirs p   throw new ioexception     p
+private void rename final path src  final path tgt  throws ioexception
+if   fs rename src  tgt
+throw new ioexception     src       tgt
+/**
+* create the system and default namespaces dirs
+* @throws ioexception
+*/
+public void makenamespacedirs   throws ioexception
+if   fs exists sysnsdir
+if   fs mkdirs sysnsdir
+throw new ioexception     sysnsdir
+if   fs exists defnsdir
+if   fs mkdirs defnsdir
+throw new ioexception     defnsdir
+/**
+* migrate all tables into respective namespaces, either default or system.  we put them into
+* a temporary location, '.data', in case a user table is name 'data'.  in a later method we will
+* move stuff from .data to data.
+* @throws ioexception
+*/
+public void migratetables   throws ioexception
+list<string> systables   lists newarraylist
+// migrate tables including archive and tmp
+for  path basedir  basedirs
+if   fs exists basedir   continue
+list<path> oldtabledirs   fsutils getlocaltabledirs fs  basedir
+for  path oldtabledir  oldtabledirs
+if  non_user_table_dirs contains oldtabledir getname     continue
+if  systables contains oldtabledir getname     continue
+// make the new directory under the ns to which we will move the table.
+path nsdir   new path this defnsdir
+tablename valueof oldtabledir getname    getqualifierasstring
+if   fs exists nsdir getparent
+if   fs mkdirs nsdir getparent
+throw new ioexception   nsdir getparent
+if  systables indexof oldtabledir getname    < 0
+log info     oldtabledir getname         nsdir
+if   fs rename oldtabledir  nsdir
+throw new ioexception   oldtabledir   nsdir
+public void migratesnapshots   throws ioexception
+//migrate snapshot dir
+path oldsnapshotdir   new path rootdir  hconstants old_snapshot_dir_name
+path newsnapshotdir   new path rootdir  hconstants snapshot_dir_name
+if  fs exists oldsnapshotdir
+boolean foundoldsnapshotdir   false
+// logic to verify old snapshot dir culled from snapshotmanager
+// ignore all the snapshots in progress
+filestatus snapshots   fs liststatus oldsnapshotdir
+new snapshotdescriptionutils completedsnaphotdirectoriesfilter fs
+// loop through all the completed snapshots
+for  filestatus snapshot   snapshots
+path info   new path snapshot getpath    snapshotdescriptionutils snapshotinfo_file
+// if the snapshot is bad
+if  fs exists info
+foundoldsnapshotdir   true
+break
+if foundoldsnapshotdir
+log info
+if   fs rename oldsnapshotdir  newsnapshotdir
+throw new ioexception
+oldsnapshotdir   newsnapshotdir
+public void migratemeta   throws ioexception
+path newmetadir   new path this sysnsdir  tablename meta_table_name getqualifierasstring
+path newmetaregiondir
+new path newmetadir  hregioninfo first_meta_regioninfo getencodedname
+path oldmetadir   new path rootdir
+if  fs exists oldmetadir
+log info     oldmetadir getname         newmetadir
+if   fs rename oldmetadir  newmetadir
+throw new ioexception
+oldmetadir getname         newmetadir
+// since meta table name has changed rename meta region dir from it's old encoding to new one
+path oldmetaregiondir   hregion getregiondir rootdir
+new path newmetadir     tostring
+if  fs exists oldmetaregiondir
+log info     oldmetaregiondir       newmetaregiondir
+if   fs rename oldmetaregiondir  newmetaregiondir
+throw new ioexception
+oldmetaregiondir       newmetaregiondir
+path oldrootdir   new path rootdir
+if  fs rename oldrootdir  backupdir
+throw new illegalstateexception   oldrootdir   backupdir
+public void migrateacl   throws ioexception
+tablename oldtablename   tablename valueof old_acl
+path oldtablepath   new path rootdir  oldtablename getnameasstring
+if  fs exists oldtablepath
+return
+log info
+tablename newtablename   accesscontrollists acl_table_name
+path newtablepath   fsutils gettabledir rootdir  newtablename
+htabledescriptor olddesc
+readtabledescriptor fs  getcurrenttableinfostatus fs  oldtablepath
+if fstabledescriptors gettableinfopath fs  newtablepath     null
+log info
+htabledescriptor newdesc   new htabledescriptor olddesc
+newdesc setname newtablename
+new fstabledescriptors this conf  createtabledescriptorfortabledirectory
+newtablepath  newdesc  true
+servername fakeserver   new servername   96 123
+string metalogname   hlogutil gethlogdirectoryname fakeserver tostring
+hlog metahlog   hlogfactory createmetahlog fs  rootdir
+metalogname  conf  null
+fakeserver tostring
+hregion meta   hregion openhregion rootdir  hregioninfo first_meta_regioninfo
+htabledescriptor meta_tabledesc  metahlog  conf
+hregion region   null
+try
+for path regiondir   fsutils getregiondirs fs  oldtablepath
+log info   regiondir getname
+hregioninfo oldregioninfo   hregionfilesystem loadregioninfofilecontent fs  regiondir
+hregioninfo newregioninfo
+new hregioninfo newtablename
+oldregioninfo getstartkey
+oldregioninfo getendkey
+oldregioninfo issplit
+oldregioninfo getregionid
+newregioninfo setoffline oldregioninfo isoffline
+region
+new hregion
+hregionfilesystem openregionfromfilesystem conf  fs  oldtablepath
+oldregioninfo  false
+metahlog
+conf
+olddesc
+
+region initialize
+//run major compaction to archive old stores
+//to keep any snapshots to _acl_ unbroken
+region compactstores true
+region waitforflushesandcompactions
+region close
+//create new region dir
+path newregiondir   new path newtablepath  newregioninfo getencodedname
+if  fs exists newregiondir
+if  fs mkdirs newregiondir
+throw new illegalstateexception     newregiondir
+//create new region info file, delete in case one exists
+hregionfilesystem openregionfromfilesystem conf  fs  newtablepath  newregioninfo  false
+//migrate region contents
+for filestatus file   fs liststatus regiondir  new fsutils usertabledirfilter fs
+if file getpath   getname   equals hregionfilesystem region_info_file
+continue
+if  fs rename file getpath    newregiondir
+throw new illegalstateexception   file getpath
+newregiondir
+meta put metaeditor makeputfromregioninfo newregioninfo
+meta delete metaeditor makedeletefromregioninfo oldregioninfo
+finally
+meta flushcache
+meta waitforflushesandcompactions
+meta close
+metahlog closeanddelete
+if region    null
+region close
+if  fs rename oldtablepath  backupdir
+throw new illegalstateexception   oldtablepath   backupdir
+//culled from fstabledescriptors
+private static htabledescriptor readtabledescriptor filesystem fs
+filestatus status  throws ioexception
+int len   ints checkedcast status getlen
+byte  content   new byte
+fsdatainputstream fsdatainputstream   fs open status getpath
+try
+fsdatainputstream readfully content
+finally
+fsdatainputstream close
+htabledescriptor htd   null
+try
+htd   htabledescriptor parsefrom content
+catch  deserializationexception e
+throw new ioexception     bytes toshort content   e
+return htd
+private static final pathfilter tableinfo_pathfilter   new pathfilter
+@override
+public boolean accept path p
+// accept any file that starts with tableinfo_name
+return p getname   startswith
+static final comparator<filestatus> tableinfo_filestatus_comparator
+new comparator<filestatus>
+@override
+public int compare filestatus left  filestatus right
+return  left compareto right
+// logic culled from fstabledescriptors
+static filestatus getcurrenttableinfostatus filesystem fs  path dir
+throws ioexception
+filestatus  status   fsutils liststatus fs  dir  tableinfo_pathfilter
+if  status    null    status length < 1  return null
+filestatus mostcurrent   null
+for  filestatus file   status
+if  mostcurrent    null    tableinfo_filestatus_comparator compare file  mostcurrent  < 0
+mostcurrent   file
+return mostcurrent
+public static boolean verifynsupgrade filesystem fs  path rootdir
+throws ioexception
+try
+return fsutils getversion fs  rootdir  equals hconstants file_system_version
+catch  deserializationexception e
+throw new ioexception    e
+@override
+public int run string args  throws exception
+if  args length < 1     args equals
+system out println
+return 0
+init
+upgradetabledirs
+return 0
+@override
+public void setconf configuration conf
+this conf   conf
+@override
+public configuration getconf
+return conf

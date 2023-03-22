@@ -1,0 +1,856 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache camel processor
+import java util concurrent callable
+import java util concurrent rejectedexecutionexception
+import java util concurrent scheduledexecutorservice
+import java util concurrent timeunit
+import org apache camel asynccallback
+import org apache camel asyncprocessor
+import org apache camel camelcontext
+import org apache camel exchange
+import org apache camel logginglevel
+import org apache camel message
+import org apache camel predicate
+import org apache camel processor
+import org apache camel model onexceptiondefinition
+import org apache camel spi shutdownprepared
+import org apache camel spi subunitofworkcallback
+import org apache camel spi unitofwork
+import org apache camel util asyncprocessorconverterhelper
+import org apache camel util asyncprocessorhelper
+import org apache camel util camelcontexthelper
+import org apache camel util camellogger
+import org apache camel util eventhelper
+import org apache camel util exchangehelper
+import org apache camel util messagehelper
+import org apache camel util objecthelper
+import org apache camel util servicehelper
+/**
+* base redeliverable error handler that also supports a final dead letter queue in case
+* all redelivery attempts fail.
+* <p/>
+* this implementation should contain all the error handling logic and the sub classes
+* should only configure it according to what they support.
+*
+* @version
+*/
+public abstract class redeliveryerrorhandler extends errorhandlersupport implements asyncprocessor  shutdownprepared
+protected scheduledexecutorservice executorservice
+protected final camelcontext camelcontext
+protected final processor deadletter
+protected final string deadletteruri
+protected final processor output
+protected final asyncprocessor outputasync
+protected final processor redeliveryprocessor
+protected final redeliverypolicy redeliverypolicy
+protected final predicate retrywhilepolicy
+protected final camellogger logger
+protected final boolean useoriginalmessagepolicy
+protected boolean redeliveryenabled
+protected volatile boolean preparingshutdown
+/**
+* contains the current redelivery data
+*/
+protected class redeliverydata
+exchange original
+boolean sync   true
+int redeliverycounter
+long redeliverydelay
+predicate retrywhilepredicate   retrywhilepolicy
+boolean redeliverfromsync
+// default behavior which can be overloaded on a per exception basis
+redeliverypolicy currentredeliverypolicy   redeliverypolicy
+processor deadletterprocessor   deadletter
+processor failureprocessor
+processor onredeliveryprocessor   redeliveryprocessor
+predicate handledpredicate   getdefaulthandledpredicate
+predicate continuedpredicate
+boolean useoriginalinmessage   useoriginalmessagepolicy
+/**
+* tasks which performs asynchronous redelivery attempts, and being triggered by a
+* {@link java.util.concurrent.scheduledexecutorservice} to avoid having any threads blocking if a task
+* has to be delayed before a redelivery attempt is performed.
+*/
+private class asyncredeliverytask implements callable<boolean>
+private final exchange exchange
+private final asynccallback callback
+private final redeliverydata data
+public asyncredeliverytask exchange exchange  asynccallback callback  redeliverydata data
+this exchange   exchange
+this callback   callback
+this data   data
+public boolean call   throws exception
+// prepare for redelivery
+prepareexchangeforredelivery exchange  data
+// letting onredeliver be executed at first
+delivertoonredeliveryprocessor exchange  data
+if  log istraceenabled
+log trace    new object exchange getexchangeid    outputasync  exchange
+// emmit event we are doing redelivery
+eventhelper notifyexchangeredelivery exchange getcontext    exchange  data redeliverycounter
+// process the exchange (also redelivery)
+boolean sync
+if  data redeliverfromsync
+// this redelivery task was scheduled from synchronous, which we forced to be asynchronous from
+// this error handler, which means we have to invoke the callback with false, to have the callback
+// be notified when we are done
+sync   asyncprocessorhelper process outputasync  exchange  new asynccallback
+public void done boolean donesync
+log trace    exchange getexchangeid    donesync
+// mark we are in sync mode now
+data sync   false
+// only process if the exchange hasn't failed
+// and it has not been handled by the error processor
+if  isdone exchange
+callback done false
+return
+// error occurred so loop back around which we do by invoking the processasyncerrorhandler
+processasyncerrorhandler exchange  callback  data
+else
+// this redelivery task was scheduled from asynchronous, which means we should only
+// handle when the asynchronous task was done
+sync   asyncprocessorhelper process outputasync  exchange  new asynccallback
+public void done boolean donesync
+log trace    exchange getexchangeid    donesync
+// this callback should only handle the async case
+if  donesync
+return
+// mark we are in async mode now
+data sync   false
+// only process if the exchange hasn't failed
+// and it has not been handled by the error processor
+if  isdone exchange
+callback done donesync
+return
+// error occurred so loop back around which we do by invoking the processasyncerrorhandler
+processasyncerrorhandler exchange  callback  data
+return sync
+public redeliveryerrorhandler camelcontext camelcontext  processor output  camellogger logger
+processor redeliveryprocessor  redeliverypolicy redeliverypolicy  processor deadletter
+string deadletteruri  boolean useoriginalmessagepolicy  predicate retrywhile  scheduledexecutorservice executorservice
+objecthelper notnull camelcontext     this
+objecthelper notnull redeliverypolicy     this
+this camelcontext   camelcontext
+this redeliveryprocessor   redeliveryprocessor
+this deadletter   deadletter
+this output   output
+this outputasync   asyncprocessorconverterhelper convert output
+this redeliverypolicy   redeliverypolicy
+this logger   logger
+this deadletteruri   deadletteruri
+this useoriginalmessagepolicy   useoriginalmessagepolicy
+this retrywhilepolicy   retrywhile
+this executorservice   executorservice
+public boolean supporttransacted
+return false
+protected boolean isrunallowed redeliverydata data
+// if camel context is forcing a shutdown then do not allow running
+boolean forceshutdown   camelcontext getshutdownstrategy   forceshutdown this
+if  forceshutdown
+log trace
+return false
+// redelivery policy can control if redelivery is allowed during stopping/shutdown
+// but this only applies during a redelivery (counter must > 0)
+if  data redeliverycounter > 0
+if  data currentredeliverypolicy allowredeliverywhilestopping
+log trace
+return true
+else if  preparingshutdown
+// we are preparing for shutdown, now determine if we can still run
+boolean answer   isrunallowedonpreparingshutdown
+log trace    answer
+return answer
+// we cannot run if we are stopping/stopped
+boolean answer    isstoppingorstopped
+log trace    answer
+return answer
+protected boolean isrunallowedonpreparingshutdown
+return false
+protected boolean isredeliveryallowed redeliverydata data
+// redelivery policy can control if redelivery is allowed during stopping/shutdown
+// but this only applies during a redelivery (counter must > 0)
+if  data redeliverycounter > 0
+boolean stopping   isstoppingorstopped
+if   preparingshutdown     stopping
+log trace
+return true
+else
+// we are stopping or preparing to shutdown
+if  data currentredeliverypolicy allowredeliverywhilestopping
+log trace
+return true
+else
+log trace
+return false
+return true
+@override
+public void prepareshutdown boolean forced
+// prepare for shutdown, eg do not allow redelivery if configured
+log trace    this
+preparingshutdown   true
+public void process exchange exchange  throws exception
+if  output    null
+// no output then just return
+return
+asyncprocessorhelper process this  exchange
+public boolean process exchange exchange  final asynccallback callback
+return processerrorhandler exchange  callback  new redeliverydata
+/**
+* process the exchange using redelivery error handling.
+*/
+protected boolean processerrorhandler final exchange exchange  final asynccallback callback  final redeliverydata data
+// do a defensive copy of the original exchange, which is needed for redelivery so we can ensure the
+// original exchange is being redelivered, and not a mutated exchange
+data original   defensivecopyexchangeifneeded exchange
+// use looping to have redelivery attempts
+while  true
+// can we still run
+if   isrunallowed data
+log trace    exchange
+if  exchange getexception      null
+exchange setexception new rejectedexecutionexception
+// we cannot process so invoke callback
+callback done data sync
+return data sync
+// did previous processing cause an exception?
+boolean handle   shouldhandleexception exchange
+if  handle
+handleexception exchange  data
+// compute if we are exhausted, and whether redelivery is allowed
+boolean exhausted   isexhausted exchange  data
+boolean redeliverallowed   isredeliveryallowed data
+// if we are exhausted or redelivery is not allowed, then deliver to failure processor (eg such as dlc)
+if   redeliverallowed    exhausted
+processor target   null
+boolean deliver   true
+// the unit of work may have an optional callback associated we need to leverage
+subunitofworkcallback uowcallback   exchange getunitofwork   getsubunitofworkcallback
+if  uowcallback    null
+// signal to the callback we are exhausted
+uowcallback onexhausted exchange
+// do not deliver to the failure processor as its been handled by the callback instead
+deliver   false
+if  deliver
+// should deliver to failure processor (either from onexception or the dead letter channel)
+target   data failureprocessor    null ? data failureprocessor   data deadletterprocessor
+// we should always invoke the delivertofailureprocessor as it prepares, logs and does a fair
+// bit of work for exhausted exchanges (its only the target processor which may be null if handled by a savepoint)
+boolean sync   delivertofailureprocessor target  exchange  data  callback
+// we are breaking out
+return sync
+if  data redeliverycounter > 0
+// calculate delay
+data redeliverydelay   determineredeliverydelay exchange  data currentredeliverypolicy  data redeliverydelay  data redeliverycounter
+if  data redeliverydelay > 0
+// okay there is a delay so create a scheduled task to have it executed in the future
+if  data currentredeliverypolicy isasyncdelayedredelivery       exchange istransacted
+// we are doing a redelivery then a thread pool must be configured (see the dostart method)
+objecthelper notnull executorservice     this
+// let the redelivertask be the logic which tries to redeliver the exchange which we can used a scheduler to
+// have it being executed in the future, or immediately
+// we are continuing asynchronously
+// mark we are routing async from now and that this redelivery task came from a synchronous routing
+data sync   false
+data redeliverfromsync   true
+asyncredeliverytask task   new asyncredeliverytask exchange  callback  data
+// schedule the redelivery task
+if  log istraceenabled
+log trace    data redeliverydelay  exchange getexchangeid
+executorservice schedule task  data redeliverydelay  timeunit milliseconds
+return false
+else
+// async delayed redelivery was disabled or we are transacted so we must be synchronous
+// as the transaction manager requires to execute in the same thread context
+try
+data currentredeliverypolicy sleep data redeliverydelay
+catch  interruptedexception e
+// we was interrupted so break out
+exchange setexception e
+// mark the exchange to stop continue routing when interrupted
+// as we do not want to continue routing (for example a task has been cancelled)
+exchange setproperty exchange route_stop  boolean true
+callback done data sync
+return data sync
+// prepare for redelivery
+prepareexchangeforredelivery exchange  data
+// letting onredeliver be executed
+delivertoonredeliveryprocessor exchange  data
+// emmit event we are doing redelivery
+eventhelper notifyexchangeredelivery exchange getcontext    exchange  data redeliverycounter
+// process the exchange (also redelivery)
+boolean sync   asyncprocessorhelper process outputasync  exchange  new asynccallback
+public void done boolean sync
+// this callback should only handle the async case
+if  sync
+return
+// mark we are in async mode now
+data sync   false
+// if we are done then notify callback and exit
+if  isdone exchange
+callback done sync
+return
+// error occurred so loop back around which we do by invoking the processasyncerrorhandler
+// method which takes care of this in a asynchronous manner
+processasyncerrorhandler exchange  callback  data
+if   sync
+// the remainder of the exchange is being processed asynchronously so we should return
+return false
+// we continue to route synchronously
+// if we are done then notify callback and exit
+boolean done   isdone exchange
+if  done
+callback done true
+return true
+// error occurred so loop back around.....
+/**
+* <p>determines the redelivery delay time by first inspecting the message header {@link exchange#redelivery_delay}
+* and if not present, defaulting to {@link redeliverypolicy#calculateredeliverydelay(long, int)}</p>
+*
+* <p>in order to prevent manipulation of the redeliverydata state, the values of {@link redeliverydata#redeliverydelay}
+* and {@link redeliverydata#redeliverycounter} are copied in.</p>
+*
+* @param exchange the current exchange in question.
+* @param redeliverypolicy the redeliverypolicy to use in the calculation.
+* @param redeliverydelay the default redelivery delay from redeliverydata
+* @param redeliverycounter the redeliverycounter
+* @return the time to wait before the next redelivery.
+*/
+protected long determineredeliverydelay exchange exchange  redeliverypolicy redeliverypolicy  long redeliverydelay  int redeliverycounter
+message message   exchange getin
+long delay   message getheader exchange redelivery_delay  long class
+if  delay    null
+delay   redeliverypolicy calculateredeliverydelay redeliverydelay  redeliverycounter
+log debug    delay
+else
+log debug    delay  exchange redelivery_delay
+return delay
+/**
+* this logic is only executed if we have to retry redelivery asynchronously, which have to be done from the callback.
+* <p/>
+* and therefore the logic is a bit different than the synchronous <tt>processerrorhandler</tt> method which can use
+* a loop based redelivery technique. however this means that these two methods in overall have to be in <b>sync</b>
+* in terms of logic.
+*/
+protected void processasyncerrorhandler final exchange exchange  final asynccallback callback  final redeliverydata data
+// can we still run
+if   isrunallowed data
+log trace    exchange
+if  exchange getexception      null
+exchange setexception new rejectedexecutionexception
+callback done data sync
+return
+// did previous processing cause an exception?
+boolean handle   shouldhandleexception exchange
+if  handle
+handleexception exchange  data
+// compute if we are exhausted or not
+boolean exhausted   isexhausted exchange  data
+if  exhausted
+processor target   null
+boolean deliver   true
+// the unit of work may have an optional callback associated we need to leverage
+subunitofworkcallback uowcallback   exchange getunitofwork   getsubunitofworkcallback
+if  uowcallback    null
+// signal to the callback we are exhausted
+uowcallback onexhausted exchange
+// do not deliver to the failure processor as its been handled by the callback instead
+deliver   false
+if  deliver
+// should deliver to failure processor (either from onexception or the dead letter channel)
+target   data failureprocessor    null ? data failureprocessor   data deadletterprocessor
+// we should always invoke the delivertofailureprocessor as it prepares, logs and does a fair
+// bit of work for exhausted exchanges (its only the target processor which may be null if handled by a savepoint)
+delivertofailureprocessor target  exchange  data  callback
+// we are breaking out
+return
+if  data redeliverycounter > 0
+// we are doing a redelivery then a thread pool must be configured (see the dostart method)
+objecthelper notnull executorservice     this
+// let the redelivertask be the logic which tries to redeliver the exchange which we can used a scheduler to
+// have it being executed in the future, or immediately
+// note: the data.redeliverfromsync should be kept as is, in case it was enabled previously
+// to ensure the callback will continue routing from where we left
+asyncredeliverytask task   new asyncredeliverytask exchange  callback  data
+// calculate the redelivery delay
+data redeliverydelay   data currentredeliverypolicy calculateredeliverydelay data redeliverydelay  data redeliverycounter
+if  data redeliverydelay > 0
+// schedule the redelivery task
+if  log istraceenabled
+log trace    data redeliverydelay  exchange getexchangeid
+executorservice schedule task  data redeliverydelay  timeunit milliseconds
+else
+// execute the task immediately
+executorservice submit task
+/**
+* performs a defensive copy of the exchange if needed
+*
+* @param exchange the exchange
+* @return the defensive copy, or <tt>null</tt> if not needed (redelivery is not enabled).
+*/
+protected exchange defensivecopyexchangeifneeded exchange exchange
+// only do a defensive copy if redelivery is enabled
+if  redeliveryenabled
+return exchangehelper createcopy exchange  true
+else
+return null
+/**
+* strategy whether the exchange has an exception that we should try to handle.
+* <p/>
+* standard implementations should just look for an exception.
+*/
+protected boolean shouldhandleexception exchange exchange
+return exchange getexception      null
+/**
+* strategy to determine if the exchange is done so we can continue
+*/
+protected boolean isdone exchange exchange
+boolean answer   iscancelledorinterrupted exchange
+// only done if the exchange hasn't failed
+// and it has not been handled by the failure processor
+// or we are exhausted
+if   answer
+answer   exchange getexception      null
+exchangehelper isfailurehandled exchange
+exchangehelper isredeliveryexhausted exchange
+log trace    exchange getexchangeid    answer
+return answer
+/**
+* strategy to determine if the exchange was cancelled or interrupted
+*/
+protected boolean iscancelledorinterrupted exchange exchange
+boolean answer   false
+if  exchangehelper isinterrupted exchange
+// mark the exchange to stop continue routing when interrupted
+// as we do not want to continue routing (for example a task has been cancelled)
+exchange setproperty exchange route_stop  boolean true
+answer   true
+log trace    exchange getexchangeid    answer
+return answer
+/**
+* returns the output processor
+*/
+public processor getoutput
+return output
+/**
+* returns the dead letter that message exchanges will be sent to if the
+* redelivery attempts fail
+*/
+public processor getdeadletter
+return deadletter
+public string getdeadletteruri
+return deadletteruri
+public boolean isuseoriginalmessagepolicy
+return useoriginalmessagepolicy
+public redeliverypolicy getredeliverypolicy
+return redeliverypolicy
+public camellogger getlogger
+return logger
+protected predicate getdefaulthandledpredicate
+// default is not not handle errors
+return null
+protected void prepareexchangeforcontinue exchange exchange  redeliverydata data
+exception caught   exchange getexception
+// we continue so clear any exceptions
+exchange setexception null
+// clear rollback flags
+exchange setproperty exchange rollback_only  null
+// reset cached streams so they can be read again
+messagehelper resetstreamcache exchange getin
+// its continued then remove traces of redelivery attempted and caught exception
+exchange getin   removeheader exchange redelivered
+exchange getin   removeheader exchange redelivery_counter
+exchange getin   removeheader exchange redelivery_max_counter
+exchange removeproperty exchange failure_handled
+// keep the exchange.exception_caught as property so end user knows the caused exception
+// create log message
+string msg       exchangehelper logids exchange
+msg   msg       data redeliverycounter       caught
+msg   msg
+// log that we failed but want to continue
+logfaileddelivery false  false  true  exchange  msg  data  null
+protected void prepareexchangeforredelivery exchange exchange  redeliverydata data
+if   redeliveryenabled
+throw new illegalstateexception     this
+// there must be a defensive copy of the exchange
+objecthelper notnull data original     this
+// okay we will give it another go so clear the exception so we can try again
+exchange setexception null
+// clear rollback flags
+exchange setproperty exchange rollback_only  null
+// todo: we may want to store these as state on redeliverydata so we keep them in case end user messes with exchange
+// and then put these on the exchange when doing a redelivery / fault processor
+// preserve these headers
+integer redeliverycounter   exchange getin   getheader exchange redelivery_counter  integer class
+integer redeliverymaxcounter   exchange getin   getheader exchange redelivery_max_counter  integer class
+boolean redelivered   exchange getin   getheader exchange redelivered  boolean class
+// we are redelivering so copy from original back to exchange
+exchange getin   copyfrom data original getin
+exchange setout null
+// reset cached streams so they can be read again
+messagehelper resetstreamcache exchange getin
+// put back headers
+if  redeliverycounter    null
+exchange getin   setheader exchange redelivery_counter  redeliverycounter
+if  redeliverymaxcounter    null
+exchange getin   setheader exchange redelivery_max_counter  redeliverymaxcounter
+if  redelivered    null
+exchange getin   setheader exchange redelivered  redelivered
+protected void handleexception exchange exchange  redeliverydata data
+exception e   exchange getexception
+// store the original caused exception in a property, so we can restore it later
+exchange setproperty exchange exception_caught  e
+// find the error handler to use (if any)
+onexceptiondefinition exceptionpolicy   getexceptionpolicy exchange  e
+if  exceptionpolicy    null
+data currentredeliverypolicy   exceptionpolicy createredeliverypolicy exchange getcontext    data currentredeliverypolicy
+data handledpredicate   exceptionpolicy gethandledpolicy
+data continuedpredicate   exceptionpolicy getcontinuedpolicy
+data retrywhilepredicate   exceptionpolicy getretrywhilepolicy
+data useoriginalinmessage   exceptionpolicy isuseoriginalmessage
+// route specific failure handler?
+processor processor   null
+unitofwork uow   exchange getunitofwork
+if  uow    null    uow getroutecontext      null
+string routeid   uow getroutecontext   getroute   getid
+processor   exceptionpolicy geterrorhandler routeid
+else if   exceptionpolicy geterrorhandlers   isempty
+// note this should really not happen, but we have this code as a fail safe
+// to be backwards compatible with the old behavior
+log warn    exchange getexchangeid
+processor   exceptionpolicy geterrorhandlers   iterator   next
+if  processor    null
+data failureprocessor   processor
+// route specific on redelivery?
+processor   exceptionpolicy getonredelivery
+if  processor    null
+data onredeliveryprocessor   processor
+// only log if not failure handled or not an exhausted unit of work
+if   exchangehelper isfailurehandled exchange      exchangehelper isunitofworkexhausted exchange
+string msg       exchangehelper logids exchange
+data redeliverycounter       e
+logfaileddelivery true  false  false  exchange  msg  data  e
+data redeliverycounter   incrementredeliverycounter exchange  e  data
+/**
+* gives an optional configure redelivery processor a chance to process before the exchange
+* will be redelivered. this can be used to alter the exchange.
+*/
+protected void delivertoonredeliveryprocessor final exchange exchange  final redeliverydata data
+if  data onredeliveryprocessor    null
+return
+if  log istraceenabled
+log trace
+data onredeliveryprocessor  exchange
+// run this synchronously as its just a processor
+try
+data onredeliveryprocessor process exchange
+catch  throwable e
+exchange setexception e
+log trace
+/**
+* all redelivery attempts failed so move the exchange to the dead letter queue
+*/
+protected boolean delivertofailureprocessor final processor processor  final exchange exchange
+final redeliverydata data  final asynccallback callback
+boolean sync   true
+exception caught   exchange getexception
+// we did not success with the redelivery so now we let the failure processor handle it
+// clear exception as we let the failure processor handle it
+exchange setexception null
+final boolean shouldhandle   shouldhandled exchange  data
+final boolean shouldcontinue   shouldcontinue exchange  data
+// regard both handled or continued as being handled
+boolean handled   false
+if  shouldhandle    shouldcontinue
+// its handled then remove traces of redelivery attempted
+exchange getin   removeheader exchange redelivered
+exchange getin   removeheader exchange redelivery_counter
+exchange getin   removeheader exchange redelivery_max_counter
+exchange removeproperty exchange redelivery_exhausted
+// and remove traces of rollback only and uow exhausted markers
+exchange removeproperty exchange rollback_only
+exchange removeproperty exchange unit_of_work_exhausted
+handled   true
+else
+// must decrement the redelivery counter as we didn't process the redelivery but is
+// handling by the failure handler. so we must -1 to not let the counter be out-of-sync
+decrementredeliverycounter exchange
+// is the a failure processor to process the exchange
+if  processor    null
+// prepare original in body if it should be moved instead of current body
+if  data useoriginalinmessage
+log trace
+message original   exchange getunitofwork   getoriginalinmessage
+exchange setin original
+if  exchange hasout
+log trace
+exchange setout null
+// reset cached streams so they can be read again
+messagehelper resetstreamcache exchange getin
+log trace    processor  exchange
+// store the last to endpoint as the failure endpoint
+exchange setproperty exchange failure_endpoint  exchange getproperty exchange to_endpoint
+// and store the route id so we know in which route we failed
+if  exchange getunitofwork   getroutecontext      null
+exchange setproperty exchange failure_route_id  exchange getunitofwork   getroutecontext   getroute   getid
+// the failure processor could also be asynchronous
+asyncprocessor afp   asyncprocessorconverterhelper convert processor
+sync   asyncprocessorhelper process afp  exchange  new asynccallback
+public void done boolean sync
+log trace    processor  exchange
+try
+prepareexchangeafterfailure exchange  data  shouldhandle  shouldcontinue
+// fire event as we had a failure processor to handle it, which there is a event for
+boolean deadletterchannel   processor    data deadletterprocessor    data deadletterprocessor    null
+eventhelper notifyexchangefailurehandled exchange getcontext    exchange  processor  deadletterchannel
+finally
+// if the fault was handled asynchronously, this should be reflected in the callback as well
+data sync    sync
+callback done data sync
+else
+try
+// no processor but we need to prepare after failure as well
+prepareexchangeafterfailure exchange  data  shouldhandle  shouldcontinue
+finally
+// callback we are done
+callback done data sync
+// create log message
+string msg       exchangehelper logids exchange
+msg   msg       data redeliverycounter       caught
+if  processor    null
+msg   msg       processor
+// log that we failed delivery as we are exhausted
+logfaileddelivery false  handled  false  exchange  msg  data  null
+return sync
+protected void prepareexchangeafterfailure final exchange exchange  final redeliverydata data
+final boolean shouldhandle  final boolean shouldcontinue
+// we could not process the exchange so we let the failure processor handled it
+exchangehelper setfailurehandled exchange
+// honor if already set a handling
+boolean alreadyset   exchange getproperty exchange errorhandler_handled     null
+if  alreadyset
+boolean handled   exchange getproperty exchange errorhandler_handled  boolean class
+log trace    handled
+if  handled
+exchange setexception null
+else
+// exception not handled, put exception back in the exchange
+exchange setexception exchange getproperty exchange exception_caught  exception class
+// and put failure endpoint back as well
+exchange setproperty exchange failure_endpoint  exchange getproperty exchange to_endpoint
+return
+if  shouldhandle
+log trace    exchange
+exchange setproperty exchange errorhandler_handled  boolean true
+else if  shouldcontinue
+log trace    exchange
+// okay we want to continue then prepare the exchange for that as well
+prepareexchangeforcontinue exchange  data
+else
+log trace    exchange
+// exception not handled, put exception back in the exchange
+exchange setproperty exchange errorhandler_handled  boolean false
+exchange setexception exchange getproperty exchange exception_caught  exception class
+// and put failure endpoint back as well
+exchange setproperty exchange failure_endpoint  exchange getproperty exchange to_endpoint
+// and store the route id so we know in which route we failed
+if  exchange getunitofwork   getroutecontext      null
+exchange setproperty exchange failure_route_id  exchange getunitofwork   getroutecontext   getroute   getid
+private void logfaileddelivery boolean shouldredeliver  boolean handled  boolean continued  exchange exchange  string message  redeliverydata data  throwable e
+if  logger    null
+return
+if   exchange isrollbackonly
+// if we should not rollback, then check whether logging is enabled
+if  handled     data currentredeliverypolicy isloghandled
+// do not log handled
+return
+if  continued     data currentredeliverypolicy islogcontinued
+// do not log handled
+return
+if  shouldredeliver     data currentredeliverypolicy islogretryattempted
+// do not log retry attempts
+return
+if   shouldredeliver     data currentredeliverypolicy islogexhausted
+// do not log exhausted
+return
+logginglevel newloglevel
+boolean logstacktrace
+if  exchange isrollbackonly
+newloglevel   data currentredeliverypolicy getretriesexhaustedloglevel
+logstacktrace   data currentredeliverypolicy islogstacktrace
+else if  shouldredeliver
+newloglevel   data currentredeliverypolicy getretryattemptedloglevel
+logstacktrace   data currentredeliverypolicy islogretrystacktrace
+else
+newloglevel   data currentredeliverypolicy getretriesexhaustedloglevel
+logstacktrace   data currentredeliverypolicy islogstacktrace
+if  e    null
+e   exchange getproperty exchange exception_caught  exception class
+if  exchange isrollbackonly
+string msg       exchangehelper logids exchange
+throwable cause   exchange getexception      null ? exchange getexception     exchange getproperty exchange exception_caught  throwable class
+if  cause    null
+msg   msg       cause getmessage
+if  newloglevel    logginglevel error
+// log intended rollback on maximum warn level (no error)
+logger log msg  logginglevel warn
+else
+// otherwise use the desired logging level
+logger log msg  newloglevel
+else if  e    null    logstacktrace
+logger log message  e  newloglevel
+else
+logger log message  newloglevel
+/**
+* determines whether the exchange is exhausted (or anyway marked to not continue such as rollback).
+* <p/>
+* if the exchange is exhausted, then we will not continue processing, but let the
+* failure processor deal with the exchange.
+*
+* @param exchange the current exchange
+* @param data     the redelivery data
+* @return <tt>false</tt> to continue/redeliver, or <tt>true</tt> to exhaust.
+*/
+private boolean isexhausted exchange exchange  redeliverydata data
+// if marked as rollback only then do not continue/redeliver
+boolean exhausted   exchange getproperty exchange redelivery_exhausted  false  boolean class
+if  exhausted
+log trace    exchange
+return true
+// if marked as rollback only then do not continue/redeliver
+boolean rollbackonly   exchange getproperty exchange rollback_only  false  boolean class
+if  rollbackonly
+log trace    exchange
+return true
+// its the first original call so continue
+if  data redeliverycounter    0
+return false
+// its a potential redelivery so determine if we should redeliver or not
+boolean redeliver   data currentredeliverypolicy shouldredeliver exchange  data redeliverycounter  data retrywhilepredicate
+return  redeliver
+/**
+* determines whether or not to continue if we are exhausted.
+*
+* @param exchange the current exchange
+* @param data     the redelivery data
+* @return <tt>true</tt> to continue, or <tt>false</tt> to exhaust.
+*/
+private boolean shouldcontinue exchange exchange  redeliverydata data
+if  data continuedpredicate    null
+return data continuedpredicate matches exchange
+// do not continue by default
+return false
+/**
+* determines whether or not to handle if we are exhausted.
+*
+* @param exchange the current exchange
+* @param data     the redelivery data
+* @return <tt>true</tt> to handle, or <tt>false</tt> to exhaust.
+*/
+private boolean shouldhandled exchange exchange  redeliverydata data
+if  data handledpredicate    null
+return data handledpredicate matches exchange
+// do not handle by default
+return false
+/**
+* increments the redelivery counter and adds the redelivered flag if the
+* message has been redelivered
+*/
+private int incrementredeliverycounter exchange exchange  throwable e  redeliverydata data
+message in   exchange getin
+integer counter   in getheader exchange redelivery_counter  integer class
+int next   1
+if  counter    null
+next   counter   1
+in setheader exchange redelivery_counter  next
+in setheader exchange redelivered  boolean true
+// if maximum redeliveries is used, then provide that information as well
+if  data currentredeliverypolicy getmaximumredeliveries   > 0
+in setheader exchange redelivery_max_counter  data currentredeliverypolicy getmaximumredeliveries
+return next
+/**
+* prepares the redelivery counter and boolean flag for the failure handle processor
+*/
+private void decrementredeliverycounter exchange exchange
+message in   exchange getin
+integer counter   in getheader exchange redelivery_counter  integer class
+if  counter    null
+int prev   counter   1
+in setheader exchange redelivery_counter  prev
+// set boolean flag according to counter
+in setheader exchange redelivered  prev > 0 ? boolean true   boolean false
+else
+// not redelivered
+in setheader exchange redelivery_counter  0
+in setheader exchange redelivered  boolean false
+/**
+* determines if redelivery is enabled by checking if any of the redelivery policy
+* settings may allow redeliveries.
+*
+* @return <tt>true</tt> if redelivery is possible, <tt>false</tt> otherwise
+* @throws exception can be thrown
+*/
+private boolean determineifredeliveryisenabled   throws exception
+// determine if redeliver is enabled either on error handler
+if  getredeliverypolicy   getmaximumredeliveries      0
+// must check for != 0 as (-1 means redeliver forever)
+return true
+if  retrywhilepolicy    null
+return true
+// or on the exception policies
+if   exceptionpolicies isempty
+// walk them to see if any of them have a maximum redeliveries > 0 or retry until set
+for  onexceptiondefinition def   exceptionpolicies values
+string ref   def getredeliverypolicyref
+if  ref    null
+// lookup in registry if ref provided
+redeliverypolicy policy   camelcontexthelper mandatorylookup camelcontext  ref  redeliverypolicy class
+if  policy getmaximumredeliveries      0
+// must check for != 0 as (-1 means redeliver forever)
+return true
+else if  def getredeliverypolicy      null
+integer max   camelcontexthelper parseinteger camelcontext  def getredeliverypolicy   getmaximumredeliveries
+if  max    null    max    0
+// must check for != 0 as (-1 means redeliver forever)
+return true
+if  def getretrywhilepolicy      null    def getretrywhile      null
+return true
+return false
+@override
+protected void dostart   throws exception
+servicehelper startservices output  outputasync  deadletter
+// determine if redeliver is enabled or not
+redeliveryenabled   determineifredeliveryisenabled
+if  log isdebugenabled
+log debug    redeliveryenabled  this
+// we only need thread pool if redelivery is enabled
+if  redeliveryenabled
+if  executorservice    null
+// use default shared executor service
+executorservice   camelcontext geterrorhandlerexecutorservice
+if  log istraceenabled
+log trace    executorservice  this
+// reset flag when starting
+preparingshutdown   false
+@override
+protected void dostop   throws exception
+// noop, do not stop any services which we only do when shutting down
+// as the error handler can be context scoped, and should not stop in case
+// a route stops
+@override
+protected void doshutdown   throws exception
+servicehelper stopandshutdownservices deadletter  output  outputasync

@@ -1,0 +1,378 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.you may obtain a copy of the license at
+*
+* http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql optimizer
+import java io ioexception
+import java io serializable
+import java util arraylist
+import java util collection
+import java util collections
+import java util hashset
+import java util iterator
+import java util linkedhashmap
+import java util list
+import java util map
+import java util map entry
+import java util set
+import java util stack
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hive ql exec functionregistry
+import org apache hadoop hive ql exec mapjoinoperator
+import org apache hadoop hive ql exec operator
+import org apache hadoop hive ql exec tablescanoperator
+import org apache hadoop hive ql lib defaultgraphwalker
+import org apache hadoop hive ql lib defaultruledispatcher
+import org apache hadoop hive ql lib dispatcher
+import org apache hadoop hive ql lib graphwalker
+import org apache hadoop hive ql lib node
+import org apache hadoop hive ql lib nodeprocessor
+import org apache hadoop hive ql lib nodeprocessorctx
+import org apache hadoop hive ql lib rule
+import org apache hadoop hive ql lib ruleregexp
+import org apache hadoop hive ql metadata hiveexception
+import org apache hadoop hive ql metadata partition
+import org apache hadoop hive ql metadata table
+import org apache hadoop hive ql optimizer ppr partitionpruner
+import org apache hadoop hive ql parse parsecontext
+import org apache hadoop hive ql parse prunedpartitionlist
+import org apache hadoop hive ql parse qbjointree
+import org apache hadoop hive ql parse semanticexception
+import org apache hadoop hive ql plan exprnodecolumndesc
+import org apache hadoop hive ql plan exprnodedesc
+import org apache hadoop hive ql plan exprnodegenericfuncdesc
+import org apache hadoop hive ql plan mapjoindesc
+import org apache hadoop hive ql udf generic genericudf
+/**
+*this transformation does bucket map join optimization.
+*/
+public class bucketmapjoinoptimizer implements transform
+private static final log log   logfactory getlog groupbyoptimizer class
+getname
+public bucketmapjoinoptimizer
+@override
+public parsecontext transform parsecontext pctx  throws semanticexception
+map<rule  nodeprocessor> oprules   new linkedhashmap<rule  nodeprocessor>
+bucketmapjoinoptprocctx bucketmapjoinoptimizectx   new bucketmapjoinoptprocctx
+// process map joins with no reducers pattern
+oprules put new ruleregexp        getbucketmapjoinproc pctx
+oprules put new ruleregexp        getbucketmapjoinrejectproc pctx
+oprules put new ruleregexp new string
+getbucketmapjoinrejectproc pctx
+oprules put new ruleregexp new string
+getbucketmapjoinrejectproc pctx
+// the dispatcher fires the processor corresponding to the closest matching
+// rule and passes the context along
+dispatcher disp   new defaultruledispatcher getdefaultproc    oprules
+bucketmapjoinoptimizectx
+graphwalker ogw   new defaultgraphwalker disp
+// create a list of topop nodes
+arraylist<node> topnodes   new arraylist<node>
+topnodes addall pctx gettopops   values
+ogw startwalking topnodes  null
+return pctx
+private nodeprocessor getbucketmapjoinrejectproc parsecontext pctx
+return new nodeprocessor
+@override
+public object process node nd  stack<node> stack
+nodeprocessorctx procctx  object    nodeoutputs
+throws semanticexception
+mapjoinoperator mapjoinop    mapjoinoperator  nd
+bucketmapjoinoptprocctx context    bucketmapjoinoptprocctx  procctx
+context listofrejectedmapjoins add mapjoinop
+return null
+private nodeprocessor getbucketmapjoinproc parsecontext pctx
+return new bucketmapjoinoptproc pctx
+private nodeprocessor getdefaultproc
+return new nodeprocessor
+@override
+public object process node nd  stack<node> stack
+nodeprocessorctx procctx  object    nodeoutputs
+throws semanticexception
+return null
+class bucketmapjoinoptproc implements nodeprocessor
+protected parsecontext pgraphcontext
+public bucketmapjoinoptproc parsecontext pgraphcontext
+super
+this pgraphcontext   pgraphcontext
+@override
+public object process node nd  stack<node> stack  nodeprocessorctx procctx
+object    nodeoutputs  throws semanticexception
+mapjoinoperator mapjoinop    mapjoinoperator  nd
+bucketmapjoinoptprocctx context    bucketmapjoinoptprocctx  procctx
+if context getlistofrejectedmapjoins   contains mapjoinop
+return null
+qbjointree joincxt   this pgraphcontext getmapjoincontext   get mapjoinop
+if joincxt    null
+return null
+list<string> joinaliases   new arraylist<string>
+string srcs   joincxt getbasesrc
+string left   joincxt getleftaliases
+list<string> mapalias   joincxt getmapaliases
+string basebigalias   null
+for string s   left
+if s    null     joinaliases contains s
+joinaliases add s
+if  mapalias contains s
+basebigalias   s
+for string s   srcs
+if s    null     joinaliases contains s
+joinaliases add s
+if  mapalias contains s
+basebigalias   s
+mapjoindesc mjdecs   mapjoinop getconf
+linkedhashmap<string  integer> aliastobucketnumbermapping   new linkedhashmap<string  integer>
+linkedhashmap<string  list<string>> aliastobucketfilenamesmapping   new linkedhashmap<string  list<string>>
+// right now this code does not work with "a join b on a.key = b.key and
+// a.ds = b.ds", where ds is a partition column. it only works with joins
+// with only one partition presents in each join source tables.
+map<string  operator<? extends serializable>> topops   this pgraphcontext gettopops
+map<tablescanoperator  table> toptotable   this pgraphcontext gettoptotable
+// (partition to bucket file names) and (partition to bucket number) for
+// the big table;
+linkedhashmap<partition  list<string>> bigtblpartstobucketfilenames   new linkedhashmap<partition  list<string>>
+linkedhashmap<partition  integer> bigtblpartstobucketnumber   new linkedhashmap<partition  integer>
+for  int index   0  index < joinaliases size    index
+string alias   joinaliases get index
+tablescanoperator tso    tablescanoperator  topops get alias
+if  tso    null
+return null
+table tbl   toptotable get tso
+if tbl ispartitioned
+prunedpartitionlist prunedparts   null
+try
+prunedparts   pgraphcontext getoptopartlist   get tso
+if  prunedparts    null
+prunedparts   partitionpruner prune tbl  pgraphcontext getoptopartpruner   get tso   pgraphcontext getconf    alias
+pgraphcontext getprunedpartitions
+pgraphcontext getoptopartlist   put tso  prunedparts
+catch  hiveexception e
+// has to use full name to make sure it does not conflict with
+// org.apache.commons.lang.stringutils
+log error org apache hadoop util stringutils stringifyexception e
+throw new semanticexception e getmessage    e
+int partnumber   prunedparts getconfirmedpartns   size
+prunedparts getunknownpartns   size
+if  partnumber > 1
+// only allow one partition for small tables
+if alias    basebigalias
+return null
+// here is the big table,and we get more than one partitions.
+// construct a mapping of (partition->bucket file names) and
+// (partition -> bucket number)
+iterator<partition> iter   prunedparts getconfirmedpartns
+iterator
+while  iter hasnext
+partition p   iter next
+if   checkbucketcolumns p getbucketcols    mjdecs  index
+return null
+list<string> filenames   getonepartitionbucketfilenames p
+bigtblpartstobucketfilenames put p  filenames
+bigtblpartstobucketnumber put p  p getbucketcount
+iter   prunedparts getunknownpartns   iterator
+while  iter hasnext
+partition p   iter next
+if   checkbucketcolumns p getbucketcols    mjdecs  index
+return null
+list<string> filenames   getonepartitionbucketfilenames p
+bigtblpartstobucketfilenames put p  filenames
+bigtblpartstobucketnumber put p  p getbucketcount
+// if there are more than one partition for the big
+// table,aliastobucketfilenamesmapping and partstobucketnumber will
+// not contain mappings for the big table. instead, the mappings are
+// contained in bigtblpartstobucketfilenames and
+// bigtblpartstobucketnumber
+else
+partition part   null
+iterator<partition> iter   prunedparts getconfirmedpartns
+iterator
+if  iter hasnext
+part   iter next
+if  part    null
+iter   prunedparts getunknownpartns   iterator
+if  iter hasnext
+part   iter next
+assert part    null
+integer num   new integer part getbucketcount
+aliastobucketnumbermapping put alias  num
+if   checkbucketcolumns part getbucketcols    mjdecs  index
+return null
+list<string> filenames   getonepartitionbucketfilenames part
+aliastobucketfilenamesmapping put alias  filenames
+if  alias    basebigalias
+bigtblpartstobucketfilenames put part  filenames
+bigtblpartstobucketnumber put part  num
+else
+if   checkbucketcolumns tbl getbucketcols    mjdecs  index
+return null
+integer num   new integer tbl getnumbuckets
+aliastobucketnumbermapping put alias  num
+list<string> filenames   new arraylist<string>
+try
+filesystem fs   filesystem get tbl getdatalocation    this pgraphcontext getconf
+filestatus files   fs liststatus new path tbl getdatalocation   tostring
+if files    null
+for filestatus file   files
+filenames add file getpath   tostring
+catch  ioexception e
+throw new semanticexception e
+aliastobucketfilenamesmapping put alias  filenames
+// all tables or partitions are bucketed, and their bucket number is
+// stored in 'bucketnumbers', we need to check if the number of buckets in
+// the big table can be divided by no of buckets in small tables.
+if  bigtblpartstobucketnumber size   > 0
+iterator<entry<partition  integer>> bigtblparttobucketnumber   bigtblpartstobucketnumber
+entryset   iterator
+while  bigtblparttobucketnumber hasnext
+int bucketnumberinpart   bigtblparttobucketnumber next   getvalue
+if   checkbucketnumberagainstbigtable aliastobucketnumbermapping
+bucketnumberinpart
+return null
+else
+int bucketnoinbigtbl   aliastobucketnumbermapping get basebigalias  intvalue
+if   checkbucketnumberagainstbigtable aliastobucketnumbermapping
+bucketnoinbigtbl
+return null
+mapjoindesc desc   mapjoinop getconf
+linkedhashmap<string  linkedhashmap<string  arraylist<string>>> aliasbucketfilenamemapping
+new linkedhashmap<string  linkedhashmap<string  arraylist<string>>>
+//sort bucket names for the big table
+if bigtblpartstobucketnumber size   > 0
+collection<list<string>> bucketnamesallparts   bigtblpartstobucketfilenames values
+for list<string> partbucketnames   bucketnamesallparts
+collections sort partbucketnames
+else
+collections sort aliastobucketfilenamesmapping get basebigalias
+// go through all small tables and get the mapping from bucket file name
+// in the big table to bucket file names in small tables.
+for  int j   0  j < joinaliases size    j
+string alias   joinaliases get j
+if alias equals basebigalias
+continue
+collections sort aliastobucketfilenamesmapping get alias
+linkedhashmap<string  arraylist<string>> mapping   new linkedhashmap<string  arraylist<string>>
+aliasbucketfilenamemapping put alias  mapping
+// for each bucket file in big table, get the corresponding bucket file
+// name in the small table.
+if  bigtblpartstobucketnumber size   > 0
+//more than 1 partition in the big table, do the mapping for each partition
+iterator<entry<partition  list<string>>> bigtblparttobucketnames   bigtblpartstobucketfilenames
+entryset   iterator
+iterator<entry<partition  integer>> bigtblparttobucketnum   bigtblpartstobucketnumber
+entryset   iterator
+while  bigtblparttobucketnames hasnext
+assert bigtblparttobucketnum hasnext
+int bigtblbucketnum   bigtblparttobucketnum next   getvalue   intvalue
+list<string> bigtblbucketnamelist   bigtblparttobucketnames next   getvalue
+fillmapping basebigalias  aliastobucketnumbermapping
+aliastobucketfilenamesmapping  alias  mapping  bigtblbucketnum
+bigtblbucketnamelist  desc getbucketfilenamemapping
+else
+list<string> bigtblbucketnamelist   aliastobucketfilenamesmapping get basebigalias
+int bigtblbucketnum    aliastobucketnumbermapping get basebigalias
+fillmapping basebigalias  aliastobucketnumbermapping
+aliastobucketfilenamesmapping  alias  mapping  bigtblbucketnum
+bigtblbucketnamelist  desc getbucketfilenamemapping
+desc setaliasbucketfilenamemapping aliasbucketfilenamemapping
+desc setbigtablealias basebigalias
+return null
+private void fillmapping string basebigalias
+linkedhashmap<string  integer> aliastobucketnumbermapping
+linkedhashmap<string  list<string>> aliastobucketfilenamesmapping
+string alias  linkedhashmap<string  arraylist<string>> mapping
+int bigtblbucketnum  list<string> bigtblbucketnamelist
+linkedhashmap<string  integer> bucketfilenamemapping
+for  int index   0  index < bigtblbucketnamelist size    index
+string inputbigtblbucket   bigtblbucketnamelist get index
+int smalltblbucketnum   aliastobucketnumbermapping get alias
+arraylist<string> resultfilenames   new arraylist<string>
+if  bigtblbucketnum >  smalltblbucketnum
+// if the big table has more buckets than the current small table,
+// use "mod" to get small table bucket names. for example, if the big
+// table has 4 buckets and the small table has 2 buckets, then the
+// mapping should be 0->0, 1->1, 2->0, 3->1.
+int toaddsmallindex   index % smalltblbucketnum
+if toaddsmallindex < aliastobucketfilenamesmapping get alias  size
+resultfilenames add aliastobucketfilenamesmapping get alias  get toaddsmallindex
+else
+int jump   smalltblbucketnum   bigtblbucketnum
+list<string> bucketnames   aliastobucketfilenamesmapping get alias
+for  int i   index  i < aliastobucketfilenamesmapping get alias  size    i   i   jump
+if i <  aliastobucketfilenamesmapping get alias  size
+resultfilenames add bucketnames get i
+mapping put inputbigtblbucket  resultfilenames
+bucketfilenamemapping put inputbigtblbucket  index
+private boolean checkbucketnumberagainstbigtable
+linkedhashmap<string  integer> aliastobucketnumber
+int bucketnumberinpart
+iterator<integer> iter   aliastobucketnumber values   iterator
+while iter hasnext
+int nxt   iter next   intvalue
+boolean ok    nxt >  bucketnumberinpart  ? nxt % bucketnumberinpart    0
+bucketnumberinpart % nxt    0
+if  ok
+return false
+return true
+private list<string> getonepartitionbucketfilenames partition part
+throws semanticexception
+list<string> filenames   new arraylist<string>
+try
+filesystem fs   filesystem get part getdatalocation    this pgraphcontext getconf
+filestatus files   fs liststatus new path part getdatalocation
+tostring
+if  files    null
+for  filestatus file   files
+filenames add file getpath   tostring
+catch  ioexception e
+throw new semanticexception e
+return filenames
+private boolean checkbucketcolumns list<string> bucketcolumns  mapjoindesc mjdesc  int index
+list<exprnodedesc> keys   mjdesc getkeys   get  byte index
+if  keys    null    bucketcolumns    null    bucketcolumns size      0
+return false
+//get all join columns from join keys stored in mapjoindesc
+list<string> joincols   new arraylist<string>
+list<exprnodedesc> joinkeys   new arraylist<exprnodedesc>
+joinkeys addall keys
+while  joinkeys size   > 0
+exprnodedesc node   joinkeys remove 0
+if  node instanceof exprnodecolumndesc
+joincols addall node getcols
+else if  node instanceof exprnodegenericfuncdesc
+exprnodegenericfuncdesc udfnode     exprnodegenericfuncdesc  node
+genericudf udf   udfnode getgenericudf
+if   functionregistry isdeterministic udf
+return false
+joinkeys addall 0  udfnode getchildexprs
+else
+return false
+// check if the join columns contains all bucket columns.
+// if a table is bucketized on column b, but the join key is a and b,
+// it is easy to see joining on different buckets yield empty results.
+if  joincols size      0     joincols containsall bucketcolumns
+return false
+return true
+class bucketmapjoinoptprocctx implements nodeprocessorctx
+// we only convert map joins that follows a root table scan in the same
+// mapper. that means there is no reducer between the root table scan and
+// mapjoin.
+set<mapjoinoperator> listofrejectedmapjoins   new hashset<mapjoinoperator>
+public set<mapjoinoperator> getlistofrejectedmapjoins
+return listofrejectedmapjoins

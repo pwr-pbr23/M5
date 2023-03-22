@@ -1,0 +1,801 @@
+/*
+* licensed under the apache license, version 2.0 (the "license");
+* you may not use this file except in compliance with the license.
+* you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase security access
+import java io ioexception
+import java util arrays
+import java util collection
+import java util hashmap
+import java util hashset
+import java util list
+import java util map
+import java util set
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop hbase coprocessorenvironment
+import org apache hadoop hbase hcolumndescriptor
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase servername
+import org apache hadoop hbase client delete
+import org apache hadoop hbase client get
+import org apache hadoop hbase client increment
+import org apache hadoop hbase client put
+import org apache hadoop hbase client result
+import org apache hadoop hbase client scan
+import org apache hadoop hbase coprocessor baseregionobserver
+import org apache hadoop hbase coprocessor coprocessorexception
+import org apache hadoop hbase coprocessor mastercoprocessorenvironment
+import org apache hadoop hbase coprocessor masterobserver
+import org apache hadoop hbase coprocessor observercontext
+import org apache hadoop hbase coprocessor regioncoprocessorenvironment
+import org apache hadoop hbase filter comparefilter
+import org apache hadoop hbase filter filterlist
+import org apache hadoop hbase filter writablebytearraycomparable
+import org apache hadoop hbase ipc hbaserpc
+import org apache hadoop hbase ipc protocolsignature
+import org apache hadoop hbase ipc requestcontext
+import org apache hadoop hbase regionserver hregion
+import org apache hadoop hbase regionserver internalscanner
+import org apache hadoop hbase regionserver regionscanner
+import org apache hadoop hbase regionserver wal waledit
+import org apache hadoop hbase security accessdeniedexception
+import org apache hadoop hbase security user
+import org apache hadoop hbase util bytes
+import com google common collect listmultimap
+import com google common collect lists
+import com google common collect mapmaker
+import com google common collect maps
+import com google common collect sets
+/**
+* provides basic authorization checks for data access and administrative
+* operations.
+*
+* <p>
+* {@code accesscontroller} performs authorization checks for hbase operations
+* based on:
+* <ul>
+*   <li>the identity of the user performing the operation</li>
+*   <li>the scope over which the operation is performed, in increasing
+*   specificity: global, table, column family, or qualifier</li>
+*   <li>the type of action being performed (as mapped to
+*   {@link permission.action} values)</li>
+* </ul>
+* if the authorization check fails, an {@link accessdeniedexception}
+* will be thrown for the operation.
+* </p>
+*
+* <p>
+* to perform authorization checks, {@code accesscontroller} relies on the
+* {@link org.apache.hadoop.hbase.ipc.securerpcengine} being loaded to provide
+* the user identities for remote requests.
+* </p>
+*
+* <p>
+* the access control lists used for authorization can be manipulated via the
+* exposed {@link accesscontrollerprotocol} implementation, and the associated
+* {@code grant}, {@code revoke}, and {@code user_permission} hbase shell
+* commands.
+* </p>
+*/
+public class accesscontroller extends baseregionobserver
+implements masterobserver  accesscontrollerprotocol
+/**
+* represents the result of an authorization check for logging and error
+* reporting.
+*/
+private static class authresult
+private final boolean allowed
+private final byte table
+private final byte family
+private final byte qualifier
+private final permission action action
+private final string reason
+private final user user
+public authresult boolean allowed  string reason   user user
+permission action action  byte table  byte family  byte qualifier
+this allowed   allowed
+this reason   reason
+this user   user
+this table   table
+this family   family
+this qualifier   qualifier
+this action   action
+public boolean isallowed     return allowed
+public user getuser     return user
+public string getreason     return reason
+public string tocontextstring
+return      user    null ? user getname
+table    null ?     bytes tostring table
+family    null ? bytes tostring family
+qualifier    null ? bytes tostring qualifier
+action    null ? action tostring
+public string tostring
+return new stringbuilder
+append tocontextstring    tostring
+public static authresult allow string reason  user user
+permission action action  byte table
+return new authresult true  reason  user  action  table  null  null
+public static authresult deny string reason  user user
+permission action action  byte table
+return new authresult false  reason  user  action  table  null  null
+public static authresult deny string reason  user user
+permission action action  byte table  byte family  byte qualifier
+return new authresult false  reason  user  action  table  family  qualifier
+public static final log log   logfactory getlog accesscontroller class
+private static final log auditlog
+logfactory getlog   accesscontroller class getname
+/**
+* version number for accesscontrollerprotocol
+*/
+private static final long protocol_version   1l
+tableauthmanager authmanager   null
+// flags if we are running on a region of the _acl_ table
+boolean aclregion   false
+// defined only for endpoint implementation, so it can have way to
+// access region services.
+private regioncoprocessorenvironment regionenv
+/** mapping of scanner instances to the user who created them */
+private map<internalscanner string> scannerowners
+new mapmaker   weakkeys   makemap
+void initialize regioncoprocessorenvironment e  throws ioexception
+final hregion region   e getregion
+map<byte listmultimap<string tablepermission>> tables
+accesscontrollists loadall region
+// for each table, write out the table's permissions to the respective
+// znode for that table.
+for  map entry<byte listmultimap<string tablepermission>> t
+tables entryset
+byte table   t getkey
+string tablename   bytes tostring table
+listmultimap<string tablepermission> perms   t getvalue
+byte serialized   accesscontrollists writepermissionsasbytes perms
+e getregion   getconf
+this authmanager getzkpermissionwatcher   writetozookeeper tablename
+serialized
+/**
+* writes all table acls for the tables in the given map up into zookeeper
+* znodes.  this is called to synchronize acl changes following {@code _acl_}
+* table updates.
+*/
+void updateacl regioncoprocessorenvironment e
+final map<byte  list<keyvalue>> familymap
+set<string> tableset   new hashset<string>
+for  map entry<byte  list<keyvalue>> f   familymap entryset
+list<keyvalue> kvs   f getvalue
+for  keyvalue kv  kvs
+if  bytes compareto kv getbuffer    kv getfamilyoffset
+kv getfamilylength    accesscontrollists acl_list_family  0
+accesscontrollists acl_list_family length     0
+string tablename   bytes tostring kv getrow
+tableset add tablename
+for  string tablename  tableset
+try
+listmultimap<string tablepermission> perms
+accesscontrollists gettablepermissions regionenv getconfiguration
+bytes tobytes tablename
+byte serialized   accesscontrollists writepermissionsasbytes
+perms  e getregion   getconf
+this authmanager getzkpermissionwatcher   writetozookeeper tablename
+serialized
+catch  ioexception ex
+log error     tablename
+ex
+/**
+* check the current user for authorization to perform a specific action
+* against the given set of row data.
+*
+* <p>note: ordering of the authorization checks
+* has been carefully optimized to short-circuit the most common requests
+* and minimize the amount of processing required.</p>
+*
+* @param permrequest the action being requested
+* @param e the coprocessor environment
+* @param families the map of column families to qualifiers present in
+* the request
+* @return
+*/
+authresult permissiongranted user user  tablepermission action permrequest
+regioncoprocessorenvironment e
+map<byte   ? extends collection<?>> families
+hregioninfo hri   e getregion   getregioninfo
+htabledescriptor htd   e getregion   gettabledesc
+byte tablename   hri gettablename
+// 1. all users need read access to .meta. and -root- tables.
+// this is a very common operation, so deal with it quickly.
+if   hri isrootregion      hri ismetaregion
+permrequest    tablepermission action read
+return authresult allow    user  permrequest
+hri gettablename
+if  user    null
+return authresult deny    null
+permrequest  hri gettablename
+// 2. the table owner has full privileges
+string owner   htd getownerstring
+if  user getshortname   equals owner
+// owner of the table has full access
+return authresult allow    user  permrequest
+hri gettablename
+// 3. check for the table-level, if successful we can short-circuit
+if  authmanager authorize user  tablename   byte null  permrequest
+return authresult allow    user
+permrequest  tablename
+// 4. check permissions against the requested families
+if  families    null    families size   > 0
+// all families must pass
+for  map entry<byte   ? extends collection<?>> family   families entryset
+// a) check for family level access
+if  authmanager authorize user  tablename  family getkey
+permrequest
+continue      family level permission overrides per qualifier
+// b) qualifier level access can still succeed
+if   family getvalue      null      family getvalue   size   > 0
+if  family getvalue   instanceof set
+// for each qualifier of the family
+set<byte> familyset    set<byte> family getvalue
+for  byte qualifier   familyset
+if   authmanager authorize user  tablename  family getkey
+qualifier  permrequest
+return authresult deny    user
+permrequest  tablename  family getkey    qualifier
+else if  family getvalue   instanceof list       list<keyvalue>
+list<keyvalue> kvlist    list<keyvalue> family getvalue
+for  keyvalue kv   kvlist
+if   authmanager authorize user  tablename  family getkey
+kv getqualifier    permrequest
+return authresult deny    user
+permrequest  tablename  family getkey    kv getqualifier
+else
+// no qualifiers and family-level check already failed
+return authresult deny    user  permrequest
+tablename  family getkey    null
+// all family checks passed
+return authresult allow    user  permrequest
+tablename
+// 5. no families to check and table level access failed
+return authresult deny
+user  permrequest  tablename
+private void logresult authresult result
+if  auditlog istraceenabled
+auditlog trace      result isallowed   ?
+result getuser      null ? result getuser   getshortname
+result getreason
+result tocontextstring
+/**
+* returns the active user to which authorization checks should be applied.
+* if we are in the context of an rpc call, the remote user is used,
+* otherwise the currently logged in user is used.
+*/
+private user getactiveuser   throws ioexception
+user user   requestcontext getrequestuser
+if   requestcontext isinrequestcontext
+// for non-rpc handling, fallback to system user
+user   user getcurrent
+return user
+/**
+* authorizes that the current user has global privileges for the given action.
+* @param perm the action being requested
+* @throws ioexception if obtaining the current user fails
+* @throws accessdeniedexception if authorization is denied
+*/
+private void requirepermission permission action perm  throws ioexception
+user user   getactiveuser
+if  authmanager authorize user  perm
+logresult authresult allow    user  perm  null
+else
+logresult authresult deny    user  perm  null
+throw new accessdeniedexception
+user    null ? user getshortname
+perm tostring
+/**
+* authorizes that the current user has permission to perform the given
+* action on the set of table column families.
+* @param perm action that is required
+* @param env the current coprocessor environment
+* @param families the set of column families present/required in the request
+* @throws accessdeniedexception if the authorization check failed
+*/
+private void requirepermission permission action perm
+regioncoprocessorenvironment env  collection<byte> families
+throws ioexception
+// create a map of family-qualifier
+hashmap<byte  set<byte>> familymap   new hashmap<byte  set<byte>>
+for  byte family   families
+familymap put family  null
+requirepermission perm  env  familymap
+/**
+* authorizes that the current user has permission to perform the given
+* action on the set of table column families.
+* @param perm action that is required
+* @param env the current coprocessor environment
+* @param families the map of column families-qualifiers.
+* @throws accessdeniedexception if the authorization check failed
+*/
+private void requirepermission permission action perm
+regioncoprocessorenvironment env
+map<byte  ? extends collection<?>> families
+throws ioexception
+user user   getactiveuser
+authresult result   permissiongranted user  perm  env  families
+logresult result
+if   result isallowed
+stringbuffer sb   new stringbuffer
+if   families    null    families size   > 0
+for  byte familyname   families keyset
+if  sb length      0
+sb append
+sb append bytes tostring familyname
+throw new accessdeniedexception
+env getregion   gettabledesc   getnameasstring
+families    null    families size   > 0  ?
+sb tostring
+perm tostring
+/**
+* returns <code>true</code> if the current user is allowed the given action
+* over at least one of the column qualifiers in the given column families.
+*/
+private boolean hasfamilyqualifierpermission user user
+tablepermission action perm
+regioncoprocessorenvironment env
+map<byte  ? extends set<byte>> familymap
+throws ioexception
+hregioninfo hri   env getregion   getregioninfo
+byte tablename   hri gettablename
+if  user    null
+return false
+if  familymap    null    familymap size   > 0
+// at least one family must be allowed
+for  map entry<byte  ? extends set<byte>> family
+familymap entryset
+if  family getvalue      null     family getvalue   isempty
+for  byte qualifier   family getvalue
+if  authmanager matchpermission user  tablename
+family getkey    qualifier  perm
+return true
+else
+if  authmanager matchpermission user  tablename  family getkey
+perm
+return true
+else if  log isdebugenabled
+log debug
+return false
+/* ---- masterobserver implementation ---- */
+public void start coprocessorenvironment env  throws ioexception
+// if running on hmaster
+if  env instanceof mastercoprocessorenvironment
+mastercoprocessorenvironment e    mastercoprocessorenvironment env
+this authmanager   tableauthmanager get
+e getmasterservices   getzookeeper
+e getconfiguration
+// if running at region
+if  env instanceof regioncoprocessorenvironment
+regionenv    regioncoprocessorenvironment env
+public void stop coprocessorenvironment env
+@override
+public void precreatetable observercontext<mastercoprocessorenvironment> c
+htabledescriptor desc  hregioninfo regions  throws ioexception
+requirepermission permission action create
+// default the table owner if not specified
+user owner   getactiveuser
+if  desc getownerstring      null
+desc getownerstring   equals
+desc setowner owner
+@override
+public void postcreatetable observercontext<mastercoprocessorenvironment> c
+htabledescriptor desc  hregioninfo regions  throws ioexception
+@override
+public void predeletetable observercontext<mastercoprocessorenvironment> c
+byte tablename  throws ioexception
+if  isactiveusertableowner c getenvironment    tablename
+requirepermission permission action create
+else
+requirepermission permission action admin
+@override
+public void postdeletetable observercontext<mastercoprocessorenvironment> c
+byte tablename  throws ioexception
+@override
+public void premodifytable observercontext<mastercoprocessorenvironment> c
+byte tablename  htabledescriptor htd  throws ioexception
+requirepermission permission action create
+@override
+public void postmodifytable observercontext<mastercoprocessorenvironment> c
+byte tablename  htabledescriptor htd  throws ioexception
+@override
+public void preaddcolumn observercontext<mastercoprocessorenvironment> c
+byte tablename  hcolumndescriptor column  throws ioexception
+requirepermission permission action create
+@override
+public void postaddcolumn observercontext<mastercoprocessorenvironment> c
+byte tablename  hcolumndescriptor column  throws ioexception
+@override
+public void premodifycolumn observercontext<mastercoprocessorenvironment> c
+byte tablename  hcolumndescriptor descriptor  throws ioexception
+requirepermission permission action create
+@override
+public void postmodifycolumn observercontext<mastercoprocessorenvironment> c
+byte tablename  hcolumndescriptor descriptor  throws ioexception
+@override
+public void predeletecolumn observercontext<mastercoprocessorenvironment> c
+byte tablename  byte col  throws ioexception
+requirepermission permission action create
+@override
+public void postdeletecolumn observercontext<mastercoprocessorenvironment> c
+byte tablename  byte col  throws ioexception
+@override
+public void preenabletable observercontext<mastercoprocessorenvironment> c
+byte tablename  throws ioexception
+if  isactiveusertableowner c getenvironment    tablename
+requirepermission permission action create
+else
+requirepermission permission action admin
+@override
+public void postenabletable observercontext<mastercoprocessorenvironment> c
+byte tablename  throws ioexception
+@override
+public void predisabletable observercontext<mastercoprocessorenvironment> c
+byte tablename  throws ioexception
+if  isactiveusertableowner c getenvironment    tablename
+requirepermission permission action create
+else
+requirepermission permission action admin
+@override
+public void postdisabletable observercontext<mastercoprocessorenvironment> c
+byte tablename  throws ioexception
+@override
+public void premove observercontext<mastercoprocessorenvironment> c
+hregioninfo region  servername srcserver  servername destserver
+throws ioexception
+requirepermission permission action admin
+@override
+public void postmove observercontext<mastercoprocessorenvironment> c
+hregioninfo region  servername srcserver  servername destserver
+throws ioexception
+@override
+public void preassign observercontext<mastercoprocessorenvironment> c
+hregioninfo regioninfo  throws ioexception
+requirepermission permission action admin
+@override
+public void postassign observercontext<mastercoprocessorenvironment> c
+hregioninfo regioninfo  throws ioexception
+@override
+public void preunassign observercontext<mastercoprocessorenvironment> c
+hregioninfo regioninfo  boolean force  throws ioexception
+requirepermission permission action admin
+@override
+public void postunassign observercontext<mastercoprocessorenvironment> c
+hregioninfo regioninfo  boolean force  throws ioexception
+@override
+public void prebalance observercontext<mastercoprocessorenvironment> c
+throws ioexception
+requirepermission permission action admin
+@override
+public void postbalance observercontext<mastercoprocessorenvironment> c
+throws ioexception
+@override
+public boolean prebalanceswitch observercontext<mastercoprocessorenvironment> c
+boolean newvalue  throws ioexception
+requirepermission permission action admin
+return newvalue
+@override
+public void postbalanceswitch observercontext<mastercoprocessorenvironment> c
+boolean oldvalue  boolean newvalue  throws ioexception
+@override
+public void preshutdown observercontext<mastercoprocessorenvironment> c
+throws ioexception
+requirepermission permission action admin
+@override
+public void prestopmaster observercontext<mastercoprocessorenvironment> c
+throws ioexception
+requirepermission permission action admin
+@override
+public void poststartmaster observercontext<mastercoprocessorenvironment> ctx
+throws ioexception
+// initialize the acl storage table
+accesscontrollists init ctx getenvironment   getmasterservices
+/* ---- regionobserver implementation ---- */
+@override
+public void postopen observercontext<regioncoprocessorenvironment> c
+regioncoprocessorenvironment e   c getenvironment
+final hregion region   e getregion
+if  region    null
+log error
+return
+try
+this authmanager   tableauthmanager get
+e getregionserverservices   getzookeeper
+e getregion   getconf
+catch  ioexception ioe
+// pass along as a runtimeexception, so that the coprocessor is unloaded
+throw new runtimeexception    ioe
+if  accesscontrollists isaclregion region
+aclregion   true
+try
+initialize e
+catch  ioexception ex
+// if we can't obtain permissions, it's better to fail
+// than perform checks incorrectly
+throw new runtimeexception    ex
+@override
+public void pregetclosestrowbefore final observercontext<regioncoprocessorenvironment> c
+final byte  row  final byte  family  final result result
+throws ioexception
+requirepermission tablepermission action read  c getenvironment
+family    null ? lists newarraylist family    null
+@override
+public void preget final observercontext<regioncoprocessorenvironment> c
+final get get  final list<keyvalue> result  throws ioexception
+/*
+if column family level checks fail, check for a qualifier level permission
+in one of the families.  if it is present, then continue with the accesscontrolfilter.
+*/
+regioncoprocessorenvironment e   c getenvironment
+user requestuser   getactiveuser
+authresult authresult   permissiongranted requestuser
+tablepermission action read  e  get getfamilymap
+if   authresult isallowed
+if  hasfamilyqualifierpermission requestuser
+tablepermission action read  e  get getfamilymap
+byte table   gettablename e
+accesscontrolfilter filter   new accesscontrolfilter authmanager
+requestuser  table
+// wrap any existing filter
+if  get getfilter      null
+filterlist wrapper   new filterlist filterlist operator must_pass_all
+lists newarraylist filter  get getfilter
+get setfilter wrapper
+else
+get setfilter filter
+logresult authresult allow    requestuser
+tablepermission action read  authresult table
+else
+logresult authresult
+throw new accessdeniedexception
+e getregion   gettabledesc   getnameasstring
+else
+// log auth success
+logresult authresult
+@override
+public boolean preexists final observercontext<regioncoprocessorenvironment> c
+final get get  final boolean exists  throws ioexception
+requirepermission tablepermission action read  c getenvironment
+get familyset
+return exists
+@override
+public void preput final observercontext<regioncoprocessorenvironment> c
+final put put  final waledit edit  final boolean writetowal
+throws ioexception
+requirepermission tablepermission action write  c getenvironment
+put getfamilymap
+@override
+public void postput final observercontext<regioncoprocessorenvironment> c
+final put put  final waledit edit  final boolean writetowal
+if  aclregion
+updateacl c getenvironment    put getfamilymap
+@override
+public void predelete final observercontext<regioncoprocessorenvironment> c
+final delete delete  final waledit edit  final boolean writetowal
+throws ioexception
+requirepermission tablepermission action write  c getenvironment
+delete getfamilymap
+@override
+public void postdelete final observercontext<regioncoprocessorenvironment> c
+final delete delete  final waledit edit  final boolean writetowal
+throws ioexception
+if  aclregion
+updateacl c getenvironment    delete getfamilymap
+@override
+public boolean precheckandput final observercontext<regioncoprocessorenvironment> c
+final byte  row  final byte  family  final byte  qualifier
+final comparefilter compareop compareop
+final writablebytearraycomparable comparator  final put put
+final boolean result  throws ioexception
+requirepermission tablepermission action read  c getenvironment
+arrays aslist new byte family
+return result
+@override
+public boolean precheckanddelete final observercontext<regioncoprocessorenvironment> c
+final byte  row  final byte  family  final byte  qualifier
+final comparefilter compareop compareop
+final writablebytearraycomparable comparator  final delete delete
+final boolean result  throws ioexception
+requirepermission tablepermission action read  c getenvironment
+arrays aslist  new byte  family
+return result
+@override
+public long preincrementcolumnvalue final observercontext<regioncoprocessorenvironment> c
+final byte  row  final byte  family  final byte  qualifier
+final long amount  final boolean writetowal
+throws ioexception
+requirepermission tablepermission action write  c getenvironment
+arrays aslist new byte family
+return  1
+@override
+public result preincrement final observercontext<regioncoprocessorenvironment> c
+final increment increment
+throws ioexception
+requirepermission tablepermission action write  c getenvironment
+increment getfamilymap   keyset
+return null
+@override
+public regionscanner prescanneropen final observercontext<regioncoprocessorenvironment> c
+final scan scan  final regionscanner s  throws ioexception
+/*
+if column family level checks fail, check for a qualifier level permission
+in one of the families.  if it is present, then continue with the accesscontrolfilter.
+*/
+regioncoprocessorenvironment e   c getenvironment
+user user   getactiveuser
+authresult authresult   permissiongranted user  tablepermission action read  e
+scan getfamilymap
+if   authresult isallowed
+if  hasfamilyqualifierpermission user  tablepermission action read  e
+scan getfamilymap
+byte table   gettablename e
+accesscontrolfilter filter   new accesscontrolfilter authmanager
+user  table
+// wrap any existing filter
+if  scan hasfilter
+filterlist wrapper   new filterlist filterlist operator must_pass_all
+lists newarraylist filter  scan getfilter
+scan setfilter wrapper
+else
+scan setfilter filter
+logresult authresult allow    user
+tablepermission action read  authresult table
+else
+// no table/family level perms and no qualifier level perms, reject
+logresult authresult
+throw new accessdeniedexception
+user    null ? user getshortname
+bytes tostring gettablename e
+else
+// log success
+logresult authresult
+return s
+@override
+public regionscanner postscanneropen final observercontext<regioncoprocessorenvironment> c
+final scan scan  final regionscanner s  throws ioexception
+user user   getactiveuser
+if  user    null    user getshortname      null            store reference to scanner owner for later checks
+scannerowners put s  user getshortname
+return s
+@override
+public boolean prescannernext final observercontext<regioncoprocessorenvironment> c
+final internalscanner s  final list<result> result
+final int limit  final boolean hasnext  throws ioexception
+requirescannerowner s
+return hasnext
+@override
+public void prescannerclose final observercontext<regioncoprocessorenvironment> c
+final internalscanner s  throws ioexception
+requirescannerowner s
+@override
+public void postscannerclose final observercontext<regioncoprocessorenvironment> c
+final internalscanner s  throws ioexception
+// clean up any associated owner mapping
+scannerowners remove s
+/**
+* verify, when servicing an rpc, that the caller is the scanner owner.
+* if so, we assume that access control is correctly enforced based on
+* the checks performed in prescanneropen()
+*/
+private void requirescannerowner internalscanner s
+throws accessdeniedexception
+if  requestcontext isinrequestcontext
+string owner   scannerowners get s
+if  owner    null     owner equals requestcontext getrequestusername
+throw new accessdeniedexception
+requestcontext getrequestusername
+/* ---- accesscontrollerprotocol implementation ---- */
+/*
+* these methods are only allowed to be called against the _acl_ region(s).
+* this will be restricted by both client side and endpoint implementations.
+*/
+@override
+public void grant byte user  tablepermission permission
+throws ioexception
+// verify it's only running at .acl.
+if  aclregion
+if  log isdebugenabled
+log debug
+bytes tostring user
+permission tostring
+requirepermission permission action admin
+accesscontrollists addtablepermission regionenv getconfiguration
+permission gettable    bytes tostring user   permission
+if  auditlog istraceenabled
+// audit log should store permission changes in addition to auth results
+auditlog trace     bytes tostring user
+permission tostring
+else
+throw new coprocessorexception accesscontroller class
+bytes tostring accesscontrollists acl_table_name
+@override
+public void revoke byte user  tablepermission permission
+throws ioexception
+// only allowed to be called on _acl_ region
+if  aclregion
+if  log isdebugenabled
+log debug
+bytes tostring user
+permission tostring
+requirepermission permission action admin
+accesscontrollists removetablepermission regionenv getconfiguration
+permission gettable    bytes tostring user   permission
+if  auditlog istraceenabled
+// audit log should record all permission changes
+auditlog trace     bytes tostring user
+permission tostring
+else
+throw new coprocessorexception accesscontroller class
+bytes tostring accesscontrollists acl_table_name
+@override
+public list<userpermission> getuserpermissions final byte tablename
+throws ioexception
+// only allowed to be called on _acl_ region
+if  aclregion
+requirepermission permission action admin
+list<userpermission> perms   accesscontrollists getuserpermissions
+regionenv getconfiguration    tablename
+return perms
+else
+throw new coprocessorexception accesscontroller class
+bytes tostring accesscontrollists acl_table_name
+@override
+public void checkpermissions permission permissions  throws ioexception
+byte tablename   regionenv getregion   gettabledesc   getname
+for  permission permission   permissions
+if  permission instanceof tablepermission
+tablepermission tperm    tablepermission  permission
+for  permission action action   permission getactions
+if   arrays equals tperm gettable    tablename
+throw new coprocessorexception accesscontroller class  string format
+bytes tostring tablename
+bytes tostring tperm gettable
+hashmap<byte  set<byte>> familymap   maps newhashmapwithexpectedsize 1
+if  tperm getfamily      null
+if  tperm getqualifier      null
+familymap put tperm getfamily    sets newhashset tperm getqualifier
+else
+familymap put tperm getfamily    null
+requirepermission action  regionenv  familymap
+else
+for  permission action action   permission getactions
+requirepermission action
+@override
+public long getprotocolversion string protocol  long clientversion  throws ioexception
+return protocol_version
+@override
+public protocolsignature getprotocolsignature string protocol
+long clientversion  int clientmethodshash  throws ioexception
+if  accesscontrollerprotocol class getname   equals protocol
+return new protocolsignature protocol_version  null
+throw new hbaserpc unknownprotocolexception
+protocol
+private byte gettablename regioncoprocessorenvironment e
+hregion region   e getregion
+byte tablename   null
+if  region    null
+hregioninfo regioninfo   region getregioninfo
+if  regioninfo    null
+tablename   regioninfo gettablename
+return tablename
+private string gettableowner mastercoprocessorenvironment e
+byte tablename  throws ioexception
+htabledescriptor htd   e gettable tablename  gettabledescriptor
+return htd getownerstring
+private boolean isactiveusertableowner mastercoprocessorenvironment e
+byte tablename  throws ioexception
+string activeuser   getactiveuser   getshortname
+return activeuser equals gettableowner e  tablename

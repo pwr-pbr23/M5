@@ -1,0 +1,779 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql optimizer
+import java util arraylist
+import java util hashmap
+import java util hashset
+import java util iterator
+import java util linkedhashmap
+import java util list
+import java util map
+import java util set
+import java util stack
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive ql errormsg
+import org apache hadoop hive ql exec abstractmapjoinoperator
+import org apache hadoop hive ql exec columninfo
+import org apache hadoop hive ql exec filesinkoperator
+import org apache hadoop hive ql exec groupbyoperator
+import org apache hadoop hive ql exec joinoperator
+import org apache hadoop hive ql exec lateralviewjoinoperator
+import org apache hadoop hive ql exec mapjoinoperator
+import org apache hadoop hive ql exec operator
+import org apache hadoop hive ql exec operatorfactory
+import org apache hadoop hive ql exec reducesinkoperator
+import org apache hadoop hive ql exec rowschema
+import org apache hadoop hive ql exec scriptoperator
+import org apache hadoop hive ql exec selectoperator
+import org apache hadoop hive ql exec unionoperator
+import org apache hadoop hive ql lib defaultruledispatcher
+import org apache hadoop hive ql lib dispatcher
+import org apache hadoop hive ql lib graphwalker
+import org apache hadoop hive ql lib node
+import org apache hadoop hive ql lib nodeprocessor
+import org apache hadoop hive ql lib nodeprocessorctx
+import org apache hadoop hive ql lib rule
+import org apache hadoop hive ql lib ruleregexp
+import org apache hadoop hive ql parse genmapredwalker
+import org apache hadoop hive ql parse opparsecontext
+import org apache hadoop hive ql parse parsecontext
+import org apache hadoop hive ql parse qbjointree
+import org apache hadoop hive ql parse rowresolver
+import org apache hadoop hive ql parse semanticexception
+import org apache hadoop hive ql plan exprnodecolumndesc
+import org apache hadoop hive ql plan exprnodedesc
+import org apache hadoop hive ql plan exprnodegenericfuncdesc
+import org apache hadoop hive ql plan fetchwork
+import org apache hadoop hive ql plan joinconddesc
+import org apache hadoop hive ql plan joindesc
+import org apache hadoop hive ql plan mapjoindesc
+import org apache hadoop hive ql plan mapredlocalwork
+import org apache hadoop hive ql plan mapredwork
+import org apache hadoop hive ql plan operatordesc
+import org apache hadoop hive ql plan partitiondesc
+import org apache hadoop hive ql plan planutils
+import org apache hadoop hive ql plan reducesinkdesc
+import org apache hadoop hive ql plan selectdesc
+import org apache hadoop hive ql plan tabledesc
+import org apache hadoop hive serde serdeconstants
+import org apache hadoop hive serde2 typeinfo typeinfofactory
+/**
+* implementation of one of the rule-based map join optimization. user passes hints to specify
+* map-joins and during this optimization, all user specified map joins are converted to mapjoins -
+* the reduce sink operator above the join are converted to map sink operators. in future, once
+* statistics are implemented, this transformation can also be done based on costs.
+*/
+public class mapjoinprocessor implements transform
+private static final log log   logfactory getlog mapjoinprocessor class getname
+private parsecontext pgraphcontext
+/**
+* empty constructor.
+*/
+public mapjoinprocessor
+pgraphcontext   null
+@suppresswarnings
+private operator<? extends operatordesc>
+putopinsertmap operator<? extends operatordesc> op  rowresolver rr
+opparsecontext ctx   new opparsecontext rr
+pgraphcontext getopparsectx   put op  ctx
+return op
+/**
+* generate the mapred local work
+* @param newwork
+* @param mapjoinop
+* @param bigtablepos
+* @return
+* @throws semanticexception
+*/
+private static string genmapjoinlocalwork mapredwork newwork  mapjoinoperator mapjoinop
+int bigtablepos  throws semanticexception
+// keep the small table alias to avoid concurrent modification exception
+arraylist<string> smalltablealiaslist   new arraylist<string>
+string bigtablealias   null
+// create a new  mapredlocalwork
+mapredlocalwork newlocalwork   new mapredlocalwork
+new linkedhashmap<string  operator<? extends operatordesc>>
+new linkedhashmap<string  fetchwork>
+for  map entry<string  operator<? extends operatordesc>> entry
+newwork getaliastowork   entryset
+string alias   entry getkey
+operator<? extends operatordesc> op   entry getvalue
+// if the table scan is for big table; then skip it
+// tracing down the operator tree from the table scan operator
+operator<? extends operatordesc> parentop   op
+operator<? extends operatordesc> childop   op getchildoperators   get 0
+while   childop    null       childop equals mapjoinop
+parentop   childop
+assert parentop getchildoperators   size      1
+childop   parentop getchildoperators   get 0
+if  childop    null
+throw new semanticexception
+// skip the big table pos
+int i   childop getparentoperators   indexof parentop
+if  i    bigtablepos
+bigtablealias   alias
+continue
+// set alias to work and put into smalltablealiaslist
+newlocalwork getaliastowork   put alias  op
+smalltablealiaslist add alias
+// get input path and remove this alias from pathtoalias
+// because this file will be fetched by fetch operator
+linkedhashmap<string  arraylist<string>> pathtoaliases   newwork getpathtoaliases
+// keep record all the input path for this alias
+hashset<string> pathset   new hashset<string>
+hashset<string> emptypath   new hashset<string>
+for  map entry<string  arraylist<string>> entry2   pathtoaliases entryset
+string path   entry2 getkey
+arraylist<string> list   entry2 getvalue
+if  list contains alias
+// add to path set
+if   pathset contains path
+pathset add path
+//remove this alias from the alias list
+list remove alias
+if list size      0
+emptypath add path
+//remove the path, with which no alias associates
+for  string path   emptypath
+pathtoaliases remove path
+// create fetch work
+fetchwork fetchwork   null
+list<string> partdir   new arraylist<string>
+list<partitiondesc> partdesc   new arraylist<partitiondesc>
+for  string tablepath   pathset
+partitiondesc partitiondesc   newwork getpathtopartitioninfo   get tablepath
+// create fetchwork for non partitioned table
+if  partitiondesc getpartspec      null    partitiondesc getpartspec   size      0
+fetchwork   new fetchwork tablepath  partitiondesc gettabledesc
+break
+// if table is partitioned,add partdir and partitiondesc
+partdir add tablepath
+partdesc add partitiondesc
+// create fetchwork for partitioned table
+if  fetchwork    null
+tabledesc table   newwork getaliastopartninfo   get alias  gettabledesc
+fetchwork   new fetchwork partdir  partdesc  table
+// set alias to fetch work
+newlocalwork getaliastofetchwork   put alias  fetchwork
+// remove small table ailias from aliastowork;avoid concurrent modification
+for  string alias   smalltablealiaslist
+newwork getaliastowork   remove alias
+// set up local work
+newwork setmaplocalwork newlocalwork
+// remove reducer
+newwork setreducer null
+// return the big table alias
+if  bigtablealias    null
+throw new semanticexception
+return bigtablealias
+public static string genmapjoinopandlocalwork mapredwork newwork  joinoperator op  int mapjoinpos
+throws semanticexception
+try
+linkedhashmap<operator<? extends operatordesc>  opparsecontext> opparsectxmap
+newwork getopparsectxmap
+qbjointree newjointree   newwork getjointree
+// generate the map join operator; already checked the map join
+mapjoinoperator newmapjoinop   mapjoinprocessor convertmapjoin opparsectxmap  op
+newjointree  mapjoinpos  true
+// generate the local work and return the big table alias
+string bigtablealias   mapjoinprocessor
+genmapjoinlocalwork newwork  newmapjoinop  mapjoinpos
+// clean up the mapred work
+newwork setopparsectxmap null
+newwork setjointree null
+return bigtablealias
+catch  exception e
+e printstacktrace
+throw new semanticexception     e getmessage
+/**
+* convert a regular join to a a map-side join.
+*
+* @param opparsectxmap
+* @param op
+*          join operator
+* @param jointree
+*          qb join tree
+* @param mapjoinpos
+*          position of the source to be read as part of map-reduce framework. all other sources
+*          are cached in memory
+* @param nocheckouterjoin
+*/
+public static mapjoinoperator convertmapjoin
+linkedhashmap<operator<? extends operatordesc>  opparsecontext> opparsectxmap
+joinoperator op  qbjointree jointree  int mapjoinpos  boolean nocheckouterjoin
+throws semanticexception
+// outer join cannot be performed on a table which is being cached
+joindesc desc   op getconf
+joinconddesc condns   desc getconds
+byte tagorder   desc gettagorder
+if   nocheckouterjoin
+checkmapjoin mapjoinpos  condns
+rowresolver oldoutputrs   opparsectxmap get op  getrowresolver
+rowresolver outputrs   new rowresolver
+arraylist<string> outputcolumnnames   new arraylist<string>
+map<byte  list<exprnodedesc>> keyexprmap   new hashmap<byte  list<exprnodedesc>>
+map<byte  list<exprnodedesc>> valueexprmap   new hashmap<byte  list<exprnodedesc>>
+// walk over all the sources (which are guaranteed to be reduce sink
+// operators).
+// the join outputs a concatenation of all the inputs.
+qbjointree leftsrc   jointree getjoinsrc
+list<operator<? extends operatordesc>> parentops   op getparentoperators
+list<operator<? extends operatordesc>> newparentops
+new arraylist<operator<? extends operatordesc>>
+list<operator<? extends operatordesc>> oldreducesinkparentops
+new arraylist<operator<? extends operatordesc>>
+map<string  exprnodedesc> colexprmap   new hashmap<string  exprnodedesc>
+hashmap<byte  hashmap<string  exprnodedesc>> columntransfer
+new hashmap<byte  hashmap<string  exprnodedesc>>
+// found a source which is not to be stored in memory
+if  leftsrc    null
+// assert mapjoinpos == 0;
+operator<? extends operatordesc> parentop   parentops get 0
+assert parentop getparentoperators   size      1
+operator<? extends operatordesc> grandparentop
+parentop getparentoperators   get 0
+oldreducesinkparentops add parentop
+grandparentop removechild parentop
+newparentops add grandparentop
+int pos   0
+// remove parent reduce-sink operators
+for  string src   jointree getbasesrc
+if  src    null
+operator<? extends operatordesc> parentop   parentops get pos
+assert parentop getparentoperators   size      1
+operator<? extends operatordesc> grandparentop
+parentop getparentoperators   get 0
+grandparentop removechild parentop
+oldreducesinkparentops add parentop
+newparentops add grandparentop
+pos
+// get the join keys from old parent reducesink operators
+for  pos   0  pos < newparentops size    pos
+reducesinkoperator oldpar    reducesinkoperator  oldreducesinkparentops get pos
+reducesinkdesc rsconf   oldpar getconf
+byte tag    byte  rsconf gettag
+list<exprnodedesc> keys   rsconf getkeycols
+keyexprmap put tag  keys
+// set column transfer
+hashmap<string  exprnodedesc> map    hashmap<string  exprnodedesc>  oldpar getcolumnexprmap
+columntransfer put tag  map
+// create the map-join operator
+for  pos   0  pos < newparentops size    pos
+rowresolver inputrs   opparsectxmap get newparentops get pos   getrowresolver
+list<exprnodedesc> values   new arraylist<exprnodedesc>
+iterator<string> keysiter   inputrs gettablenames   iterator
+while  keysiter hasnext
+string key   keysiter next
+hashmap<string  columninfo> rrmap   inputrs getfieldmap key
+iterator<string> fnamesiter   rrmap keyset   iterator
+while  fnamesiter hasnext
+string field   fnamesiter next
+columninfo valueinfo   inputrs get key  field
+columninfo oldvalueinfo   oldoutputrs get key  field
+if  oldvalueinfo    null
+continue
+string outputcol   oldvalueinfo getinternalname
+if  outputrs get key  field     null
+outputcolumnnames add outputcol
+exprnodedesc coldesc   new exprnodecolumndesc valueinfo gettype    valueinfo
+getinternalname    valueinfo gettabalias    valueinfo getisvirtualcol
+values add coldesc
+outputrs put key  field  new columninfo outputcol  valueinfo gettype    valueinfo
+gettabalias    valueinfo getisvirtualcol    valueinfo ishiddenvirtualcol
+colexprmap put outputcol  coldesc
+valueexprmap put byte valueof  byte  pos   values
+map<byte  list<exprnodedesc>> filters   desc getfilters
+for  map entry<byte  list<exprnodedesc>> entry   filters entryset
+byte srcalias   entry getkey
+list<exprnodedesc> columndesclist   entry getvalue
+for  exprnodedesc nodeexpr   columndesclist
+exprnodegenericfuncdesc funcdesc    exprnodegenericfuncdesc  nodeexpr
+for  exprnodedesc childdesc   funcdesc getchildexprs
+if    childdesc instanceof exprnodecolumndesc
+continue
+exprnodecolumndesc columndesc    exprnodecolumndesc  childdesc
+// reset columns
+string column   columndesc getcolumn
+string newcolumn   null
+hashmap<string  exprnodedesc> map   columntransfer get srcalias
+exprnodecolumndesc tmpdesc    exprnodecolumndesc  map get column
+if  tmpdesc    null
+newcolumn   tmpdesc getcolumn
+if  newcolumn    null
+throw new semanticexception
+columndesc setcolumn newcolumn
+joinconddesc joincondns   op getconf   getconds
+operator newpar   new operator
+pos   0
+for  operator<? extends operatordesc> o   newparentops
+newpar   o
+list<exprnodedesc> keycols   keyexprmap get byte valueof  byte  0
+stringbuilder keyorder   new stringbuilder
+for  int i   0  i < keycols size    i
+keyorder append
+tabledesc keytabledesc   planutils getmapjoinkeytabledesc planutils
+getfieldschemasfromcolumnlist keycols
+list<tabledesc> valuetabledescs   new arraylist<tabledesc>
+list<tabledesc> valuefiltedtabledescs   new arraylist<tabledesc>
+int filtermap   desc getfiltermap
+for  pos   0  pos < newparentops size    pos
+list<exprnodedesc> valuecols   valueexprmap get byte valueof  byte  pos
+int length   valuecols size
+list<exprnodedesc> valuefilteredcols   new arraylist<exprnodedesc> length
+// deep copy expr node desc
+for  int i   0  i < length  i
+valuefilteredcols add valuecols get i  clone
+if  filtermap    null    filtermap    null    pos    mapjoinpos
+exprnodecolumndesc isfilterdesc   new exprnodecolumndesc typeinfofactory
+getprimitivetypeinfo serdeconstants tinyint_type_name         false
+valuefilteredcols add isfilterdesc
+keyorder   new stringbuilder
+for  int i   0  i < valuecols size    i
+keyorder append
+tabledesc valuetabledesc   planutils getmapjoinvaluetabledesc planutils
+getfieldschemasfromcolumnlist valuecols
+tabledesc valuefilteredtabledesc   planutils getmapjoinvaluetabledesc planutils
+getfieldschemasfromcolumnlist valuefilteredcols
+valuetabledescs add valuetabledesc
+valuefiltedtabledescs add valuefilteredtabledesc
+string dumpfileprefix
+if  jointree getmapaliases      null
+for string mapalias   jointree getmapaliases
+dumpfileprefix   dumpfileprefix   mapalias
+dumpfileprefix   dumpfileprefix   planutils getcountformapjoindumpfileprefix
+else
+dumpfileprefix     planutils getcountformapjoindumpfileprefix
+mapjoindesc mapjoindescriptor   new mapjoindesc keyexprmap  keytabledesc  valueexprmap
+valuetabledescs  valuefiltedtabledescs  outputcolumnnames  mapjoinpos  joincondns
+filters  op getconf   getnoouterjoin    dumpfileprefix
+mapjoindescriptor settagorder tagorder
+mapjoindescriptor setnullsafes desc getnullsafes
+mapjoindescriptor setfiltermap desc getfiltermap
+mapjoinoperator mapjoinop    mapjoinoperator  operatorfactory getandmakechild
+mapjoindescriptor  new rowschema outputrs getcolumninfos     newpar
+opparsecontext ctx   new opparsecontext outputrs
+opparsectxmap put mapjoinop  ctx
+mapjoinop getconf   setreversedexprs op getconf   getreversedexprs
+mapjoinop setcolumnexprmap colexprmap
+// change the children of the original join operator to point to the map
+// join operator
+list<operator<? extends operatordesc>> childops   op getchildoperators
+for  operator<? extends operatordesc> childop   childops
+childop replaceparent op  mapjoinop
+mapjoinop setchildoperators childops
+mapjoinop setparentoperators newparentops
+op setchildoperators null
+op setparentoperators null
+return mapjoinop
+public mapjoinoperator generatemapjoinoperator parsecontext pctx  joinoperator op
+qbjointree jointree  int mapjoinpos  throws semanticexception
+hiveconf hiveconf   pctx getconf
+boolean nocheckouterjoin   hiveconf getboolvar hiveconf
+hiveconf confvars hiveoptsortmergebucketmapjoin
+hiveconf getboolvar hiveconf  hiveconf confvars hiveoptbucketmapjoin
+linkedhashmap<operator<? extends operatordesc>  opparsecontext> opparsectxmap   pctx
+getopparsectx
+mapjoinoperator mapjoinop   convertmapjoin opparsectxmap  op  jointree  mapjoinpos
+nocheckouterjoin
+// create a dummy select to select all columns
+genselectplan pctx  mapjoinop
+return mapjoinop
+/**
+* get a list of big table candidates. only the tables in the returned set can
+* be used as big table in the join operation.
+*
+* the logic here is to scan the join condition array from left to right. if
+* see a inner join, and the bigtablecandidates is empty or the outer join
+* that we last saw is a right outer join, add both side of this inner join to
+* big table candidates only if they are not in bad position. if see a left
+* outer join, set lastseenrightouterjoin to false, and the bigtablecandidates
+* is empty, add the left side to it, and if the bigtablecandidates is not
+* empty, do nothing (which means the bigtablecandidates is from left side).
+* if see a right outer join, set lastseenrightouterjoin to true, clear the
+* bigtablecandidates, and add right side to the bigtablecandidates, it means
+* the right side of a right outer join always win. if see a full outer join,
+* return null immediately (no one can be the big table, can not do a
+* mapjoin).
+*
+*
+* @param condns
+* @return list of big table candidates
+*/
+public static hashset<integer> getbigtablecandidates joinconddesc condns
+hashset<integer> bigtablecandidates   new hashset<integer>
+boolean seenouterjoin   false
+set<integer> seenpostitions   new hashset<integer>
+set<integer> leftposlistoflastrightouterjoin   new hashset<integer>
+// is the outer join that we saw most recently is a right outer join?
+boolean lastseenrightouterjoin   false
+for  joinconddesc condn   condns
+int jointype   condn gettype
+seenpostitions add condn getleft
+seenpostitions add condn getright
+if  jointype    joindesc full_outer_join
+// setting these 2 parameters here just in case that if the code got
+// changed in future, these 2 are not missing.
+seenouterjoin   true
+lastseenrightouterjoin   false
+return null
+else if  jointype    joindesc left_outer_join
+jointype    joindesc left_semi_join
+seenouterjoin   true
+if bigtablecandidates size      0
+bigtablecandidates add condn getleft
+lastseenrightouterjoin   false
+else if  jointype    joindesc right_outer_join
+seenouterjoin   true
+lastseenrightouterjoin   true
+// add all except the right side to the bad positions
+leftposlistoflastrightouterjoin clear
+leftposlistoflastrightouterjoin addall seenpostitions
+leftposlistoflastrightouterjoin remove condn getright
+bigtablecandidates clear
+bigtablecandidates add condn getright
+else if  jointype    joindesc inner_join
+if   seenouterjoin    lastseenrightouterjoin
+// is the left was at the left side of a right outer join?
+if   leftposlistoflastrightouterjoin contains condn getleft
+bigtablecandidates add condn getleft
+// is the right was at the left side of a right outer join?
+if   leftposlistoflastrightouterjoin contains condn getright
+bigtablecandidates add condn getright
+return bigtablecandidates
+public static void checkmapjoin int mapjoinpos  joinconddesc condns  throws semanticexception
+hashset<integer> bigtablecandidates   mapjoinprocessor getbigtablecandidates condns
+if  bigtablecandidates    null     bigtablecandidates contains mapjoinpos
+throw new semanticexception errormsg no_outer_mapjoin getmsg
+return
+private void genselectplan parsecontext pctx  mapjoinoperator input  throws semanticexception
+list<operator<? extends operatordesc>> childops   input getchildoperators
+input setchildoperators null
+// create a dummy select - this select is needed by the walker to split the
+// mapjoin later on
+rowresolver inputrr   pctx getopparsectx   get input  getrowresolver
+arraylist<exprnodedesc> exprs   new arraylist<exprnodedesc>
+arraylist<string> outputs   new arraylist<string>
+list<string> outputcols   input getconf   getoutputcolumnnames
+rowresolver outputrs   new rowresolver
+map<string  exprnodedesc> colexprmap   new hashmap<string  exprnodedesc>
+for  int i   0  i < outputcols size    i
+string internalname   outputcols get i
+string nm   inputrr reverselookup internalname
+columninfo valueinfo   inputrr get nm  nm
+exprnodedesc coldesc   new exprnodecolumndesc valueinfo gettype    valueinfo
+getinternalname    nm  valueinfo getisvirtualcol
+exprs add coldesc
+outputs add internalname
+outputrs put nm  nm  new columninfo internalname  valueinfo gettype    nm  valueinfo
+getisvirtualcol    valueinfo ishiddenvirtualcol
+colexprmap put internalname  coldesc
+selectdesc select   new selectdesc exprs  outputs  false
+selectoperator sel    selectoperator  putopinsertmap operatorfactory getandmakechild select
+new rowschema inputrr getcolumninfos     input   inputrr
+sel setcolumnexprmap colexprmap
+// insert the select operator in between.
+sel setchildoperators childops
+for  operator<? extends operatordesc> ch   childops
+ch replaceparent input  sel
+/**
+* is it a map-side join.
+*
+* @param op
+*          join operator
+* @param qbjoin
+*          qb join tree
+* @return -1 if it cannot be converted to a map-side join, position of the map join node
+*         otherwise
+*/
+private int mapsidejoin joinoperator op  qbjointree jointree  throws semanticexception
+int mapjoinpos    1
+if  jointree ismapsidejoin
+int pos   0
+// in a map-side join, exactly one table is not present in memory.
+// the client provides the list of tables which can be cached in memory
+// via a hint.
+if  jointree getjoinsrc      null
+mapjoinpos   pos
+for  string src   jointree getbasesrc
+if  src    null
+if   jointree getmapaliases   contains src
+if  mapjoinpos >  0
+return  1
+mapjoinpos   pos
+pos
+// all tables are to be cached - this is not possible. in future, we can
+// support this by randomly
+// leaving some table from the list of tables to be cached
+if  mapjoinpos     1
+throw new semanticexception errormsg invalid_mapjoin_hint getmsg pgraphcontext getqb
+getparseinfo   gethints
+return mapjoinpos
+/**
+* transform the query tree. for each join, check if it is a map-side join (user specified). if
+* yes, convert it to a map-side join.
+*
+* @param pactx
+*          current parse context
+*/
+public parsecontext transform parsecontext pactx  throws semanticexception
+pgraphcontext   pactx
+list<mapjoinoperator> listmapjoinops   new arraylist<mapjoinoperator>
+// traverse all the joins and convert them if necessary
+if  pgraphcontext getjoincontext      null
+map<joinoperator  qbjointree> joinmap   new hashmap<joinoperator  qbjointree>
+map<mapjoinoperator  qbjointree> mapjoinmap   pgraphcontext getmapjoincontext
+if  mapjoinmap    null
+mapjoinmap   new hashmap<mapjoinoperator  qbjointree>
+pgraphcontext setmapjoincontext mapjoinmap
+set<map entry<joinoperator  qbjointree>> joinctx   pgraphcontext getjoincontext   entryset
+iterator<map entry<joinoperator  qbjointree>> joinctxiter   joinctx iterator
+while  joinctxiter hasnext
+map entry<joinoperator  qbjointree> joinentry   joinctxiter next
+joinoperator joinop   joinentry getkey
+qbjointree qbjoin   joinentry getvalue
+int mapjoinpos   mapsidejoin joinop  qbjoin
+if  mapjoinpos >  0
+mapjoinoperator mapjoinop   generatemapjoinoperator pactx  joinop  qbjoin  mapjoinpos
+listmapjoinops add mapjoinop
+mapjoinmap put mapjoinop  qbjoin
+else
+joinmap put joinop  qbjoin
+// store the new joincontext
+pgraphcontext setjoincontext joinmap
+// go over the list and find if a reducer is not needed
+list<abstractmapjoinoperator<? extends mapjoindesc>> listmapjoinopsnored   new arraylist<abstractmapjoinoperator<? extends mapjoindesc>>
+// create a walker which walks the tree in a dfs manner while maintaining
+// the operator stack.
+// the dispatcher generates the plan from the operator tree
+map<rule  nodeprocessor> oprules   new linkedhashmap<rule  nodeprocessor>
+oprules put new ruleregexp
+mapjoinoperator getoperatorname
+getcurrentmapjoin
+oprules put new ruleregexp
+mapjoinoperator getoperatorname         filesinkoperator getoperatorname
+getmapjoinfs
+oprules put new ruleregexp
+mapjoinoperator getoperatorname         reducesinkoperator getoperatorname
+getmapjoindefault
+oprules put new ruleregexp
+mapjoinoperator getoperatorname         unionoperator getoperatorname
+getmapjoindefault
+// the dispatcher fires the processor corresponding to the closest matching
+// rule and passes the context along
+dispatcher disp   new defaultruledispatcher getdefault    oprules  new mapjoinwalkerctx
+listmapjoinopsnored  pgraphcontext
+graphwalker ogw   new genmapredwalker disp
+arraylist<node> topnodes   new arraylist<node>
+topnodes addall listmapjoinops
+ogw startwalking topnodes  null
+pgraphcontext setlistmapjoinopsnoreducer listmapjoinopsnored
+return pgraphcontext
+/**
+* currentmapjoin.
+*
+*/
+public static class currentmapjoin implements nodeprocessor
+/**
+* store the current mapjoin in the context.
+*/
+@override
+public object process node nd  stack<node> stack  nodeprocessorctx procctx
+object    nodeoutputs  throws semanticexception
+mapjoinwalkerctx ctx    mapjoinwalkerctx  procctx
+mapjoinoperator mapjoin    mapjoinoperator  nd
+if  ctx getlistrejectedmapjoins      null     ctx getlistrejectedmapjoins   contains mapjoin
+// for rule: mapjoin%.*mapjoin
+// have a child mapjoin. if the the current mapjoin is on a local work,
+// will put the current mapjoin in the rejected list.
+boolean bigbranch   findgrandchildsubquerymapjoin ctx  mapjoin
+if  bigbranch    null       no child map join
+ctx setcurrmapjoinop mapjoin
+return null
+if  bigbranch
+addnoreducermapjointoctx ctx  mapjoin
+else
+addrejectmapjointoctx ctx  mapjoin
+else
+ctx setcurrmapjoinop mapjoin
+return null
+private boolean findgrandchildsubquerymapjoin mapjoinwalkerctx ctx  mapjoinoperator mapjoin
+operator<? extends operatordesc> parent   mapjoin
+while  true
+if  parent getchildoperators      null    parent getchildoperators   size      1
+return null
+operator<? extends operatordesc> ch   parent getchildoperators   get 0
+if  ch instanceof mapjoinoperator
+if   nonsubquerymapjoin ctx getpgraphcontext     mapjoinoperator  ch  mapjoin
+if  ch getparentoperators   indexof parent       mapjoinoperator  ch  getconf
+getposbigtable
+// not come from the local branch
+return true
+return false     not from a sub query
+if   ch instanceof joinoperator      ch instanceof unionoperator
+ch instanceof reducesinkoperator      ch instanceof lateralviewjoinoperator
+ch instanceof groupbyoperator      ch instanceof scriptoperator
+return null
+parent   ch
+private boolean nonsubquerymapjoin parsecontext pgraphcontext  mapjoinoperator mapjoin
+mapjoinoperator parentmapjoin
+qbjointree jointree   pgraphcontext getmapjoincontext   get mapjoin
+qbjointree parentjointree   pgraphcontext getmapjoincontext   get parentmapjoin
+if  jointree getjoinsrc      null    jointree getjoinsrc   equals parentjointree
+return true
+return false
+private static void addnoreducermapjointoctx mapjoinwalkerctx ctx
+abstractmapjoinoperator<? extends mapjoindesc> mapjoin
+if  ctx getlistrejectedmapjoins      null    ctx getlistrejectedmapjoins   contains mapjoin
+return
+list<abstractmapjoinoperator<? extends mapjoindesc>> listmapjoinsnored   ctx
+getlistmapjoinsnored
+if  listmapjoinsnored    null
+listmapjoinsnored   new arraylist<abstractmapjoinoperator<? extends mapjoindesc>>
+if   listmapjoinsnored contains mapjoin
+listmapjoinsnored add mapjoin
+ctx setlistmapjoins listmapjoinsnored
+private static void addrejectmapjointoctx mapjoinwalkerctx ctx
+abstractmapjoinoperator<? extends mapjoindesc> mapjoin
+// current map join is null means it has been handled by currentmapjoin
+// process.
+if  mapjoin    null
+return
+list<abstractmapjoinoperator<? extends mapjoindesc>> listrejectedmapjoins   ctx
+getlistrejectedmapjoins
+if  listrejectedmapjoins    null
+listrejectedmapjoins   new arraylist<abstractmapjoinoperator<? extends mapjoindesc>>
+if   listrejectedmapjoins contains mapjoin
+listrejectedmapjoins add mapjoin
+if  ctx getlistmapjoinsnored      null    ctx getlistmapjoinsnored   contains mapjoin
+ctx getlistmapjoinsnored   remove mapjoin
+ctx setlistrejectedmapjoins listrejectedmapjoins
+/**
+* mapjoinfs.
+*
+*/
+public static class mapjoinfs implements nodeprocessor
+/**
+* store the current mapjoin in a list of mapjoins followed by a filesink.
+*/
+@override
+public object process node nd  stack<node> stack  nodeprocessorctx procctx
+object    nodeoutputs  throws semanticexception
+mapjoinwalkerctx ctx    mapjoinwalkerctx  procctx
+abstractmapjoinoperator<? extends mapjoindesc> mapjoin   ctx getcurrmapjoinop
+list<abstractmapjoinoperator<? extends mapjoindesc>> listrejectedmapjoins   ctx
+getlistrejectedmapjoins
+// the mapjoin has already been handled
+if   listrejectedmapjoins    null      listrejectedmapjoins contains mapjoin
+return null
+addnoreducermapjointoctx ctx  mapjoin
+return null
+/**
+* mapjoindefault.
+*
+*/
+public static class mapjoindefault implements nodeprocessor
+/**
+* store the mapjoin in a rejected list.
+*/
+@override
+public object process node nd  stack<node> stack  nodeprocessorctx procctx
+object    nodeoutputs  throws semanticexception
+mapjoinwalkerctx ctx    mapjoinwalkerctx  procctx
+abstractmapjoinoperator<? extends mapjoindesc> mapjoin   ctx getcurrmapjoinop
+addrejectmapjointoctx ctx  mapjoin
+return null
+/**
+* default.
+*
+*/
+public static class default implements nodeprocessor
+/**
+* nothing to do.
+*/
+@override
+public object process node nd  stack<node> stack  nodeprocessorctx procctx
+object    nodeoutputs  throws semanticexception
+return null
+public static nodeprocessor getmapjoinfs
+return new mapjoinfs
+public static nodeprocessor getmapjoindefault
+return new mapjoindefault
+public static nodeprocessor getdefault
+return new default
+public static nodeprocessor getcurrentmapjoin
+return new currentmapjoin
+/**
+* mapjoinwalkerctx.
+*
+*/
+public static class mapjoinwalkerctx implements nodeprocessorctx
+private parsecontext pgraphcontext
+private list<abstractmapjoinoperator<? extends mapjoindesc>> listmapjoinsnored
+private list<abstractmapjoinoperator<? extends mapjoindesc>> listrejectedmapjoins
+private abstractmapjoinoperator<? extends mapjoindesc> currmapjoinop
+/**
+* @param listmapjoinsnored
+* @param pgraphcontext
+*/
+public mapjoinwalkerctx list<abstractmapjoinoperator<? extends mapjoindesc>> listmapjoinsnored
+parsecontext pgraphcontext
+this listmapjoinsnored   listmapjoinsnored
+currmapjoinop   null
+listrejectedmapjoins   new arraylist<abstractmapjoinoperator<? extends mapjoindesc>>
+this pgraphcontext   pgraphcontext
+/**
+* @return the listmapjoins
+*/
+public list<abstractmapjoinoperator<? extends mapjoindesc>> getlistmapjoinsnored
+return listmapjoinsnored
+/**
+* @param listmapjoinsnored
+*          the listmapjoins to set
+*/
+public void setlistmapjoins
+list<abstractmapjoinoperator<? extends mapjoindesc>> listmapjoinsnored
+this listmapjoinsnored   listmapjoinsnored
+/**
+* @return the currmapjoinop
+*/
+public abstractmapjoinoperator<? extends mapjoindesc> getcurrmapjoinop
+return currmapjoinop
+/**
+* @param currmapjoinop
+*          the currmapjoinop to set
+*/
+public void setcurrmapjoinop abstractmapjoinoperator<? extends mapjoindesc> currmapjoinop
+this currmapjoinop   currmapjoinop
+/**
+* @return the listrejectedmapjoins
+*/
+public list<abstractmapjoinoperator<? extends mapjoindesc>> getlistrejectedmapjoins
+return listrejectedmapjoins
+/**
+* @param listrejectedmapjoins
+*          the listrejectedmapjoins to set
+*/
+public void setlistrejectedmapjoins
+list<abstractmapjoinoperator<? extends mapjoindesc>> listrejectedmapjoins
+this listrejectedmapjoins   listrejectedmapjoins
+public parsecontext getpgraphcontext
+return pgraphcontext
+public void setpgraphcontext parsecontext pgraphcontext
+this pgraphcontext   pgraphcontext

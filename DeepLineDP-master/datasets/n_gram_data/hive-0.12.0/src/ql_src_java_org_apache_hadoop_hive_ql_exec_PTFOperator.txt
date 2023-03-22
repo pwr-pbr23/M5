@@ -1,0 +1,225 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql exec
+import java io serializable
+import java util arraylist
+import java util list
+import java util stack
+import org apache hadoop conf configuration
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive ql exec ptfpartition ptfpartitioniterator
+import org apache hadoop hive ql metadata hiveexception
+import org apache hadoop hive ql plan exprnodegenericfuncdesc
+import org apache hadoop hive ql plan operatordesc
+import org apache hadoop hive ql plan ptfdesc
+import org apache hadoop hive ql plan ptfdesc ptfexpressiondef
+import org apache hadoop hive ql plan ptfdesc ptfinputdef
+import org apache hadoop hive ql plan ptfdesc partitiondef
+import org apache hadoop hive ql plan ptfdesc partitionedtablefunctiondef
+import org apache hadoop hive ql plan ptfdeserializer
+import org apache hadoop hive ql plan api operatortype
+import org apache hadoop hive ql udf generic genericudfleadlag
+import org apache hadoop hive ql udf ptf tablefunctionevaluator
+import org apache hadoop hive serde2 serde
+import org apache hadoop hive serde2 objectinspector objectinspector
+import org apache hadoop hive serde2 objectinspector objectinspectorutils
+import org apache hadoop hive serde2 objectinspector objectinspectorutils objectinspectorcopyoption
+import org apache hadoop hive serde2 objectinspector structobjectinspector
+public class ptfoperator extends operator<ptfdesc> implements serializable
+private static final long serialversionuid   1l
+ptfpartition inputpart
+boolean ismapoperator
+transient keywrapperfactory keywrapperfactory
+protected transient keywrapper currentkeys
+protected transient keywrapper newkeys
+transient hiveconf hiveconf
+/*
+* 1. find out if the operator is invoked at map-side or reduce-side
+* 2. get the deserialized querydef
+* 3. reconstruct the transient variables in querydef
+* 4. create input partition to store rows coming from previous operator
+*/
+@override
+protected void initializeop configuration jobconf  throws hiveexception
+hiveconf   new hiveconf jobconf  ptfoperator class
+// if the parent is extractoperator, this invocation is from reduce-side
+operator<? extends operatordesc> parentop   getparentoperators   get 0
+ismapoperator   conf ismapside
+reconstructquerydef hiveconf
+inputpart   createfirstpartitionforchain
+inputobjinspectors  hiveconf  ismapoperator
+if  ismapoperator
+partitionedtablefunctiondef tdef   conf getstartofchain
+outputobjinspector   tdef getrawinputshape   getoi
+else
+outputobjinspector   conf getfuncdef   getoutputshape   getoi
+setupkeyswrapper inputobjinspectors
+super initializeop jobconf
+@override
+protected void closeop boolean abort  throws hiveexception
+super closeop abort
+if inputpart size      0
+if  ismapoperator
+processmapfunction
+else
+processinputpartition
+inputpart close
+@override
+public void processop object row  int tag  throws hiveexception
+if   ismapoperator
+/*
+* checkif current row belongs to the current accumulated partition:
+* - if not:
+*  - process the current partition
+*  - reset input partition
+* - set currentkey to the newkey if it is null or has changed.
+*/
+newkeys getnewkey row  inputpart getinputoi
+boolean keysareequal    currentkeys    null    newkeys    null ?
+newkeys equals currentkeys    false
+if  currentkeys    null     keysareequal
+processinputpartition
+inputpart reset
+if  currentkeys    null     keysareequal
+if  currentkeys    null
+currentkeys   newkeys copykey
+else
+currentkeys copykey newkeys
+// add row to current partition.
+inputpart append row
+/**
+* initialize the visitor to use the querydefdeserializer use the order
+* defined in querydefwalker to visit the querydef
+*
+* @param hiveconf
+* @throws hiveexception
+*/
+protected void reconstructquerydef hiveconf hiveconf  throws hiveexception
+ptfdeserializer ds
+new ptfdeserializer conf   structobjectinspector inputobjinspectors  hiveconf
+ds initializeptfchain conf getfuncdef
+protected void setupkeyswrapper objectinspector inputoi  throws hiveexception
+partitiondef pdef   conf getstartofchain   getpartition
+arraylist<ptfexpressiondef> exprs   pdef getexpressions
+int numexprs   exprs size
+exprnodeevaluator keyfields   new exprnodeevaluator
+objectinspector keyois   new objectinspector
+objectinspector currentkeyois   new objectinspector
+for int i 0  i<numexprs  i
+ptfexpressiondef exprdef   exprs get i
+/*
+* why cannot we just use the exprnodeevaluator on the column?
+* - because on the reduce-side it is initialized based on the rowoi of the hivetable
+*   and not the oi of the extractop ( the parent of this operator on the reduce-side)
+*/
+keyfields   exprnodeevaluatorfactory get exprdef getexprnode
+keyois   keyfields initialize inputoi
+currentkeyois
+objectinspectorutils getstandardobjectinspector keyois
+objectinspectorcopyoption writable
+keywrapperfactory   new keywrapperfactory keyfields  keyois  currentkeyois
+newkeys   keywrapperfactory getkeywrapper
+protected void processinputpartition   throws hiveexception
+ptfpartition outpart   executechain inputpart
+ptfpartitioniterator<object> pitr   outpart iterator
+while  pitr hasnext
+object orow   pitr next
+forward orow  outputobjinspector
+protected void processmapfunction   throws hiveexception
+partitionedtablefunctiondef tdef   conf getstartofchain
+ptfpartition outpart   tdef gettfunction   transformrawinput inputpart
+ptfpartitioniterator<object> pitr   outpart iterator
+while  pitr hasnext
+object orow   pitr next
+forward orow  outputobjinspector
+/**
+* @return the name of the operator
+*/
+@override
+public string getname
+return getoperatorname
+static public string getoperatorname
+return
+@override
+public operatortype gettype
+return operatortype ptf
+/**
+* for all the table functions to be applied to the input
+* hive table or query, push them on a stack.
+* for each table function popped out of the stack,
+* execute the function on the input partition
+* and return an output partition.
+* @param part
+* @return
+* @throws hiveexception
+*/
+private ptfpartition executechain ptfpartition part
+throws hiveexception
+stack<partitionedtablefunctiondef> fndefs   new stack<partitionedtablefunctiondef>
+ptfinputdef idef   conf getfuncdef
+while  idef instanceof partitionedtablefunctiondef
+fndefs push  partitionedtablefunctiondef  idef
+idef     partitionedtablefunctiondef  idef  getinput
+partitionedtablefunctiondef currfndef
+while   fndefs isempty
+currfndef   fndefs pop
+part   currfndef gettfunction   execute part
+return part
+/**
+* create a new partition.
+* a partition has 2 ois: the oi for the rows being put in and the oi for the rows
+* coming out. you specify the output oi by giving the serde to use to serialize.
+* typically these 2 ois are the same; but not always. for the
+* first ptf in a chain the oi of the incoming rows is dictated by the parent op
+* to this ptfop. the output oi from the partition is typically lazybinarystruct, but
+* not always. in the case of noop/noopmap we keep the strcuture the same as
+* what is given to us.
+* <p>
+* the partition we want to create here is for feeding the first table function in the chain.
+* so for map-side processing use the serde from the output shape its inputdef.
+* for reduce-side processing use the serde from its rawinputshape(the shape
+* after map-side processing).
+* @param oi
+* @param hiveconf
+* @param ismapside
+* @return
+* @throws hiveexception
+*/
+public ptfpartition createfirstpartitionforchain objectinspector oi
+hiveconf hiveconf  boolean ismapside  throws hiveexception
+partitionedtablefunctiondef tabdef   conf getstartofchain
+tablefunctionevaluator teval   tabdef gettfunction
+ptfpartition part   null
+serde serde   ismapside ? tabdef getinput   getoutputshape   getserde
+tabdef getrawinputshape   getserde
+structobjectinspector outputoi   ismapside ? tabdef getinput   getoutputshape   getoi
+tabdef getrawinputshape   getoi
+part   ptfpartition create conf getcfg
+serde
+structobjectinspector  oi
+outputoi
+return part
+public static void connectleadlagfunctionstopartition ptfdesc ptfdesc
+ptfpartitioniterator<object> pitr  throws hiveexception
+list<exprnodegenericfuncdesc> llfndescs   ptfdesc getllinfo   getleadlagexprs
+if  llfndescs    null
+return
+for  exprnodegenericfuncdesc llfndesc   llfndescs
+genericudfleadlag llfn    genericudfleadlag  llfndesc
+getgenericudf
+llfn setpitr pitr

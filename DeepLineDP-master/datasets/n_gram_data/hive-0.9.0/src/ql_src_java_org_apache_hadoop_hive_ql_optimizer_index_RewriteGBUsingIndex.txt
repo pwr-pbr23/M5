@@ -1,0 +1,394 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql optimizer index
+import java io serializable
+import java util arraylist
+import java util collection
+import java util hashmap
+import java util hashset
+import java util iterator
+import java util linkedhashmap
+import java util linkedhashset
+import java util list
+import java util map
+import java util set
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive metastore api fieldschema
+import org apache hadoop hive metastore api index
+import org apache hadoop hive metastore api storagedescriptor
+import org apache hadoop hive ql exec operator
+import org apache hadoop hive ql exec tablescanoperator
+import org apache hadoop hive ql index aggregateindexhandler
+import org apache hadoop hive ql metadata hive
+import org apache hadoop hive ql metadata hiveexception
+import org apache hadoop hive ql metadata partition
+import org apache hadoop hive ql metadata table
+import org apache hadoop hive ql optimizer indexutils
+import org apache hadoop hive ql optimizer transform
+import org apache hadoop hive ql parse opparsecontext
+import org apache hadoop hive ql parse parsecontext
+import org apache hadoop hive ql parse semanticexception
+/**
+* rewritegbusingindex is implemented as one of the rule-based optimizations.
+* implements optimizations for groupby clause rewrite using aggregate index.
+* this optimization rewrites groupby query over base table to the query over simple table-scan
+* over index table, if there is index on the group by key(s) or the distinct column(s).
+* e.g.
+* <code>
+*   select count(key)
+*   from table
+*   group by key;
+* </code>
+*  to
+*  <code>
+*   select sum(_count_of_key)
+*   from idx_table
+*   group by key;
+*  </code>
+*
+*  the rewrite supports following queries:
+*  <ul>
+*  <li> queries having only those col refs that are in the index key.
+*  <li> queries that have index key col refs
+*  <ul>
+*    <li> in select
+*    <li> in where
+*    <li> in group by
+*  </ul>
+*  <li> queries with agg func count(index key col ref) in select
+*  <li> queries with select distinct index_key_col_refs
+*  <li> queries having a subquery satisfying above condition (only the subquery is rewritten)
+*  </ul>
+*
+*  @see aggregateindexhandler
+*  @see indexutils
+*  @see rewritecanapplyctx
+*  @see rewritecanapplyprocfactory
+*  @see rewriteparsecontextgenerator
+*  @see rewritequeryusingaggregateindexctx
+*  @see rewritequeryusingaggregateindex
+*  for test cases, @see ql_rewrite_gbtoidx.q
+*/
+public class rewritegbusingindex implements transform
+private parsecontext parsecontext
+private hive hivedb
+private hiveconf hiveconf
+private static final log log   logfactory getlog rewritegbusingindex class getname
+/*
+* stores the list of top tablescanoperator names for which the rewrite
+* can be applied and the action that needs to be performed for operator tree
+* starting from this tablescanoperator
+*/
+private final map<string  rewritecanapplyctx> tsoptoprocess
+new linkedhashmap<string  rewritecanapplyctx>
+//name of the current table on which rewrite is being performed
+private string basetablename   null
+//name of the current index which is used for rewrite
+private string indextablename   null
+//index validation variables
+private static final string idx_bucket_col
+private static final string idx_offsets_array_col
+@override
+public parsecontext transform parsecontext pctx  throws semanticexception
+parsecontext   pctx
+hiveconf   parsecontext getconf
+try
+hivedb   hive get hiveconf
+catch  hiveexception e
+log error org apache hadoop util stringutils stringifyexception e
+throw new semanticexception e getmessage    e
+// don't try to index optimize the query to build the index
+hiveconf setboolvar hiveconf  hiveconf confvars hiveoptindexfilter  false
+/* check if the input query passes all the tests to be eligible for a rewrite
+* if yes, rewrite original query; else, return the current parsecontext
+*/
+if shouldapplyoptimization
+log info     getname
+rewriteoriginalquery
+return parsecontext
+private string getname
+return
+/**
+* we traverse the current operator tree to check for conditions in which the
+* optimization cannot be applied.
+*
+* at the end, we check if all conditions have passed for rewrite. if yes, we
+* determine if the the index is usable for rewrite. else, we log the condition which
+* did not meet the rewrite criterion.
+*
+* @return
+* @throws semanticexception
+*/
+boolean shouldapplyoptimization   throws semanticexception
+boolean canapply   false
+if ifqueryhasmultipletables
+//we do not apply this optimization for this case as of now.
+return false
+else
+/*
+* this code iterates over each tablescanoperator from the topops map from parsecontext.
+* for each operator tree originating from this top tablescanoperator, we determine
+* if the optimization can be applied. if yes, we add the name of the top table to
+* the tsoptoprocess to apply rewrite later on.
+* */
+map<tablescanoperator  table> toptotable   parsecontext gettoptotable
+iterator<tablescanoperator> topopitr   toptotable keyset   iterator
+while topopitr hasnext
+tablescanoperator topop   topopitr next
+table table   toptotable get topop
+basetablename   table gettablename
+map<table  list<index>> indexes   getindexesforrewrite
+if indexes    null
+log debug
+getname
+return false
+if indexes size      0
+log debug
+getname
+return false
+else
+//we need to check if the base table has confirmed or unknown partitions
+if parsecontext getoptopartlist      null    parsecontext getoptopartlist   size   > 0
+//if base table has partitions, we need to check if index is built for
+//all partitions. if not, then we do not apply the optimization
+if checkifindexbuiltonalltablepartitions topop  indexes
+//check if rewrite can be applied for operator tree
+//if partitions condition returns true
+canapply   checkifrewritecanbeapplied topop  table  indexes
+else
+log debug
+getname
+return false
+else
+//check if rewrite can be applied for operator tree
+//if there are no partitions on base table
+canapply   checkifrewritecanbeapplied topop  table  indexes
+return canapply
+/**
+* this methods checks if rewrite can be applied using the index and also
+* verifies all conditions of the operator tree.
+*
+* @param topop - tablescanoperator for a single the operator tree branch
+* @param indexes - map of a table and list of indexes on it
+* @return - true if rewrite can be applied on the current branch; false otherwise
+* @throws semanticexception
+*/
+private boolean checkifrewritecanbeapplied tablescanoperator topop  table basetable
+map<table  list<index>> indexes  throws semanticexception
+boolean canapply   false
+//context for checking if this optimization can be applied to the input query
+rewritecanapplyctx canapplyctx   rewritecanapplyctx getinstance parsecontext
+map<string  operator<? extends serializable>> topops   parsecontext gettopops
+canapplyctx setbasetablename basetablename
+canapplyctx populaterewritevars topop
+map<index  set<string>> indextablemap   getindextokeysmap indexes get basetable
+iterator<index> indexmapitr   indextablemap keyset   iterator
+index index   null
+while indexmapitr hasnext
+//we rewrite the original query using the first valid index encountered
+//this can be changed if we have a better mechanism to
+//decide which index will produce a better rewrite
+index   indexmapitr next
+canapply   canapplyctx isindexusableforquerybranchrewrite index
+indextablemap get index
+if canapply
+canapply   checkifallrewritecriteriaismet canapplyctx
+//break here if any valid index is found to apply rewrite
+if canapply
+//check if aggregation function is set.
+//if not, set it using the only indexed column
+if canapplyctx getaggfunction      null
+//strip of the start and end braces [...]
+string aggregationfunction   indextablemap get index  tostring
+aggregationfunction   aggregationfunction substring 1
+aggregationfunction length     1
+canapplyctx setaggfunction     aggregationfunction
+break
+indextablename   index getindextablename
+if canapply    topops containsvalue topop
+iterator<string> topopnamesitr   topops keyset   iterator
+while topopnamesitr hasnext
+string topopname   topopnamesitr next
+if topops get topopname  equals topop
+tsoptoprocess put topopname  canapplyctx
+if tsoptoprocess size      0
+canapply   false
+else
+canapply   true
+return canapply
+/**
+* this block of code iterates over the toptotable map from parsecontext
+* to determine if the query has a scan over multiple tables.
+* @return
+*/
+boolean ifqueryhasmultipletables
+map<tablescanoperator  table> toptotable   parsecontext gettoptotable
+iterator<table> valuesitr   toptotable values   iterator
+set<string> tablenameset   new hashset<string>
+while valuesitr hasnext
+table table   valuesitr next
+tablenameset add table gettablename
+if tablenameset size   > 1
+log debug
+getname
+return true
+return false
+/**
+* get a list of indexes which can be used for rewrite.
+* @return
+* @throws semanticexception
+*/
+private map<table  list<index>> getindexesforrewrite   throws semanticexception
+list<string> supportedindexes   new arraylist<string>
+supportedindexes add aggregateindexhandler class getname
+// query the metastore to know what columns we have indexed
+collection<table> toptables   parsecontext gettoptotable   values
+map<table  list<index>> indexes   new hashmap<table  list<index>>
+for  table tbl   toptables
+list<index> tblindexes   indexutils getindexes tbl  supportedindexes
+if  tblindexes size   > 0
+indexes put tbl  tblindexes
+return indexes
+/**
+* this method checks if the index is built on all partitions of the base
+* table. if not, then the method returns false as we do not apply optimization
+* for this case.
+* @param tablescan
+* @param indexes
+* @return
+* @throws semanticexception
+*/
+private boolean checkifindexbuiltonalltablepartitions tablescanoperator tablescan
+map<table  list<index>> indexes  throws semanticexception
+// check if we have indexes on all partitions in this table scan
+set<partition> querypartitions
+try
+querypartitions   indexutils checkpartitionscoveredbyindex tablescan  parsecontext  indexes
+if  querypartitions    null       partitions not covered
+return false
+catch  hiveexception e
+log error    e
+throw new semanticexception e
+if querypartitions size      0
+return true
+return false
+/**
+* this code block iterates over indexes on the table and populates the indextokeys map
+* for all the indexes that satisfy the rewrite criteria.
+* @param indextables
+* @return
+* @throws semanticexception
+*/
+map<index  set<string>> getindextokeysmap list<index> indextables  throws semanticexception
+index index   null
+hive hiveinstance   hivedb
+map<index  set<string>> indextokeysmap   new linkedhashmap<index  set<string>>
+for  int idxctr   0  idxctr < indextables size    idxctr
+final set<string> indexkeynames   new linkedhashset<string>
+index   indextables get idxctr
+//getting index key columns
+storagedescriptor sd   index getsd
+list<fieldschema> idxcollist   sd getcols
+for  fieldschema fieldschema   idxcollist
+indexkeynames add fieldschema getname
+assert indexkeynames size    1
+// check that the index schema is as expected. this code block should
+// catch problems of this rewrite breaking when the aggregateindexhandler
+// index is changed.
+list<string> idxtblcolnames   new arraylist<string>
+try
+table idxtbl   hiveinstance gettable index getdbname
+index getindextablename
+for  fieldschema idxtblcol   idxtbl getcols
+idxtblcolnames add idxtblcol getname
+catch  hiveexception e
+log error
+getname
+log error org apache hadoop util stringutils stringifyexception e
+throw new semanticexception e getmessage    e
+assert idxtblcolnames contains idx_bucket_col
+assert idxtblcolnames contains idx_offsets_array_col
+// we add all index tables which can be used for rewrite
+// and defer the decision of using a particular index for later
+// this is to allow choosing a index if a better mechanism is
+// designed later to chose a better rewrite
+indextokeysmap put index  indexkeynames
+return indextokeysmap
+/**
+* method to rewrite the input query if all optimization criteria is passed.
+* the method iterates over the tsoptoprocess {@link arraylist} to apply the rewrites
+* @throws semanticexception
+*
+*/
+@suppresswarnings
+private void rewriteoriginalquery   throws semanticexception
+map<string  operator<? extends serializable>> topopmap
+hashmap<string  operator<? extends serializable>>  parsecontext gettopops   clone
+iterator<string> tsopitr   tsoptoprocess keyset   iterator
+while tsopitr hasnext
+basetablename   tsopitr next
+rewritecanapplyctx canapplyctx   tsoptoprocess get basetablename
+tablescanoperator topop    tablescanoperator  topopmap get basetablename
+rewritequeryusingaggregateindexctx rewritequeryctx
+rewritequeryusingaggregateindexctx getinstance parsecontext  hivedb
+indextablename  basetablename  canapplyctx getaggfunction
+rewritequeryctx invokerewritequeryproc topop
+parsecontext   rewritequeryctx getparsecontext
+parsecontext setopparsectx  linkedhashmap<operator<? extends serializable>
+opparsecontext>  rewritequeryctx getopc
+log info
+/**
+* this method logs the reason for which we cannot apply the rewrite optimization.
+* @return
+*/
+boolean checkifallrewritecriteriaismet rewritecanapplyctx canapplyctx
+if  canapplyctx getaggfunccnt   > 1
+log debug
+getname
+return false
+if  canapplyctx isaggfuncisnotcount
+log debug
+getname
+return false
+if  canapplyctx iscountonallcols
+log debug
+getname
+return false
+if  canapplyctx iscountofone
+log debug
+getname
+return false
+if  canapplyctx isaggfunccolsfetchexception
+log debug
+getname
+return false
+if  canapplyctx iswhrclausecolsfetchexception
+log debug
+getname
+return false
+if  canapplyctx isselclausecolsfetchexception
+log debug
+getname
+return false
+if  canapplyctx isgbykeysfetchexception
+log debug
+getname
+return false
+return true

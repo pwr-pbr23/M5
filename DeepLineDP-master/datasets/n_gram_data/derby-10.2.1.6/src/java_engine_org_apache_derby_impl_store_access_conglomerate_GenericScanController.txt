@@ -1,0 +1,1343 @@
+/*
+derby - class org.apache.derby.impl.store.access.conglomerate.genericscancontroller
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store access conglomerate
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby iapi store access conglomerate conglomerate
+import org apache derby iapi store access conglomerate logicalundo
+import org apache derby iapi store access conglomerate scanmanager
+import org apache derby iapi store access conglomerate transactionmanager
+import org apache derby iapi store access conglomeratecontroller
+import org apache derby iapi store access dynamiccompiledopenconglominfo
+import org apache derby iapi store access qualifier
+import org apache derby iapi store access rowutil
+import org apache derby iapi store access scancontroller
+import org apache derby iapi store access scaninfo
+import org apache derby iapi store access spaceinfo
+import org apache derby iapi store raw containerhandle
+import org apache derby iapi store raw fetchdescriptor
+import org apache derby iapi store raw page
+import org apache derby iapi store raw recordhandle
+import org apache derby iapi store raw transaction
+import org apache derby iapi store access qualifier
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi types orderable
+import org apache derby iapi types rowlocation
+import org apache derby iapi store access backingstorehashtable
+import org apache derby iapi services io formatablebitset
+import java util properties
+/**
+generic class implementing shared scancontroller methods.
+logically a scancontroller is used to scan a set of rows that meet some
+specified qualification.  rows that meet the qualification may be operated
+upon by the scan to fetch, delete, or replace.  the scancontroller also
+supports the notion or "repositioning" the scan, which simply resets the
+beginning of the scan to a new place, and allows the user to continue from
+there.
+this class attempts to abstract out some of the parts of the scan such that
+maybe multiple access methods can share code, even if they perform parts of
+the scan wildly differently.  here is how the scan has been broken apart:
+scan_position - this variable holds the current scan position, it may be
+extended
+to provide more information if necessary.
+scan_state    - a scan has 3 possible states:
+scan_init, scan_inprogress, scan_done
+positionatinitscan()
+- this routine is called to move the scan to the scan_init state.
+it is used both for initialization of the scancontroller and
+by reopenscan().
+positionatstartforforwardscan()
+- this routine is called to move the scan from scan_init to
+scan_inprogress.  upon return from this routine it is expected
+that scan_position is set such that calling the generic
+scan loop will reach the first row of the scan.  note that this
+usually means setting the scan_postion to one before the 1st
+row to be returned.
+fetchrows()   - this routine is the meat of the scan, it moves the scan to the
+next row, applies necessary qualifiers, and handles group or
+non-group operations.  it moves through rows on a page in
+order and then moves to the "next" page.
+positionatnextpage()
+- this routine handles moving the scan from the current
+scan_position to the next page.
+positionatdonescan()
+- handle all cleanup associated with moving the scan state from
+scan_inprogress to scan_done.  this may include releasing locks,
+and setting the state of the scan.  this does not close the
+scan, it allows for a reopenscan() to be called.
+**/
+public abstract class genericscancontroller
+extends genericcontroller implements scanmanager
+{
+/**************************************************************************
+* constants of the class
+**************************************************************************
+*/
+/*
+* there are 5 states a scan can be in.
+*     scan_init - a scan has started but no positioning has been done.
+*                 the scan will be positioned when the first next() call
+*                 has been made.  none of the positioning state variables
+*                 are valid in this state.
+*     scan_inprogress -
+*                 a scan is in this state after the first next() call.
+*                 on exit from any genericscancontroller method, while in
+*                 this state,
+*                 the scan "points" at a row which qualifies for the
+*                 scan.  while not maintaining latches on a page the
+*                 current position of the scan is either kept by record
+*                 handle or key.  to tell which use the following:
+*                 if (record key == null)
+*                    record handle has current position
+*                 else
+*                    record key has current position
+*
+*     scan_done - once the end of the table or the stop condition is met
+*                 then the scan is placed in this state.  only valid
+*                 scancontroller method at this point is close().
+*
+*     scan_hold_init -
+*                 the scan has been opened and held open across a commit,
+*                 at the last commit the state was scan_init.
+*                 the scan has never progressed from the scan_init state
+*                 during a transaction.  when a next is done the state
+*                 will either progress to scan_inprogress or scan_done.
+*
+*     scan_hold_inprogress -
+*                 the scan has been opened and held open across a commit,
+*                 at the last commit the state was in scan_inprogress.
+*                 the transaction which opened the scan has committed,
+*                 but the scan was opened with the "hold" option true.
+*                 at commit the locks were released and the "current"
+*                 position is remembered.  in this state only two calls
+*                 are valid, either next() or close().  when next() is
+*                 called the scan is reopened, the underlying container
+*                 is opened thus associating all new locks with the current
+*                 transaction, and the scan continues at the "next" row.
+*/
+public static final int    scan_init               1
+public static final int    scan_inprogress         2
+public static final int    scan_done               3
+public static final int    scan_hold_init          4
+public static final int    scan_hold_inprogress    5
+/**************************************************************************
+* fields of the class
+**************************************************************************
+*/
+/**
+* the following group of fields are all basic input parameters which are
+* provided by the calling code when doing a scan.
+* these are just saved values from what was initially input.
+**/
+private formatablebitset                 init_scancolumnlist
+private datavaluedescriptor   init_startkeyvalue
+private int                     init_startsearchoperator
+private qualifier           init_qualifier
+private datavaluedescriptor   init_stopkeyvalue
+private int                     init_stopsearchoperator
+private fetchdescriptor init_fetchdesc
+/**
+* delay positioning the table at the start position until the first
+* next() call.
+*/
+private int         scan_state
+/**
+* if this flag is set to true, a rowlocation returned from this controller
+* may have been reused for another row.
+*/
+protected boolean rowlocationsinvalidated   false
+/**
+* this is the sequence number for when a record id can be
+* reused. if it has been changed in the container, a rowlocation
+* may be reused for another row.
+*/
+private long reusablerecordidsequencenumber   0
+/**
+* the position for the current scan.  the can be maintained in any
+* of the following ways:
+*     record handle - scan_position.current_rh:
+*         the scan maintains it's position using the record handle while
+*         it does not have a latch on the page, which is the case anytime
+*         control leaves access.  the access method must take appropriate
+*         steps to make sure the record handle will still be valid when
+*         the scan needs to reposition using the record handle.
+*     slot number   - scan_position.current_slot:
+*         while the scan has a latch on the page the scan is positioned
+*         using the slot number as the order of the rows cannot change
+*         while the latch is held (unless the holder of the latch causes
+*         them to move).
+*     page number   - (resolve - todo)
+*         sometimes it would be interesting to position a scan "between"
+*         pages, such that the next time the scan starts is starts at
+*         the next page.  this would allow us to efficiently do group
+*         scans returning page at atime results.
+*         not implemented currently.
+**/
+protected rowposition         scan_position
+/**
+* performance counters ...
+*/
+protected int stat_numpages_visited           0
+protected int stat_numrows_visited            0
+protected int stat_numrows_qualified          0
+/**************************************************************************
+* constructors for this class:
+**************************************************************************
+*/
+/**************************************************************************
+* private methods of this class:
+**************************************************************************
+*/
+private final void repositionscanforupateoper
+throws standardexception
+{
+if  scan_state    scan_inprogress
+throw standardexception newexception
+sqlstate am_scan_not_positioned
+if   open_conglom latchpage scan_position
+{
+throw standardexception newexception
+sqlstate am_record_not_found
+open_conglom getcontainer   getid
+new long scan_position current_rh getid
+}
+if  open_conglom isuseupdatelocks
+{
+// we only have an u lock at this point which was acquired when the
+// scan positioned on the row, need to request an
+// x lock before we can actually perform the delete
+open_conglom lockpositionforwrite
+scan_position  false    not insert     true
+}
+}
+/**************************************************************************
+* protected methods implementing mechanics of scanning rows:
+*
+*     positionatinitscan()             - move scan state to scan_init
+*     positionatstartforforwardscan()  - scan_init -> scan_inprogress
+*     positionatresumescan()           - reposition after losing scan latch
+*     fetchrows()                      - move scan while in scan_inprogress
+*     positionatnextpage()             - move page while in scan_inprogress
+*     positionatdonescan()             - scan_inprogress -> scan_done
+*
+**************************************************************************
+*/
+/**
+* move scan to the the scan_init state.
+* <p>
+* this routine is called to move the scan to the scan_init state.
+* it is used both for initialization of the scancontroller and
+* by reopenscan().
+**/
+protected void positionatinitscan
+datavaluedescriptor   startkeyvalue
+int                     startsearchoperator
+qualifier               qualifier
+datavaluedescriptor   stopkeyvalue
+int                     stopsearchoperator
+rowposition             pos
+throws standardexception
+{
+// startkeyvalue init.
+this init_startkeyvalue           startkeyvalue
+if  rowutil isrowempty this init_startkeyvalue
+this init_startkeyvalue   null
+// startsearchoperator init.
+this init_startsearchoperator     startsearchoperator
+// qualifier init.
+if   qualifier    null      qualifier  length    0
+qualifier   null
+this init_qualifier               qualifier
+// todo (mikem) - this could be more efficient, by writing
+// code to figure out length of row, but scratch row is cached
+// so allocating it here is probably not that bad.
+init_fetchdesc
+new fetchdescriptor
+open_conglom getruntimemem   get_scratch_row    length
+init_scancolumnlist
+init_qualifier
+// stopkeyvalue init.
+this init_stopkeyvalue            stopkeyvalue
+if  rowutil isrowempty this init_stopkeyvalue
+this init_stopkeyvalue   null
+// stopsearchoperator init.
+this init_stopsearchoperator      stopsearchoperator
+// reset the "current" position to starting condition.
+pos init
+// verify that all columns in start key value, stop key value, and
+// qualifiers are present in the list of columns described by the
+// scancolumnlist.
+if (sanitymanager.debug)
+{
+if  init_scancolumnlist    null
+{
+// verify that all columns specified in qualifiers, start
+// and stop positions are specified in the scancolumnlist.
+formatablebitset required_cols
+if  qualifier    null
+required_cols   rowutil getqualifierbitset qualifier
+else
+required_cols   new formatablebitset 0
+// add in start columns
+if  this init_startkeyvalue    null
+{
+required_cols grow this init_startkeyvalue length
+for  int i   0  i < this init_startkeyvalue length  i
+required_cols set i
+}
+if  this init_stopkeyvalue    null
+{
+required_cols grow this init_stopkeyvalue length
+for  int i   0  i < this init_stopkeyvalue length  i
+required_cols set i
+}
+formatablebitset required_cols_and_scan_list
+formatablebitset  required_cols clone
+required_cols_and_scan_list and init_scancolumnlist
+// formatablebitset equals requires the two formatablebitsets to be of same
+// length.
+required_cols grow init_scancolumnlist size
+if   required_cols_and_scan_list equals required_cols
+{
+sanitymanager.throwassert(
+required_cols_and_scan_list
+required_cols
+init_scancolumnlist
+}
+}
+}
+// scan is fully initialized and ready to go.
+scan_state   scan_init
+}
+/**
+* reposition the scan upon entering the fetchrows loop.
+* <p>
+* called upon entering fetchrows() while in the scan_inprogress state.
+* do work necessary to look at rows in the current page of the scan.
+* <p>
+* the default implementation uses a record handle to maintain a scan
+* position.  it will get the latch again on the current
+* scan position and set the slot to the current record handle.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected void positionatresumescan
+rowposition pos
+throws standardexception
+{
+if (sanitymanager.debug)
+{
+sanitymanager assert
+scan_position current_rh    null  this tostring
+}
+// reposition the scan at the row just before the next one to return.
+// this routine handles the mess of repositioning if the row or the
+// page has disappeared. this can happen if a lock was not held on the
+// row while not holding the latch.
+open_conglom latchpageandrepositionscan scan_position
+}
+/**
+* move the scan from scan_init to scan_inprogress.
+* <p>
+* this routine is called to move the scan from scan_init to
+* scan_inprogress.  upon return from this routine it is expected
+* that scan_position is set such that calling the generic
+* scan loop will reach the first row of the scan.  note that this
+* usually means setting the scan_postion to one before the 1st
+* row to be returned.
+* <p>
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected void positionatstartforforwardscan
+rowposition pos
+throws standardexception
+{
+if  pos current_rh    null
+{
+// 1st positioning of scan (delayed from openscan).
+pos current_page
+open_conglom getcontainer   getfirstpage
+if (sanitymanager.debug)
+{
+sanitymanager assert
+pos current_page getpagenumber
+containerhandle first_page_number
+if  pos current_page recordcount   < 1
+sanitymanager.throwassert(
+pos current_page recordcount
+}
+// set up for scan to continue at beginning of first page just
+// after first first control row on first page.
+pos current_slot   page first_slot_number
+}
+else
+{
+// 1st positioning of scan following a reopenscanbyrowlocation
+// reposition the scan at the row just before the next one to
+// return.  this routine handles the mess of repositioning if the
+// row or the page has disappeared. this can happen if a lock was
+// not held on the row while not holding the latch.
+open_conglom latchpageandrepositionscan pos
+// set up for scan to at the specified record handle (position one
+// before it so that the loop increment and find it).
+pos current_slot    1
+}
+pos current_rh      null
+this stat_numpages_visited    1
+this scan_state               scan_inprogress
+}
+/**
+* position scan to slot before first slot on next page.
+* <p>
+* @exception  standardexception  standard exception policy.
+**/
+protected void positionatnextpage
+rowposition pos
+throws standardexception
+{
+// the current_page can become null, in a rare multi-user case, where
+// all pages in the heap are deallocated, in the middle of the scan
+// loop, when no latches are held, and the scan is waiting on a lock.
+// in this case the lockpositionforread code, has nowhere good to
+// position the scan, so it just sets the page to null and returns.
+if  pos current_page    null
+{
+// save current page number.
+long pageid   pos current_page getpagenumber
+// unlatch old page.
+pos unlatch
+// latch page after current page number.
+pos current_page
+open_conglom getcontainer   getnextpage pageid
+// set up for scan to continue at beginning of this new page.
+pos current_slot   page first_slot_number   1
+}
+}
+/**
+* do any necessary work to complete the scan.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected void positionatdonescan
+rowposition pos
+throws standardexception
+{
+// unlatch current page if any.
+pos unlatch
+// unlock the previous row.
+if  scan_position current_rh    null
+{
+open_conglom unlockpositionafterread scan_position
+scan_position current_rh   null
+}
+this scan_state   scan_done
+}
+public void reopenscanbyrowlocation
+rowlocation startrowlocation
+qualifier qualifier
+throws standardexception
+{
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+}
+/**************************************************************************
+* protected methods of this class:
+**************************************************************************
+*/
+/**
+* create object which represents the scan position.
+* <p>
+* designed so that extending classes can override and allocate
+* implementation specific row position's.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected rowposition allocatescanposition
+throws standardexception
+{
+return new rowposition
+}
+/**
+* fetch the next n rows from the table.
+* <p>
+* utility routine used by both fetchset() and fetchnextgroup().
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected int fetchrows
+datavaluedescriptor row_array
+rowlocation           rowloc_array
+backingstorehashtable   hash_table
+long                    max_rowcnt
+int                   key_column_numbers
+throws standardexception
+{
+int                     ret_row_count             0
+datavaluedescriptor   fetch_row                 null
+if  max_rowcnt     1
+max_rowcnt   long max_value
+if (sanitymanager.debug)
+{
+if  row_array    null
+{
+sanitymanager assert row_array    null
+sanitymanager assert hash_table    null
+}
+else
+{
+sanitymanager assert hash_table    null
+}
+}
+if  this scan_state    scan_inprogress
+{
+positionatresumescan scan_position
+}
+else if  this scan_state    scan_init
+{
+positionatstartforforwardscan scan_position
+}
+else if  this scan_state    scan_hold_inprogress
+{
+reopenafterendtransaction
+if (sanitymanager.debug)
+{
+sanitymanager assert
+scan_position current_rh    null  this tostring
+}
+// reposition the scan at the row just before the next one to
+// return.
+// this routine handles the mess of repositioning if the row or
+// the page has disappeared. this can happen if a lock was not
+// held on the row while not holding the latch.
+open_conglom latchpageandrepositionscan scan_position
+this scan_state   scan_inprogress
+}
+else if  this scan_state    scan_hold_init
+{
+reopenafterendtransaction
+positionatstartforforwardscan scan_position
+}
+else
+{
+if (sanitymanager.debug)
+sanitymanager assert this scan_state    scan_done
+return 0
+}
+// at this point:
+// scan_position.current_page is latched.
+// scan_position.current_slot is the slot on scan_position.current_page
+// just before the "next" record this routine should process.
+// loop through successive pages and successive slots on those
+// pages.  stop when either the last page is reached
+// (scan_position.current_page will be null).
+// along the way apply qualifiers to skip rows which don't qualify.
+while  scan_position current_page    null
+{
+while   scan_position current_slot   1  <
+scan_position current_page recordcount
+{
+// unlock the previous row.
+if  scan_position current_rh    null
+{
+open_conglom unlockpositionafterread scan_position
+}
+// allocate a new row to read the row into.
+if  fetch_row    null
+{
+if  hash_table    null
+{
+// point at allocated row in array if one exists.
+if  row_array    null
+{
+row_array
+open_conglom getruntimemem   get_row_for_export
+}
+fetch_row   row_array
+}
+else
+{
+fetch_row
+open_conglom getruntimemem   get_row_for_export
+}
+}
+// move scan current position forward.
+scan_position positionatnextslot
+// lock the row.
+boolean lock_granted_while_latch_held
+open_conglom lockpositionforread
+scan_position   rowposition  null  true  true
+if   lock_granted_while_latch_held
+{
+// if lock could not be granted while holding
+// latch, then the row may either be on the same page
+// or it may no longer exist, this implementation does not
+// handle rows which move to different pages.
+//
+// if the row moved on the same page then
+// lockpositionforread() will have automatically updated
+// the scan_postion argument to point to it, and we
+// wil now have a latch and a lock on that row.
+//
+// if the row no longer exists then the
+// "moveforwardifrowdisappears" argument makes this routine
+// find the "next" row in the heap and position on it.  if
+// a valid row exists in the current page to position on,
+// then lockpositionforread() will position on it, get
+// a lock on it, and return with a latch on the page.
+// otherwise the routine will return with current_slot == -1
+// and it is up to this routine to continue the scan as
+// normal at the top of the loop.
+if  scan_position current_page    null
+{
+// page has been unlatched and the scan is done, there
+// are no more pages.  getnextpage() has been coded to
+// handle a null current_page.
+break
+}
+else if  scan_position current_slot     1
+{
+// this means that lockpositionforread() had to
+// reposition the scan forward to a new page, because
+// the row the scan was locking was purged, when the
+// latch was released to wait on the lock.  in this
+// case just jump back to the top of loop and continue
+// scan.
+if (sanitymanager.debug)
+{
+sanitymanager assert
+scan_position current_rh    null
+}
+continue
+}
+}
+this stat_numrows_visited
+// lockrowatposition set pos.current_rh as part of getting lock.
+if (sanitymanager.debug)
+{
+sanitymanager assert scan_position current_rh    null
+// make sure current_rh and current_slot are in sync
+if  scan_position current_slot
+scan_position current_page getslotnumber
+scan_position current_rh
+{
+sanitymanager.throwassert(
+scan_position current_slot
+scan_position current_rh
+scan_position current_page getslotnumber
+scan_position current_rh
+}
+}
+// fetchfromslot returns null if row does not qualify.
+scan_position current_rh_qualified
+scan_position current_page fetchfromslot
+scan_position current_rh
+scan_position current_slot
+fetch_row
+init_fetchdesc
+false     null
+if  scan_position current_rh_qualified
+{
+// qualifying row.
+// scan_position.current_rh is save position of scan while
+// latch is not held.  it currently points at the
+// scan_position.current_slot in search (while latch is
+// held).
+if (sanitymanager.debug)
+{
+// make sure current_rh and current_slot are in sync
+sanitymanager assert
+scan_position current_slot
+scan_position current_page getslotnumber
+scan_position current_rh
+}
+// found qualifying row.  done fetching rows for the group?
+ret_row_count
+stat_numrows_qualified
+if  hash_table    null
+{
+if  rowloc_array    null
+{
+// if requested return the associated row location.
+setrowlocationarray
+rowloc_array  ret_row_count   1  scan_position
+}
+fetch_row   null
+}
+else
+{
+if  hash_table put false  fetch_row
+{
+// the row was inserted into the hash table so we
+// need to create a new row next time through.
+fetch_row   null
+}
+}
+if  max_rowcnt <  ret_row_count
+{
+// exit fetch row loop and return to the client.
+scan_position unlatch
+if (sanitymanager.debug)
+{
+sanitymanager assert
+scan_position current_rh    null
+}
+return ret_row_count
+}
+}
+}
+positionatnextpage scan_position
+this stat_numpages_visited
+}
+// reached last page of scan.
+positionatdonescan scan_position
+// we need to decrement when we stop scan at the end of the table.
+this stat_numpages_visited
+return ret_row_count
+}
+/**
+reposition the current scan.  this call is semantically the same as if
+the current scan had been closed and a openscan() had been called instead.
+the scan is reopened against the same conglomerate, and the scan
+is reopened with the same "scan column list", "hold" and "forupdate"
+parameters passed in the original openscan.
+<p>
+the statistics gathered by the scan are not reset to 0 by a reopenscan(),
+rather they continue to accumulate.
+<p>
+note that this operation is currently only supported on heap conglomerates.
+also note that order of rows within are heap are not guaranteed, so for
+instance positioning at a rowlocation in the "middle" of a heap, then
+inserting more data, then continuing the scan is not guaranteed to see
+the new rows - they may be put in the "beginning" of the heap.
+@param startrecordhandle  an existing recordhandle within the conglomerate,
+at which to position the start of the scan.  the scan will begin at this
+location and continue forward until the end of the conglomerate.
+positioning at a non-existent rowlocation (ie. an invalid one or one that
+had been deleted), will result in an exception being thrown when the
+first next operation is attempted.
+@param qualifier an array of qualifiers which, applied
+to each key, restrict the rows returned by the scan.  rows
+for which any one of the qualifiers returns false are not
+returned by the scan. if null, all rows are returned.
+@exception standardexception standard exception policy.
+**/
+protected void reopenscanbyrecordhandle
+recordhandle    startrecordhandle
+qualifier       qualifier
+throws standardexception
+{
+// initialize scan position parameters at beginning of scan
+this scan_state
+open_conglom gethold   ? scan_init   scan_hold_init
+// position the scan at the row before the given record id, so that
+// the first "next" starts on the given row.
+scan_position current_rh   startrecordhandle
+}
+protected abstract void setrowlocationarray
+rowlocation   rowloc_array
+int             index
+rowposition     pos
+throws standardexception
+/**************************************************************************
+* abstract protected methods of this class:
+**************************************************************************
+*/
+/**************************************************************************
+* public methods of this class:
+**************************************************************************
+*/
+public void init
+openconglomerate                open_conglom
+formatablebitset				            scancolumnlist
+datavaluedescriptor	        startkeyvalue
+int                             startsearchoperator
+qualifier                       qualifier
+datavaluedescriptor	        stopkeyvalue
+int                             stopsearchoperator
+throws standardexception
+{
+super init open_conglom
+// resolve (mikem) - move this into runtime_mem
+scan_position   allocatescanposition
+// remember inputs
+init_scancolumnlist           scancolumnlist
+positionatinitscan
+startkeyvalue
+startsearchoperator
+qualifier
+stopkeyvalue
+stopsearchoperator
+scan_position
+reusablerecordidsequencenumber
+open_conglom getcontainer   getreusablerecordidsequencenumber
+}
+public final int getnumpagesvisited
+{
+return stat_numpages_visited
+}
+public final int getnumrowsvisited
+{
+return stat_numrows_visited
+}
+public final int getnumrowsqualified
+{
+return stat_numrows_qualified
+}
+public final formatablebitset getscancolumnlist
+{
+return init_scancolumnlist
+}
+public final datavaluedescriptor getstartkeyvalue
+{
+return init_startkeyvalue
+}
+public final int getstartsearchoperator
+{
+return init_startsearchoperator
+}
+public final datavaluedescriptor getstopkeyvalue
+{
+return init_stopkeyvalue
+}
+public final int getstopsearchoperator
+{
+return init_stopsearchoperator
+}
+public final qualifier getqualifier
+{
+return init_qualifier
+}
+public final int getscanstate
+{
+return scan_state
+}
+public final void setscanstate int state
+{
+scan_state   state
+}
+public final rowposition getscanposition
+{
+return scan_position
+}
+public final void setscanposition rowposition   pos
+{
+scan_position   pos
+}
+/**************************************************************************
+* public methods implementing scancontroller:
+**************************************************************************
+*/
+private void closescan
+throws standardexception
+{
+super close
+// if we are closed due to catching an error in the middle of init,
+// xact_manager may not be set yet.
+if  open_conglom getxactmgr      null
+open_conglom getxactmgr   closeme this
+// help the garbage collector.
+this init_qualifier           null
+init_scancolumnlist           null
+init_startkeyvalue            null
+init_stopkeyvalue             null
+}
+public void close
+throws standardexception
+{
+// finish the scan - this may release locks if read committed and scan
+// still holds some locks, and close comes before scan.next() returned
+// that scan was done.
+positionatdonescan scan_position
+closescan
+}
+/**
+* reopens the scan after it has been closed as part of a commit.
+* this method will check the reusablerecordidsequencenumber of the
+* container, and will set the rowlocationsinvalidated flag if it has
+* changed.
+* @return true if the conglomerate has been reopened
+* @exception standardexception derby standard exception
+*/
+protected final boolean reopenafterendtransaction
+throws standardexception
+{
+// only reopen if holdable
+if   open_conglom gethold
+{
+return false
+}
+containerhandle container   open_conglom reopen
+switch  scan_state
+case scan_inprogress
+case scan_hold_inprogress
+case scan_done
+if  container getreusablerecordidsequencenumber
+reusablerecordidsequencenumber
+{
+rowlocationsinvalidated   true
+}
+break
+case scan_init
+case scan_hold_init
+reusablerecordidsequencenumber
+container getreusablerecordidsequencenumber
+break
+default
+break
+}
+return true
+}
+public boolean closeforendtransaction
+boolean closeheldscan
+throws standardexception
+{
+if    open_conglom gethold       closeheldscan
+{
+// close the scan as part of the commit/abort
+this scan_state   scan_done
+closescan
+return true
+}
+else
+{
+super close
+// allow the scan to continue after the commit.
+// locks and latches will be released as part of the commit, so
+// no need to release them by hand.
+if  this scan_state    scan_inprogress
+this scan_state   scan_hold_inprogress
+else if  this scan_state    scan_init
+this scan_state   scan_hold_init
+return false
+}
+}
+/**
+@see scancontroller#delete
+**/
+public boolean delete
+throws standardexception
+{
+repositionscanforupateoper
+boolean ret_val   true
+// resolve (mikem) - recid - performance could be better if we did not
+// have to call isdeletedatslot().
+// resolve (mikem) - share code below with conglomeratecontroller.
+if  scan_position current_page isdeletedatslot
+scan_position current_slot
+{
+ret_val   false
+}
+else
+{
+// delete the row
+scan_position current_page deleteatslot
+scan_position current_slot  true   logicalundo  null
+if  scan_position current_page nondeletedrecordcount      0
+{
+queuedeletepostcommitwork scan_position
+}
+}
+scan_position unlatch
+return ret_val
+}
+/**
+* a call to allow client to indicate that current row does not qualify.
+* <p>
+* indicates to the scancontroller that the current row does not
+* qualify for the scan.  if the isolation level of the scan allows,
+* this may result in the scan releasing the lock on this row.
+* <p>
+* note that some scan implimentations may not support releasing locks on
+* non-qualifying rows, or may delay releasing the lock until sometime
+* later in the scan (ie. it may be necessary to keep the lock until
+* either the scan is repositioned on the next row or page).
+* <p>
+* this call should only be made while the scan is positioned on a current
+* valid row.
+* resolve (mikem-05/29/98) - implement this when we support levels of
+* concurrency less than serializable.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void didnotqualify
+throws standardexception
+{
+}
+/**
+* insert all rows that qualify for the current scan into the input
+* hash table.
+* <p>
+* this routine scans executes the entire scan as described in the
+* openscan call.  for every qualifying unique row value an entry is
+* placed into the hashtable. for unique row values the entry in the
+* hashtable has a key value of the object stored in
+* row[key_column_number], and the value of the data is row.  for row
+* values with duplicates, the key value is also row[key_column_number],
+* but the value of the data is a vector of
+* rows.  the caller will have to call "instanceof" on the data value
+* object if duplicates are expected, to determine if the data value
+* of the hashtable entry is a row or is a vector of rows.
+* <p>
+* note, that for this routine to work efficiently the caller must
+* ensure that the object in row[key_column_number] implements
+* the hashcode and equals method as appropriate for it's datatype.
+* <p>
+* it is expected that this call will be the first and only call made in
+* an openscan.  qualifiers and stop position of the openscan are applied
+* just as in a normal scan.  this call is logically equivalent to the
+* caller performing the following:
+*
+* import java.util.hashtable;
+*
+* hash_table = new hashtable();
+*
+* while (next())
+* {
+*     row = create_new_row();
+*     fetch(row);
+*     if ((duplicate_value =
+*         hash_table.put(row[key_column_number], row)) != null)
+*     {
+*         vector row_vec;
+*
+*         // inserted a duplicate
+*         if ((duplicate_value instanceof vector))
+*         {
+*             row_vec = (vector) duplicate_value;
+*         }
+*         else
+*         {
+*             // allocate vector to hold duplicates
+*             row_vec = new vector(2);
+*
+*             // insert original row into vector
+*             row_vec.addelement(duplicate_value);
+*
+*             // put the vector as the data rather than the row
+*             hash_table.put(row[key_column_number], row_vec);
+*         }
+*
+*         // insert new row into vector
+*         row_vec.addelement(row);
+*     }
+* }
+* <p>
+* the columns of the row will be the standard columns returned as
+* part of a scan, as described by the validcolumns - see openscan for
+* description.
+* resolve - is this ok?  or should i hard code somehow the row to
+*           be the first column and the row location?
+* <p>
+* currently it is only possible to hash on the first column in the
+* conglomerate, in the future we may change the interface to allow
+* hashing either on a different column or maybe on a combination of
+* columns.
+* <p>
+* no overflow to external storage is provided, so calling this routine
+* on a 1 gigabyte conglomerate will incur at least 1 gigabyte of memory
+* (probably failing with a java out of memory condition).  if this
+* routine gets an out of memory condition, or if "max_rowcnt" is
+* exceeded then then the routine will give up, empty the hashtable,
+* and return "false."
+* <p>
+* on exit from this routine, whether the fetchset() succeeded or not
+* the scan is complete, it is positioned just the same as if the scan
+* had been drained by calling "next()" until it returns false (ie.
+* fetchnext() and next() calls will return false).
+* reopenscan() can be called to restart the scan.
+* <p>
+*
+* resolve - until we get row counts what should we do for sizing the
+*           the size, capasity, and load factor of the hash table.
+*           for now it is up to the caller to create the hashtable,
+*           access does not reset any parameters.
+* <p>
+* resolve - i am not sure if access should be in charge of allocating
+*           the new row objects.  i know that i can do this in the
+*           case of btree's, but i don't think i can do this in heaps.
+*           maybe this is solved by work to be done on the sort
+*           interface.
+*
+*
+* @param max_rowcnt        the maximum number of rows to insert into the
+*                          hash table.  pass in -1 if there is no maximum.
+* @param key_column_numbers the column numbers of the columns in the
+*                          scan result row to be the key to the hashtable.
+*                          "0" is the first column in the scan result
+*                          row (which may be different than the first
+*                          column in the row in the table of the scan).
+* @param hash_table        the java hashtable to load into.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void fetchset
+long                    max_rowcnt
+int                   key_column_numbers
+backingstorehashtable   hash_table
+throws standardexception
+{
+fetchrows
+datavaluedescriptor  null
+rowlocation  null
+hash_table
+max_rowcnt
+key_column_numbers
+return
+}
+/**
+reposition the current scan.  this call is semantically the same as if
+the current scan had been closed and a openscan() had been called instead.
+the scan is reopened with against the same conglomerate, and the scan
+is reopened with the same "hold" and "forupdate" parameters passed in
+the original openscan.  the previous template row continues to be used.
+@param startkeyvalue  an indexable row which holds a
+(partial) key value which, in combination with the
+startsearchoperator, defines the starting position of
+the scan.  if null, the starting position of the scan
+is the first row of the conglomerate.
+@param startsearchoperator an operator which defines
+how the startkeyvalue is to be searched for.  if
+startsearchoperator is scancontroller.ge, the scan starts on
+the first row which is greater than or equal to the
+startkeyvalue.  if startsearchoperation is scancontroller.gt,
+the scan starts on the first row whose key is greater than
+startkeyvalue.  the startsearchoperation parameter is
+ignored if the startkeyvalue parameter is null.
+@param qualifier an array of qualifiers which, applied
+to each key, restrict the rows returned by the scan.  rows
+for which any one of the qualifiers returns false are not
+returned by the scan. if null, all rows are returned.
+@param stopkeyvalue  an indexable row which holds a
+(partial) key value which, in combination with the
+stopsearchoperator, defines the ending position of
+the scan.  if null, the ending position of the scan
+is the last row of the conglomerate.
+@param stopsearchoperator an operator which defines
+how the stopkeyvalue is used to determine the scan stopping
+position. if stopsearchoperation is scancontroller.ge, the scan
+stops just before the first row which is greater than or
+equal to the stopkeyvalue.  if stopsearchoperation is
+scancontroller.gt, the scan stops just before the first row whose
+key is greater than	startkeyvalue.  the stopsearchoperation
+parameter is ignored if the stopkeyvalue parameter is null.
+@exception standardexception standard exception policy.
+**/
+public void reopenscan
+datavaluedescriptor   startkeyvalue
+int                     startsearchoperator
+qualifier               qualifier
+datavaluedescriptor   stopkeyvalue
+int                     stopsearchoperator
+throws standardexception
+{
+if (sanitymanager.debug)
+{
+if   open_conglom gethold
+{
+sanitymanager assert
+open_conglom isclosed
+}
+}
+// initialize scan position parameters at beginning of scan
+this scan_state
+open_conglom gethold   ? scan_init   scan_hold_init
+scan_position current_rh     null
+}
+/**
+@see scancontroller#replace
+**/
+public boolean replace
+datavaluedescriptor   row
+formatablebitset                 validcolumns
+throws standardexception
+{
+repositionscanforupateoper
+boolean ret_val
+scan_position current_page update
+scan_position current_rh  row  validcolumns
+scan_position unlatch
+return ret_val
+}
+/**
+returns true if the current position of the scan still qualifies
+under the set of qualifiers passed to the openscan().  when called
+this routine will reapply all qualifiers against the row currently
+positioned and return true if the row still qualifies.  if the row
+has been deleted or no longer passes the qualifiers then this routine
+will return false.
+this case can come about if the current scan
+or another scan on the same table in the same transaction
+deleted the row or changed columns referenced by the qualifier after
+the next() call which positioned the scan at this row.
+note that for comglomerates which don't support update, like btree's,
+there is no need to recheck the qualifiers.
+the results of a fetch() performed on a scan positioned on
+a deleted row are undefined.
+@exception standardexception standard exception policy.
+**/
+public boolean doescurrentpositionqualify
+throws standardexception
+{
+if  scan_state    scan_inprogress
+throw standardexception newexception
+sqlstate am_scan_not_positioned
+if   open_conglom latchpage scan_position
+{
+return false
+}
+datavaluedescriptor row
+open_conglom getruntimemem   get_scratch_row
+// if fetchfromslot returns null it either means the row is deleted,
+// or the qualifier evaluates to false.
+boolean ret_val
+scan_position current_page fetchfromslot
+scan_position current_rh
+scan_position current_slot
+row
+init_fetchdesc
+false     null
+scan_position unlatch
+return ret_val
+}
+/**
+fetch the row at the current position of the scan without applying the
+qualifiers.
+@see scancontroller#fetchwithoutqualify
+**/
+public void fetchwithoutqualify datavaluedescriptor row
+throws standardexception
+{
+fetch row  false
+}
+/**
+fetch the row at the current position of the scan.
+@see scancontroller#fetch
+**/
+public void fetch datavaluedescriptor row
+throws standardexception
+{
+fetch row  true
+}
+/**
+fetch the row at the current position of the scan.
+@param row the row into which the value of the current
+position in the scan is to be stored.
+@param qualify indicates whether the qualifiers should be applied.
+@exception standardexception standard exception policy.
+**/
+private void fetch datavaluedescriptor row  boolean qualify
+throws standardexception
+{
+if  scan_state    scan_inprogress
+throw standardexception newexception
+sqlstate am_scan_not_positioned
+if   open_conglom latchpage scan_position
+{
+throw standardexception newexception
+sqlstate am_record_not_found
+open_conglom getcontainer   getid
+new long scan_position current_rh getid
+}
+// resolve (mikem) - should this call apply the qualifiers again?
+recordhandle rh
+scan_position current_page fetchfromslot
+scan_position current_rh
+scan_position current_slot
+row
+qualify ? init_fetchdesc   null
+false
+scan_position unlatch
+if  rh    null
+{
+/*
+if (sanitymanager.debug)
+{
+if (iscurrentpositiondeleted())
+sanitymanager.throwassert(
+"the record (" +
+open_conglom.getcontainer().getid() +
+", " +
+scan_position.current_rh.getpagenumber() + ", " +
+scan_position.current_rh.getid() + ") " +
+"being fetched is marked deleted on page.:\n");
+}
+*/
+throw standardexception newexception
+sqlstate am_record_not_found
+open_conglom getcontainer   getid
+new long scan_position current_rh getid
+}
+return
+}
+/**
+fetch the location of the current position in the scan.
+@see scancontroller#fetchlocation
+@exception  standardexception  standard exception policy.
+**/
+public void fetchlocation rowlocation templatelocation
+throws standardexception
+{
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+}
+/**
+* return scaninfo object which describes performance of scan.
+* <p>
+* return scaninfo object which contains information about the current
+* scan.
+* <p>
+*
+* @see scaninfo
+*
+* @return the scaninfo object which contains info about current scan.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public scaninfo getscaninfo
+throws standardexception
+{
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+}
+/**
+returns true if the current position of the scan is at a
+deleted row.  this case can come about if the current scan
+or another scan on the same table in the same transaction
+deleted the row after the next() call which positioned the
+scan at this row.
+the results of a fetch() performed on a scan positioned on
+a deleted row are undefined.
+@exception standardexception standard exception policy.
+**/
+public boolean iscurrentpositiondeleted
+throws standardexception
+{
+if  scan_state    scan_inprogress
+throw standardexception newexception
+sqlstate am_scan_not_positioned
+if   open_conglom latchpage scan_position
+{
+return true
+}
+boolean ret_val
+scan_position current_page isdeletedatslot
+scan_position current_slot
+scan_position unlatch
+return ret_val
+}
+}

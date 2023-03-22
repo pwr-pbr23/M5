@@ -1,0 +1,1391 @@
+/*
+derby - class org.apache.derby.impl.services.cache.clock
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl services cache
+import org apache derby iapi services cache cachemanager
+import org apache derby iapi services cache cacheable
+import org apache derby iapi services cache cacheablefactory
+import org apache derby iapi services cache sizedcacheable
+import org apache derby iapi services context contextmanager
+import org apache derby iapi services daemon daemonservice
+import org apache derby iapi services daemon serviceable
+import org apache derby iapi error standardexception
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services cache classsize
+import org apache derby iapi util matchable
+import org apache derby iapi util operator
+import org apache derby iapi reference sqlstate
+import java util arraylist
+import java util hashtable
+import java util properties
+/**
+a cache manager that uses a hashtable and a arraylist. the arraylist holds
+cacheditem objects, each with a holder object. the hashtable is keyed
+by the identity of the holder object (cacheable.getidentity()) and
+the data portion is a pointer to the cacheditem. cacheditems that have
+holder objects with no identity do not have entries in the hashtable.
+<p>
+cacheditems can in various state.
+<ul>
+<li>isvalid - the entry has a valid identity
+<li>increate - the entry is being created or being faulted in from persistent store
+<li>inclean - the entry is being written out to persistent store
+<li>iskept - the entry is currently being looked at/updated, do not remove or
+clean it.
+</ol>
+<p>multithreading considerations:<br>
+a clock cache manager must be mt-safe.
+all member variables are accessed single threaded (synchronized on this) or
+set once or readonly. assumptions: holders size() and addelement must be
+synchronized.
+<br>
+cacheditem is never passed out of the clock cache manager, only the
+cacheable object is.  the cacheditem is responsible for the setting and
+clearing of its own member fields (resolve: now they are done in cache
+manager, need to be moved to the cacheditem).  the cache manager will
+following the following rules while accessing a cacheditem:
+<ul>
+<li>invalid item is never returned from the cache
+<li>setvalidstate and isvalid() is only called single threaded through the cache manager.
+<li>keep() and iskept() is only called single threaded through the cache
+manager once the item has been added to the holders array
+<li>item that iskept() won't be cleaned or removed or invalidated from the cache.
+<li>item that is inclean() or increate(), the cache manager
+will wait on the cacheditem to finish cleaning or creating before it
+returns the cached item outside of the cache.
+</ul>
+<br>
+the cacheable must be cleaned thru the cache if it is managed by a cache.
+on cacheitem, a inclean state is maintain to stablelize the content of the
+cacheable while it is being cleaned.  only unkept items are cleaned.  if an
+item is found to be inclean, it will wait until it exits the inclean state.
+if a cached item calls it own clean method without notifying the cache, it
+has to stablize its content for the duration of the clean.
+<br>
+it is assumed that the cacheable object maintain its own mt-safeness.<br>
+@see cacheditem
+@see cacheable
+*/
+final class clock extends hashtable implements cachemanager  serviceable
+/*
+** fields
+*/
+public final cachestat			stat
+private daemonservice		cleaner 	   the background worker thread who is going to
+// do pre-flush for this cache.
+private final arraylist		holders
+private int validitemcount   0
+private long			maximumsize
+private boolean usebytecount     regulate the total byte count or the entry count
+private long currentbytecount   0
+/* currentbytecount should be the sum of entry.getsize() for all entries in the cache.
+* that is, it should be the sum of getitemsize( item, false) for each item in the holders
+* vector.
+*/
+private static final int item_overhead   classsize estimatebasefromcatalog  cacheditem class
+classsize getrefsize      one ref per item in the holder arraylist
+classsize estimatehashentrysize
+private final cacheablefactory holderfactory
+private boolean		active 		   true if active for find create
+private string		name 		   name of the cache  mainly for debugging purposes
+private int			clockhand                 the sweep of the clock hand
+private	int			myclientnumber 	   use this number to talk to cleaner service
+private boolean	wokentoclean 	   true if the client was woken to clean  false if to shrink
+private boolean   cleanerrunning
+private boolean	  needservice
+/**
+construct a new clock cache manager.
+<p>mt - not needed for constructor.
+@param holderfactory the cacheable object class
+@param name the name of the cache
+@param initialsize the initial number of cachable object this cache
+holds.
+@param maximumsize the maximum size of the cache.  the cache may grow
+from initialsize to maximumsize if the cache policy notices that there
+is not enough free buffers availiable.  once the cache hits maximumsize
+it will not grow.  if the cache is full, an exception will be thrown
+*/
+clock cacheablefactory holderfactory
+string name
+int initialsize
+long maximumsize
+boolean usebytecount
+super initialsize   float  0 95
+this maximumsize   maximumsize
+this holderfactory   holderfactory
+this usebytecount   usebytecount
+if  sanitymanager debug
+if  sanitymanager debug_on clockfactory cachetrace
+sanitymanager debug clockfactory cachetrace      name       initialsize
+}
+}
+//int delta = initialsize / 2;
+//if (delta < 5)
+//	delta = 5;
+holders   new arraylist initialsize
+this name   name
+active   true
+this stat   new cachestat
+stat initialsize   initialsize
+stat maxsize   maximumsize
+}
+/**
+find the object or materialize one in the cache.  if it has not been
+created in the persistent store yet, return null.
+<p>mt - must be mt-safe.  the cache is single threaded through finding
+the item in cache and finding a free item if it is not in cache, thus
+preventing another thread from creating the same item while is is being
+faulted in.  (resolve - this is really low performance if the cache
+cleaner cannot keep a steady supply of free items and we have to do an
+i/o while blocking the cache).   if it needs to be faulted in, the
+increate bit is set.  the item is kept before it exits the sync block.
+<br>
+if the item is in cache but in the middle of being faulted in or
+cleaned, it needs to wait until this is done being before returning.
+<br>
+the keep status prevents other threads from removing this item.
+the increate status prevents other threads from looking at or writing
+out this item while it is being faulted in.
+(resolve: need to handle the case where the object is marked for
+removal and being waited on)
+@param key the key to the object
+@return a cacheable object that is kept in the cache.
+@exception standardexception cloudscape standard error policy
+*/
+public cacheable find object key  throws standardexception
+cacheditem item
+boolean		add
+/*
+** we will only loop if someone else tried to add the
+** same key as we did and they failed.  in this case
+** we start all over.  an example of this would be an
+** attempt to cache an object that failed due to a
+** transient error (e.g. deadlock), which should not
+** prevent another thread from trying to add the
+** key to the cache (e.g. it might be the one holding
+** the lock that caused the other thread to deadlock).
+*/
+while  true
+add   false
+synchronized (this) {
+if   active
+return null
+item    cacheditem  get key
+if  item    null
+item keepaftersearch
+stat findhit
+if  sanitymanager debug
+if  sanitymanager debug_on clockfactory cachetrace
+sanitymanager debug clockfactory cachetrace  name
+key       item
+}
+}
+}
+}
+// no entry was found, need to add one
+if  item    null
+// get a free item
+item   findfreeitem
+stat findmiss
+if  sanitymanager debug
+if  sanitymanager debug_on clockfactory cachetrace
+sanitymanager debug clockfactory cachetrace  name
+key       item
+}
+}
+if  sanitymanager debug
+sanitymanager assert item    null
+synchronized (this) {
+cacheditem incacheitem    cacheditem  get key
+if  incacheitem    null
+// some-one beat us to adding an item into the cache,
+// just use that one
+item unkeepforcreate
+item   incacheitem
+item keepaftersearch
+else
+// yes, we really are the ones to add it
+put key  item
+add   true
+if  sanitymanager debug
+if  sanitymanager debug_on
+if  size   >   11   maximumsize    10
+system out println     name       size
+}
+}
+}
+}
+}
+if  add
+if  sanitymanager debug
+if  sanitymanager debug_on clockfactory cachetrace
+sanitymanager debug clockfactory cachetrace  name
+key       item
+}
+}
+stat findfault
+return addentry item  key  false   object  null
+}
+cacheable entry   item use
+if  entry    null
+// item was not added by the other user successfully ...
+synchronized (this) {
+item unkeep
+}
+// try to hash the key again (see
+// comment at head of loop)
+continue
+}
+return entry
+}
+}
+/**
+find an object in the cache.  do not fault in or create the object if
+is is not found in the cache.
+<p>mt - must be mt-safe.  the cache is single threaded through finding
+the item in cache.  if it needs to wait for it to be faulted in or
+cleaned it is synchronized/waited on the cached item itself.
+@param key the key to the object
+@return a cacheable object that is kept in the cache.
+*/
+public cacheable findcached object key  throws standardexception
+cacheditem item
+synchronized (this) {
+if   active
+return null
+item    cacheditem  get key
+if  item    null
+stat findcachedmiss
+return null
+else
+stat findcachedhit
+item keepaftersearch
+}
+cacheable entry   item use
+if  entry    null
+// item was not added by the other user successfully ...
+synchronized (this) {
+item unkeep
+}
+}
+return entry
+}
+/**
+* mark a set of  entries as having been used. normally this is done as a side effect
+* of find() or findcached. entries that are no longer in the cache are ignored.
+*
+* @param keys the key of the used entry.
+*/
+public void setused  object keys
+cacheditem item
+for  int i   0  i < keys length
+// do not hold the synchronization lock for too long.
+synchronized  this
+if   active
+return
+int endidx   i   32
+if  endidx > keys length
+endidx   keys length
+for    i < endidx  i
+if  keys    null
+return
+item    cacheditem  get keys
+if  null    item
+item setused  true
+}
+}
+}
+end of setused
+/**
+create a new object with the said key.
+<p>mt - must be mt-safe.  single thread thru verifying no such item
+exist in cache and finding a free item, keep the item and set increate
+state.  the actual creating of the  object is done outside
+the sync block and is protected by the iskept and increate bits.
+@param key the key to the object
+@return a cacheable object that is kept in the cache.
+@exception standardexception cloudscape standard error policy
+*/
+public cacheable create object key  object createparameter  throws standardexception
+// assume the item is not already in the cache
+cacheditem item   findfreeitem
+stat create
+synchronized (this) {
+if   active
+return null
+if  get key     null
+item unkeepforcreate
+throw standardexception newexception sqlstate object_exists_in_cache  this name  key
+}
+put key  item
+if  sanitymanager debug
+if  sanitymanager debug_on
+if  size   >   11   maximumsize    10
+system out println     name       size
+}
+}
+}
+cacheable entry   addentry item  key  true  createparameter
+if  sanitymanager debug
+if  entry    null
+sanitymanager assert item getentry      entry
+}
+return entry
+}
+/**
+the caller is no longer looking at or updating the entry.  since there
+could be more than one piece of code looking at this entry, release
+does not mean nobody is looking at or updating the entry, just one
+less.  if the cacheable is marked for remove (someone is waiting to
+remove the persistent object once nobody is looking at it), then notify
+the waiter if this is the last one looking at it.
+<br>
+unless there is a good reason to do otherwise, release should be used
+to release a cachable and not directly call cacheditem unkeep, since
+unkeep does not handle the case of remove.
+<p>mt - must be mt-safe.  getting and deleteing item from the hashtable
+is in the same synchronized block.  if the cacheable object is waiting
+to be removed, that is synchronized thru the cacheditem itself
+(resolve: need to move this sync block to cacheditem instead)
+@param entry the cached entry
+*/
+public void release cacheable entry
+boolean removeitem
+cacheditem item
+long toshrink   0
+synchronized (this) {
+item    cacheditem  get entry getidentity
+if  sanitymanager debug
+sanitymanager assert item    null
+sanitymanager assert item getentry      entry
+sanitymanager assert item iskept
+}
+removeitem   item unkeep
+if  removeitem
+remove entry getidentity
+// we keep the item here to stop another thread trying to evict it
+// while we are destroying it.
+item keepforclean
+}
+if  cleaner    null
+// try to shrink the cache on a release
+toshrink   shrinksize  getcurrentsize
+}
+}
+if  removeitem
+item notifyremover
+}
+if  toshrink > 0
+performwork true    shrink only
+}
+protected void release cacheditem item
+boolean removeitem
+synchronized (this) {
+if  sanitymanager debug
+sanitymanager assert item iskept
+}
+removeitem   item unkeep
+if  removeitem
+remove item getentry   getidentity
+// we keep the item here to stop another thread trying to evict it
+// while we are destroying it.
+item keepforclean
+}
+}
+if  removeitem
+item notifyremover
+}
+}
+/**
+remove an object from the cache. the item will be placed into the noidentity
+state through clean() (if required) and clearidentity(). the removal of the
+object will be delayed until it is not kept by anyone.
+after this call the caller must throw away the reference to item.
+<p>mt - must be mt-safe.  single thread thru finding and setting the
+remove state of the item, the actual removal of the cacheable is
+synchronized on the cacheditem itself.
+@exception standardexception standard cloudscape error policy.
+*/
+public void remove cacheable entry  throws standardexception
+boolean removenow
+cacheditem item
+long origitemsize   0
+stat remove
+synchronized (this) {
+item    cacheditem  get entry getidentity
+if  sanitymanager debug
+sanitymanager assert item    null
+sanitymanager assert item getentry      entry
+sanitymanager assert item iskept
+}
+if  usebytecount
+origitemsize   getitemsize  item
+item setremovestate
+removenow   item unkeep
+if  removenow
+remove entry getidentity
+item keepforclean
+}
+}
+try
+// if removenow is false then this thread may sleep
+item remove removenow
+finally
+synchronized  this
+// in the case where this thread didn't call keepforclean() the thread
+// that woke us would have called keepforclean.
+item unkeep
+item setvalidstate false
+validitemcount
+item getentry   clearidentity
+if  usebytecount
+currentbytecount    getitemsize  item    origitemsize
+}
+}
+}
+/**
+clean all objects in the cache.
+*/
+public void cleanall   throws standardexception
+stat cleanall
+cleancache  matchable  null
+}
+/**
+clean all objects that match a partial key.
+*/
+public void clean matchable partialkey  throws standardexception
+cleancache partialkey
+}
+/**
+age as many objects as possible out of the cache.
+<br>mt - thread safe
+@see cachemanager#ageout
+*/
+public void ageout
+stat ageout
+synchronized (this) {
+int size = holders.size();
+long toshrink   shrinksize  getcurrentsize
+boolean shrunk   false
+for (int position = 0; position < size; position++) {
+cacheditem item = (cacheditem) holders.get(position);
+if  item iskept
+continue
+if   item isvalid
+continue
+if  item getentry   isdirty
+continue
+}
+long itemsize   removeidentity item
+if  toshrink > 0
+if  sanitymanager debug
+if  sanitymanager debug_on clockfactory cachetrace
+sanitymanager debug clockfactory cachetrace  name
+item       position
+}
+}
+toshrink    itemsize
+shrunk   true
+}
+end of for loop
+if  shrunk
+trimtosize
+out of sync block
+end of ageout
+/**
+mt - synchronization provided by caller
+@exception standardexception standard cloudscape error policy.
+*/
+public void shutdown   throws standardexception
+if  cleaner    null
+cleaner unsubscribe myclientnumber
+cleaner   null
+}
+synchronized (this) {
+active   false
+}
+ageout
+cleanall
+ageout
+}
+/**
+mt - synchronization provided by caller
+can use this daemomn service if needed
+*/
+public void usedaemonservice daemonservice daemon
+// if we were using another cleaner, unsubscribe first
+if  cleaner    null
+cleaner unsubscribe myclientnumber
+cleaner   daemon
+myclientnumber   cleaner subscribe this  true    ondemandonly
+}
+/**
+discard all objects that match the partial key.
+<br>mt - thread safe
+*/
+public boolean discard matchable partialkey
+// we miss something because it was kept
+boolean nomisses   true
+synchronized (this) {
+int size = holders.size();
+long toshrink   shrinksize  getcurrentsize
+boolean shrunk   false
+for (int position = 0; position < size; position++) {
+cacheditem item = (cacheditem) holders.get(position);
+if   item isvalid
+continue
+object key   item getentry   getidentity
+if  partialkey    null     partialkey match key
+continue
+if  item iskept
+nomisses   false
+continue
+}
+long itemsize   removeidentity item
+if  toshrink > 0
+if  sanitymanager debug
+if  sanitymanager debug_on clockfactory cachetrace
+sanitymanager debug clockfactory cachetrace  name
+item       position
+}
+}
+// and we shrunk one item
+toshrink    itemsize
+shrunk   true
+}
+}
+if  shrunk
+trimtosize
+}
+return nomisses
+}
+/**
+add a new cacheditem and a holder object to the cache. the holder object
+is returned kept.
+<p>mt - need to be mt-safe.  the insertion of the key into the hash
+table is synchronized on this.
+*/
+private cacheable addentry cacheditem item  object key  boolean forcreate  object createparameter
+throws standardexception
+cacheable entry   null
+long origentrysize   0
+if  usebytecount
+origentrysize   getitemsize  item
+try
+if  sanitymanager debug
+if  sanitymanager debug_on clockfactory cachetrace
+sanitymanager debug clockfactory cachetrace  name
+item       key
+}
+}
+// tell the object it needs to create itself
+entry   item takeonidentity this  holderfactory  key  forcreate  createparameter
+}
+finally
+boolean	notifywaiters
+synchronized (this) {
+object removed   remove key
+if  sanitymanager debug
+sanitymanager assert removed    item
+}
+if  entry    null
+// put the actual key into the hash table, not the one that was passed in
+// for the find or create. this is because the caller may re-use the key
+// for another cache operation, which would corrupt our hashtable
+put entry getidentity    item
+if  usebytecount
+currentbytecount      sizedcacheable  entry  getsize     origentrysize
+item setvalidstate true
+validitemcount
+notifywaiters   true
+else
+item unkeep
+notifywaiters   item iskept
+}
+}
+// whatever the outcome, we have to notify waiters ...
+if  notifywaiters
+item settingidentitycomplete
+}
+return entry
+}
+protected cacheditem findfreeitem   throws standardexception
+// need to avoid thrashing the cache when we start out
+// so if the cache is smaller than its maximum size
+// then that's a good indication we should grow.
+long currentsize   getcurrentsize
+if  currentsize >  maximumsize
+// look at 20%
+cacheditem item   rotateclock 0 2f
+if  item    null
+return item
+}
+// however, if the cache contains a large number of invalid
+// items then we should see if we can avoid growing.
+// this avoids simple use of cloudscape looking like
+// a memory leak, as the page cache fills the holders array
+// with page objects including the 4k (or 32k) pages.
+// size() is the number of valid entries in the hash table
+// no need to sync on getting the sizes since if they are
+// wrong we will discover it in the loop.
+if  validitemcount < holders size
+synchronized (this) {
+// 1) find out how many invalid items there are in the
+//    cache
+// 2) search for a free invalid item
+// 3) stop searching when there are no more invalid
+//    items to find
+int invaliditems   holders size     validitemcount
+// invalid items might occur in the cache when
+//   a) a new item is created in growcache(), but it
+//      is not in use yet, or
+//   b) an item is deleted (usually when a table is
+//      dropped)
+// it is critical to break out of the loop as soon as
+// possible since we are blocking others trying to
+// access the page cache. new items are added to the
+// end of the page cache, so the search for invalid
+// items should start from the end.
+for  int i   holders size     1   invaliditems > 0      i >  0    i
+cacheditem item    cacheditem  holders get i
+if  item iskept
+if   item isvalid    invaliditems
+continue
+}
+// found a free item, just use it
+if   item isvalid
+item keepforcreate
+return item
+}
+}
+}
+}
+return growcache
+}
+/**
+go through the list of holder objects and find a free one.
+<p>mt - must be mt-safe.  the moving of the clockhand and finding of an
+eviction candidate is synchronized.  the cleaning of the cachable is
+handled by the cacheable itself.
+*/
+protected cacheditem rotateclock float percentofclock  throws standardexception
+// statistics -- only used in debug
+int evictions   0
+int cleaned   0
+int resetused   0
+int iskept   0
+// when we are managing the entry count (usebytecount == false) this method just
+// has to find or manufacture an available item (a cache slot). when we are managing
+// the total byte count then this method must find both available space and an
+// available item.
+cacheditem availableitem   null
+boolean kickcleaner   false
+try
+// this can be approximate
+int itemcount   holders size
+int itemstocheck
+if  itemcount < 20
+itemstocheck   2   itemcount
+else
+itemstocheck    int     float  itemcount    percentofclock
+// if we can grow then shrinking is ok too, if we can't grow
+// then shrinking the cache won't help us find an item.
+long toshrink   shrinksize getcurrentsize
+restartclock
+for    itemstocheck > 0
+cacheditem item   null
+synchronized (this) {
+if  sanitymanager debug
+if  sanitymanager debug_on clockfactory cachetrace
+sanitymanager debug clockfactory cachetrace  name
+clockhand       itemstocheck
+}
+}
+// size of holders cannot change while in the synchronized block.
+int size = holders.size();
+for    itemstocheck > 0  item   null  itemstocheck    incrclockhand
+//
+// this uses a very simple clock algorithm.
+//
+// the cache consist of a circular list of cacheditems.  each cached item
+// has a 'recentlyused' bit which is set every time that item is kept.
+// each clock cache manager keeps a global variable clockhand which
+// refers to the item that is most recently replaced.
+//
+// to find a free item, the clock hand moves to the next cached item.
+// if it is kept, or in the middle of being created, the clock hand
+// moves on.
+// if it is recentlyused, clear the recently used bit and moves on.
+// if it is not recentlyused, clean the item and use
+//
+// if all the cached item is kept, then create a new entry.
+// so it is possible, although very unlikely,  that, in time, the cache
+// will grow beyond the maximum size.
+if  clockhand >  size
+if  size    0
+break
+clockhand   0
+}
+item    cacheditem  holders get clockhand
+if  item iskept
+if  sanitymanager debug     stats only in debug mode
+iskept
+continue
+}
+if   item isvalid       found a free item  just use it
+if  null    availableitem
+// we have found an available item, now we are looking for bytes
+continue
+if  sanitymanager debug
+if  sanitymanager debug_on clockfactory cachetrace
+sanitymanager debug clockfactory cachetrace
+name       clockhand       item
+}
+}
+item keepforcreate
+if  usebytecount    getcurrentsize   > maximumsize
+availableitem   item
+// now look for bytes.
+continue
+}
+// since we are using this item, move the clock past it.
+incrclockhand
+return item
+}
+if  item recentlyused
+if  sanitymanager debug     stats only in debug mode
+resetused
+item setused false
+continue
+}
+if  toshrink > 0
+if   cleanerrunning
+// try an get the cleaner to shrink the cache
+kickcleaner   true
+cleanerrunning   true
+needservice   true
+}
+}
+// we are seeing valid, not recently used buffers. evict this.
+if  sanitymanager debug
+evictions
+if  sanitymanager debug_on clockfactory cachetrace
+sanitymanager debug clockfactory cachetrace
+name
+clockhand       item
+}
+}
+if   item getentry   isdirty
+if  sanitymanager debug
+if  sanitymanager debug_on clockfactory cachetrace
+sanitymanager debug clockfactory cachetrace
+name
+item
+}
+}
+// a valid, unkept, clean item, clear its identity
+// and use it.
+long itemsize   removeidentity item
+if  usebytecount
+toshrink    itemsize
+if  getcurrentsize   > maximumsize    0 < toshrink
+if  null    availableitem
+item keepforcreate
+availableitem   item
+}
+continue
+}
+}
+// since we are using it move the clock past it
+incrclockhand
+if  null    availableitem
+return availableitem
+// item is kept but not valid when returned
+item keepforcreate
+return item
+}
+// item is valid, unkept, and dirty. clean it.
+if   cleaner    null      cleanerrunning
+kickcleaner   true
+wokentoclean   true
+cleanerrunning   true     at least it soon will be
+}
+item keepforclean
+// leave the clock hand where it is so that we will pick it
+// up if no-one else uses the cache. other hunters will
+// skip over it as it is kept, and thus move the clock
+// hand past it.
+break
+}
+if  item    null
+return availableitem
+}
+out of synchronized block
+// clean the entry outside of a sync block
+try
+if   sanitymanager debug
+if  sanitymanager debug_on clockfactory cachetrace
+sanitymanager debug clockfactory cachetrace name       item
+}
+}
+item clean false
+if  sanitymanager debug     stats only in debug mode
+cleaned
+}
+}
+finally
+release item
+item   null
+}
+// at this point the item we cleaned could be in any state
+// so we can't just re-use it. continue searching
+continue restartclock
+}
+return availableitem
+finally
+if  sanitymanager debug
+// report statistics
+if
+sanitymanager debug_on clockfactory cachetrace
+sanitymanager debug clockfactory cachetrace  name       evictions
+cleaned
+resetused
+iskept
+holders size
+}
+if  kickcleaner     cleaner    null
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace  name       myclientnumber
+}
+}
+cleaner servicenow myclientnumber
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace  name   thread currentthread   getname
+}
+}
+}
+}
+end of rotateclock
+/**
+synchronously increment clock hand position
+*/
+private int incrclockhand
+if    clockhand >  holders size
+clockhand   0
+return clockhand
+}
+/*
+* serviceable methods
+*/
+public int performwork contextmanager contextmgr    ignored
+int ret   performwork false
+synchronized (this) {
+cleanerrunning   false
+}
+return ret
+}
+/**
+<p>mt - read only.
+*/
+public boolean serviceasap
+return needservice
+}
+// @return true, if this work needs to be done on a user thread immediately
+public boolean serviceimmediately
+return false
+}
+public synchronized int getnumberinuse
+int size = holders.size();
+int inuse = 0;
+for (int position = 0; position < size; position++) {
+cacheditem item = (cacheditem) holders.get(position);
+if  item isvalid
+inuse++;
+}
+}
+return inuse;
+}
+/*
+public int getnumberkept() {
+synchronized (this) {
+int size = holders.size();
+int inuse = 0;
+for (int position = 0; position < size; position++) {
+cacheditem item = (cacheditem) holders.get(position);
+if (item.isvalid() && item.iskept()) {
+inuse++;
+}
+}
+return inuse;
+}
+}
+*/
+/**
+grow the cache and return a unused, kept item.
+@exception standardexception thrown if the cache cannot be grown.
+*/
+private cacheditem growcache
+cacheditem item   new cacheditem
+item keepforcreate
+// if we run out of memory below here we don't
+// know what state the holders could be in
+// so don't trap it
+synchronized (this) {
+holders add item
+// do not adjust currentbytecount until we put the entry into the cacheditem.
+}
+return item
+}
+/**
+clear an item's identity. item must be
+unkept and valid. this is called for
+dirty items from the discard code.
+caller must hold the cache synchronization.
+@return the amount by which this shrinks the cache.
+*/
+protected long removeidentity cacheditem item
+long shrink   1
+if  sanitymanager debug
+sanitymanager assert  item iskept
+sanitymanager assert item isvalid
+}
+if  usebytecount
+shrink     sizedcacheable  item getentry    getsize
+remove item getentry   getidentity
+item setvalidstate false
+validitemcount
+item getentry   clearidentity
+if  usebytecount
+shrink      sizedcacheable  item getentry    getsize
+currentbytecount    shrink
+}
+return shrink
+}
+/**
+write out all dirty buffers.
+<p>mt - must be mt safe.
+single thread on the part that finds the next dirty buffer to write
+out, the synchronization of cleaning of the individual cachable is
+provided by the cacheable itself.
+*/
+protected void cleancache matchable partialkey  throws standardexception
+int position
+synchronized this
+// this is at many dirty buffers as the cleaner is ever going to
+// see
+position   holders size     1
+}
+outerscan
+for
+cacheditem item   null
+synchronized (this) {
+// the cache may have shrunk by quite a bit since we last came
+// in here
+int size = holders.size();
+if  position >  size
+position   size   1
+innerscan
+// go from position (the last cached item in the holder array
+// to 0 (the first).  otherwise, if we go from 0 to
+// position, some other thread may come in and shrink items
+// which are between 0 and position.  since a shrink moves all
+// items up, we may skip some items without cleaning.
+for      position >  0  position    item   null
+item    cacheditem  holders get position
+if   item isvalid
+continue innerscan
+if   item getentry   isdirty
+continue innerscan
+if  partialkey    null
+object key   item getentry   getidentity
+if   partialkey match key
+continue
+}
+item keepforclean
+break innerscan
+}
+end of synchronized block
+if  position < 0
+return
+}
+try
+item clean false
+finally
+release item
+}
+position
+for
+}
+protected long shrinksize long currentsize
+long maxsize   getmaximumsize
+long toshrink   currentsize   maxsize
+if  toshrink <  0
+return 0
+// only shrink 10% of the maximum size
+long shrinklimit   maxsize   10
+if  shrinklimit    0
+shrinklimit   2
+if  toshrink < shrinklimit
+return toshrink
+else
+return shrinklimit
+}
+/**
+the background cleaner tries to make sure that there are serveral
+cleaned or invalied buffers ahead of the clock hand so that when they
+are evicted, they don't need to be cleaned.
+the way this routine work is as follows, starting at the current clock
+hand position, go forward around the cache buffers, moving the same
+route that the clock hand moves.  it keep tracks of the number of
+invalid or not recently used buffers it sees along the way.  if it sees
+a not recently used buffer, it will clean it.  after it has seen n
+invalid or not recently used buffers, or it has gone around and visited
+all buffers in the cache, it finished.
+it does not clean recently used buffers.
+<p>mt - must be mt-safe.  it takes a snapshot of the current clock hand
+position (a synchronous call).  getting and looking at the next
+serveral cached item is synchronized on this (resolve: probably doesn't
+need to be).  cleaning of the cacheable is handle by the cacheable itself.
+*/
+protected int performwork boolean shrinkonly
+long target
+long toshrink
+int maxlooks
+synchronized this
+if   active
+needservice   false
+return serviceable done
+}
+else
+long currentsize   getcurrentsize
+target   currentsize   20      attempt to get 5% of the cache clean
+toshrink   wokentoclean ? 0   shrinksize currentsize
+}
+if  target    0
+wokentoclean   false
+needservice   false
+return serviceable done
+}
+if   wokentoclean     toshrink <  0
+needservice   false
+return serviceable done
+}
+maxlooks   usebytecount ?  holders size   10     int   target   2
+}
+// try to clean the next n (target) cached item,
+long clean   0
+int cleaned   0     only used in debug
+cacheditem item   null
+int currentposition   0
+string threadname   null
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+threadname   thread currentthread   getname
+sanitymanager debug daemonservice daemontrace  threadname       name       myclientnumber
+}
+}
+synchronized this
+int itemcount   holders size
+currentposition   clockhand
+// see if the cache needs to shrink
+boolean shrunk   false
+long currentsize   getcurrentsize
+for    shrinkonly ?  currentsize > maximumsize    toshrink > 0     clean < target   item   null
+if    currentposition >  itemcount
+if  itemcount    0
+break
+currentposition   0
+}
+if  maxlooks   <  0
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace  threadname       name
+}
+}
+break 			   done one round
+}
+item    cacheditem  holders get currentposition
+if  item iskept
+continue
+if   item isvalid
+if  toshrink > 0
+if  sanitymanager debug
+if  sanitymanager debug_on clockfactory cachetrace
+sanitymanager debug clockfactory cachetrace  name
+item       currentposition
+}
+}
+toshrink    currentsize
+holders remove currentposition
+if  usebytecount
+currentbytecount    getitemsize  item
+currentsize   getcurrentsize
+toshrink    currentsize
+itemcount
+// account for the fact all the items have shifted down
+currentposition
+shrunk   true
+}
+continue
+}
+if  item recentlyused
+continue
+// found a valid, not kept, and not recently used item
+// this item will be cleaned
+int itemsize   getitemsize  item
+clean    itemsize
+if   item getentry   isdirty
+if  toshrink > 0
+if  sanitymanager debug
+if  sanitymanager debug_on clockfactory cachetrace
+sanitymanager debug clockfactory cachetrace  name
+item       currentposition
+}
+}
+toshrink    currentsize
+removeidentity item
+holders remove currentposition
+if  usebytecount
+currentbytecount    getitemsize  item
+currentsize   getcurrentsize
+toshrink    currentsize
+itemcount
+shrunk   true
+// account for the fact all the items have shifted down
+currentposition
+}
+continue
+}
+if  shrinkonly
+continue
+// found one that needs cleaning, keep it to clean
+item keepforclean
+break
+end of for loop
+if  shrunk
+trimtosize
+if  item    null
+wokentoclean   false
+needservice   false
+return serviceable done
+}
+end of sync block
+try
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace  threadname       name
+}
+}
+item clean false
+if  sanitymanager debug     only need stats for debug
+cleaned
+catch  standardexception se
+// resolve - should probably throw the error into the log.
+}
+finally
+release item
+item   null
+}
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace  threadname       clean
+cleaned       name
+}
+}
+needservice   true
+return serviceable requeue     return is actually ignored
+end of performwork
+private int getitemsize  cacheditem item
+if    usebytecount
+return 1
+sizedcacheable entry    sizedcacheable  item getentry
+if  null    entry
+return 0
+return entry getsize
+end of getitemsize
+/**
+return statistics about cache that may be implemented.
+**/
+public synchronized long getcachestats
+stat currentsize   getcurrentsize
+return stat getstats
+}
+/**
+reset the statistics to 0.
+**/
+public void resetcachestats
+stat reset
+}
+/**
+* @return the current maximum size of the cache.
+*/
+public synchronized long getmaximumsize
+return maximumsize
+}
+/**
+* change the maximum size of the cache. if the size is decreased then cache entries
+* will be thrown out.
+*
+* @param newsize the new maximum cache size
+*
+* @exception standardexception cloudscape standard error policy
+*/
+public void resize  long newsize  throws standardexception
+boolean shrink
+synchronized  this
+maximumsize   newsize
+stat maxsize   maximumsize
+shrink     shrinksize  getcurrentsize    > 0
+}
+if  shrink
+performwork true    shrink only
+/* performwork does not remove recently used entries nor does it mark them as
+* not recently used. therefore if the cache has not shrunk enough we will call rotateclock
+* to free up some entries.
+*/
+if  shrinksize  getcurrentsize    > 0
+cacheditem freeitem   rotateclock   float  2 0
+/* rotateclock(2.0) means that the clock will rotate through the cache as much as
+* twice.  if it does not find sufficient unused items the first time through it
+* will almost certainly find enough of them the second time through, because it
+* marked all the items as not recently used in the first pass.
+*
+* if the cache is very heavily used by other threads then a lot of the items marked as
+* unused in the first pass may be used before rotateclock passes over them again. in this
+* unlikely case rotateclock( 2.0) may not be able to clear out enough space to bring the
+* current size down to the maximum. however the cache size should come down as rotateclock
+* is called in the normal course of operation.
+*/
+if  freeitem    null
+freeitem unkeepforcreate
+}
+}
+end of resize
+private synchronized long getcurrentsize
+if    usebytecount
+return holders size
+return currentbytecount   holders size   item_overhead
+}
+/**
+* perform an operation on (approximately) all entries that matches the filter,
+* or all entries if the filter is null.  entries that are added while the
+* cache is being scanned might or might not be missed.
+*
+* @param filter
+* @param operator
+*/
+public void scan  matchable filter  operator operator
+int itemcount   1
+cacheable entry   null
+cacheditem item   null
+// do not call the operator while holding the synchronization lock.
+// however we cannot access an item's links without holding the synchronization lock,
+// nor can we assume that an item is still in the cache unless we hold the synchronization
+// lock or the item is marked as kept.
+for  int position   0   position
+synchronized  this
+if  null    item
+release  item
+item   null
+}
+for    position < holders size    position
+item    cacheditem  holders get  position
+if  null    item
+try
+entry   item use
+}
+catch  standardexception se
+continue
+}
+if  null    entry     null    filter    filter match  entry
+item keepforclean
+break
+}
+}
+}
+if  position >  holders size
+return
+end of synchronization
+operator operate  entry
+// do not release the item until we have re-acquired the synchronization lock.
+// otherwise the item may be removed and its next link invalidated.
+}
+end of scan
+private int trimrequests   0
+/* trim out invalid items from holders if there are a lot of them. this is expensive if
+* holders is large.
+* the caller must hold the cache synchronization lock.
+*/
+private void trimtosize
+int size = holders.size();
+// trimming is expensive, don't do it often.
+trimrequests
+if  trimrequests < size 8
+return
+trimrequests   0
+// move invalid items to the end.
+int endposition   size   1
+int invalidcount   0
+for  int i   0  i <  endposition  i
+cacheditem item    cacheditem  holders get i
+if  item iskept
+continue
+if  item isvalid
+continue
+invalidcount
+// swap with an item later in the list
+// try to keep free items at the end of the holders array.
+for    endposition > i  endposition
+cacheditem last    cacheditem  holders get endposition
+if  last isvalid
+holders set i  last
+holders set endposition  item
+endposition
+break
+}
+}
+}
+// small cache - don't shrink.
+if  size < 32
+return
+// now decide if we need to shrink the holder array or not.
+int validitems   size   invalidcount
+// over 75% entries used, don't shrink.
+if  validitems >   3   size    4
+return
+// keep 10% new items.
+int newsize   validitems    validitems   10
+if  newsize >  size
+return
+// remove items, starting at the end,  where
+// hopefully most of the free items are.
+for  int r   size   1  r > newsize  r
+cacheditem remove    cacheditem  holders get r
+if  remove iskept      remove isvalid
+continue
+}
+if  usebytecount
+currentbytecount    getitemsize remove
+}
+holders remove r
+}
+holders trimtosize
+// move the clock hand to the start of the invalid items.
+clockhand   validitems   1
+end of trimtosize
+}

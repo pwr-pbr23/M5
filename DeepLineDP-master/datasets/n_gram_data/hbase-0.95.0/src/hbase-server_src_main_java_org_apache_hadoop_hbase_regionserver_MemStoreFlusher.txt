@@ -1,0 +1,491 @@
+/**
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver
+import java io ioexception
+import java lang thread uncaughtexceptionhandler
+import java lang management managementfactory
+import java util concurrentmodificationexception
+import java util hashmap
+import java util hashset
+import java util map
+import java util set
+import java util sortedmap
+import java util concurrent blockingqueue
+import java util concurrent delayqueue
+import java util concurrent delayed
+import java util concurrent threadfactory
+import java util concurrent timeunit
+import java util concurrent atomic atomicboolean
+import java util concurrent locks reentrantreadwritelock
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop hbase exceptions droppedsnapshotexception
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase remoteexceptionhandler
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util environmentedgemanager
+import org apache hadoop hbase util hasthread
+import org apache hadoop hbase util threads
+import org apache hadoop util stringutils
+import org cliffc high_scale_lib counter
+import com google common base preconditions
+/**
+* thread that flushes cache on request
+*
+* note: this class extends thread rather than chore because the sleep time
+* can be interrupted when there is something to do, rather than the chore
+* sleep time which is invariant.
+*
+* @see flushrequester
+*/
+@interfaceaudience private
+class memstoreflusher implements flushrequester
+static final log log   logfactory getlog memstoreflusher class
+// these two data members go together.  any entry in the one must have
+// a corresponding entry in the other.
+private final blockingqueue<flushqueueentry> flushqueue
+new delayqueue<flushqueueentry>
+private final map<hregion  flushregionentry> regionsinqueue
+new hashmap<hregion  flushregionentry>
+private atomicboolean wakeuppending   new atomicboolean
+private final long threadwakefrequency
+private final hregionserver server
+private final reentrantreadwritelock lock   new reentrantreadwritelock
+private final object blocksignal   new object
+protected final long globalmemstorelimit
+protected final long globalmemstorelimitlowmark
+static final float default_upper   0 4f
+private static final float default_lower   0 35f
+static final string upper_key
+private static final string lower_key
+private long blockingwaittime
+private final counter updatesblockedmshighwater   new counter
+private final flushhandler flushhandlers
+/**
+* @param conf
+* @param server
+*/
+public memstoreflusher final configuration conf
+final hregionserver server
+super
+this server   server
+this threadwakefrequency
+conf getlong hconstants thread_wake_frequency  10   1000
+long max   managementfactory getmemorymxbean   getheapmemoryusage   getmax
+this globalmemstorelimit   globalmemstorelimit max  default_upper
+upper_key  conf
+long lower   globalmemstorelimit max  default_lower  lower_key  conf
+if  lower > this globalmemstorelimit
+lower   this globalmemstorelimit
+log info
+lower_key       upper_key
+this globalmemstorelimitlowmark   lower
+this blockingwaittime   conf getint
+90000
+int handlercount   conf getint    1
+this flushhandlers   new flushhandler
+log info
+stringutils humanreadableint this globalmemstorelimit
+stringutils humanreadableint this globalmemstorelimitlowmark
+stringutils humanreadableint max
+/**
+* calculate size using passed <code>key</code> for configured
+* percentage of <code>max</code>.
+* @param max
+* @param defaultlimit
+* @param key
+* @param c
+* @return limit.
+*/
+static long globalmemstorelimit final long max
+final float defaultlimit  final string key  final configuration c
+float limit   c getfloat key  defaultlimit
+return getmemstorelimit max  limit  defaultlimit
+static long getmemstorelimit final long max  final float limit
+final float defaultlimit
+float effectivelimit   limit
+if  limit >  0 9f    limit < 0 1f
+log warn     defaultlimit
+effectivelimit   defaultlimit
+return  long  max   effectivelimit
+public counter getupdatesblockedmshighwater
+return this updatesblockedmshighwater
+/**
+* the memstore across all regions has exceeded the low water mark. pick
+* one region to flush and flush it synchronously (this is called from the
+* flush thread)
+* @return true if successful
+*/
+private boolean flushoneforglobalpressure
+sortedmap<long  hregion> regionsbysize
+server getcopyofonlineregionssortedbysize
+set<hregion> excludedregions   new hashset<hregion>
+boolean flushedone   false
+while   flushedone
+// find the biggest region that doesn't have too many storefiles
+// (might be null!)
+hregion bestflushableregion   getbiggestmemstoreregion
+regionsbysize  excludedregions  true
+// find the biggest region, total, even if it might have too many flushes.
+hregion bestanyregion   getbiggestmemstoreregion
+regionsbysize  excludedregions  false
+if  bestanyregion    null
+log error
+return false
+hregion regiontoflush
+if  bestflushableregion    null
+bestanyregion memstoresize get   > 2   bestflushableregion memstoresize get
+// even if it's not supposed to be flushed, pick a region if it's more than twice
+// as big as the best flushable one - otherwise when we're under pressure we make
+// lots of little flushes and cause lots of compactions, etc, which just makes
+// life worse!
+if  log isdebugenabled
+log debug
+bestanyregion getregionnameasstring
+stringutils humanreadableint bestanyregion memstoresize get
+stringutils humanreadableint bestflushableregion memstoresize get
+regiontoflush   bestanyregion
+else
+if  bestflushableregion    null
+regiontoflush   bestanyregion
+else
+regiontoflush   bestflushableregion
+preconditions checkstate regiontoflush memstoresize get   > 0
+log info     regiontoflush
+flushedone   flushregion regiontoflush  true
+if   flushedone
+log info     regiontoflush
+excludedregions add regiontoflush
+return true
+private class flushhandler extends hasthread
+@override
+public void run
+while   server isstopped
+flushqueueentry fqe   null
+try
+wakeuppending set false      allow someone to wake us up again
+fqe   flushqueue poll threadwakefrequency  timeunit milliseconds
+if  fqe    null    fqe instanceof wakeupflushthread
+if  isabovelowwatermark
+log debug
+stringutils humanreadableint globalmemstorelimitlowmark
+if   flushoneforglobalpressure
+// wasn't able to flush any region, but we're above low water mark
+// this is unlikely to happen, but might happen when closing the
+// entire server - another thread is flushing regions. we'll just
+// sleep a little bit to avoid spinning, and then pretend that
+// we flushed one, so anyone blocked will check again
+thread sleep 1000
+wakeupifblocking
+// enqueue another one of these tokens so we'll wake up again
+wakeupflushthread
+continue
+flushregionentry fre    flushregionentry  fqe
+if   flushregion fre
+break
+catch  interruptedexception ex
+continue
+catch  concurrentmodificationexception ex
+continue
+catch  exception ex
+log error     fqe  ex
+if   server checkfilesystem
+break
+synchronized  regionsinqueue
+regionsinqueue clear
+flushqueue clear
+// signal anyone waiting, so they see the close flag
+wakeupifblocking
+log info getname
+private void wakeupflushthread
+if  wakeuppending compareandset false  true
+flushqueue add new wakeupflushthread
+private hregion getbiggestmemstoreregion
+sortedmap<long  hregion> regionsbysize
+set<hregion> excludedregions
+boolean checkstorefilecount
+synchronized  regionsinqueue
+for  hregion region   regionsbysize values
+if  excludedregions contains region
+continue
+if  region writestate flushing     region writestate writesenabled
+continue
+if  checkstorefilecount    istoomanystorefiles region
+continue
+return region
+return null
+/**
+* return true if global memory usage is above the high watermark
+*/
+private boolean isabovehighwatermark
+return server getregionserveraccounting
+getglobalmemstoresize   >  globalmemstorelimit
+/**
+* return true if we're above the high watermark
+*/
+private boolean isabovelowwatermark
+return server getregionserveraccounting
+getglobalmemstoresize   >  globalmemstorelimitlowmark
+public void requestflush hregion r
+synchronized  regionsinqueue
+if   regionsinqueue containskey r
+// this entry has no delay so it will be added at the top of the flush
+// queue.  it'll come out near immediately.
+flushregionentry fqe   new flushregionentry r
+this regionsinqueue put r  fqe
+this flushqueue add fqe
+public int getflushqueuesize
+return flushqueue size
+/**
+* only interrupt once it's done with a run through the work loop.
+*/
+void interruptifnecessary
+lock writelock   lock
+try
+for  flushhandler flushhander   flushhandlers
+if  flushhander    null  flushhander interrupt
+finally
+lock writelock   unlock
+synchronized void start uncaughtexceptionhandler eh
+threadfactory flusherthreadfactory   threads newdaemonthreadfactory
+server getservername   tostring        eh
+for  int i   0  i < flushhandlers length  i
+flushhandlers   new flushhandler
+flusherthreadfactory newthread flushhandlers
+flushhandlers start
+boolean isalive
+for  flushhandler flushhander   flushhandlers
+if  flushhander    null    flushhander isalive
+return true
+return false
+void join
+for  flushhandler flushhander   flushhandlers
+if  flushhander    null
+threads shutdown flushhander getthread
+/*
+* a flushregion that checks store file count.  if too many, puts the flush
+* on delay queue to retry later.
+* @param fqe
+* @return true if the region was successfully flushed, false otherwise. if
+* false, there will be accompanying log messages explaining why the log was
+* not flushed.
+*/
+private boolean flushregion final flushregionentry fqe
+hregion region   fqe region
+if   region getregioninfo   ismetaregion
+istoomanystorefiles region
+if  fqe ismaximumwait this blockingwaittime
+log info      system currenttimemillis     fqe createtime
+region getregionnameasstring
+else
+// if this is first time we've been put off, then emit a log message.
+if  fqe getrequeuecount   <  0
+// note: we don't impose blockingstorefiles constraint on meta regions
+log warn     region getregionnameasstring
+this blockingwaittime
+if   this server compactsplitthread requestsplit region
+try
+this server compactsplitthread requestcompaction region  thread
+currentthread   getname
+catch  ioexception e
+log error
+bytes tostringbinary region getregionname
+remoteexceptionhandler checkioexception e
+// put back on the queue.  have it come back out of the queue
+// after a delay of this.blockingwaittime / 100 ms.
+this flushqueue add fqe requeue this blockingwaittime   100
+// tell a lie, it's not flushed but it's ok
+return true
+return flushregion region  false
+/*
+* flush a region.
+* @param region region to flush.
+* @param emergencyflush set if we are being force flushed. if true the region
+* needs to be removed from the flush queue. if false, when we were called
+* from the main flusher run loop and we got the entry to flush by calling
+* poll on the flush queue (which removed it).
+*
+* @return true if the region was successfully flushed, false otherwise. if
+* false, there will be accompanying log messages explaining why the log was
+* not flushed.
+*/
+private boolean flushregion final hregion region  final boolean emergencyflush
+synchronized  this regionsinqueue
+flushregionentry fqe   this regionsinqueue remove region
+if  fqe    null    emergencyflush
+// need to remove from region from delay queue.  when not an
+// emergencyflush, then item was removed via a flushqueue.poll.
+flushqueue remove fqe
+lock readlock   lock
+try
+boolean shouldcompact   region flushcache
+// we just want to check the size
+boolean shouldsplit   region checksplit      null
+if  shouldsplit
+this server compactsplitthread requestsplit region
+else if  shouldcompact
+server compactsplitthread requestcompaction region  thread currentthread   getname
+catch  droppedsnapshotexception ex
+// cache flush can fail in a few places. if it fails in a critical
+// section, we get a droppedsnapshotexception and a replay of hlog
+// is required. currently the only way to do this is a restart of
+// the server. abort because hdfs is probably bad (hbase-644 is a case
+// where hdfs was bad but passed the hdfs check).
+server abort    ex
+return false
+catch  ioexception ex
+log error
+region    null ?      bytes tostringbinary region getregionname
+remoteexceptionhandler checkioexception ex
+if   server checkfilesystem
+return false
+finally
+lock readlock   unlock
+wakeupifblocking
+return true
+private void wakeupifblocking
+synchronized  blocksignal
+blocksignal notifyall
+private boolean istoomanystorefiles hregion region
+for  store store   region stores values
+if  store hastoomanystorefiles
+return true
+return false
+/**
+* check if the regionserver's memstore memory usage is greater than the
+* limit. if so, flush regions with the biggest memstores until we're down
+* to the lower limit. this method blocks callers until we're down to a safe
+* amount of memstore consumption.
+*/
+public void reclaimmemstorememory
+if  isabovehighwatermark
+long start   system currenttimemillis
+synchronized  this blocksignal
+boolean blocked   false
+long starttime   0
+while  isabovehighwatermark       server isstopped
+if   blocked
+starttime   environmentedgemanager currenttimemillis
+log info     server tostring
+stringutils humanreadableint server getregionserveraccounting   getglobalmemstoresize
+stringutils humanreadableint globalmemstorelimit
+blocked   true
+wakeupflushthread
+try
+// we should be able to wait forever, but we've seen a bug where
+// we miss a notify, so put a 5 second bound on it at least.
+blocksignal wait 5   1000
+catch  interruptedexception ie
+thread currentthread   interrupt
+long took   system currenttimemillis     start
+log warn     took
+if blocked
+final long totaltime   environmentedgemanager currenttimemillis     starttime
+if totaltime > 0
+this updatesblockedmshighwater add totaltime
+log info     server tostring
+else if  isabovelowwatermark
+wakeupflushthread
+@override
+public string tostring
+return
+flushqueue size
+public string dumpqueue
+stringbuilder queuelist   new stringbuilder
+queuelist append
+queuelist append
+java util iterator<flushqueueentry> it   flushqueue iterator
+while it hasnext
+queuelist append   it next   tostring
+queuelist append
+return queuelist tostring
+interface flushqueueentry extends delayed
+/**
+* token to insert into the flush queue that ensures that the flusher does not sleep
+*/
+static class wakeupflushthread implements flushqueueentry
+@override
+public long getdelay timeunit unit
+return 0
+@override
+public int compareto delayed o
+return  1
+@override
+public boolean equals object obj
+return  this    obj
+/**
+* datastructure used in the flush queue.  holds region and retry count.
+* keeps tabs on how old this object is.  implements {@link delayed}.  on
+* construction, the delay is zero. when added to a delay queue, we'll come
+* out near immediately.  call {@link #requeue(long)} passing delay in
+* milliseconds before readding to delay queue if you want it to stay there
+* a while.
+*/
+static class flushregionentry implements flushqueueentry
+private final hregion region
+private final long createtime
+private long whentoexpire
+private int requeuecount   0
+flushregionentry final hregion r
+this region   r
+this createtime   system currenttimemillis
+this whentoexpire   this createtime
+/**
+* @param maximumwait
+* @return true if we have been delayed > <code>maximumwait</code> milliseconds.
+*/
+public boolean ismaximumwait final long maximumwait
+return  system currenttimemillis     this createtime  > maximumwait
+/**
+* @return count of times {@link #requeue(long)} was called; i.e this is
+* number of times we've been requeued.
+*/
+public int getrequeuecount
+return this requeuecount
+/**
+* @param when when to expire, when to come up out of the queue.
+* specify in milliseconds.  this method adds system.currenttimemillis()
+* to whatever you pass.
+* @return this.
+*/
+public flushregionentry requeue final long when
+this whentoexpire   system currenttimemillis     when
+this requeuecount
+return this
+@override
+public long getdelay timeunit unit
+return unit convert this whentoexpire   system currenttimemillis
+timeunit milliseconds
+@override
+public int compareto delayed other
+return long valueof getdelay timeunit milliseconds
+other getdelay timeunit milliseconds   intvalue
+@override
+public string tostring
+return     bytes tostringbinary region getregionname
+@override
+public boolean equals object obj
+if  this    obj
+return true
+if  obj    null    getclass      obj getclass
+return false
+delayed other    delayed  obj
+return compareto other     0

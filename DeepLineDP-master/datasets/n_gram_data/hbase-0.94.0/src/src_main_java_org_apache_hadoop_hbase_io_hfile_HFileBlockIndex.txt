@@ -1,0 +1,1033 @@
+/*
+* copyright 2011 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase io hfile
+import java io bytearrayoutputstream
+import java io datainput
+import java io datainputstream
+import java io dataoutput
+import java io dataoutputstream
+import java io ioexception
+import java nio bytebuffer
+import java util arraylist
+import java util arrays
+import java util collections
+import java util list
+import java util concurrent atomic atomicreference
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs fsdataoutputstream
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase io heapsize
+import org apache hadoop hbase io encoding datablockencoding
+import org apache hadoop hbase io hfile hfile cachingblockreader
+import org apache hadoop hbase regionserver metrics schemaconfigured
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util classsize
+import org apache hadoop hbase util compoundbloomfilterwriter
+import org apache hadoop io rawcomparator
+import org apache hadoop io writableutils
+import org apache hadoop util stringutils
+/**
+* provides functionality to write ({@link blockindexwriter}) and read
+* ({@link blockindexreader}) single-level and multi-level block indexes.
+*
+* examples of how to use the block index writer can be found in
+* {@link compoundbloomfilterwriter} and {@link hfilewriterv2}. examples of how
+* to use the reader can be found in {@link hfilereaderv2} and
+* testhfileblockindex.
+*/
+public class hfileblockindex
+private static final log log   logfactory getlog hfileblockindex class
+static final int default_max_chunk_size   128   1024
+/**
+* the maximum size guideline for index blocks (both leaf, intermediate, and
+* root). if not specified, <code>default_max_chunk_size</code> is used.
+*/
+public static final string max_chunk_size_key
+/**
+* the number of bytes stored in each "secondary index" entry in addition to
+* key bytes in the non-root index block format. the first long is the file
+* offset of the deeper-level block the entry points to, and the int that
+* follows is that block's on-disk size without including header.
+*/
+static final int secondary_index_entry_overhead   bytes sizeof_int
+bytes sizeof_long
+/**
+* error message when trying to use inline block api in single-level mode.
+*/
+private static final string inline_blocks_not_allowed
+/**
+* the size of a meta-data record used for finding the mid-key in a
+* multi-level index. consists of the middle leaf-level index block offset
+* (long), its on-disk size without header included (int), and the mid-key
+* entry's zero-based index in that leaf index block.
+*/
+private static final int mid_key_metadata_size   bytes sizeof_long
+2   bytes sizeof_int
+/**
+* the reader will always hold the root level index in the memory. index
+* blocks at all other levels will be cached in the lru cache in practice,
+* although this api does not enforce that.
+*
+* all non-root (leaf and intermediate) index blocks contain what we call a
+* "secondary index": an array of offsets to the entries within the block.
+* this allows us to do binary search for the entry corresponding to the
+* given key without having to deserialize the block.
+*/
+public static class blockindexreader implements heapsize
+/** needed doing lookup on blocks. */
+private final rawcomparator<byte> comparator
+// root-level data.
+private byte blockkeys
+private long blockoffsets
+private int blockdatasizes
+private int rootbytesize   0
+private int rootcount   0
+// mid-key metadata.
+private long midleafblockoffset    1
+private int midleafblockondisksize    1
+private int midkeyentry    1
+/** pre-computed mid-key */
+private atomicreference<byte> midkey   new atomicreference<byte>
+/**
+* the number of levels in the block index tree. one if there is only root
+* level, two for root and leaf levels, etc.
+*/
+private int searchtreelevel
+/** a way to read {@link hfile} blocks at a given offset */
+private cachingblockreader cachingblockreader
+public blockindexreader final rawcomparator<byte> c  final int treelevel
+final cachingblockreader cachingblockreader
+this c  treelevel
+this cachingblockreader   cachingblockreader
+public blockindexreader final rawcomparator<byte> c  final int treelevel
+comparator   c
+searchtreelevel   treelevel
+/**
+* @return true if the block index is empty.
+*/
+public boolean isempty
+return blockkeys length    0
+/**
+* verifies that the block index is non-empty and throws an
+* {@link illegalstateexception} otherwise.
+*/
+public void ensurenonempty
+if  blockkeys length    0
+throw new illegalstateexception
+/**
+* return the data block which contains this key. this function will only
+* be called when the hfile version is larger than 1.
+*
+* @param key the key we are looking for
+* @param keyoffset the offset of the key in its byte array
+* @param keylength the length of the key
+* @param currentblock the current block, to avoid re-reading the same
+*          block
+* @return reader a basic way to load blocks
+* @throws ioexception
+*/
+public hfileblock seektodatablock final byte key  int keyoffset
+int keylength  hfileblock currentblock  boolean cacheblocks
+boolean pread  boolean iscompaction
+throws ioexception
+int rootlevelindex   rootblockcontainingkey key  keyoffset  keylength
+if  rootlevelindex < 0    rootlevelindex >  blockoffsets length
+return null
+// read the next-level (intermediate or leaf) index block.
+long currentoffset   blockoffsets
+int currentondisksize   blockdatasizes
+int lookuplevel   1     how many levels deep we are in our lookup
+hfileblock block
+while  true
+if  currentblock    null    currentblock getoffset      currentoffset
+// avoid reading the same block again, even with caching turned off.
+// this is crucial for compaction-type workload which might have
+// caching turned off. this is like a one-block cache inside the
+// scanner.
+block   currentblock
+else
+// call hfile's caching block reader api. we always cache index
+// blocks, otherwise we might get terrible performance.
+boolean shouldcache   cacheblocks     lookuplevel < searchtreelevel
+blocktype expectedblocktype
+if  lookuplevel < searchtreelevel   1
+expectedblocktype   blocktype intermediate_index
+else if  lookuplevel    searchtreelevel   1
+expectedblocktype   blocktype leaf_index
+else
+// this also accounts for encoded_data
+expectedblocktype   blocktype data
+block   cachingblockreader readblock currentoffset
+currentondisksize  shouldcache  pread  iscompaction
+expectedblocktype
+if  block    null
+throw new ioexception
+currentoffset       currentondisksize
+// found a data block, break the loop and check our level in the tree.
+if  block getblocktype   equals blocktype data
+block getblocktype   equals blocktype encoded_data
+break
+// not a data block. this must be a leaf-level or intermediate-level
+// index block. we don't allow going deeper than searchtreelevel.
+if    lookuplevel > searchtreelevel
+throw new ioexception
+lookuplevel       searchtreelevel
+// locate the entry corresponding to the given key in the non-root
+// (leaf or intermediate-level) index block.
+bytebuffer buffer   block getbufferwithoutheader
+if   locatenonrootindexentry buffer  key  keyoffset  keylength
+comparator
+throw new ioexception
+bytes tostringbinary key  keyoffset  keylength
+block
+currentoffset   buffer getlong
+currentondisksize   buffer getint
+if  lookuplevel    searchtreelevel
+throw new ioexception     lookuplevel
+searchtreelevel
+return block
+/**
+* an approximation to the {@link hfile}'s mid-key. operates on block
+* boundaries, and does not go inside blocks. in other words, returns the
+* first key of the middle block of the file.
+*
+* @return the first key of the middle block
+*/
+public byte midkey   throws ioexception
+if  rootcount    0
+throw new ioexception
+byte midkey   this midkey get
+if  midkey    null
+return midkey
+if  midleafblockoffset >  0
+if  cachingblockreader    null
+throw new ioexception
+// caching, using pread, assuming this is not a compaction.
+hfileblock midleafblock   cachingblockreader readblock
+midleafblockoffset  midleafblockondisksize  true  true  false
+blocktype leaf_index
+bytebuffer b   midleafblock getbufferwithoutheader
+int numdatablocks   b getint
+int keyreloffset   b getint bytes sizeof_int    midkeyentry   1
+int keylen   b getint bytes sizeof_int    midkeyentry   2
+keyreloffset
+int keyoffset   b arrayoffset
+bytes sizeof_int    numdatablocks   2    keyreloffset
+secondary_index_entry_overhead
+midkey   arrays copyofrange b array    keyoffset  keyoffset   keylen
+else
+// the middle of the root-level index.
+midkey   blockkeys
+this midkey set midkey
+return midkey
+/**
+* @param i from 0 to {@link #getrootblockcount() - 1}
+*/
+public byte getrootblockkey int i
+return blockkeys
+/**
+* @param i from 0 to {@link #getrootblockcount() - 1}
+*/
+public long getrootblockoffset int i
+return blockoffsets
+/**
+* @param i zero-based index of a root-level block
+* @return the on-disk size of the root-level block for version 2, or the
+*         uncompressed size for version 1
+*/
+public int getrootblockdatasize int i
+return blockdatasizes
+/**
+* @return the number of root-level blocks in this block index
+*/
+public int getrootblockcount
+return rootcount
+/**
+* finds the root-level index block containing the given key.
+*
+* @param key
+*          key to find
+* @return offset of block containing <code>key</code> (between 0 and the
+*         number of blocks - 1) or -1 if this file does not contain the
+*         request.
+*/
+public int rootblockcontainingkey final byte key  int offset
+int length
+int pos   bytes binarysearch blockkeys  key  offset  length
+comparator
+// pos is between -(blockkeys.length + 1) to blockkeys.length - 1, see
+// binarysearch's javadoc.
+if  pos >  0
+// this means this is an exact match with an element of blockkeys.
+assert pos < blockkeys length
+return pos
+// otherwise, pos = -(i + 1), where blockkeys[i - 1] < key < blockkeys[i],
+// and i is in [0, blockkeys.length]. we are returning j = i - 1 such that
+// blockkeys[j] <= key < blockkeys[j + 1]. in particular, j = -1 if
+// key < blockkeys[0], meaning the file does not contain the given key.
+int i    pos   1
+assert 0 <  i    i <  blockkeys length
+return i   1
+/**
+* adds a new entry in the root block index. only used when reading.
+*
+* @param key last key in the block
+* @param offset file offset where the block is stored
+* @param datasize the uncompressed data size
+*/
+private void add final byte key  final long offset  final int datasize
+blockoffsets   offset
+blockkeys   key
+blockdatasizes   datasize
+rootcount
+rootbytesize    secondary_index_entry_overhead   key length
+/**
+* performs a binary search over a non-root level index block. utilizes the
+* secondary index, which records the offsets of (offset, ondisksize,
+* firstkey) tuples of all entries.
+*
+* @param key the key we are searching for offsets to individual entries in
+*          the blockindex buffer
+* @param keyoffset the offset of the key in its byte array
+* @param keylength the length of the key
+* @param nonrootindex the non-root index block buffer, starting with the
+*          secondary index. the position is ignored.
+* @return the index i in [0, numentries - 1] such that keys[i] <= key <
+*         keys[i + 1], if keys is the array of all keys being searched, or
+*         -1 otherwise
+* @throws ioexception
+*/
+static int binarysearchnonrootindex byte key  int keyoffset
+int keylength  bytebuffer nonrootindex
+rawcomparator<byte> comparator
+int numentries   nonrootindex getint 0
+int low   0
+int high   numentries   1
+int mid   0
+// entries start after the number of entries and the secondary index.
+// the secondary index takes numentries + 1 ints.
+int entriesoffset   bytes sizeof_int    numentries   2
+// if we imagine that keys[-1] = -infinity and
+// keys[numentries] = infinity, then we are maintaining an invariant that
+// keys[low - 1] < key < keys[high + 1] while narrowing down the range.
+while  low <  high
+mid    low   high  >>> 1
+// midkey's offset relative to the end of secondary index
+int midkeyreloffset   nonrootindex getint
+bytes sizeof_int    mid   1
+// the offset of the middle key in the blockindex buffer
+int midkeyoffset   entriesoffset          skip secondary index
+midkeyreloffset                     skip all entries until mid
+secondary_index_entry_overhead      skip offset and on disk size
+// we subtract the two consecutive secondary index elements, which
+// gives us the size of the whole (offset, ondisksize, key) tuple. we
+// then need to subtract the overhead of offset and ondisksize.
+int midlength   nonrootindex getint bytes sizeof_int    mid   2
+midkeyreloffset   secondary_index_entry_overhead
+// we have to compare in this order, because the comparator order
+// has special logic when the 'left side' is a special key.
+int cmp   comparator compare key  keyoffset  keylength
+nonrootindex array    nonrootindex arrayoffset     midkeyoffset
+midlength
+// key lives above the midpoint
+if  cmp > 0
+low   mid   1     maintain the invariant that keys < key
+// key lives below the midpoint
+else if  cmp < 0
+high   mid   1     maintain the invariant that key < keys
+else
+return mid     exact match
+// as per our invariant, keys[low - 1] < key < keys[high + 1], meaning
+// that low - 1 < high + 1 and (low - high) <= 1. as per the loop break
+// condition, low >= high + 1. therefore, low = high + 1.
+if  low    high   1
+throw new illegalstateexception     low
+high   1
+// ok, our invariant says that keys[low - 1] < key < keys[low]. we need to
+// return i such that keys[i] <= key < keys[i + 1]. therefore i = low - 1.
+int i   low   1
+// some extra validation on the result.
+if  i <  1    i >  numentries
+throw new illegalstateexception
+i
+numentries   1
+return i
+/**
+* search for one key using the secondary index in a non-root block. in case
+* of success, positions the provided buffer at the entry of interest, where
+* the file offset and the on-disk-size can be read.
+*
+* @param nonrootblock a non-root block without header. initial position
+*          does not matter.
+* @param key the byte array containing the key
+* @param keyoffset the offset of the key in its byte array
+* @param keylength the length of the key
+* @return true in the case the index entry containing the given key was
+*         found, false in the case the given key is before the first key
+*
+*/
+static boolean locatenonrootindexentry bytebuffer nonrootblock  byte key
+int keyoffset  int keylength  rawcomparator<byte> comparator
+int entryindex   binarysearchnonrootindex key  keyoffset  keylength
+nonrootblock  comparator
+if  entryindex     1
+return false
+int numentries   nonrootblock getint 0
+// the end of secondary index and the beginning of entries themselves.
+int entriesoffset   bytes sizeof_int    numentries   2
+// the offset of the entry we are interested in relative to the end of
+// the secondary index.
+int entryreloffset   nonrootblock getint bytes sizeof_int
+1   entryindex
+nonrootblock position entriesoffset   entryreloffset
+return true
+/**
+* read in the root-level index from the given input stream. must match
+* what was written into the root level by
+* {@link blockindexwriter#writeindexblocks(fsdataoutputstream)} at the
+* offset that function returned.
+*
+* @param in the buffered input stream or wrapped byte input stream
+* @param numentries the number of root-level index entries
+* @throws ioexception
+*/
+public void readrootindex datainput in  final int numentries
+throws ioexception
+blockoffsets   new long
+blockkeys   new byte
+blockdatasizes   new int
+// if index size is zero, no index was written.
+if  numentries > 0
+for  int i   0  i < numentries    i
+long offset   in readlong
+int datasize   in readint
+byte key   bytes readbytearray in
+add key  offset  datasize
+/**
+* read in the root-level index from the given input stream. must match
+* what was written into the root level by
+* {@link blockindexwriter#writeindexblocks(fsdataoutputstream)} at the
+* offset that function returned.
+*
+* @param blk the hfile block
+* @param numentries the number of root-level index entries
+* @return the buffered input stream or wrapped byte input stream
+* @throws ioexception
+*/
+public datainputstream readrootindex hfileblock blk  final int numentries  throws ioexception
+datainputstream in   blk getbytestream
+readrootindex in  numentries
+return in
+/**
+* read the root-level metadata of a multi-level block index. based on
+* {@link #readrootindex(datainput, int)}, but also reads metadata
+* necessary to compute the mid-key in a multi-level index.
+*
+* @param blk the hfile block
+* @param numentries the number of root-level index entries
+* @throws ioexception
+*/
+public void readmultilevelindexroot hfileblock blk
+final int numentries  throws ioexception
+datainputstream in   readrootindex blk  numentries
+// after reading the root index the checksum bytes have to
+// be subtracted to know if the mid key exists.
+int checksumbytes   blk totalchecksumbytes
+if   in available     checksumbytes  < mid_key_metadata_size
+// no mid-key metadata available.
+return
+midleafblockoffset   in readlong
+midleafblockondisksize   in readint
+midkeyentry   in readint
+@override
+public string tostring
+stringbuilder sb   new stringbuilder
+sb append     rootcount  append
+for  int i   0  i < rootcount  i
+sb append    append keyvalue keytostring blockkeys
+append    append blockoffsets
+append     blockdatasizes  append
+return sb tostring
+@override
+public long heapsize
+long heapsize   classsize align 6   classsize reference
+3   bytes sizeof_int   classsize object
+// mid-key metadata.
+heapsize    mid_key_metadata_size
+// calculating the size of blockkeys
+if  blockkeys    null
+// adding array + references overhead
+heapsize    classsize align classsize array   blockkeys length
+classsize reference
+// adding bytes
+for  byte key   blockkeys
+heapsize    classsize align classsize array   key length
+if  blockoffsets    null
+heapsize    classsize align classsize array   blockoffsets length
+bytes sizeof_long
+if  blockdatasizes    null
+heapsize    classsize align classsize array   blockdatasizes length
+bytes sizeof_int
+return classsize align heapsize
+/**
+* writes the block index into the output stream. generate the tree from
+* bottom up. the leaf level is written to disk as a sequence of inline
+* blocks, if it is larger than a certain number of bytes. if the leaf level
+* is not large enough, we write all entries to the root level instead.
+*
+* after all leaf blocks have been written, we end up with an index
+* referencing the resulting leaf index blocks. if that index is larger than
+* the allowed root index size, the writer will break it up into
+* reasonable-size intermediate-level index block chunks write those chunks
+* out, and create another index referencing those chunks. this will be
+* repeated until the remaining index is small enough to become the root
+* index. however, in most practical cases we will only have leaf-level
+* blocks and the root index, or just the root index.
+*/
+public static class blockindexwriter extends schemaconfigured
+implements inlineblockwriter
+/**
+* while the index is being written, this represents the current block
+* index referencing all leaf blocks, with one exception. if the file is
+* being closed and there are not enough blocks to complete even a single
+* leaf block, no leaf blocks get written and this contains the entire
+* block index. after all levels of the index were written by
+* {@link #writeindexblocks(fsdataoutputstream)}, this contains the final
+* root-level index.
+*/
+private blockindexchunk rootchunk   new blockindexchunk
+/**
+* current leaf-level chunk. new entries referencing data blocks get added
+* to this chunk until it grows large enough to be written to disk.
+*/
+private blockindexchunk curinlinechunk   new blockindexchunk
+/**
+* the number of block index levels. this is one if there is only root
+* level (even empty), two if there a leaf level and root level, and is
+* higher if there are intermediate levels. this is only final after
+* {@link #writeindexblocks(fsdataoutputstream)} has been called. the
+* initial value accounts for the root level, and will be increased to two
+* as soon as we find out there is a leaf-level in
+* {@link #blockwritten(long, int)}.
+*/
+private int numlevels   1
+private hfileblock writer blockwriter
+private byte firstkey   null
+/**
+* the total number of leaf-level entries, i.e. entries referenced by
+* leaf-level blocks. for the data block index this is equal to the number
+* of data blocks.
+*/
+private long totalnumentries
+/** total compressed size of all index blocks. */
+private long totalblockondisksize
+/** total uncompressed size of all index blocks. */
+private long totalblockuncompressedsize
+/** the maximum size guideline of all multi-level index blocks. */
+private int maxchunksize
+/** whether we require this block index to always be single-level. */
+private boolean singlelevelonly
+/** block cache, or null if cache-on-write is disabled */
+private blockcache blockcache
+/** name to use for computing cache keys */
+private string nameforcaching
+/** creates a single-level block index writer */
+public blockindexwriter
+this null  null  null
+singlelevelonly   true
+/**
+* creates a multi-level block index writer.
+*
+* @param blockwriter the block writer to use to write index blocks
+* @param blockcache if this is not null, index blocks will be cached
+*    on write into this block cache.
+*/
+public blockindexwriter hfileblock writer blockwriter
+blockcache blockcache  string nameforcaching
+if   blockcache    null      nameforcaching    null
+throw new illegalargumentexception
+this blockwriter   blockwriter
+this blockcache   blockcache
+this nameforcaching   nameforcaching
+this maxchunksize   hfileblockindex default_max_chunk_size
+public void setmaxchunksize int maxchunksize
+if  maxchunksize <  0
+throw new illegalargumentexception
+this maxchunksize   maxchunksize
+/**
+* writes the root level and intermediate levels of the block index into
+* the output stream, generating the tree from bottom up. assumes that the
+* leaf level has been inline-written to the disk if there is enough data
+* for more than one leaf block. we iterate by breaking the current level
+* of the block index, starting with the index of all leaf-level blocks,
+* into chunks small enough to be written to disk, and generate its parent
+* level, until we end up with a level small enough to become the root
+* level.
+*
+* if the leaf level is not large enough, there is no inline block index
+* anymore, so we only write that level of block index to disk as the root
+* level.
+*
+* @param out fsdataoutputstream
+* @return position at which we entered the root-level index.
+* @throws ioexception
+*/
+public long writeindexblocks fsdataoutputstream out  throws ioexception
+if  curinlinechunk getnumentries      0
+throw new ioexception
+curinlinechunk getnumentries
+// we need to get mid-key metadata before we create intermediate
+// indexes and overwrite the root chunk.
+byte midkeymetadata   numlevels > 1 ? rootchunk getmidkeymetadata
+
+while  rootchunk getrootsize   > maxchunksize
+rootchunk   writeintermediatelevel out  rootchunk
+numlevels    1
+// write the root level
+long rootlevelindexpos   out getpos
+dataoutput blockstream
+blockwriter startwriting blocktype root_index
+rootchunk writeroot blockstream
+if  midkeymetadata    null
+blockstream write midkeymetadata
+blockwriter writeheaderanddata out
+// add root index block size
+totalblockondisksize    blockwriter getondisksizewithoutheader
+totalblockuncompressedsize
+blockwriter getuncompressedsizewithoutheader
+if  log istraceenabled
+log trace     numlevels
+rootlevelindexpos       rootchunk getnumentries
+totalnumentries
+stringutils humanreadableint this totalblockondisksize
+stringutils humanreadableint totalblockuncompressedsize
+return rootlevelindexpos
+/**
+* writes the block index data as a single level only. does not do any
+* block framing.
+*
+* @param out the buffered output stream to write the index to. typically a
+*          stream writing into an {@link hfile} block.
+* @param description a short description of the index being written. used
+*          in a log message.
+* @throws ioexception
+*/
+public void writesinglelevelindex dataoutput out  string description
+throws ioexception
+expectnumlevels 1
+if   singlelevelonly
+throw new ioexception
+if  rootchunk getnumentries   > 0
+throw new ioexception
+rootchunk   curinlinechunk
+curinlinechunk   new blockindexchunk
+if  log istraceenabled
+log trace     description
+rootchunk getnumentries         rootchunk getrootsize
+rootchunk writeroot out
+/**
+* split the current level of the block index into intermediate index
+* blocks of permitted size and write those blocks to disk. return the next
+* level of the block index referencing those intermediate-level blocks.
+*
+* @param out
+* @param currentlevel the current level of the block index, such as the a
+*          chunk referencing all leaf-level index blocks
+* @return the parent level block index, which becomes the root index after
+*         a few (usually zero) iterations
+* @throws ioexception
+*/
+private blockindexchunk writeintermediatelevel fsdataoutputstream out
+blockindexchunk currentlevel  throws ioexception
+// entries referencing intermediate-level blocks we are about to create.
+blockindexchunk parent   new blockindexchunk
+// the current intermediate-level block index chunk.
+blockindexchunk curchunk   new blockindexchunk
+for  int i   0  i < currentlevel getnumentries      i
+curchunk add currentlevel getblockkey i
+currentlevel getblockoffset i   currentlevel getondiskdatasize i
+if  curchunk getrootsize   >  maxchunksize
+writeintermediateblock out  parent  curchunk
+if  curchunk getnumentries   > 0
+writeintermediateblock out  parent  curchunk
+return parent
+private void writeintermediateblock fsdataoutputstream out
+blockindexchunk parent  blockindexchunk curchunk  throws ioexception
+long beginoffset   out getpos
+dataoutputstream dos   blockwriter startwriting
+blocktype intermediate_index
+curchunk writenonroot dos
+byte curfirstkey   curchunk getblockkey 0
+blockwriter writeheaderanddata out
+if  blockcache    null
+hfileblock blockforcaching   blockwriter getblockforcaching
+passschemametricsto blockforcaching
+blockcache cacheblock new blockcachekey nameforcaching
+beginoffset  datablockencoding none
+blockforcaching getblocktype     blockforcaching
+// add intermediate index block size
+totalblockondisksize    blockwriter getondisksizewithoutheader
+totalblockuncompressedsize
+blockwriter getuncompressedsizewithoutheader
+// offset is the beginning offset the chunk of block index entries.
+// size is the total byte size of the chunk of block index entries
+// + the secondary index size
+// first_key is the first key in the chunk of block index
+// entries.
+parent add curfirstkey  beginoffset
+blockwriter getondisksizewithheader
+// clear current block index chunk
+curchunk clear
+curfirstkey   null
+/**
+* @return how many block index entries there are in the root level
+*/
+public final int getnumrootentries
+return rootchunk getnumentries
+/**
+* @return the number of levels in this block index.
+*/
+public int getnumlevels
+return numlevels
+private void expectnumlevels int expectednumlevels
+if  numlevels    expectednumlevels
+throw new illegalstateexception
+numlevels       expectednumlevels
+/**
+* whether there is an inline block ready to be written. in general, we
+* write an leaf-level index block as an inline block as soon as its size
+* as serialized in the non-root format reaches a certain threshold.
+*/
+@override
+public boolean shouldwriteblock boolean closing
+if  singlelevelonly
+throw new unsupportedoperationexception inline_blocks_not_allowed
+if  curinlinechunk getnumentries      0
+return false
+// we do have some entries in the current inline chunk.
+if  closing
+if  rootchunk getnumentries      0
+// we did not add any leaf-level blocks yet. instead of creating a
+// leaf level with one block, move these entries to the root level.
+expectnumlevels 1
+rootchunk   curinlinechunk
+curinlinechunk   new blockindexchunk
+return false
+return true
+else
+return curinlinechunk getnonrootsize   >  maxchunksize
+/**
+* write out the current inline index block. inline blocks are non-root
+* blocks, so the non-root index format is used.
+*
+* @param out
+*/
+@override
+public void writeinlineblock dataoutput out  throws ioexception
+if  singlelevelonly
+throw new unsupportedoperationexception inline_blocks_not_allowed
+// write the inline block index to the output stream in the non-root
+// index block format.
+curinlinechunk writenonroot out
+// save the first key of the inline block so that we can add it to the
+// parent-level index.
+firstkey   curinlinechunk getblockkey 0
+// start a new inline index block
+curinlinechunk clear
+/**
+* called after an inline block has been written so that we can add an
+* entry referring to that block to the parent-level index.
+*/
+@override
+public void blockwritten long offset  int ondisksize  int uncompressedsize
+// add leaf index block size
+totalblockondisksize    ondisksize
+totalblockuncompressedsize    uncompressedsize
+if  singlelevelonly
+throw new unsupportedoperationexception inline_blocks_not_allowed
+if  firstkey    null
+throw new illegalstateexception
+offset       ondisksize
+if  rootchunk getnumentries      0
+// we are writing the first leaf block, so increase index level.
+expectnumlevels 1
+numlevels   2
+// add another entry to the second-level index. include the number of
+// entries in all previous leaf-level chunks for mid-key calculation.
+rootchunk add firstkey  offset  ondisksize  totalnumentries
+firstkey   null
+@override
+public blocktype getinlineblocktype
+return blocktype leaf_index
+/**
+* add one index entry to the current leaf-level block. when the leaf-level
+* block gets large enough, it will be flushed to disk as an inline block.
+*
+* @param firstkey the first key of the data block
+* @param blockoffset the offset of the data block
+* @param blockdatasize the on-disk size of the data block ({@link hfile}
+*          format version 2), or the uncompressed size of the data block (
+*          {@link hfile} format version 1).
+*/
+public void addentry byte firstkey  long blockoffset  int blockdatasize
+curinlinechunk add firstkey  blockoffset  blockdatasize
+totalnumentries
+/**
+* @throws ioexception if we happened to write a multi-level index.
+*/
+public void ensuresinglelevel   throws ioexception
+if  numlevels > 1
+throw new ioexception      numlevels
+rootchunk getnumentries
+/**
+* @return true if we are using cache-on-write. this is configured by the
+*         caller of the constructor by either passing a valid block cache
+*         or null.
+*/
+@override
+public boolean cacheonwrite
+return blockcache    null
+/**
+* the total uncompressed size of the root index block, intermediate-level
+* index blocks, and leaf-level index blocks.
+*
+* @return the total uncompressed size of all index blocks
+*/
+public long gettotaluncompressedsize
+return totalblockuncompressedsize
+/**
+* a single chunk of the block index in the process of writing. the data in
+* this chunk can become a leaf-level, intermediate-level, or root index
+* block.
+*/
+static class blockindexchunk
+/** first keys of the key range corresponding to each index entry. */
+private final list<byte> blockkeys   new arraylist<byte>
+/** block offset in backing stream. */
+private final list<long> blockoffsets   new arraylist<long>
+/** on-disk data sizes of lower-level data or index blocks. */
+private final list<integer> ondiskdatasizes   new arraylist<integer>
+/**
+* the cumulative number of sub-entries, i.e. entries on deeper-level block
+* index entries. numsubentriesat[i] is the number of sub-entries in the
+* blocks corresponding to this chunk's entries #0 through #i inclusively.
+*/
+private final list<long> numsubentriesat   new arraylist<long>
+/**
+* the offset of the next entry to be added, relative to the end of the
+* "secondary index" in the "non-root" format representation of this index
+* chunk. this is the next value to be added to the secondary index.
+*/
+private int curtotalnonrootentrysize   0
+/**
+* the accumulated size of this chunk if stored in the root index format.
+*/
+private int curtotalrootsize   0
+/**
+* the "secondary index" used for binary search over variable-length
+* records in a "non-root" format block. these offsets are relative to the
+* end of this secondary index.
+*/
+private final list<integer> secondaryindexoffsetmarks
+new arraylist<integer>
+/**
+* adds a new entry to this block index chunk.
+*
+* @param firstkey the first key in the block pointed to by this entry
+* @param blockoffset the offset of the next-level block pointed to by this
+*          entry
+* @param ondiskdatasize the on-disk data of the block pointed to by this
+*          entry, including header size
+* @param curtotalnumsubentries if this chunk is the root index chunk under
+*          construction, this specifies the current total number of
+*          sub-entries in all leaf-level chunks, including the one
+*          corresponding to the second-level entry being added.
+*/
+void add byte firstkey  long blockoffset  int ondiskdatasize
+long curtotalnumsubentries
+// record the offset for the secondary index
+secondaryindexoffsetmarks add curtotalnonrootentrysize
+curtotalnonrootentrysize    secondary_index_entry_overhead
+firstkey length
+curtotalrootsize    bytes sizeof_long   bytes sizeof_int
+writableutils getvintsize firstkey length    firstkey length
+blockkeys add firstkey
+blockoffsets add blockoffset
+ondiskdatasizes add ondiskdatasize
+if  curtotalnumsubentries     1
+numsubentriesat add curtotalnumsubentries
+// make sure the parallel arrays are in sync.
+if  numsubentriesat size      blockkeys size
+throw new illegalstateexception
+numsubentriesat size
+blockkeys size
+/**
+* the same as {@link #add(byte[], long, int, long)} but does not take the
+* key/value into account. used for single-level indexes.
+*
+* @see {@link #add(byte[], long, int, long)}
+*/
+public void add byte firstkey  long blockoffset  int ondiskdatasize
+add firstkey  blockoffset  ondiskdatasize   1
+public void clear
+blockkeys clear
+blockoffsets clear
+ondiskdatasizes clear
+secondaryindexoffsetmarks clear
+numsubentriesat clear
+curtotalnonrootentrysize   0
+curtotalrootsize   0
+/**
+* finds the entry corresponding to the deeper-level index block containing
+* the given deeper-level entry (a "sub-entry"), assuming a global 0-based
+* ordering of sub-entries.
+*
+* <p>
+* <i> implementation note. </i> we are looking for i such that
+* numsubentriesat[i - 1] <= k < numsubentriesat[i], because a deeper-level
+* block #i (0-based) contains sub-entries # numsubentriesat[i - 1]'th
+* through numsubentriesat[i] - 1, assuming a global 0-based ordering of
+* sub-entries. i is by definition the insertion point of k in
+* numsubentriesat.
+*
+* @param k sub-entry index, from 0 to the total number sub-entries - 1
+* @return the 0-based index of the entry corresponding to the given
+*         sub-entry
+*/
+public int getentrybysubentry long k
+// we define mid-key as the key corresponding to k'th sub-entry
+// (0-based).
+int i   collections binarysearch numsubentriesat  k
+// exact match: cumulativeweight[i] = k. this means chunks #0 through
+// #i contain exactly k sub-entries, and the sub-entry #k (0-based)
+// is in the (i + 1)'th chunk.
+if  i >  0
+return i   1
+// inexact match. return the insertion point.
+return  i   1
+/**
+* used when writing the root block index of a multi-level block index.
+* serializes additional information allowing to efficiently identify the
+* mid-key.
+*
+* @return a few serialized fields for finding the mid-key
+* @throws ioexception if could not create metadata for computing mid-key
+*/
+public byte getmidkeymetadata   throws ioexception
+bytearrayoutputstream baos   new bytearrayoutputstream
+mid_key_metadata_size
+dataoutputstream baosdos   new dataoutputstream baos
+long totalnumsubentries   numsubentriesat get blockkeys size     1
+if  totalnumsubentries    0
+throw new ioexception
+long midkeysubentry    totalnumsubentries   1    2
+int midkeyentry   getentrybysubentry midkeysubentry
+baosdos writelong blockoffsets get midkeyentry
+baosdos writeint ondiskdatasizes get midkeyentry
+long numsubentriesbefore   midkeyentry > 0
+? numsubentriesat get midkeyentry   1    0
+long subentrywithinentry   midkeysubentry   numsubentriesbefore
+if  subentrywithinentry < 0    subentrywithinentry > integer max_value
+throw new ioexception
+subentrywithinentry
+numsubentriesbefore       midkeysubentry
+baosdos writeint  int  subentrywithinentry
+if  baosdos size      mid_key_metadata_size
+throw new ioexception
+baosdos size         mid_key_metadata_size
+// close just to be good citizens, although this has no effect.
+baos close
+return baos tobytearray
+/**
+* writes the block index chunk in the non-root index block format. this
+* format contains the number of entries, an index of integer offsets
+* for quick binary search on variable-length records, and tuples of
+* block offset, on-disk block size, and the first key for each entry.
+*
+* @param out
+* @throws ioexception
+*/
+void writenonroot dataoutput out  throws ioexception
+// the number of entries in the block.
+out writeint blockkeys size
+if  secondaryindexoffsetmarks size      blockkeys size
+throw new ioexception
+blockkeys size
+secondaryindexoffsetmarks size
+// for each entry, write a "secondary index" of relative offsets to the
+// entries from the end of the secondary index. this works, because at
+// read time we read the number of entries and know where the secondary
+// index ends.
+for  int currentsecondaryindex   secondaryindexoffsetmarks
+out writeint currentsecondaryindex
+// we include one other element in the secondary index to calculate the
+// size of each entry more easily by subtracting secondary index elements.
+out writeint curtotalnonrootentrysize
+for  int i   0  i < blockkeys size      i
+out writelong blockoffsets get i
+out writeint ondiskdatasizes get i
+out write blockkeys get i
+/**
+* @return the size of this chunk if stored in the non-root index block
+*         format
+*/
+int getnonrootsize
+return bytes sizeof_int                             number of entries
+bytes sizeof_int    blockkeys size     1      secondary index
+curtotalnonrootentrysize                      all entries
+/**
+* writes this chunk into the given output stream in the root block index
+* format. this format is similar to the {@link hfile} version 1 block
+* index format, except that we store on-disk size of the block instead of
+* its uncompressed size.
+*
+* @param out the data output stream to write the block index to. typically
+*          a stream writing into an {@link hfile} block.
+* @throws ioexception
+*/
+void writeroot dataoutput out  throws ioexception
+for  int i   0  i < blockkeys size      i
+out writelong blockoffsets get i
+out writeint ondiskdatasizes get i
+bytes writebytearray out  blockkeys get i
+/**
+* @return the size of this chunk if stored in the root index block format
+*/
+int getrootsize
+return curtotalrootsize
+/**
+* @return the number of entries in this block index chunk
+*/
+public int getnumentries
+return blockkeys size
+public byte getblockkey int i
+return blockkeys get i
+public long getblockoffset int i
+return blockoffsets get i
+public int getondiskdatasize int i
+return ondiskdatasizes get i
+public long getcumulativenumkv int i
+if  i < 0
+return 0
+return numsubentriesat get i
+public static int getmaxchunksize configuration conf
+return conf getint max_chunk_size_key  default_max_chunk_size

@@ -1,0 +1,211 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase master snapshot
+import java io filenotfoundexception
+import java io ioexception
+import java util hashset
+import java util list
+import java util set
+import java util concurrent cancellationexception
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase servername
+import org apache hadoop hbase catalog metareader
+import org apache hadoop hbase errorhandling foreignexception
+import org apache hadoop hbase errorhandling foreignexceptiondispatcher
+import org apache hadoop hbase errorhandling foreignexceptionsnare
+import org apache hadoop hbase exceptions snapshotcreationexception
+import org apache hadoop hbase executor eventhandler
+import org apache hadoop hbase executor eventtype
+import org apache hadoop hbase master masterservices
+import org apache hadoop hbase master snapshotsentinel
+import org apache hadoop hbase master tablelockmanager
+import org apache hadoop hbase master tablelockmanager tablelock
+import org apache hadoop hbase protobuf generated hbaseprotos snapshotdescription
+import org apache hadoop hbase snapshot clientsnapshotdescriptionutils
+import org apache hadoop hbase snapshot snapshotdescriptionutils
+import org apache hadoop hbase snapshot tableinfocopytask
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util pair
+import org apache zookeeper keeperexception
+/**
+* a handler for taking snapshots from the master.
+*
+* this is not a subclass of tableeventhandler because using that would incur an extra meta scan.
+*
+* the {@link #snapshotregions(list)} call should get implemented for each snapshot flavor.
+*/
+@interfaceaudience private
+public abstract class takesnapshothandler extends eventhandler implements snapshotsentinel
+foreignexceptionsnare
+private static final log log   logfactory getlog takesnapshothandler class
+private volatile boolean finished
+// none of these should ever be null
+protected final masterservices master
+protected final snapshotdescription snapshot
+protected final configuration conf
+protected final filesystem fs
+protected final path rootdir
+private final path snapshotdir
+protected final path workingdir
+private final mastersnapshotverifier verifier
+protected final foreignexceptiondispatcher monitor
+protected final tablelockmanager tablelockmanager
+protected final tablelock tablelock
+/**
+* @param snapshot descriptor of the snapshot to take
+* @param masterservices master services provider
+* @throws ioexception on unexpected error
+*/
+public takesnapshothandler snapshotdescription snapshot
+final masterservices masterservices  throws ioexception
+super masterservices  eventtype c_m_snapshot_table
+assert snapshot    null
+assert masterservices    null
+this master   masterservices
+this snapshot   snapshot
+this conf   this master getconfiguration
+this fs   this master getmasterfilesystem   getfilesystem
+this rootdir   this master getmasterfilesystem   getrootdir
+this snapshotdir   snapshotdescriptionutils getcompletedsnapshotdir snapshot  rootdir
+this workingdir   snapshotdescriptionutils getworkingsnapshotdir snapshot  rootdir
+this monitor    new foreignexceptiondispatcher
+this tablelockmanager   master gettablelockmanager
+this tablelock   this tablelockmanager writelock bytes tobytes snapshot gettable
+eventtype c_m_snapshot_table tostring
+// prepare the verify
+this verifier   new mastersnapshotverifier masterservices  snapshot  rootdir
+private htabledescriptor loadtabledescriptor
+throws filenotfoundexception  ioexception
+final string name   snapshot gettable
+htabledescriptor htd
+this master gettabledescriptors   get name
+if  htd    null
+throw new ioexception     name
+return htd
+public takesnapshothandler prepare   throws exception
+super prepare
+loadtabledescriptor       check that  tableinfo is present
+this tablelock acquire      after this  you should ensure to release this lock in
+//case of exceptions
+return this
+/**
+* execute the core common portions of taking a snapshot. the {@link #snapshotregions(list)}
+* call should get implemented for each snapshot flavor.
+*/
+@override
+public void process
+log info     eventtype       snapshot gettable
+try
+// if regions move after this meta scan, the region specific snapshot should fail, triggering
+// an external exception that gets captured here.
+// write down the snapshot info in the working directory
+snapshotdescriptionutils writesnapshotinfo snapshot  workingdir  this fs
+new tableinfocopytask monitor  snapshot  fs  rootdir  call
+monitor rethrowexception
+list<pair<hregioninfo  servername>> regionsandlocations
+metareader gettableregionsandlocations this server getcatalogtracker
+bytes tobytes snapshot gettable     true
+// run the snapshot
+snapshotregions regionsandlocations
+// extract each pair to separate lists
+set<string> servernames   new hashset<string>
+for  pair<hregioninfo  servername> p   regionsandlocations
+servernames add p getsecond   tostring
+// verify the snapshot is valid
+verifier verifysnapshot this workingdir  servernames
+// complete the snapshot, atomically moving from tmp to .snapshot dir.
+completesnapshot this snapshotdir  this workingdir  this fs
+catch  exception e
+string reason       clientsnapshotdescriptionutils tostring snapshot
+e getmessage
+log error reason  e
+foreignexception ee   new foreignexception reason  e
+monitor receive ee
+// need to mark this completed to close off and allow cleanup to happen.
+cancel     clientsnapshotdescriptionutils tostring snapshot
+finally
+log debug     workingdir
+try
+// if the working dir is still present, the snapshot has failed.  it is present we delete
+// it.
+if  fs exists workingdir      this fs delete workingdir  true
+log error     workingdir
+catch  ioexception e
+log error     workingdir
+releasetablelock
+protected void releasetablelock
+if  this tablelock    null
+try
+this tablelock release
+catch  ioexception ex
+log warn    ex
+/**
+* reset the manager to allow another snapshot to proceed
+*
+* @param snapshotdir final path of the snapshot
+* @param workingdir directory where the in progress snapshot was built
+* @param fs {@link filesystem} where the snapshot was built
+* @throws snapshotcreationexception if the snapshot could not be moved
+* @throws ioexception the filesystem could not be reached
+*/
+public void completesnapshot path snapshotdir  path workingdir  filesystem fs
+throws snapshotcreationexception  ioexception
+log debug     workingdir
+snapshotdir
+if   fs rename workingdir  snapshotdir
+throw new snapshotcreationexception     workingdir
+snapshotdir
+finished   true
+/**
+* snapshot the specified regions
+*/
+protected abstract void snapshotregions list<pair<hregioninfo  servername>> regions
+throws ioexception  keeperexception
+@override
+public void cancel string why
+if  finished  return
+this finished   true
+log info     clientsnapshotdescriptionutils tostring snapshot
+why
+cancellationexception ce   new cancellationexception why
+monitor receive new foreignexception master getservername   tostring    ce
+@override
+public boolean isfinished
+return finished
+@override
+public snapshotdescription getsnapshot
+return snapshot
+@override
+public foreignexception getexceptioniffailed
+return monitor getexception
+@override
+public void rethrowexception   throws foreignexception
+monitor rethrowexception
+@override
+public boolean hasexception
+return monitor hasexception
+@override
+public foreignexception getexception
+return monitor getexception

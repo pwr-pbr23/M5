@@ -1,0 +1,502 @@
+/*
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase util
+import org apache hadoop io rawcomparator
+import org apache hadoop io writable
+import java io datainput
+import java io dataoutput
+import java io ioexception
+import java nio bytebuffer
+import java text numberformat
+import java util random
+/**
+* implements a <i>bloom filter</i>, as defined by bloom in 1970.
+* <p>
+* the bloom filter is a data structure that was introduced in 1970 and that has
+* been adopted by the networking research community in the past decade thanks
+* to the bandwidth efficiencies that it offers for the transmission of set
+* membership information between networked hosts. a sender encodes the
+* information into a bit vector, the bloom filter, that is more compact than a
+* conventional representation. computation and space costs for construction are
+* linear in the number of elements. the receiver uses the filter to test
+* whether various elements are members of the set. though the filter will
+* occasionally return a false positive, it will never return a false negative.
+* when creating the filter, the sender can choose its desired point in a
+* trade-off between the false positive rate and the size.
+*
+* <p>
+* originally inspired by <a href="http://www.one-lab.org">european commission
+* one-lab project 034819</a>.
+*
+* bloom filters are very sensitive to the number of elements inserted into
+* them. for hbase, the number of entries depends on the size of the data stored
+* in the column. currently the default region size is 256mb, so entry count ~=
+* 256mb / (average value size for column). despite this rule of thumb, there is
+* no efficient way to calculate the entry count after compactions. therefore,
+* it is often easier to use a dynamic bloom filter that will add extra space
+* instead of allowing the error rate to grow.
+*
+* ( http://www.eecs.harvard.edu/~michaelm/newwork/postscripts/bloomfiltersurvey
+* .pdf )
+*
+* m denotes the number of bits in the bloom filter (bitsize) n denotes the
+* number of elements inserted into the bloom filter (maxkeys) k represents the
+* number of hash functions used (nbhash) e represents the desired false
+* positive rate for the bloom (err)
+*
+* if we fix the error rate (e) and know the number of entries, then the optimal
+* bloom size m = -(n * ln(err) / (ln(2)^2) ~= n * ln(err) / ln(0.6185)
+*
+* the probability of false positives is minimized when k = m/n ln(2).
+*
+* @see bloomfilter the general behavior of a filter
+*
+* @see <a
+*      href="http://portal.acm.org/citation.cfm?id=362692&dl=acm&coll=portal">
+*      space/time trade-offs in hash coding with allowable errors</a>
+*/
+public class bytebloomfilter implements bloomfilter  bloomfilterwriter
+/** current file format version */
+public static final int version   1
+/** bytes (b) in the array. this actually has to fit into an int. */
+protected long bytesize
+/** number of hash functions */
+protected int hashcount
+/** hash type */
+protected final int hashtype
+/** hash function */
+protected final hash hash
+/** keys currently in the bloom */
+protected int keycount
+/** max keys expected for the bloom */
+protected int maxkeys
+/** bloom bits */
+protected bytebuffer bloom
+/** record separator for the bloom filter statistics human-readable string */
+public static final string stats_record_sep
+/**
+* used in computing the optimal bloom filter size. this approximately equals
+* 0.480453.
+*/
+public static final double log2_squared   math log 2    math log 2
+/**
+* a random number generator to use for "fake lookups" when testing to
+* estimate the ideal false positive rate.
+*/
+private static random randomgeneratorfortest
+/** bit-value lookup array to prevent doing the same work over and over */
+private static final byte  bitvals
+byte  0x01
+byte  0x02
+byte  0x04
+byte  0x08
+byte  0x10
+byte  0x20
+byte  0x40
+byte  0x80
+/**
+* loads bloom filter meta data from file input.
+* @param meta stored bloom meta data
+* @throws illegalargumentexception meta data is invalid
+*/
+public bytebloomfilter datainput meta
+throws ioexception  illegalargumentexception
+this bytesize   meta readint
+this hashcount   meta readint
+this hashtype   meta readint
+this keycount   meta readint
+this maxkeys   this keycount
+this hash   hash getinstance this hashtype
+if  hash    null
+throw new illegalargumentexception     hashtype
+sanitycheck
+/**
+* @param maxkeys
+* @param errorrate
+* @return the number of bits for a bloom filter than can hold the given
+*         number of keys and provide the given error rate, assuming that the
+*         optimal number of hash functions is used and it does not have to
+*         be an integer.
+*/
+public static long computebitsize long maxkeys  double errorrate
+return  long  math ceil maxkeys     math log errorrate    log2_squared
+/**
+* the maximum number of keys we can put into a bloom filter of a certain
+* size to maintain the given error rate, assuming the number of hash
+* functions is chosen optimally and does not even have to be an integer
+* (hence the "ideal" in the function name).
+*
+* @param bitsize
+* @param errorrate
+* @return maximum number of keys that can be inserted into the bloom filter
+* @see #computemaxkeys(long, double, int) for a more precise estimate
+*/
+public static long idealmaxkeys long bitsize  double errorrate
+// the reason we need to use floor here is that otherwise we might put
+// more keys in a bloom filter than is allowed by the target error rate.
+return  long   bitsize    log2_squared    math log errorrate
+/**
+* the maximum number of keys we can put into a bloom filter of a certain
+* size to get the given error rate, with the given number of hash functions.
+*
+* @param bitsize
+* @param errorrate
+* @param hashcount
+* @return the maximum number of keys that can be inserted in a bloom filter
+*         to maintain the target error rate, if the number of hash functions
+*         is provided.
+*/
+public static long computemaxkeys long bitsize  double errorrate
+int hashcount
+return  long    bitsize   1 0   hashcount
+math log 1   math exp math log errorrate    hashcount
+/**
+* computes the error rate for this bloom filter, taking into account the
+* actual number of hash functions and keys inserted. the return value of
+* this function changes as a bloom filter is being populated. used for
+* reporting the actual error rate of compound bloom filters when writing
+* them out.
+*
+* @return error rate for this particular bloom filter
+*/
+public double actualerrorrate
+return actualerrorrate keycount  bytesize   8  hashcount
+/**
+* computes the actual error rate for the given number of elements, number
+* of bits, and number of hash functions. taken directly from the
+* <a href=
+* "http://en.wikipedia.org/wiki/bloom_filter#probability_of_false_positives"
+* > wikipedia bloom filter article</a>.
+*
+* @param maxkeys
+* @param bitsize
+* @param functioncount
+* @return the actual error rate
+*/
+public static double actualerrorrate long maxkeys  long bitsize
+int functioncount
+return math exp math log 1   math exp  functioncount   maxkeys   1 0
+bitsize     functioncount
+/**
+* increases the given byte size of a bloom filter until it can be folded by
+* the given factor.
+*
+* @param bitsize
+* @param foldfactor
+* @return foldable byte size
+*/
+public static int computefoldablebytesize long bitsize  int foldfactor
+long bytesizelong    bitsize   7    8
+int mask    1 << foldfactor    1
+if   mask   bytesizelong     0
+bytesizelong >>  foldfactor
+bytesizelong
+bytesizelong <<  foldfactor
+if  bytesizelong > integer max_value
+throw new illegalargumentexception     bytesizelong
+bitsize       foldfactor
+return  int  bytesizelong
+private static int optimalfunctioncount int maxkeys  long bitsize
+return  int  math ceil math log 2     bitsize   maxkeys
+/** private constructor used by other constructors. */
+private bytebloomfilter int hashtype
+this hashtype   hashtype
+this hash   hash getinstance hashtype
+/**
+* determines & initializes bloom filter meta data from user config. call
+* {@link #allocbloom()} to allocate bloom filter data.
+*
+* @param maxkeys maximum expected number of keys that will be stored in this
+*          bloom
+* @param errorrate desired false positive error rate. lower rate = more
+*          storage required
+* @param hashtype type of hash function to use
+* @param foldfactor when finished adding entries, you may be able to 'fold'
+*          this bloom to save space. tradeoff potentially excess bytes in
+*          bloom for ability to fold if keycount is exponentially greater
+*          than maxkeys.
+* @throws illegalargumentexception
+*/
+public bytebloomfilter int maxkeys  double errorrate  int hashtype
+int foldfactor  throws illegalargumentexception
+this hashtype
+long bitsize   computebitsize maxkeys  errorrate
+hashcount   optimalfunctioncount maxkeys  bitsize
+this maxkeys   maxkeys
+// increase bytesize so folding is possible
+bytesize   computefoldablebytesize bitsize  foldfactor
+sanitycheck
+/**
+* creates a bloom filter of the given size.
+*
+* @param bytesizehint the desired number of bytes for the bloom filter bit
+*          array. will be increased so that folding is possible.
+* @param errorrate target false positive rate of the bloom filter
+* @param hashtype bloom filter hash function type
+* @param foldfactor
+* @return the new bloom filter of the desired size
+*/
+public static bytebloomfilter createbysize int bytesizehint
+double errorrate  int hashtype  int foldfactor
+bytebloomfilter bbf   new bytebloomfilter hashtype
+bbf bytesize   computefoldablebytesize bytesizehint   8  foldfactor
+long bitsize   bbf bytesize   8
+bbf maxkeys    int  idealmaxkeys bitsize  errorrate
+bbf hashcount   optimalfunctioncount bbf maxkeys  bitsize
+// adjust max keys to bring error rate closer to what was requested,
+// because bytesize was adjusted to allow for folding, and hashcount was
+// rounded.
+bbf maxkeys    int  computemaxkeys bitsize  errorrate  bbf hashcount
+return bbf
+/**
+* creates another similar bloom filter. does not copy the actual bits, and
+* sets the new filter's key count to zero.
+*
+* @return a bloom filter with the same configuration as this
+*/
+public bytebloomfilter createanother
+bytebloomfilter bbf   new bytebloomfilter hashtype
+bbf bytesize   bytesize
+bbf hashcount   hashcount
+bbf maxkeys   maxkeys
+return bbf
+@override
+public void allocbloom
+if  this bloom    null
+throw new illegalargumentexception
+this bloom   bytebuffer allocate  int this bytesize
+assert this bloom hasarray
+void sanitycheck   throws illegalargumentexception
+if 0 >  this bytesize    this bytesize > integer max_value
+throw new illegalargumentexception     this bytesize
+if this hashcount <  0
+throw new illegalargumentexception
+if  this hash    null
+throw new illegalargumentexception
+if  this keycount < 0
+throw new illegalargumentexception
+void bloomcheck bytebuffer bloom   throws illegalargumentexception
+if  this bytesize    bloom limit
+throw new illegalargumentexception
+public void add byte  buf
+add buf  0  buf length
+@override
+public void add byte  buf  int offset  int len
+/*
+* for faster hashing, use combinatorial generation
+* http://www.eecs.harvard.edu/~kirsch/pubs/bbbf/esa06.pdf
+*/
+int hash1   this hash hash buf  offset  len  0
+int hash2   this hash hash buf  offset  len  hash1
+for  int i   0  i < this hashcount  i
+long hashloc   math abs  hash1   i   hash2  %  this bytesize   8
+set hashloc
+this keycount
+/** should only be used in tests */
+boolean contains byte  buf
+return contains buf  0  buf length  this bloom
+/** should only be used in tests */
+boolean contains byte  buf  int offset  int length
+return contains buf  offset  length  bloom
+/** should only be used in tests */
+boolean contains byte buf  bytebuffer bloom
+return contains buf  0  buf length  bloom
+@override
+public boolean contains byte buf  int offset  int length
+bytebuffer thebloom
+if  thebloom    null
+// in a version 1 hfile bloom filter data is stored in a separate meta
+// block which is loaded on demand, but in version 2 it is pre-loaded.
+// we want to use the same api in both cases.
+thebloom   bloom
+if  thebloom limit      bytesize
+throw new illegalargumentexception
+thebloom limit         bytesize
+return contains buf  offset  length  thebloom array
+thebloom arrayoffset     int  bytesize  hash  hashcount
+public static boolean contains byte buf  int offset  int length
+byte bloomarray  int bloomoffset  int bloomsize  hash hash
+int hashcount
+int hash1   hash hash buf  offset  length  0
+int hash2   hash hash buf  offset  length  hash1
+int bloombitsize   bloomsize   8
+if  randomgeneratorfortest    null
+// production mode.
+for  int i   0  i < hashcount  i
+long hashloc   math abs  hash1   i   hash2  % bloombitsize
+if   get hashloc  bloomarray  bloomoffset
+return false
+else
+// test mode with "fake lookups" to estimate "ideal false positive rate".
+for  int i   0  i < hashcount  i
+long hashloc   randomgeneratorfortest nextint bloombitsize
+if   get hashloc  bloomarray  bloomoffset
+return false
+return true
+//---------------------------------------------------------------------------
+/** private helpers */
+/**
+* set the bit at the specified index to 1.
+*
+* @param pos index of bit
+*/
+void set long pos
+int bytepos    int  pos   8
+int bitpos    int  pos % 8
+byte curbyte   bloom get bytepos
+curbyte    bitvals
+bloom put bytepos  curbyte
+/**
+* check if bit at specified index is 1.
+*
+* @param pos index of bit
+* @return true if bit at specified index is 1, false if 0.
+*/
+static boolean get long pos  byte bloomarray  int bloomoffset
+int bytepos    int  pos   8
+int bitpos    int  pos % 8
+byte curbyte   bloomarray
+curbyte    bitvals
+return  curbyte    0
+@override
+public long getkeycount
+return keycount
+@override
+public long getmaxkeys
+return maxkeys
+@override
+public long getbytesize
+return bytesize
+public int gethashtype
+return hashtype
+@override
+public void compactbloom
+// see if the actual size is exponentially smaller than expected.
+if  this keycount > 0    this bloom hasarray
+int pieces   1
+int newbytesize    int this bytesize
+int newmaxkeys   this maxkeys
+// while exponentially smaller & folding is lossless
+while    newbytesize   1     0    newmaxkeys >  this keycount<<1
+pieces <<  1
+newbytesize >>  1
+newmaxkeys >>  1
+// if we should fold these into pieces
+if  pieces > 1
+byte array   this bloom array
+int start   this bloom arrayoffset
+int end   start   newbytesize
+int off   end
+for int p   1  p < pieces    p
+for int pos   start  pos < end    pos
+array    array
+// folding done, only use a subset of this array
+this bloom rewind
+this bloom limit newbytesize
+this bloom   this bloom slice
+this bytesize   newbytesize
+this maxkeys   newmaxkeys
+//---------------------------------------------------------------------------
+/**
+* writes just the bloom filter to the output array
+* @param out outputstream to place bloom
+* @throws ioexception error writing bloom array
+*/
+public void writebloom final dataoutput out  throws ioexception
+if   this bloom hasarray
+throw new ioexception
+out write bloom array    bloom arrayoffset    bloom limit
+@override
+public writable getmetawriter
+return new metawriter
+@override
+public writable getdatawriter
+return new datawriter
+private class metawriter implements writable
+protected metawriter
+@override
+public void readfields datainput arg0  throws ioexception
+throw new ioexception
+@override
+public void write dataoutput out  throws ioexception
+out writeint version
+out writeint  int  bytesize
+out writeint hashcount
+out writeint hashtype
+out writeint keycount
+private class datawriter implements writable
+protected datawriter
+@override
+public void readfields datainput arg0  throws ioexception
+throw new ioexception
+@override
+public void write dataoutput out  throws ioexception
+writebloom out
+public int gethashcount
+return hashcount
+@override
+public boolean supportsautoloading
+return bloom    null
+public static void setfakelookupmode boolean enabled
+if  enabled
+randomgeneratorfortest   new random 283742987l
+else
+randomgeneratorfortest   null
+/**
+* {@inheritdoc}
+* just concatenate row and column by default. may return the original row
+* buffer if the column qualifier is empty.
+*/
+@override
+public byte createbloomkey byte rowbuf  int rowoffset  int rowlen
+byte qualbuf  int qualoffset  int quallen
+// optimize the frequent case when only the row is provided.
+if  quallen <  0    rowoffset    0    rowlen    rowbuf length
+return rowbuf
+byte  result   new byte
+system arraycopy rowbuf  rowoffset  result  0   rowlen
+if  quallen > 0
+system arraycopy qualbuf  qualoffset  result  rowlen  quallen
+return result
+@override
+public rawcomparator<byte> getcomparator
+return bytes bytes_rawcomparator
+/**
+* a human-readable string with statistics for the given bloom filter.
+*
+* @param bloomfilter the bloom filter to output statistics for;
+* @return a string consisting of "&lt;key&gt;: &lt;value&gt;" parts
+*         separated by {@link #stats_record_sep}.
+*/
+public static string formatstats bloomfilterbase bloomfilter
+stringbuilder sb   new stringbuilder
+long k   bloomfilter getkeycount
+long m   bloomfilter getmaxkeys
+sb append     bloomfilter getbytesize     stats_record_sep
+sb append     k   stats_record_sep
+sb append     m
+if  m > 0
+sb append stats_record_sep
+numberformat getpercentinstance   format k   1 0   m
+return sb tostring
+@override
+public string tostring
+return formatstats this    stats_record_sep
+string format    actualerrorrate

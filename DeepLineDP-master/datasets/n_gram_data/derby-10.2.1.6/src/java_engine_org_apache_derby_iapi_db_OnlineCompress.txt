@@ -1,0 +1,551 @@
+/*
+derby - class org.apache.derby.iapi.db.onlinecompress
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby iapi db
+import org apache derby iapi error standardexception
+import org apache derby iapi error publicapi
+import org apache derby iapi sql dictionary datadictionarycontext
+import org apache derby iapi sql dictionary datadictionary
+import org apache derby iapi sql dictionary schemadescriptor
+import org apache derby iapi sql dictionary tabledescriptor
+import org apache derby iapi sql dictionary columndescriptor
+import org apache derby iapi sql dictionary columndescriptorlist
+import org apache derby iapi sql dictionary constraintdescriptor
+import org apache derby iapi sql dictionary constraintdescriptorlist
+import org apache derby iapi sql dictionary conglomeratedescriptor
+import org apache derby iapi sql depend dependencymanager
+import org apache derby iapi sql execute execrow
+import org apache derby iapi sql execute executioncontext
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi types datavaluefactory
+import org apache derby iapi sql conn languageconnectioncontext
+import org apache derby iapi sql conn connectionutil
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi types rowlocation
+import org apache derby iapi store access scancontroller
+import org apache derby iapi store access conglomeratecontroller
+import org apache derby iapi store access groupfetchscancontroller
+import org apache derby iapi store access rowutil
+import org apache derby iapi store access qualifier
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services io formatablebitset
+import java sql sqlexception
+/**
+implementation of syscs_util.syscs_inplace_compress_table().
+<p>
+code which implements the following system procedure:
+void syscs_util.syscs_inplace_compress_table(
+in schemaname        varchar(128),
+in tablename         varchar(128),
+in purge_rows        smallint,
+in defragment_rows   smallint,
+in truncate_end      smallint)
+<p>
+use the syscs_util.syscs_inplace_compress_table system procedure to reclaim
+unused, allocated space in a table and its indexes. typically, unused allocated
+space exists when a large amount of data is deleted from a table, and there
+have not been subsequent inserts to use the space freed by the deletes.
+by default, derby does not return unused space to the operating system. for
+example, once a page has been allocated to a table or index, it is not
+automatically returned to the operating system until the table or index is
+destroyed. syscs_util.syscs_inplace_compress_table allows you to return unused
+space to the operating system.
+<p>
+this system procedure can be used to force 3 levels of in place compression
+of a sql table: purge_rows, defragment_rows, truncate_end.  unlike
+syscs_util.syscs_compress_table() all work is done in place in the existing
+table/index.
+<p>
+syntax:
+syscs_util.syscs_inplace_compress_table(
+in schemaname        varchar(128),
+in tablename         varchar(128),
+in purge_rows        smallint,
+in defragment_rows   smallint,
+in truncate_end      smallint)
+<p>
+schemaname:
+an input argument of type varchar(128) that specifies the schema of the table. passing a null will result in an error.
+<p>
+tablename:
+an input argument of type varchar(128) that specifies the table name of the
+table. the string must exactly match the case of the table name, and the
+argument of "fred" will be passed to sql as the delimited identifier 'fred'.
+passing a null will result in an error.
+<p>
+purge_rows:
+if purge_rows is set to non-zero then a single pass is made through the table
+which will purge committed deleted rows from the table.  this space is then
+available for future inserted rows, but remains allocated to the table.
+as this option scans every page of the table, it's performance is linearly
+related to the size of the table.
+<p>
+defragment_rows:
+if defragment_rows is set to non-zero then a single defragment pass is made
+which will move existing rows from the end of the table towards the front
+of the table.  the goal of the defragment run is to empty a set of pages
+at the end of the table which can then be returned to the os by the
+truncate_end option.  it is recommended to only run defragment_rows, if also
+specifying the truncate_end option.  this option scans the whole table and
+needs to update index entries for every base table row move, and thus execution
+time is linearly related to the size of the table.
+<p>
+truncate_end:
+if truncate_end is set to non-zero then all contiguous pages at the end of
+the table will be returned to the os.  running the purge_rows and/or
+defragment_rows passes options may increase the number of pages affected.
+this option itself does no scans of the table, so performs on the order of a
+few system calls.
+<p>
+sql example:
+to compress a table called customer in a schema called us, using all
+available compress options:
+call syscs_util.syscs_inplace_compress_table('us', 'customer', 1, 1, 1);
+to quickly just return the empty free space at the end of the same table,
+this option will run much quicker than running all phases but will likely
+return much less space:
+call syscs_util.syscs_inplace_compress_table('us', 'customer', 0, 0, 1);
+java example:
+to compress a table called customer in a schema called us, using all
+available compress options:
+callablestatement cs = conn.preparecall
+("call syscs_util.syscs_compress_table(?, ?, ?, ?, ?)");
+cs.setstring(1, "us");
+cs.setstring(2, "customer");
+cs.setshort(3, (short) 1);
+cs.setshort(4, (short) 1);
+cs.setshort(5, (short) 1);
+cs.execute();
+to quickly just return the empty free space at the end of the same table,
+this option will run much quicker than running all phases but will likely
+return much less space:
+callablestatement cs = conn.preparecall
+("call syscs_util.syscs_compress_table(?, ?, ?, ?, ?)");
+cs.setstring(1, "us");
+cs.setstring(2, "customer");
+cs.setshort(3, (short) 0);
+cs.setshort(4, (short) 0);
+cs.setshort(5, (short) 1);
+cs.execute();
+<p>
+it is recommended that the syscs_util.syscs_compress_table procedure is
+issued in auto-commit mode.
+note: this procedure acquires an exclusive table lock on the table being compressed. all statement plans dependent on the table or its indexes are invalidated. for information on identifying unused space, see the derby server and administration guide.
+todo list:
+o defragment requires table level lock in nested user transaction, which
+will conflict with user lock on same table in user transaction.
+**/
+public class onlinecompress
+/** no requirement for a constructor */
+private onlinecompress
+/**
+* implementation of syscs_util.syscs_inplace_compress_table().
+* <p>
+* top level implementation of the system procedure.  all the
+* real work is found in the other routines in this file implementing
+* the 3 phases of inplace compression:  purge, defragment, and truncate.
+* <p>
+* @param schemaname        schema name of table, required
+* @param tablename         table name to be compressed
+* @param purgerows         if true, do a purge pass on the table
+* @param defragmentrows    if true, do a defragment pass on the table
+* @param truncateend       if true, return empty pages at end to os.
+*
+* @exception  sqlexception  errors returned by throwing sqlexception.
+**/
+public static void compresstable
+string  schemaname
+string  tablename
+boolean purgerows
+boolean defragmentrows
+boolean truncateend
+throws sqlexception
+languageconnectioncontext lcc         connectionutil getcurrentlcc
+transactioncontroller     tc          lcc gettransactionexecute
+try
+datadictionary data_dictionary   lcc getdatadictionary
+// each of the following may give up locks allowing ddl on the
+// table, so each phase needs to do the data dictionary lookup.
+// the order is important as it makes sense to first purge
+// deleted rows, then defragment existing non-deleted rows, and
+// finally to truncate the end of the file which may have been
+// made larger by the previous purge/defragment pass.
+if  purgerows
+purgerows schemaname  tablename  data_dictionary  tc
+if  defragmentrows
+defragmentrows schemaname  tablename  data_dictionary  tc
+if  truncateend
+truncateend schemaname  tablename  data_dictionary  tc
+catch  standardexception se
+throw publicapi wrapstandardexception se
+/**
+* defragment rows in the given table.
+* <p>
+* scans the rows at the end of a table and moves them to free spots
+* towards the beginning of the table.  in the same transaction all
+* associated indexes are updated to reflect the new location of the
+* base table row.
+* <p>
+* after a defragment pass, if was possible, there will be a set of
+* empty pages at the end of the table which can be returned to the
+* operating system by calling truncateend().  the allocation bit
+* maps will be set so that new inserts will tend to go to empty and
+* half filled pages starting from the front of the conglomerate.
+*
+* @param schemaname        schema of table to defragement
+* @param tablename         name of table to defragment
+* @param data_dictionary   an open data dictionary to look up the table in.
+* @param tc                transaction controller to use to do updates.
+*
+**/
+private static void defragmentrows
+string                  schemaname
+string                  tablename
+datadictionary          data_dictionary
+transactioncontroller   tc
+throws sqlexception
+groupfetchscancontroller base_group_fetch_cc   null
+int                      num_indexes           0
+int                  index_col_map          null
+scancontroller         index_scan             null
+conglomeratecontroller index_cc               null
+datavaluedescriptor  index_row              null
+languageconnectioncontext lcc         connectionutil getcurrentlcc
+transactioncontroller     nested_tc   null
+try
+schemadescriptor sd
+data_dictionary getschemadescriptor
+schemaname  nested_tc  true
+tabledescriptor td
+data_dictionary gettabledescriptor tablename  sd
+nested_tc
+tc startnestedusertransaction false
+if  td    null
+throw standardexception newexception
+sqlstate lang_table_not_found
+schemaname       tablename
+switch  td gettabletype
+/* skip views and vti tables */
+case tabledescriptor view_type
+case tabledescriptor vti_type
+return
+// other types give various errors here
+// derby-719,derby-720
+default
+break
+conglomeratedescriptor heapcd
+td getconglomeratedescriptor td getheapconglomerateid
+/* get a row template for the base table */
+execrow baserow
+lcc getexecutioncontext   getexecutionfactory   getvaluerow
+td getnumberofcolumns
+/* fill the row with nulls of the correct type */
+columndescriptorlist cdl   td getcolumndescriptorlist
+int					 cdlsize   cdl size
+for  int index   0  index < cdlsize  index
+columndescriptor cd    columndescriptor  cdl elementat index
+baserow setcolumn cd getposition    cd gettype   getnull
+datavaluedescriptor row_array   new datavaluedescriptor
+row_array   baserow getrowarray
+rowlocation old_row_location_array   new rowlocation
+rowlocation new_row_location_array   new rowlocation
+// create the following 3 arrays which will be used to update
+// each index as the scan moves rows about the heap as part of
+// the compress:
+//     index_col_map - map location of index cols in the base row,
+//                     ie. index_col_map[0] is column offset of 1st
+//                     key collumn in base row.  all offsets are 0
+//                     based.
+//     index_scan - open scancontroller used to delete old index row
+//     index_cc   - open conglomeratecontroller used to insert new
+//                  row
+conglomeratedescriptor conglom_descriptors
+td getconglomeratedescriptors
+// conglom_descriptors has an entry for the conglomerate and each
+// one of it's indexes.
+num_indexes   conglom_descriptors length   1
+// if indexes exist, set up data structures to update them
+if  num_indexes > 0
+// allocate arrays
+index_col_map     new int
+index_scan        new scancontroller
+index_cc          new conglomeratecontroller
+index_row         new datavaluedescriptor
+setup_indexes
+nested_tc
+td
+index_col_map
+index_scan
+index_cc
+index_row
+/* open the heap for reading */
+base_group_fetch_cc
+nested_tc defragmentconglomerate
+td getheapconglomerateid
+false
+true
+transactioncontroller openmode_forupdate
+transactioncontroller mode_table
+transactioncontroller isolation_serializable
+int num_rows_fetched   0
+while   num_rows_fetched
+base_group_fetch_cc fetchnextgroup
+row_array
+old_row_location_array
+new_row_location_array      0
+if  num_indexes > 0
+for  int row   0  row < num_rows_fetched  row
+for  int index   0  index < num_indexes  index
+fixindex
+row_array
+index_row
+old_row_location_array
+new_row_location_array
+index_cc
+index_scan
+index_col_map
+// todo - it would be better if commits happened more frequently
+// in the nested transaction, but to do that there has to be more
+// logic to catch a ddl that might jump in the middle of the
+// above loop and invalidate the various table control structures
+// which are needed to properly update the indexes.  for example
+// the above loop would corrupt an index added midway through
+// the loop if not properly handled.  see derby-1188.
+nested_tc commit
+catch  standardexception se
+throw publicapi wrapstandardexception se
+finally
+try
+/* clean up before we leave */
+if  base_group_fetch_cc    null
+base_group_fetch_cc close
+base_group_fetch_cc   null
+if  num_indexes > 0
+for  int i   0  i < num_indexes  i
+if  index_scan    null    index_scan    null
+index_scan close
+index_scan   null
+if  index_cc    null    index_cc    null
+index_cc close
+index_cc   null
+if  nested_tc    null
+nested_tc destroy
+catch  standardexception se
+throw publicapi wrapstandardexception se
+return
+/**
+* purge committed deleted rows from conglomerate.
+* <p>
+* scans the table and purges any committed deleted rows from the
+* table.  if all rows on a page are purged then page is also
+* reclaimed.
+* <p>
+*
+* @param schemaname        schema of table to defragement
+* @param tablename         name of table to defragment
+* @param data_dictionary   an open data dictionary to look up the table in.
+* @param tc                transaction controller to use to do updates.
+*
+**/
+private static void purgerows
+string                  schemaname
+string                  tablename
+datadictionary          data_dictionary
+transactioncontroller   tc
+throws standardexception
+schemadescriptor sd
+data_dictionary getschemadescriptor schemaname  tc  true
+tabledescriptor  td
+data_dictionary gettabledescriptor tablename  sd
+if  td    null
+throw standardexception newexception
+sqlstate lang_table_not_found
+schemaname       tablename
+switch  td gettabletype
+/* skip views and vti tables */
+case tabledescriptor view_type
+case tabledescriptor vti_type
+break
+// other types give various errors here
+// derby-719,derby-720
+default
+conglomeratedescriptor conglom_descriptors
+td getconglomeratedescriptors
+for  int cd_idx   0  cd_idx < conglom_descriptors length  cd_idx
+conglomeratedescriptor cd   conglom_descriptors
+tc purgeconglomerate cd getconglomeratenumber
+return
+/**
+* truncate end of conglomerate.
+* <p>
+* returns the contiguous free space at the end of the table back to
+* the operating system.  takes care of space allocation bit maps, and
+* os call to return the actual space.
+* <p>
+*
+* @param schemaname        schema of table to defragement
+* @param tablename         name of table to defragment
+* @param data_dictionary   an open data dictionary to look up the table in.
+* @param tc                transaction controller to use to do updates.
+*
+**/
+private static void truncateend
+string                  schemaname
+string                  tablename
+datadictionary          data_dictionary
+transactioncontroller   tc
+throws standardexception
+schemadescriptor sd
+data_dictionary getschemadescriptor schemaname  tc  true
+tabledescriptor  td
+data_dictionary gettabledescriptor tablename  sd
+if  td    null
+throw standardexception newexception
+sqlstate lang_table_not_found
+schemaname       tablename
+switch  td gettabletype
+/* skip views and vti tables */
+case tabledescriptor view_type
+case tabledescriptor vti_type
+break
+// other types give various errors here
+// derby-719,derby-720
+default
+conglomeratedescriptor conglom_descriptors
+td getconglomeratedescriptors
+for  int cd_idx   0  cd_idx < conglom_descriptors length  cd_idx
+conglomeratedescriptor cd   conglom_descriptors
+tc compressconglomerate cd getconglomeratenumber
+return
+private static void setup_indexes
+transactioncontroller       tc
+tabledescriptor             td
+int                     index_col_map
+scancontroller            index_scan
+conglomeratecontroller    index_cc
+datavaluedescriptor     index_row
+throws standardexception
+// initialize the following 3 arrays which will be used to update
+// each index as the scan moves rows about the heap as part of
+// the compress:
+//     index_col_map - map location of index cols in the base row, ie.
+//                     index_col_map[0] is column offset of 1st key
+//                     collumn in base row.  all offsets are 0 based.
+//     index_scan - open scancontroller used to delete old index row
+//     index_cc   - open conglomeratecontroller used to insert new row
+conglomeratedescriptor conglom_descriptors
+td getconglomeratedescriptors
+int index_idx   0
+for  int cd_idx   0  cd_idx < conglom_descriptors length  cd_idx
+conglomeratedescriptor index_cd   conglom_descriptors
+if   index_cd isindex
+// skip the heap descriptor entry
+continue
+// scancontrollers are used to delete old index row
+index_scan
+tc openscan
+index_cd getconglomeratenumber
+true 	   hold
+transactioncontroller openmode_forupdate
+transactioncontroller mode_table
+transactioncontroller isolation_serializable
+null       full row is retrieved
+// so that full row can be used for start/stop keys
+null 	   startkeyvalue   will be reset with reopenscan
+0
+null 	   qualifier
+null 	   stopkeyvalue    will be reset with reopenscan
+0
+// conglomeratecontrollers are used to insert new index row
+index_cc
+tc openconglomerate
+index_cd getconglomeratenumber
+true      hold
+transactioncontroller openmode_forupdate
+transactioncontroller mode_table
+transactioncontroller isolation_serializable
+// build column map to allow index row to be built from base row
+int basecolumnpositions
+index_cd getindexdescriptor   basecolumnpositions
+int zero_based_map
+new int
+for  int i   0  i < basecolumnpositions length  i
+zero_based_map   basecolumnpositions   1
+index_col_map   zero_based_map
+// build row array to delete from index and insert into index
+//     length is length of column map + 1 for rowlocation.
+index_row
+new datavaluedescriptor
+index_idx
+return
+/**
+* delete old index row and insert new index row in input index.
+* <p>
+*
+* @param base_row      all columns of base row
+* @param index_row     an index row template, filled in by this routine
+* @param old_row_loc   old location of base row, used to delete index
+* @param new_row_loc   new location of base row, used to update index
+* @param index_cc      index conglomerate to insert new row
+* @param index_scan    index scan to delete old entry
+* @param index_col_map description of mapping of index row to base row,
+*
+*
+* @exception  standardexception  standard exception policy.
+**/
+private static void fixindex
+datavaluedescriptor   base_row
+datavaluedescriptor   index_row
+rowlocation             old_row_loc
+rowlocation             new_row_loc
+conglomeratecontroller  index_cc
+scancontroller          index_scan
+int					index_col_map
+throws standardexception
+if  sanitymanager debug
+// basecolumnpositions should describe all columns in index row
+// except for the final column, which is the rowlocation.
+sanitymanager assert index_col_map    null
+sanitymanager assert index_row    null
+sanitymanager assert
+index_col_map length     index_row length   1
+// create the index row to delete from from the base row, using map
+for  int index   0  index < index_col_map length  index
+index_row   base_row]
+// last column in index in the rowlocation
+index_row   old_row_loc
+// position the scan for the delete, the scan should already be open.
+// this is done by setting start scan to full key, ge and stop scan
+// to full key, gt.
+index_scan reopenscan
+index_row
+scancontroller ge
+qualifier  null
+index_row
+scancontroller gt
+// position the scan, serious problem if scan does not find the row.
+if  index_scan next
+index_scan delete
+else
+// didn't find the row we wanted to delete.
+if  sanitymanager debug
+sanitymanager throwassert
+rowutil tostring base_row
+rowutil tostring index_row
+// insert the new index row into the conglomerate
+index_row   new_row_loc
+index_cc insert index_row
+return

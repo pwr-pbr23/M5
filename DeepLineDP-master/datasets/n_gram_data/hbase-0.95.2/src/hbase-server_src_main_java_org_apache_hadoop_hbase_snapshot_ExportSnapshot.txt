@@ -1,0 +1,545 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase snapshot
+import java io ioexception
+import java util arraylist
+import java util collections
+import java util comparator
+import java util linkedlist
+import java util list
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop classification interfacestability
+import org apache hadoop conf configuration
+import org apache hadoop conf configured
+import org apache hadoop fs fsdatainputstream
+import org apache hadoop fs fsdataoutputstream
+import org apache hadoop fs filechecksum
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs fileutil
+import org apache hadoop fs path
+import org apache hadoop fs permission fspermission
+import org apache hadoop hbase tablename
+import org apache hadoop hbase hbaseconfiguration
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase io hfilelink
+import org apache hadoop hbase io hloglink
+import org apache hadoop hbase mapreduce jobutil
+import org apache hadoop hbase protobuf protobufutil
+import org apache hadoop hbase protobuf generated hbaseprotos snapshotdescription
+import org apache hadoop hbase regionserver storefileinfo
+import org apache hadoop hbase util environmentedgemanager
+import org apache hadoop hbase util fsutils
+import org apache hadoop hbase util pair
+import org apache hadoop io nullwritable
+import org apache hadoop io sequencefile
+import org apache hadoop io text
+import org apache hadoop mapreduce job
+import org apache hadoop mapreduce mapper
+import org apache hadoop mapreduce lib input sequencefileinputformat
+import org apache hadoop mapreduce lib output nulloutputformat
+import org apache hadoop util stringutils
+import org apache hadoop util tool
+import org apache hadoop util toolrunner
+/**
+* export the specified snapshot to a given filesystem.
+*
+* the .snapshot/name folder is copied to the destination cluster
+* and then all the hfiles/hlogs are copied using a map-reduce job in the .archive/ location.
+* when everything is done, the second cluster can restore the snapshot.
+*/
+@interfaceaudience public
+@interfacestability evolving
+public final class exportsnapshot extends configured implements tool
+private static final log log   logfactory getlog exportsnapshot class
+private static final string conf_files_user
+private static final string conf_files_group
+private static final string conf_files_mode
+private static final string conf_checksum_verify
+private static final string conf_output_root
+private static final string conf_input_root
+private static final string input_folder_prefix
+// export map-reduce counters, to keep track of the progress
+public enum counter   missing_files  copy_failed  bytes_expected  bytes_copied
+private static class exportmapper extends mapper<text  nullwritable  nullwritable  nullwritable>
+final static int report_size   1   1024   1024
+final static int buffer_size   64   1024
+private boolean verifychecksum
+private string filesgroup
+private string filesuser
+private short filesmode
+private filesystem outputfs
+private path outputarchive
+private path outputroot
+private filesystem inputfs
+private path inputarchive
+private path inputroot
+@override
+public void setup context context
+configuration conf   context getconfiguration
+verifychecksum   conf getboolean conf_checksum_verify  true
+filesgroup   conf get conf_files_group
+filesuser   conf get conf_files_user
+filesmode    short conf getint conf_files_mode  0
+outputroot   new path conf get conf_output_root
+inputroot   new path conf get conf_input_root
+inputarchive   new path inputroot  hconstants hfile_archive_directory
+outputarchive   new path outputroot  hconstants hfile_archive_directory
+try
+inputfs   filesystem get inputroot touri    conf
+catch  ioexception e
+throw new runtimeexception     inputroot  e
+try
+outputfs   filesystem get outputroot touri    conf
+catch  ioexception e
+throw new runtimeexception    outputroot  e
+@override
+public void map text key  nullwritable value  context context
+throws interruptedexception  ioexception
+path inputpath   new path key tostring
+path outputpath   getoutputpath inputpath
+log info     inputpath       outputpath
+if  copyfile context  inputpath  outputpath
+log info     inputpath       outputpath
+/**
+* returns the location where the inputpath will be copied.
+*  - hfiles are encoded as hfile links hfile-region-table
+*  - logs are encoded as servername/logname
+*/
+private path getoutputpath final path inputpath  throws ioexception
+path path
+if  hfilelink ishfilelink inputpath     storefileinfo isreference inputpath
+string family   inputpath getparent   getname
+tablename table
+hfilelink getreferencedtablename inputpath getname
+string region   hfilelink getreferencedregionname inputpath getname
+string hfile   hfilelink getreferencedhfilename inputpath getname
+path   new path fsutils gettabledir new path     table
+new path region  new path family  hfile
+else if  ishloglinkpath inputpath
+string logname   inputpath getname
+path   new path new path outputroot  hconstants hregion_oldlogdir_name   logname
+else
+path   inputpath
+return new path outputarchive  path
+private boolean copyfile final context context  final path inputpath  final path outputpath
+throws ioexception
+fsdatainputstream in   opensourcefile inputpath
+if  in    null
+context getcounter counter missing_files  increment 1
+return false
+try
+// verify if the input file exists
+filestatus inputstat   getfilestatus inputfs  inputpath
+if  inputstat    null  return false
+// verify if the output file exists and is the same that we want to copy
+if  outputfs exists outputpath
+filestatus outputstat   outputfs getfilestatus outputpath
+if  samefile inputstat  outputstat
+log info     inputpath       outputpath
+return true
+context getcounter counter bytes_expected  increment inputstat getlen
+// ensure that the output folder is there and copy the file
+outputfs mkdirs outputpath getparent
+fsdataoutputstream out   outputfs create outputpath  true
+try
+if   copydata context  inputpath  in  outputpath  out  inputstat getlen
+return false
+finally
+out close
+// preserve attributes
+return preserveattributes outputpath  inputstat
+finally
+in close
+/**
+* preserve the files attribute selected by the user copying them from the source file
+*/
+private boolean preserveattributes final path path  final filestatus refstat
+filestatus stat
+try
+stat   outputfs getfilestatus path
+catch  ioexception e
+log warn     path
+return false
+try
+if  filesmode > 0    stat getpermission   toshort      filesmode
+outputfs setpermission path  new fspermission filesmode
+else if   stat getpermission   equals refstat getpermission
+outputfs setpermission path  refstat getpermission
+catch  ioexception e
+log error     path  e
+return false
+try
+string user    filesuser    null  ? filesuser   refstat getowner
+string group    filesgroup    null  ? filesgroup   refstat getgroup
+if    user equals stat getowner       group equals stat getgroup
+outputfs setowner path  user  group
+catch  ioexception e
+log error     path  e
+return false
+return true
+private boolean copydata final context context
+final path inputpath  final fsdatainputstream in
+final path outputpath  final fsdataoutputstream out
+final long inputfilesize
+final string statusmessage       stringutils humanreadableint inputfilesize
+try
+byte buffer   new byte
+long totalbyteswritten   0
+int reportbytes   0
+int bytesread
+while   bytesread   in read buffer   > 0
+out write buffer  0  bytesread
+totalbyteswritten    bytesread
+reportbytes    bytesread
+if  reportbytes >  report_size
+context getcounter counter bytes_copied  increment reportbytes
+context setstatus string format statusmessage
+stringutils humanreadableint totalbyteswritten
+totalbyteswritten  float inputfilesize
+inputpath       outputpath
+reportbytes   0
+context getcounter counter bytes_copied  increment reportbytes
+context setstatus string format statusmessage
+stringutils humanreadableint totalbyteswritten
+totalbyteswritten  float inputfilesize
+inputpath       outputpath
+// verify that the written size match
+if  totalbyteswritten    inputfilesize
+log error     totalbyteswritten
+inputfilesize       inputpath
+context getcounter counter copy_failed  increment 1
+return false
+return true
+catch  ioexception e
+log error     inputpath       outputpath  e
+context getcounter counter copy_failed  increment 1
+return false
+private fsdatainputstream opensourcefile final path path
+try
+if  hfilelink ishfilelink path     storefileinfo isreference path
+return new hfilelink inputroot  inputarchive  path  open inputfs
+else if  ishloglinkpath path
+string servername   path getparent   getname
+string logname   path getname
+return new hloglink inputroot  servername  logname  open inputfs
+return inputfs open path
+catch  ioexception e
+log error     path  e
+return null
+private filestatus getfilestatus final filesystem fs  final path path
+try
+if  hfilelink ishfilelink path     storefileinfo isreference path
+hfilelink link   new hfilelink inputroot  inputarchive  path
+return link getfilestatus fs
+else if  ishloglinkpath path
+string servername   path getparent   getname
+string logname   path getname
+return new hloglink inputroot  servername  logname  getfilestatus fs
+return fs getfilestatus path
+catch  ioexception e
+log warn     path
+return null
+private filechecksum getfilechecksum final filesystem fs  final path path
+try
+return fs getfilechecksum path
+catch  ioexception e
+log warn     path  e
+return null
+/**
+* check if the two files are equal by looking at the file length,
+* and at the checksum (if user has specified the verifychecksum flag).
+*/
+private boolean samefile final filestatus inputstat  final filestatus outputstat
+// not matching length
+if  inputstat getlen      outputstat getlen    return false
+// mark files as equals, since user asked for no checksum verification
+if   verifychecksum  return true
+// if checksums are not available, files are not the same.
+filechecksum inchecksum   getfilechecksum inputfs  inputstat getpath
+if  inchecksum    null  return false
+filechecksum outchecksum   getfilechecksum outputfs  outputstat getpath
+if  outchecksum    null  return false
+return inchecksum equals outchecksum
+/**
+* hlog files are encoded as servername/logname
+* and since all the other files should be in /hbase/table/..path..
+* we can rely on the depth, for now.
+*/
+private static boolean ishloglinkpath final path path
+return path depth      2
+/**
+* extract the list of files (hfiles/hlogs) to copy using map-reduce.
+* @return list of files referenced by the snapshot (pair of path and size)
+*/
+private list<pair<path  long>> getsnapshotfiles final filesystem fs  final path snapshotdir
+throws ioexception
+snapshotdescription snapshotdesc   snapshotdescriptionutils readsnapshotinfo fs  snapshotdir
+final list<pair<path  long>> files   new arraylist<pair<path  long>>
+final tablename table
+tablename valueof snapshotdesc gettable
+final configuration conf   getconf
+// get snapshot files
+snapshotreferenceutil visitreferencedfiles fs  snapshotdir
+new snapshotreferenceutil filevisitor
+public void storefile  final string region  final string family  final string hfile
+throws ioexception
+path path   new path family  hfilelink createhfilelinkname table  region  hfile
+long size   new hfilelink conf  path  getfilestatus fs  getlen
+files add new pair<path  long> path  size
+public void recoverededits  final string region  final string logfile
+throws ioexception
+// copied with the snapshot referenecs
+public void logfile  final string server  final string logfile
+throws ioexception
+long size   new hloglink conf  server  logfile  getfilestatus fs  getlen
+files add new pair<path  long> new path server  logfile   size
+return files
+/**
+* given a list of file paths and sizes, create around ngroups in as balanced a way as possible.
+* the groups created will have similar amounts of bytes.
+* <p>
+* the algorithm used is pretty straightforward; the file list is sorted by size,
+* and then each group fetch the bigger file available, iterating through groups
+* alternating the direction.
+*/
+static list<list<path>> getbalancedsplits final list<pair<path  long>> files  int ngroups
+// sort files by size, from small to big
+collections sort files  new comparator<pair<path  long>>
+public int compare pair<path  long> a  pair<path  long> b
+long r   a getsecond     b getsecond
+return  r < 0  ?  1     r > 0  ? 1   0
+// create balanced groups
+list<list<path>> filegroups   new linkedlist<list<path>>
+long sizegroups   new long
+int hi   files size     1
+int lo   0
+list<path> group
+int dir   1
+int g   0
+while  hi >  lo
+if  g    filegroups size
+group   new linkedlist<path>
+filegroups add group
+else
+group   filegroups get g
+pair<path  long> fileinfo   files get hi
+// add the hi one
+sizegroups    fileinfo getsecond
+group add fileinfo getfirst
+// change direction when at the end or the beginning
+g    dir
+if  g    ngroups
+dir    1
+g   ngroups   1
+else if  g < 0
+dir   1
+g   0
+if  log isdebugenabled
+for  int i   0  i < sizegroups length    i
+log debug     i       stringutils humanreadableint sizegroups
+return filegroups
+private static path getinputfolderpath configuration conf
+throws ioexception  interruptedexception
+path stagingdir   jobutil getstagingdir conf
+return new path stagingdir  input_folder_prefix
+string valueof environmentedgemanager currenttimemillis
+/**
+* create the input files, with the path to copy, for the mr job.
+* each input files contains n files, and each input file has a similar amount data to copy.
+* the number of input files created are based on the number of mappers provided as argument
+* and the number of the files to copy.
+*/
+private static path createinputfiles final configuration conf
+final list<pair<path  long>> snapshotfiles  int mappers
+throws ioexception  interruptedexception
+path inputfolderpath   getinputfolderpath conf
+filesystem fs   inputfolderpath getfilesystem conf
+log debug     inputfolderpath
+list<list<path>> splits   getbalancedsplits snapshotfiles  mappers
+path inputfiles   new path
+text key   new text
+for  int i   0  i < inputfiles length  i
+list<path> files   splits get i
+inputfiles   new path inputfolderpath  string format    i
+sequencefile writer writer   sequencefile createwriter fs  conf  inputfiles
+text class  nullwritable class
+log debug     i
+try
+for  path file  files
+log debug file tostring
+key set file tostring
+writer append key  nullwritable get
+finally
+writer close
+return inputfiles
+/**
+* run map-reduce job to perform the files copy.
+*/
+private boolean runcopyjob final path inputroot  final path outputroot
+final list<pair<path  long>> snapshotfiles  final boolean verifychecksum
+final string filesuser  final string filesgroup  final int filesmode
+final int mappers  throws ioexception  interruptedexception  classnotfoundexception
+configuration conf   getconf
+if  filesgroup    null  conf set conf_files_group  filesgroup
+if  filesuser    null  conf set conf_files_user  filesuser
+conf setint conf_files_mode  filesmode
+conf setboolean conf_checksum_verify  verifychecksum
+conf set conf_output_root  outputroot tostring
+conf set conf_input_root  inputroot tostring
+conf setint    mappers
+job job   new job conf
+job setjobname
+job setjarbyclass exportsnapshot class
+job setmapperclass exportmapper class
+job setinputformatclass sequencefileinputformat class
+job setoutputformatclass nulloutputformat class
+job setmapspeculativeexecution false
+job setnumreducetasks 0
+for  path path  createinputfiles conf  snapshotfiles  mappers
+log debug     path
+sequencefileinputformat addinputpath job  path
+return job waitforcompletion true
+/**
+* execute the export snapshot by copying the snapshot metadata, hfiles and hlogs.
+* @return 0 on success, and != 0 upon failure.
+*/
+@override
+public int run string args  throws exception
+boolean verifychecksum   true
+string snapshotname   null
+string filesgroup   null
+string filesuser   null
+path outputroot   null
+int filesmode   0
+int mappers   getconf   getint    1
+// process command line args
+for  int i   0  i < args length  i
+string cmd   args
+try
+if  cmd equals
+snapshotname   args
+else if  cmd equals
+outputroot   new path args
+else if  cmd equals
+verifychecksum   false
+else if  cmd equals
+mappers   integer parseint args
+else if  cmd equals
+filesuser   args
+else if  cmd equals
+filesgroup   args
+else if  cmd equals
+filesmode   integer parseint args  8
+else if  cmd equals       cmd equals
+printusageandexit
+else
+system err println     cmd
+printusageandexit
+catch  exception e
+printusageandexit
+// check user options
+if  snapshotname    null
+system err println
+printusageandexit
+if  outputroot    null
+system err println
+printusageandexit
+configuration conf   getconf
+path inputroot   fsutils getrootdir conf
+filesystem inputfs   filesystem get conf
+filesystem outputfs   filesystem get outputroot touri    conf
+path snapshotdir   snapshotdescriptionutils getcompletedsnapshotdir snapshotname  inputroot
+path snapshottmpdir   snapshotdescriptionutils getworkingsnapshotdir snapshotname  outputroot
+path outputsnapshotdir   snapshotdescriptionutils getcompletedsnapshotdir snapshotname  outputroot
+// check if the snapshot already exists
+if  outputfs exists outputsnapshotdir
+system err println     snapshotname
+outputsnapshotdir
+return 1
+// check if the snapshot already in-progress
+if  outputfs exists snapshottmpdir
+system err println     snapshotname
+system err println     snapshottmpdir
+system err println     snapshottmpdir
+return 1
+// step 0 - extract snapshot files to copy
+final list<pair<path  long>> files   getsnapshotfiles inputfs  snapshotdir
+// step 1 - copy fs1:/.snapshot/<snapshot> to  fs2:/.snapshot/.tmp/<snapshot>
+// the snapshot references must be copied before the hfiles otherwise the cleaner
+// will remove them because they are unreferenced.
+try
+fileutil copy inputfs  snapshotdir  outputfs  snapshottmpdir  false  false  conf
+catch  ioexception e
+system err println     snapshotdir
+snapshottmpdir
+e printstacktrace system err
+return 1
+// step 2 - start mr job to copy files
+// the snapshot references must be copied before the files otherwise the files gets removed
+// by the hfilearchiver, since they have no references.
+try
+if  files size      0
+log warn
+else
+if   runcopyjob inputroot  outputroot  files  verifychecksum
+filesuser  filesgroup  filesmode  mappers
+throw new exportsnapshotexception
+// step 3 - rename fs2:/.snapshot/.tmp/<snapshot> fs2:/.snapshot/<snapshot>
+if   outputfs rename snapshottmpdir  outputsnapshotdir
+system err println
+system err println
+snapshottmpdir       outputsnapshotdir
+return 1
+return 0
+catch  exception e
+system err println
+e printstacktrace system err
+outputfs delete outputsnapshotdir  true
+return 1
+// exportsnapshot
+private void printusageandexit
+system err printf    getclass   getname
+system err println
+system err println
+system err println
+system err println
+system err println
+system err println
+system err println
+system err println
+system err println
+system err println
+system err println
+system err println     getclass
+system err println
+system err println
+system exit 1
+/**
+* the guts of the {@link #main} method.
+* call this method to avoid the {@link #main(string[])} system.exit.
+* @param args
+* @return errcode
+* @throws exception
+*/
+static int innermain final configuration conf  final string  args  throws exception
+return toolrunner run conf  new exportsnapshot    args
+public static void main string args  throws exception
+system exit innermain hbaseconfiguration create    args

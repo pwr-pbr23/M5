@@ -1,0 +1,382 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql exec mr
+import java io file
+import java io ioexception
+import java io objectoutputstream
+import java io outputstream
+import java io serializable
+import java lang management managementfactory
+import java lang management memorymxbean
+import java text simpledateformat
+import java util arraylist
+import java util calendar
+import java util collection
+import java util hashmap
+import java util list
+import java util map
+import java util properties
+import org apache commons lang stringutils
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop fs filesystem
+import org apache hadoop fs fileutil
+import org apache hadoop fs path
+import org apache hadoop hive common io cachingprintstream
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive ql context
+import org apache hadoop hive ql drivercontext
+import org apache hadoop hive ql queryplan
+import org apache hadoop hive ql exec bucketmatcher
+import org apache hadoop hive ql exec fetchoperator
+import org apache hadoop hive ql exec hashtablesinkoperator
+import org apache hadoop hive ql exec operator
+import org apache hadoop hive ql exec securecmddoas
+import org apache hadoop hive ql exec tablescanoperator
+import org apache hadoop hive ql exec task
+import org apache hadoop hive ql exec utilities
+import org apache hadoop hive ql exec utilities streamprinter
+import org apache hadoop hive ql exec mapjoin mapjoinmemoryexhaustionexception
+import org apache hadoop hive ql exec persistence mapjointablecontainerserde
+import org apache hadoop hive ql metadata hiveexception
+import org apache hadoop hive ql plan bucketmapjoincontext
+import org apache hadoop hive ql plan fetchwork
+import org apache hadoop hive ql plan mapredlocalwork
+import org apache hadoop hive ql plan operatordesc
+import org apache hadoop hive ql plan api stagetype
+import org apache hadoop hive ql session sessionstate
+import org apache hadoop hive ql session sessionstate loghelper
+import org apache hadoop hive serde2 columnprojectionutils
+import org apache hadoop hive serde2 objectinspector inspectableobject
+import org apache hadoop hive serde2 objectinspector objectinspector
+import org apache hadoop hive shims hadoopshims
+import org apache hadoop hive shims shimloader
+import org apache hadoop mapred jobconf
+import org apache hadoop util reflectionutils
+/**
+* mapredlocaltask represents any local work (i.e.: client side work) that hive needs to
+* execute. e.g.: this is used for generating hashtables for mapjoins on the client
+* before the join is executed on the cluster.
+*
+* mapredlocaltask does not actually execute the work in process, but rather generates
+* a command using execdriver. execdriver is what will finally drive processing the records.
+*/
+public class mapredlocaltask extends task<mapredlocalwork> implements serializable
+private map<string  fetchoperator> fetchoperators
+protected hadoopjobexechelper jobexechelper
+private jobconf job
+public static transient final log l4j   logfactory getlog mapredlocaltask class
+static final string hadoop_mem_key
+static final string hadoop_opts_key
+static final string hive_sys_prop
+public static memorymxbean memorymxbean
+private static final log log   logfactory getlog mapredlocaltask class
+// not sure we need this exec context; but all the operators in the work
+// will pass this context throught
+private final execmappercontext execcontext   new execmappercontext
+private process executor
+public mapredlocaltask
+super
+public mapredlocaltask mapredlocalwork plan  jobconf job  boolean issilent  throws hiveexception
+setwork plan
+this job   job
+console   new loghelper log  issilent
+@override
+public void initialize hiveconf conf  queryplan queryplan  drivercontext drivercontext
+super initialize conf  queryplan  drivercontext
+job   new jobconf conf  execdriver class
+//we don't use the hadoopjobexechooks for local tasks
+this jobexechelper   new hadoopjobexechelper job  console  this  null
+public static string now
+calendar cal   calendar getinstance
+simpledateformat sdf   new simpledateformat
+return sdf format cal gettime
+@override
+public boolean requirelock
+return true
+@override
+public int execute drivercontext drivercontext
+try
+// generate the cmd line to run in the child jvm
+context ctx   drivercontext getctx
+string hivejar   conf getjar
+string hadoopexec   conf getvar hiveconf confvars hadoopbin
+string libjarsoption
+// write out the plan to a local file
+path planpath   new path ctx getlocaltmpfileuri
+outputstream out   filesystem getlocal conf  create planpath
+mapredlocalwork plan   getwork
+log info     planpath tostring
+utilities serializeplan plan  out
+string issilent     equalsignorecase system getproperty     ?
+string jarcmd
+jarcmd   hivejar       execdriver class getname
+string hiveconfargs   execdriver generatecmdline conf  ctx
+string cmdline   hadoopexec       jarcmd       planpath tostring
+issilent       hiveconfargs
+string workdir    new file     getcanonicalpath
+string files   utilities getresourcefiles conf  sessionstate resourcetype file
+if   files isempty
+cmdline   cmdline       files
+workdir    new path ctx getlocaltmpfileuri     touri   getpath
+if    new file workdir   mkdir
+throw new ioexception     workdir
+for  string f   stringutils split files
+path p   new path f
+string target   p touri   getpath
+string link   workdir   path separator   p getname
+if  fileutil symlink target  link     0
+throw new ioexception     target       link
+// inherit java system variables
+string hadoopopts
+stringbuilder sb   new stringbuilder
+properties p   system getproperties
+for  string element   hive_sys_prop
+if  p containskey element
+sb append     element       p getproperty element
+hadoopopts   sb tostring
+// inherit the environment variables
+string env
+map<string  string> variables   new hashmap system getenv
+// the user can specify the hadoop memory
+// if ("local".equals(conf.getvar(hiveconf.confvars.hadoopjt))) {
+// if we are running in local mode - then the amount of memory used
+// by the child jvm can no longer default to the memory used by the
+// parent jvm
+// int hadoopmem = conf.getintvar(hiveconf.confvars.hivehadoopmaxmem);
+int hadoopmem   conf getintvar hiveconf confvars hivehadoopmaxmem
+if  hadoopmem    0
+// remove env var that would default child jvm to use parent's memory
+// as default. child jvm would use default memory for a hadoop client
+variables remove hadoop_mem_key
+else
+// user specified the memory for local mode hadoop run
+console printinfo     hadoopmem
+variables put hadoop_mem_key  string valueof hadoopmem
+// } else {
+// nothing to do - we are not running in local mode - only submitting
+// the job via a child process. in this case it's appropriate that the
+// child jvm use the same memory as the parent jvm
+// }
+//set hadoop_user_name env variable for child process, so that
+// it also runs with hadoop permissions for the user the job is running as
+// this will be used by hadoop only in unsecure(/non kerberos) mode
+hadoopshims shim   shimloader gethadoopshims
+string endusername   shim getshortusername shim getugiforconf job
+log debug     endusername
+variables put    endusername
+if  variables containskey hadoop_opts_key
+variables put hadoop_opts_key  variables get hadoop_opts_key    hadoopopts
+else
+variables put hadoop_opts_key  hadoopopts
+if variables containskey mapredtask hive_debug_recursive
+mapredtask configuredebugvariablesforchildjvm variables
+if shimloader gethadoopshims   issecurityenabled
+conf getboolvar hiveconf confvars hive_server2_enable_doas     true
+//if kerberos security is enabled, and hs2 doas is enabled,
+// then additional params need to be set so that the command is run as
+// intended user
+securecmddoas securedoas   new securecmddoas conf
+securedoas addenv variables
+env   new string
+int pos   0
+for  map entry<string  string> entry   variables entryset
+string name   entry getkey
+string value   entry getvalue
+env   name       value
+log debug     env
+log info     cmdline
+// run execdriver in another jvm
+executor   runtime getruntime   exec cmdline  env  new file workdir
+cachingprintstream errprintstream   new cachingprintstream system err
+streamprinter outprinter   new streamprinter executor getinputstream    null  system out
+streamprinter errprinter   new streamprinter executor geterrorstream    null  errprintstream
+outprinter start
+errprinter start
+int exitval   jobexechelper progresslocal executor  getid
+if  exitval    0
+log error     exitval
+if  sessionstate get      null
+sessionstate get   addlocalmaprederrors getid    errprintstream getoutput
+else
+log info
+console printinfo
+return exitval
+catch  exception e
+e printstacktrace
+log error     e getmessage
+return  1
+public int executefromchildjvm drivercontext drivercontext
+// check the local work
+if  work    null
+return  1
+memorymxbean   managementfactory getmemorymxbean
+long starttime   system currenttimemillis
+console printinfo utilities now
+memorymxbean getheapmemoryusage   getmax
+fetchoperators   new hashmap<string  fetchoperator>
+map<fetchoperator  jobconf> fetchopjobconfmap   new hashmap<fetchoperator  jobconf>
+execcontext setjc job
+// set the local work, so all the operator can get this context
+execcontext setlocalwork work
+boolean inputfilechangesenstive   work getinputfilechangesensitive
+try
+initializeoperators fetchopjobconfmap
+// for each big table's bucket, call the start forward
+if  inputfilechangesenstive
+for  map<string  list<string>> bigtablebucketfiles   work
+getbucketmapjoincontext   getaliasbucketfilenamemapping   values
+for  string bigtablebucket   bigtablebucketfiles keyset
+startforward inputfilechangesenstive  bigtablebucket
+else
+startforward inputfilechangesenstive  null
+long currenttime   system currenttimemillis
+long elapsed   currenttime   starttime
+console printinfo utilities now
+utilities showtime elapsed
+catch  throwable throwable
+if  throwable instanceof outofmemoryerror
+throwable instanceof mapjoinmemoryexhaustionexception
+l4j error    throwable
+return 3
+else
+l4j error    throwable
+return 2
+return 0
+private void startforward boolean inputfilechangesenstive  string bigtablebucket
+throws exception
+for  map entry<string  fetchoperator> entry   fetchoperators entryset
+string alias   entry getkey
+fetchoperator fetchop   entry getvalue
+if  inputfilechangesenstive
+fetchop clearfetchcontext
+setupfetchopcontext fetchop  alias  bigtablebucket
+if  fetchop isemptytable
+//generate empty hashtable for empty table
+this generatedummyhashtable alias  bigtablebucket
+continue
+// get the root operator
+operator<? extends operatordesc> forwardop   work getaliastowork   get alias
+// walk through the operator tree
+while  true
+inspectableobject row   fetchop getnextrow
+if  row    null
+if  inputfilechangesenstive
+execcontext setcurrentbigbucketfile bigtablebucket
+forwardop reset
+forwardop close false
+break
+forwardop process row o  0
+// check if any operator had a fatal error or early exit during
+// execution
+if  forwardop getdone
+// execmapper.setdone(true);
+break
+private void initializeoperators map<fetchoperator  jobconf> fetchopjobconfmap
+throws hiveexception
+// this mapper operator is used to initialize all the operators
+for  map entry<string  fetchwork> entry   work getaliastofetchwork   entryset
+jobconf jobclone   new jobconf job
+operator<? extends operatordesc> tablescan
+work getaliastowork   get entry getkey
+boolean setcolumnsneeded   false
+if  tablescan instanceof tablescanoperator
+arraylist<integer> list     tablescanoperator  tablescan  getneededcolumnids
+if  list    null
+columnprojectionutils appendreadcolumnids jobclone  list
+setcolumnsneeded   true
+if   setcolumnsneeded
+columnprojectionutils setfullyreadcolumns jobclone
+// create a fetch operator
+fetchoperator fetchop   new fetchoperator entry getvalue    jobclone
+fetchopjobconfmap put fetchop  jobclone
+fetchoperators put entry getkey    fetchop
+l4j info     entry getkey
+// initilize all forward operator
+for  map entry<string  fetchoperator> entry   fetchoperators entryset
+// get the forward op
+string alias   entry getkey
+operator<? extends operatordesc> forwardop   work getaliastowork   get alias
+// put the exe context into all the operators
+forwardop setexeccontext execcontext
+// all the operators need to be initialized before process
+fetchoperator fetchop   entry getvalue
+jobconf jobconf   fetchopjobconfmap get fetchop
+if  jobconf    null
+jobconf   job
+// initialize the forward operator
+objectinspector objectinspector   fetchop getoutputobjectinspector
+forwardop initialize jobconf  new objectinspector  objectinspector
+l4j info     entry getkey
+private void generatedummyhashtable string alias  string bigbucketfilename
+throws hiveexception ioexception
+// find the (byte)tag for the map join(hashtablesinkoperator)
+operator<? extends operatordesc> parentop   work getaliastowork   get alias
+operator<? extends operatordesc> childop   parentop getchildoperators   get 0
+while   childop    null        childop instanceof hashtablesinkoperator
+parentop   childop
+assert parentop getchildoperators   size      1
+childop   parentop getchildoperators   get 0
+if  childop    null
+throw new hiveexception
+byte tag    byte  childop getparentoperators   indexof parentop
+// generate empty hashtable for this (byte)tag
+string tmpuri   this getwork   gettmpfileuri
+string filename   work getbucketfilename bigbucketfilename
+hashtablesinkoperator htso    hashtablesinkoperator childop
+string tmpuripath   utilities generatepath tmpuri  htso getconf   getdumpfileprefix
+tag  filename
+console printinfo utilities now         tmpuripath
+path path   new path tmpuripath
+filesystem fs   path getfilesystem job
+objectoutputstream out   new objectoutputstream fs create path
+try
+mapjointablecontainerserde persistdummytable out
+finally
+out close
+console printinfo utilities now         tmpuripath
+fs getfilestatus path  getlen
+private void setupfetchopcontext fetchoperator fetchop  string alias  string currentinputfile
+throws exception
+bucketmapjoincontext bucketmatchercxt   this work getbucketmapjoincontext
+class<? extends bucketmatcher> bucketmatchercls   bucketmatchercxt getbucketmatcherclass
+bucketmatcher bucketmatcher    bucketmatcher  reflectionutils newinstance bucketmatchercls
+
+bucketmatcher setaliasbucketfilenamemapping bucketmatchercxt getaliasbucketfilenamemapping
+list<path> aliasfiles   bucketmatcher getaliasbucketfiles currentinputfile  bucketmatchercxt
+getmapjoinbigtablealias    alias
+fetchop setupcontext aliasfiles
+@override
+public boolean ismapredlocaltask
+return true
+@override
+public collection<operator<? extends operatordesc>> gettopoperators
+return getwork   getaliastowork   values
+@override
+public string getname
+return
+@override
+public stagetype gettype
+//assert false;
+return stagetype mapredlocal
+@override
+public void shutdown
+super shutdown
+if  executor    null
+executor destroy
+executor   null

@@ -1,0 +1,813 @@
+/**
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase util
+import java io ioexception
+import java math biginteger
+import java util arrays
+import java util collections
+import java util comparator
+import java util linkedlist
+import java util list
+import java util map
+import java util set
+import java util treemap
+import org apache commons cli commandline
+import org apache commons cli gnuparser
+import org apache commons cli helpformatter
+import org apache commons cli optionbuilder
+import org apache commons cli options
+import org apache commons cli parseexception
+import org apache commons lang arrayutils
+import org apache commons lang stringutils
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs fsdatainputstream
+import org apache hadoop fs fsdataoutputstream
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase hbaseconfiguration
+import org apache hadoop hbase hcolumndescriptor
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase hregionlocation
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase servername
+import org apache hadoop hbase client hbaseadmin
+import org apache hadoop hbase client htable
+import org apache hadoop hbase client noserverforregionexception
+import org apache hadoop hbase regionserver store
+import org apache hadoop hbase regionserver storefile
+import com google common base preconditions
+import com google common collect lists
+import com google common collect maps
+import com google common collect sets
+/**
+* the {@link regionsplitter} class provides several utilities to help in the
+* administration lifecycle for developers who choose to manually split regions
+* instead of having hbase handle that automatically. the most useful utilities
+* are:
+* <p>
+* <ul>
+* <li>create a table with a specified number of pre-split regions
+* <li>execute a rolling split of all regions on an existing table
+* </ul>
+* <p>
+* both operations can be safely done on a live server.
+* <p>
+* <b>question:</b> how do i turn off automatic splitting? <br>
+* <b>answer:</b> automatic splitting is determined by the configuration value
+* <i>hconstants.hregion_max_filesize</i>. it is not recommended that you set this
+* to long.max_value in case you forget about manual splits. a suggested setting
+* is 100gb, which would result in > 1hr major compactions if reached.
+* <p>
+* <b>question:</b> why did the original authors decide to manually split? <br>
+* <b>answer:</b> specific workload characteristics of our use case allowed us
+* to benefit from a manual split system.
+* <p>
+* <ul>
+* <li>data (~1k) that would grow instead of being replaced
+* <li>data growth was roughly uniform across all regions
+* <li>oltp workload. data loss is a big deal.
+* </ul>
+* <p>
+* <b>question:</b> why is manual splitting good for this workload? <br>
+* <b>answer:</b> although automated splitting is not a bad option, there are
+* benefits to manual splitting.
+* <p>
+* <ul>
+* <li>with growing amounts of data, splits will continually be needed. since
+* you always know exactly what regions you have, long-term debugging and
+* profiling is much easier with manual splits. it is hard to trace the logs to
+* understand region level problems if it keeps splitting and getting renamed.
+* <li>data offlining bugs + unknown number of split regions == oh crap! if an
+* hlog or storefile was mistakenly unprocessed by hbase due to a weird bug and
+* you notice it a day or so later, you can be assured that the regions
+* specified in these files are the same as the current regions and you have
+* less headaches trying to restore/replay your data.
+* <li>you can finely tune your compaction algorithm. with roughly uniform data
+* growth, it's easy to cause split / compaction storms as the regions all
+* roughly hit the same data size at the same time. with manual splits, you can
+* let staggered, time-based major compactions spread out your network io load.
+* </ul>
+* <p>
+* <b>question:</b> what's the optimal number of pre-split regions to create? <br>
+* <b>answer:</b> mileage will vary depending upon your application.
+* <p>
+* the short answer for our application is that we started with 10 pre-split
+* regions / server and watched our data growth over time. it's better to err on
+* the side of too little regions and rolling split later.
+* <p>
+* the more complicated answer is that this depends upon the largest storefile
+* in your region. with a growing data size, this will get larger over time. you
+* want the largest region to be just big enough that the {@link store} compact
+* selection algorithm only compacts it due to a timed major. if you don't, your
+* cluster can be prone to compaction storms as the algorithm decides to run
+* major compactions on a large series of regions all at once. note that
+* compaction storms are due to the uniform data growth, not the manual split
+* decision.
+* <p>
+* if you pre-split your regions too thin, you can increase the major compaction
+* interval by configuring hconstants.major_compaction_period. if your data size
+* grows too large, use this script to perform a network io safe rolling split
+* of all regions.
+*/
+public class regionsplitter
+static final log log   logfactory getlog regionsplitter class
+/**
+* a generic interface for the regionsplitter code to use for all it's
+* functionality. note that the original authors of this code use
+* {@link hexstringsplit} to partition their table and set it as default, but
+* provided this for your custom algorithm. to use, create a new derived class
+* from this interface and call {@link regionsplitter#createpresplittable} or
+* {@link regionsplitter#rollingsplit(string, string, configuration)} with the
+* argument splitclassname giving the name of your class.
+*/
+public static interface splitalgorithm
+/**
+* split a pre-existing region into 2 regions.
+*
+* @param start
+*          first row (inclusive)
+* @param end
+*          last row (exclusive)
+* @return the split row to use
+*/
+byte split byte start  byte end
+/**
+* split an entire table.
+*
+* @param numregions
+*          number of regions to split the table into
+*
+* @throws runtimeexception
+*           user input is validated at this time. may throw a runtime
+*           exception in response to a parse failure
+* @return array of split keys for the initial regions of the table. the
+*         length of the returned array should be numregions-1.
+*/
+byte split int numregions
+/**
+* in hbase, the first row is represented by an empty byte array. this might
+* cause problems with your split algorithm or row printing. all your apis
+* will be passed firstrow() instead of empty array.
+*
+* @return your representation of your first row
+*/
+byte firstrow
+/**
+* in hbase, the last row is represented by an empty byte array. this might
+* cause problems with your split algorithm or row printing. all your apis
+* will be passed firstrow() instead of empty array.
+*
+* @return your representation of your last row
+*/
+byte lastrow
+/**
+* in hbase, the last row is represented by an empty byte array. set this
+* value to help the split code understand how to evenly divide the first
+* region.
+*
+* @param userinput
+*          raw user input (may throw runtimeexception on parse failure)
+*/
+void setfirstrow string userinput
+/**
+* in hbase, the last row is represented by an empty byte array. set this
+* value to help the split code understand how to evenly divide the last
+* region. note that this last row is inclusive for all rows sharing the
+* same prefix.
+*
+* @param userinput
+*          raw user input (may throw runtimeexception on parse failure)
+*/
+void setlastrow string userinput
+/**
+* @param input
+*          user or file input for row
+* @return byte array representation of this row for hbase
+*/
+byte strtorow string input
+/**
+* @param row
+*          byte array representing a row in hbase
+* @return string to use for debug & file printing
+*/
+string rowtostr byte row
+/**
+* @return the separator character to use when storing / printing the row
+*/
+string separator
+/**
+* the main function for the regionsplitter application. common uses:
+* <p>
+* <ul>
+* <li>create a table named 'mytable' with 60 pre-split regions containing 2
+* column families 'test' & 'rs', assuming the keys are hex-encoded ascii:
+* <ul>
+* <li>bin/hbase org.apache.hadoop.hbase.util.regionsplitter -c 60 -f test:rs
+* mytable hexstringsplit
+* </ul>
+* <li>perform a rolling split of 'mytable' (i.e. 60 => 120 regions), # 2
+* outstanding splits at a time, assuming keys are uniformly distributed
+* bytes:
+* <ul>
+* <li>bin/hbase org.apache.hadoop.hbase.util.regionsplitter -r -o 2 mytable
+* uniformsplit
+* </ul>
+* </ul>
+*
+* there are two splitalgorithms built into regionsplitter, hexstringsplit
+* and uniformsplit. these are different strategies for choosing region
+* boundaries. see their source code for details.
+*
+* @param args
+*          usage: regionsplitter &lt;table&gt; &lt;splitalgorithm&gt;
+*          &lt;-c &lt;# regions&gt; -f &lt;family:family:...&gt; | -r
+*          [-o &lt;# outstanding splits&gt;]&gt;
+*          [-d &lt;conf.param=value&gt;]
+* @throws ioexception
+*           hbase io problem
+* @throws interruptedexception
+*           user requested exit
+* @throws parseexception
+*           problem parsing user input
+*/
+@suppresswarnings
+public static void main string args  throws ioexception
+interruptedexception  parseexception
+configuration conf   hbaseconfiguration create
+// parse user input
+options opt   new options
+opt addoption optionbuilder withargname    hasarg
+withdescription    create
+opt addoption optionbuilder withargname    hasarg
+withdescription
+create
+opt addoption optionbuilder withargname    hasarg
+withdescription
+create
+opt addoption    false
+opt addoption    false
+opt addoption optionbuilder withargname    hasarg   withdescription
+create
+opt addoption null     true
+opt addoption null     true
+opt addoption null     false
+commandline cmd   new gnuparser   parse opt  args
+if  cmd hasoption
+for  string confopt   cmd getoptionvalues
+string kv   confopt split    2
+if  kv length    2
+conf set kv  kv
+log debug     kv       kv
+else
+throw new parseexception     confopt
+if  cmd hasoption
+conf setboolean    false
+boolean createtable   cmd hasoption       cmd hasoption
+boolean rollingsplit   cmd hasoption
+boolean oneoperonly   createtable ^ rollingsplit
+if  2    cmd getarglist   size       oneoperonly    cmd hasoption
+new helpformatter   printhelp
+opt
+return
+string tablename   cmd getargs
+string splitclass   cmd getargs
+splitalgorithm splitalgo   newsplitalgoinstance conf  splitclass
+if  cmd hasoption
+splitalgo setfirstrow cmd getoptionvalue
+if  cmd hasoption
+splitalgo setlastrow cmd getoptionvalue
+if  createtable
+conf set    cmd getoptionvalue
+createpresplittable tablename  splitalgo  cmd getoptionvalue    split     conf
+if  rollingsplit
+if  cmd hasoption
+conf set    cmd getoptionvalue
+rollingsplit tablename  splitalgo  conf
+static void createpresplittable string tablename  splitalgorithm splitalgo
+string columnfamilies  configuration conf  throws ioexception
+interruptedexception
+final int splitcount   conf getint    0
+preconditions checkargument splitcount > 1
+preconditions checkargument columnfamilies length > 0
+log debug     tablename       columnfamilies length
+splitcount
+htabledescriptor desc   new htabledescriptor tablename
+for  string cf   columnfamilies
+desc addfamily new hcolumndescriptor bytes tobytes cf
+hbaseadmin admin   new hbaseadmin conf
+preconditions checkargument  admin tableexists tablename
+tablename
+admin createtable desc  splitalgo split splitcount
+log debug
+if   conf getboolean    true
+// note: createtable is synchronous on the table, but not on the regions
+htable table   new htable conf  tablename
+int onlineregions   0
+while  onlineregions < splitcount
+onlineregions   table getregionsinfo   size
+log debug onlineregions       splitcount
+if  onlineregions < splitcount
+thread sleep 10   1000      sleep
+table close
+log debug     splitcount
+static void rollingsplit string tablename  splitalgorithm splitalgo
+configuration conf  throws ioexception  interruptedexception
+final int minos   conf getint    2
+htable table   new htable conf  tablename
+// max outstanding splits. default == 50% of servers
+final int max_outstanding
+math max table getconnection   getcurrentnrhrs     2  minos
+path hbdir   new path conf get hconstants hbase_dir
+path tabledir   htabledescriptor gettabledir hbdir  table gettablename
+path splitfile   new path tabledir
+filesystem fs   filesystem get conf
+// get a list of daughter regions to create
+linkedlist<pair<byte  byte>> tmpregionset   getsplits table  splitalgo
+linkedlist<pair<byte  byte>> outstanding   lists newlinkedlist
+int splitcount   0
+final int origcount   tmpregionset size
+// all splits must compact & we have 1 compact thread, so 2 split
+// requests to the same rs can stall the outstanding split queue.
+// to fix, group the regions into an rs pool and round-robin through it
+log debug
+treemap<string  linkedlist<pair<byte  byte>>> daughterregions
+maps newtreemap
+for  pair<byte  byte> dr   tmpregionset
+string rslocation   table getregionlocation dr getsecond
+gethostnameport
+if   daughterregions containskey rslocation
+linkedlist<pair<byte  byte>> entry   lists newlinkedlist
+daughterregions put rslocation  entry
+daughterregions get rslocation  add dr
+log debug
+long starttime   system currenttimemillis
+// open the split file and modify it as splits finish
+fsdatainputstream tmpin   fs open splitfile
+byte rawdata   new byte
+tmpin readfully rawdata
+tmpin close
+fsdataoutputstream splitout   fs create splitfile
+splitout write rawdata
+try
+// *** split code ***
+while   daughterregions isempty
+log debug daughterregions size
+// get regionserver : region count mapping
+final treemap<servername  integer> rssizes   maps newtreemap
+map<hregioninfo  servername> regionsinfo   table getregionlocations
+for  servername rs   regionsinfo values
+if  rssizes containskey rs
+rssizes put rs  rssizes get rs    1
+else
+rssizes put rs  1
+// sort the rs by the number of regions they have
+list<string> serversleft   lists newarraylist daughterregions  keyset
+collections sort serversleft  new comparator<string>
+public int compare string o1  string o2
+return rssizes get o1  compareto rssizes get o2
+// round-robin through the rs list. choose the lightest-loaded servers
+// first to keep the master from load-balancing regions as we split.
+for  string rsloc   serversleft
+pair<byte  byte> dr   null
+// find a region in the rs list that hasn't been moved
+log debug     rsloc
+linkedlist<pair<byte  byte>> regionlist   daughterregions
+get rsloc
+while   regionlist isempty
+dr   regionlist pop
+// get current region info
+byte split   dr getsecond
+hregionlocation regionloc   table getregionlocation split
+// if this region moved locations
+string newrs   regionloc gethostnameport
+if  newrs compareto rsloc     0
+log debug     splitalgo rowtostr split
+newrs
+// relocate it, don't use it right now
+if   daughterregions containskey newrs
+linkedlist<pair<byte  byte>> entry   lists newlinkedlist
+daughterregions put newrs  entry
+daughterregions get newrs  add dr
+dr   null
+continue
+// make sure this region wasn't already split
+byte sk   regionloc getregioninfo   getstartkey
+if  sk length    0
+if  bytes equals split  sk
+log debug
+splitalgo rowtostr split
+splitcount
+dr   null
+continue
+byte start   dr getfirst
+preconditions checkargument bytes equals start  sk   splitalgo
+rowtostr start        splitalgo rowtostr sk
+// passed all checks! found a good region
+break
+if  regionlist isempty
+daughterregions remove rsloc
+if  dr    null
+continue
+// we have a good region, time to split!
+byte split   dr getsecond
+log debug     splitalgo rowtostr split
+hbaseadmin admin   new hbaseadmin table getconfiguration
+admin split table gettablename    split
+linkedlist<pair<byte  byte>> finished   lists newlinkedlist
+if  conf getboolean    true
+// we need to verify and rate-limit our splits
+outstanding addlast dr
+// with too many outstanding splits, wait for some to finish
+while  outstanding size   >  max_outstanding
+finished   splitscan outstanding  table  splitalgo
+if  finished isempty
+thread sleep 30   1000
+else
+outstanding removeall finished
+else
+finished add dr
+// mark each finished region as successfully split.
+for  pair<byte  byte> region   finished
+splitout writechars     splitalgo rowtostr region getfirst
+splitalgo rowtostr region getsecond
+splitcount
+if  splitcount % 10    0
+long tdiff    system currenttimemillis     starttime
+splitcount
+log debug     splitcount       origcount
+org apache hadoop util stringutils formattime tdiff
+if  conf getboolean    true
+while   outstanding isempty
+linkedlist<pair<byte  byte>> finished   splitscan outstanding
+table  splitalgo
+if  finished isempty
+thread sleep 30   1000
+else
+outstanding removeall finished
+for  pair<byte  byte> region   finished
+splitout writechars     splitalgo rowtostr region getfirst
+splitalgo rowtostr region getsecond
+log debug
+finally
+long tdiff   system currenttimemillis     starttime
+log debug
+org apache hadoop util stringutils formattime tdiff
+log debug     splitcount
+log debug
+org apache hadoop util stringutils formattime tdiff   splitcount
+splitout close
+if  table    null
+table close
+fs delete splitfile  false
+/**
+* @throws ioexception if the specified splitalgorithm class couldn't be
+* instantiated
+*/
+public static splitalgorithm newsplitalgoinstance configuration conf
+string splitclassname  throws ioexception
+class<?> splitclass
+// for split algorithms builtin to regionsplitter, the user can specify
+// their simple class name instead of a fully qualified class name.
+if splitclassname equals hexstringsplit class getsimplename
+splitclass   hexstringsplit class
+else if  splitclassname equals uniformsplit class getsimplename
+splitclass   uniformsplit class
+else
+try
+splitclass   conf getclassbyname splitclassname
+catch  classnotfoundexception e
+throw new ioexception     splitclassname  e
+if splitclass    null
+throw new ioexception     splitclassname
+if  splitalgorithm class isassignablefrom splitclass
+throw new ioexception
+try
+return splitclass assubclass splitalgorithm class  newinstance
+catch  exception e
+throw new ioexception    e
+static linkedlist<pair<byte  byte>> splitscan
+linkedlist<pair<byte  byte>> regionlist  htable table
+splitalgorithm splitalgo
+throws ioexception  interruptedexception
+linkedlist<pair<byte  byte>> finished   lists newlinkedlist
+linkedlist<pair<byte  byte>> logicalsplitting   lists newlinkedlist
+linkedlist<pair<byte  byte>> physicalsplitting   lists newlinkedlist
+// get table info
+path hbdir   new path table getconfiguration   get hconstants hbase_dir
+path tabledir   htabledescriptor gettabledir hbdir  table gettablename
+path splitfile   new path tabledir
+filesystem fs   filesystem get table getconfiguration
+// clear the cache to forcibly refresh region information
+table clearregioncache
+// for every region that hasn't been verified as a finished split
+for  pair<byte  byte> region   regionlist
+byte start   region getfirst
+byte split   region getsecond
+// see if the new split daughter region has come online
+try
+hregioninfo dri   table getregionlocation split  getregioninfo
+if  dri isoffline       bytes equals dri getstartkey    split
+logicalsplitting add region
+continue
+catch  noserverforregionexception nsfre
+// nsfre will occur if the old meta entry has no server assigned
+log info nsfre
+logicalsplitting add region
+continue
+try
+// when a daughter region is opened, a compaction is triggered
+// wait until compaction completes for both daughter regions
+linkedlist<hregioninfo> check   lists newlinkedlist
+check add table getregionlocation start  getregioninfo
+check add table getregionlocation split  getregioninfo
+for  hregioninfo hri   check toarray new hregioninfo
+boolean reffound   false
+byte sk   hri getstartkey
+if  sk length    0
+sk   splitalgo firstrow
+string startkey   splitalgo rowtostr sk
+htabledescriptor htd   table gettabledescriptor
+// check every column family for that region
+for  hcolumndescriptor c   htd getfamilies
+path cfdir   store getstorehomedir tabledir  hri getencodedname
+c getname
+if  fs exists cfdir
+for  filestatus file   fs liststatus cfdir
+reffound    storefile isreference file getpath
+if  reffound
+break
+if  reffound
+break
+// compaction is completed when all reference files are gone
+if   reffound
+check remove hri
+if  check isempty
+finished add region
+else
+physicalsplitting add region
+catch  noserverforregionexception nsfre
+log debug
+splitalgo rowtostr start
+physicalsplitting add region
+table clearregioncache
+log debug     finished size
+logicalsplitting size
+physicalsplitting size
+return finished
+static linkedlist<pair<byte  byte>> getsplits htable table
+splitalgorithm splitalgo  throws ioexception
+path hbdir   new path table getconfiguration   get hconstants hbase_dir
+path tabledir   htabledescriptor gettabledir hbdir  table gettablename
+path splitfile   new path tabledir
+filesystem fs   filesystem get table getconfiguration
+// using strings because (new byte[]{0}).equals(new byte[]{0}) == false
+set<pair<string  string>> daughterregions   sets newhashset
+// does a split file exist?
+if   fs exists splitfile
+// no = fresh start. calculate splits to make
+log debug
+// query meta for all regions in the table
+set<pair<byte  byte>> rows   sets newhashset
+pair<byte  byte> tmp   table getstartendkeys
+preconditions checkargument
+tmp getfirst   length    tmp getsecond   length
+for  int i   0  i < tmp getfirst   length    i
+byte start   tmp getfirst    end   tmp getsecond
+if  start length    0
+start   splitalgo firstrow
+if  end length    0
+end   splitalgo lastrow
+rows add pair newpair start  end
+log debug     bytes tostring table gettablename
+rows size
+// prepare the split file
+path tmpfile   new path tabledir
+fsdataoutputstream tmpout   fs create tmpfile
+// calculate all the splits == [daughterregions] = [(start, splitpoint)]
+for  pair<byte  byte> r   rows
+byte splitpoint   splitalgo split r getfirst    r getsecond
+string startstr   splitalgo rowtostr r getfirst
+string splitstr   splitalgo rowtostr splitpoint
+daughterregions add pair newpair startstr  splitstr
+log debug     startstr
+splitalgo rowtostr r getsecond          splitstr
+tmpout writechars     startstr   splitalgo separator     splitstr
+tmpout close
+fs rename tmpfile  splitfile
+else
+log debug
+fsutils getinstance fs  table getconfiguration
+recoverfilelease fs  splitfile  table getconfiguration
+// parse split file and process remaining splits
+fsdatainputstream tmpin   fs open splitfile
+stringbuilder sb   new stringbuilder tmpin available
+while  tmpin available   > 0
+sb append tmpin readchar
+tmpin close
+for  string line   sb tostring   split
+string cmd   line split splitalgo separator
+preconditions checkargument 3    cmd length
+byte start   splitalgo strtorow cmd
+string startstr   splitalgo rowtostr start
+byte splitpoint   splitalgo strtorow cmd
+string splitstr   splitalgo rowtostr splitpoint
+pair<string  string> r   pair newpair startstr  splitstr
+if  cmd equals
+log debug     r
+daughterregions add r
+else
+log debug     r
+preconditions checkargument cmd equals
+cmd
+preconditions checkstate daughterregions contains r
+r
+daughterregions remove r
+log debug     daughterregions size
+linkedlist<pair<byte  byte>> ret   lists newlinkedlist
+for  pair<string  string> r   daughterregions
+ret add pair newpair splitalgo strtorow r getfirst     splitalgo
+strtorow r getsecond
+return ret
+/**
+* hexstringsplit is a well-known {@link splitalgorithm} for choosing region
+* boundaries. the format of a hexstringsplit region boundary is the ascii
+* representation of an md5 checksum, or any other uniformly distributed
+* hexadecimal value. row are hex-encoded long values in the range
+* <b>"00000000" => "ffffffff"</b> and are left-padded with zeros to keep the
+* same order lexicographically as if they were binary.
+*
+* since this split algorithm uses hex strings as keys, it is easy to read &
+* write in the shell but takes up more space and may be non-intuitive.
+*/
+public static class hexstringsplit implements splitalgorithm
+final static string default_min_hex
+final static string default_max_hex
+string firstrow   default_min_hex
+biginteger firstrowint   biginteger zero
+string lastrow   default_max_hex
+biginteger lastrowint   new biginteger lastrow  16
+int rowcomparisonlength   lastrow length
+public byte split byte start  byte end
+biginteger s   converttobiginteger start
+biginteger e   converttobiginteger end
+preconditions checkargument  e equals biginteger zero
+return converttobyte split2 s  e
+public byte split int n
+preconditions checkargument lastrowint compareto firstrowint  > 0
+lastrow
+firstrow
+// +1 to range because the last row is inclusive
+biginteger range   lastrowint subtract firstrowint  add biginteger one
+preconditions checkstate range compareto biginteger valueof n   >  0
+n  range
+biginteger splits   new biginteger
+biginteger sizeofeachsplit   range divide biginteger valueof n
+for  int i   1  i < n  i
+// note: this means the last region gets all the slop.
+// this is not a big deal if we're assuming n << maxhex
+splits   firstrowint add sizeofeachsplit multiply biginteger
+valueof i
+return converttobytes splits
+public byte firstrow
+return converttobyte firstrowint
+public byte lastrow
+return converttobyte lastrowint
+public void setfirstrow string userinput
+firstrow   userinput
+firstrowint   new biginteger firstrow  16
+public void setlastrow string userinput
+lastrow   userinput
+lastrowint   new biginteger lastrow  16
+// precondition: lastrow > firstrow, so last's length is the greater
+rowcomparisonlength   lastrow length
+public byte strtorow string in
+return converttobyte new biginteger in  16
+public string rowtostr byte row
+return bytes tostringbinary row
+public string separator
+return
+/**
+* divide 2 numbers in half (for split algorithm)
+*
+* @param a number #1
+* @param b number #2
+* @return the midpoint of the 2 numbers
+*/
+public biginteger split2 biginteger a  biginteger b
+return a add b  divide biginteger valueof 2   abs
+/**
+* returns an array of bytes corresponding to an array of bigintegers
+*
+* @param bigintegers numbers to convert
+* @return bytes corresponding to the bigintegers
+*/
+public byte converttobytes biginteger bigintegers
+byte returnbytes   new byte
+for  int i   0  i < bigintegers length  i
+returnbytes   converttobyte bigintegers
+return returnbytes
+/**
+* returns the bytes corresponding to the biginteger
+*
+* @param biginteger number to convert
+* @param pad padding length
+* @return byte corresponding to input biginteger
+*/
+public static byte converttobyte biginteger biginteger  int pad
+string bigintegerstring   biginteger tostring 16
+bigintegerstring   stringutils leftpad bigintegerstring  pad
+return bytes tobytes bigintegerstring
+/**
+* returns the bytes corresponding to the biginteger
+*
+* @param biginteger number to convert
+* @return corresponding bytes
+*/
+public byte converttobyte biginteger biginteger
+return converttobyte biginteger  rowcomparisonlength
+/**
+* returns the biginteger represented by the byte array
+*
+* @param row byte array representing row
+* @return the corresponding biginteger
+*/
+public biginteger converttobiginteger byte row
+return  row length > 0  ? new biginteger bytes tostring row   16
+biginteger zero
+@override
+public string tostring
+return this getclass   getsimplename         rowtostr firstrow
+rowtostr lastrow
+/**
+* a splitalgorithm that divides the space of possible keys evenly. useful
+* when the keys are approximately uniform random bytes (e.g. hashes). rows
+* are raw byte values in the range <b>00 => ff</b> and are right-padded with
+* zeros to keep the same memcmp() order. this is the natural algorithm to use
+* for a byte[] environment and saves space, but is not necessarily the
+* easiest for readability.
+*/
+public static class uniformsplit implements splitalgorithm
+static final byte xff    byte  0xff
+byte firstrowbytes   arrayutils empty_byte_array
+byte lastrowbytes
+new byte  xff  xff  xff  xff  xff  xff  xff  xff
+public byte split byte start  byte end
+return bytes split start  end  1
+@override
+public byte split int numregions
+preconditions checkargument
+bytes compareto lastrowbytes  firstrowbytes  > 0
+bytes tostringbinary lastrowbytes
+bytes tostringbinary firstrowbytes
+byte splits   bytes split firstrowbytes  lastrowbytes  true
+numregions   1
+preconditions checkstate splits    null
+this
+// remove endpoints, which are included in the splits list
+return arrays copyofrange splits  1  splits length   1
+@override
+public byte firstrow
+return firstrowbytes
+@override
+public byte lastrow
+return lastrowbytes
+@override
+public void setfirstrow string userinput
+firstrowbytes   bytes tobytesbinary userinput
+@override
+public void setlastrow string userinput
+lastrowbytes   bytes tobytesbinary userinput
+@override
+public byte strtorow string input
+return bytes tobytesbinary input
+@override
+public string rowtostr byte row
+return bytes tostringbinary row
+@override
+public string separator
+return
+@override
+public string tostring
+return this getclass   getsimplename         rowtostr firstrow
+rowtostr lastrow

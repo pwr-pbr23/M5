@@ -1,0 +1,389 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq broker region cursors
+import java io ioexception
+import java util iterator
+import java util linkedlist
+import java util concurrent atomic atomicboolean
+import java util concurrent atomic atomiclong
+import org apache activemq broker broker
+import org apache activemq broker connectioncontext
+import org apache activemq broker region destination
+import org apache activemq broker region indirectmessagereference
+import org apache activemq broker region messagereference
+import org apache activemq broker region queuemessagereference
+import org apache activemq command message
+import org apache activemq filter noncachedmessageevaluationcontext
+import org apache activemq openwire openwireformat
+import org apache activemq store plist
+import org apache activemq store pliststore
+import org apache activemq store plistentry
+import org apache activemq usage systemusage
+import org apache activemq usage usage
+import org apache activemq usage usagelistener
+import org apache activemq wireformat wireformat
+import org slf4j logger
+import org slf4j loggerfactory
+import org apache activemq util bytesequence
+/**
+* persist pending messages pending message (messages awaiting dispatch to a
+* consumer) cursor
+*
+*
+*/
+public class filependingmessagecursor extends abstractpendingmessagecursor implements usagelistener
+static final logger log   loggerfactory getlogger filependingmessagecursor class
+private static final atomiclong name_count   new atomiclong
+protected broker broker
+private final pliststore store
+private final string name
+private pendinglist memorylist
+private plist disklist
+private iterator<messagereference> iter
+private destination regiondestination
+private boolean iterating
+private boolean flushrequired
+private final atomicboolean started   new atomicboolean
+private final wireformat wireformat   new openwireformat
+/**
+* @param broker
+* @param name
+* @param prioritizedmessages
+*/
+public filependingmessagecursor broker broker  string name  boolean prioritizedmessages
+super prioritizedmessages
+if  this prioritizedmessages
+this memorylist   new prioritizedpendinglist
+else
+this memorylist   new orderedpendinglist
+this broker   broker
+// the store can be null if the brokerservice has persistence
+// turned off
+this store   broker gettempdatastore
+this name   name_count incrementandget         name
+@override
+public void start   throws exception
+if  started compareandset false  true
+super start
+if  systemusage    null
+systemusage getmemoryusage   addusagelistener this
+@override
+public void stop   throws exception
+if  started compareandset true  false
+super stop
+if  systemusage    null
+systemusage getmemoryusage   removeusagelistener this
+/**
+* @return true if there are no pending messages
+*/
+@override
+public synchronized boolean isempty
+if  memorylist isempty      isdisklistempty
+return true
+for  iterator<messagereference> iterator   memorylist iterator    iterator hasnext
+messagereference node   iterator next
+if  node    queuemessagereference null_message
+continue
+if   node isdropped
+return false
+// we can remove dropped references.
+iterator remove
+return isdisklistempty
+/**
+* reset the cursor
+*/
+@override
+public synchronized void reset
+iterating   true
+last   null
+if  isdisklistempty
+this iter   this memorylist iterator
+else
+this iter   new diskiterator
+@override
+public synchronized void release
+iterating   false
+if  iter instanceof diskiterator
+diskiterator iter  release
+if  flushrequired
+flushrequired   false
+if   hasspace
+flushtodisk
+// ensure any memory ref is released
+iter   null
+@override
+public synchronized void destroy   throws exception
+stop
+for  iterator<messagereference> i   memorylist iterator    i hasnext
+messagereference node   i next
+node decrementreferencecount
+memorylist clear
+destroydisklist
+private void destroydisklist   throws exception
+if  disklist    null
+store removeplist name
+disklist   null
+@override
+public synchronized linkedlist<messagereference> pageinlist int maxitems
+linkedlist<messagereference> result   new linkedlist<messagereference>
+int count   0
+for  iterator<messagereference> i   memorylist iterator    i hasnext      count < maxitems
+messagereference ref   i next
+ref incrementreferencecount
+result add ref
+count
+if  count < maxitems     isdisklistempty
+for  iterator<messagereference> i   new diskiterator    i hasnext      count < maxitems
+message message    message  i next
+message setregiondestination regiondestination
+message setmemoryusage this getsystemusage   getmemoryusage
+message incrementreferencecount
+result add message
+count
+return result
+/**
+* add message to await dispatch
+*
+* @param node
+* @throws exception
+*/
+@override
+public synchronized void addmessagelast messagereference node  throws exception
+tryaddmessagelast node  0
+@override
+public synchronized boolean tryaddmessagelast messagereference node  long maxwaittime  throws exception
+if   node isexpired
+try
+regiondestination    destination  node getmessage   getregiondestination
+if  isdisklistempty
+if  hasspace      this store    null
+memorylist addmessagelast node
+node incrementreferencecount
+setcacheenabled true
+return true
+if   hasspace
+if  isdisklistempty
+expireoldmessages
+if  hasspace
+memorylist addmessagelast node
+node incrementreferencecount
+return true
+else
+flushtodisk
+if  systemusage gettempusage   waitforspace maxwaittime
+bytesequence bs   getbytesequence node getmessage
+getdisklist   addlast node getmessageid   tostring    bs
+return true
+return false
+catch  exception e
+log error     node      e
+throw new runtimeexception e
+else
+discardexpiredmessage node
+//message expired
+return true
+/**
+* add message to await dispatch
+*
+* @param node
+*/
+@override
+public synchronized void addmessagefirst messagereference node
+if   node isexpired
+try
+regiondestination    destination  node getmessage   getregiondestination
+if  isdisklistempty
+if  hasspace
+memorylist addmessagefirst node
+node incrementreferencecount
+setcacheenabled true
+return
+if   hasspace
+if  isdisklistempty
+expireoldmessages
+if  hasspace
+memorylist addmessagefirst node
+node incrementreferencecount
+return
+else
+flushtodisk
+systemusage gettempusage   waitforspace
+node decrementreferencecount
+bytesequence bs   getbytesequence node getmessage
+object locator   getdisklist   addfirst node getmessageid   tostring    bs
+node getmessageid   setplistlocator locator
+catch  exception e
+log error     node      e
+throw new runtimeexception e
+else
+discardexpiredmessage node
+/**
+* @return true if there pending messages to dispatch
+*/
+@override
+public synchronized boolean hasnext
+return iter hasnext
+/**
+* @return the next pending message
+*/
+@override
+public synchronized messagereference next
+messagereference reference   iter next
+last   reference
+if   isdisklistempty
+// got from disk
+reference getmessage   setregiondestination regiondestination
+reference getmessage   setmemoryusage this getsystemusage   getmemoryusage
+reference incrementreferencecount
+return reference
+/**
+* remove the message at the cursor position
+*/
+@override
+public synchronized void remove
+iter remove
+if  last    null
+last decrementreferencecount
+/**
+* @param node
+* @see org.apache.activemq.broker.region.cursors.abstractpendingmessagecursor#remove(org.apache.activemq.broker.region.messagereference)
+*/
+@override
+public synchronized void remove messagereference node
+if  memorylist remove node     null
+node decrementreferencecount
+if   isdisklistempty
+try
+getdisklist   remove node getmessageid   getplistlocator
+catch  ioexception e
+throw new runtimeexception e
+/**
+* @return the number of pending messages
+*/
+@override
+public synchronized int size
+return memorylist size      isdisklistempty   ? 0    int getdisklist   size
+/**
+* clear all pending messages
+*/
+@override
+public synchronized void clear
+memorylist clear
+if   isdisklistempty
+try
+getdisklist   destroy
+catch  ioexception e
+throw new runtimeexception e
+last   null
+@override
+public synchronized boolean isfull
+return super isfull        isdisklistempty      systemusage    null    systemusage gettempusage   isfull
+@override
+public boolean hasmessagesbufferedtodeliver
+return  isempty
+@override
+public void setsystemusage systemusage usagemanager
+super setsystemusage usagemanager
+public void onusagechanged usage usage  int oldpercentusage  int newpercentusage
+if  newpercentusage >  getmemoryusagehighwatermark
+synchronized  this
+if   flushrequired    size      0
+flushrequired  true
+if   iterating
+expireoldmessages
+if   hasspace
+flushtodisk
+flushrequired   false
+@override
+public boolean istransient
+return true
+protected boolean isspaceinmemorylist
+return hasspace      isdisklistempty
+protected synchronized void expireoldmessages
+if   memorylist isempty
+for  iterator<messagereference> iterator   memorylist iterator    iterator hasnext
+messagereference node   iterator next
+if  node isexpired
+node decrementreferencecount
+discardexpiredmessage node
+iterator remove
+protected synchronized void flushtodisk
+if   memorylist isempty      store    null
+long start   0
+if  log istraceenabled
+start   system currenttimemillis
+log trace     name      memorylist size            systemusage    null ? systemusage getmemoryusage
+for  iterator<messagereference> iterator   memorylist iterator    iterator hasnext
+messagereference node   iterator next
+node decrementreferencecount
+bytesequence bs
+try
+bs   getbytesequence node getmessage
+getdisklist   addlast node getmessageid   tostring    bs
+catch  ioexception e
+log error    e
+throw new runtimeexception e
+memorylist clear
+setcacheenabled false
+if  log istraceenabled
+log trace     name        system currenttimemillis     start         systemusage    null ? systemusage getmemoryusage
+protected boolean isdisklistempty
+return disklist    null    disklist isempty
+public plist getdisklist
+if  disklist    null
+try
+disklist   store getplist name
+catch  exception e
+log error     name  e
+throw new runtimeexception e
+return disklist
+private void discardexpiredmessage messagereference reference
+if  log isdebugenabled
+log debug     reference
+if  broker isexpired reference
+connectioncontext context   new connectioncontext new noncachedmessageevaluationcontext
+context setbroker broker
+destination reference getregiondestination    messageexpired context  null  new indirectmessagereference reference getmessage
+protected bytesequence getbytesequence message message  throws ioexception
+org apache activemq util bytesequence packet   wireformat marshal message
+return new bytesequence packet data  packet offset  packet length
+protected message getmessage bytesequence bs  throws ioexception
+org apache activemq util bytesequence packet   new org apache activemq util bytesequence bs getdata    bs
+getoffset    bs getlength
+return  message  this wireformat unmarshal packet
+final class diskiterator implements iterator<messagereference>
+private final plist plistiterator iterator
+diskiterator
+try
+iterator   getdisklist   iterator
+catch  exception e
+throw new runtimeexception e
+public boolean hasnext
+return iterator hasnext
+public messagereference next
+try
+plistentry entry   iterator next
+message message   getmessage entry getbytesequence
+message getmessageid   setplistlocator entry getlocator
+return message
+catch  ioexception e
+log error    e
+throw new runtimeexception e
+public void remove
+iterator remove
+public void release
+iterator release

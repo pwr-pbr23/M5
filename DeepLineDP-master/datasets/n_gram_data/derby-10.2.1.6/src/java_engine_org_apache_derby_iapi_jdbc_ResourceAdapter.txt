@@ -1,0 +1,360 @@
+/*
+derby - class org.apache.derby.iapi.jdbc.resourceadapter
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby iapi jdbc
+import org apache derby iapi services context contextservice
+import org apache derby iapi store access xa xaresourcemanager
+import org apache derby iapi store access xa xaxactid
+import org apache derby iapi error standardexception
+/**
+the resource adapter is the clearing house for managing connections,
+transactions, and xaresources in a jdbc based resource manager living in
+the distributed transaction processing environment.
+<p> there is one instance of resourceadapter per resource manager (database).
+the resourceadapter is responsible for keeping track of all run time global
+transactions and their state.   the resource adapter only knows of run time
+global transactions, i.e., it does not know of in-doubt global transactions
+re-created by recovery.
+<p>	the following is an overall design of the jta implementation in cloudscape,
+most of it has little to do with the resourceadapter interface itself.
+<p><b>design overview </b>
+<p>the overriding design principle is that existing code should be disturbed
+as little as possible.  this is so that dtp code will not add to the bloat
+and drag of a normal, local, embbeded system.  the second design principle
+is that as much of the jdbc 2.0 extension functionality is to be
+implemented in the connectivity layer and not in the underlying storage
+system as possible.  ideally, the additional storage interface will
+implement no more than what is necessary to support the xaresource
+interface.
+<p>language and replication code should not be touched, or have very
+minimal api changes.  the api changes are confined to passing xa calls down
+to the store.
+<p>some change will be made to existing connectivity code and new xa
+modules will be added.  this collection of code is hereby referred to as
+the "blob of mysterious connectivity code", or the "resource adapter", or
+"ra" for short.  in the jta doc, the resource adapter is considered to be
+part of the jdbc driver.  this ra means "some connectivity code", it
+doesn't mean the object that implements the resourceadapter interface.
+<p>the most important difference, in terms of implementation, between a
+connection that deals with a local transaction and a connection that deals
+with a global transaction is that in a global transaction, 2 or more
+objects and threads can influence it - maybe concurrently.  the normal jdbc
+interaction goes thru the connection, but transaction demarcation comes
+from an xaresource object(s).  the ra will channel all xaresource calls
+that deal with a run time xa transaction (i.e., commit, end, forget,
+prepare, start) thru the transactioncontroller that represents the real
+transaction underneath.   furthermore, the ra will make sure that all calls
+thru a connection or thru any xaresource objects must pass thru some sort
+of synchronized object before it can get to the underlying transaction
+object.  this is so that there is only one path to change the state of a
+run time transaction and the transaction object and the context manager can
+remain single thread access.
+<p>in-doubt transaction (i.e., transactions re-created by recovery)
+management and concurrency control is the responsibiliy of store. moreover,
+since the ra does not know the identities of the list of in-doubt
+transactions, store must deal with (throw exception) when someone wants to
+start a transaction with the same xid as an existing in-doubt transaction.
+<p>in terms of what this means to the app server that is calling us: if the
+connection and the xaresource that represents a global transaction is being
+accessed by 2 different threads, they will access the database serially and
+not concurrently. an in-doubt transaction gotten thru recovery has no
+transaction object that is ever visible to the ra - because there is no
+connection that was ever made to it.  therefore it is safe to influence the
+state of an in-doubt transaction directly thru some store factory interface
+- and have that go thru the transaction table underneath to find the actual
+transaction object and context manager etc.
+<p>one new functionality of a connection is the ability to switch around
+with different transactions.  before jta, the lifetime of a transaction is
+bounded by a connection, and a transaction cannot migrate from one
+connection to another.  in jta, a global transaction can be detached from a
+connection.  a transaction can move around and be attached to different
+connections and its lifetime is not confine to the connection that started
+it.  from the connection's point of view, before jta, a (local) transaction
+is always started and ended in the same connection. with jta, it needs to
+"take on" existing global transactions that was started by some other
+connections.
+<p>the ra will have the responsibility of
+<ol>
+<li>setting up a context with the appropriate transaction before calling
+store to do work.</li>
+<li>handling error on the context.</li>
+<li>restoring a previous context if it was switched out due to an xaresouce
+call to commit a transaction that is not what the xaresoruce is currently
+attached to. </li>
+</ol>
+<p>because of all these switching around, a connection may be in a
+transaction-less state.  this happens between an xaresource.end call that
+detached the current global transaction from the connection, and the next
+xaresource.start call that attach the next global transaction with the
+connection.
+<br>an (inferior) implementation is for the connection object to start a
+local connection once it is detached from a global transaction.  if the
+user then uses the connection immediately without a xaresource.start call,
+then this connection behaves just like it did before jta, i.e., with a
+local transaction.  if, on the other hand, an xaresource.start call happens
+next, then either the local transaction is "morphed" into a global
+transaction, or, if the start call is to attach the connection to a
+pre-existing global transaction, then the local transaction is thrown away
+and the connection will take on the pre-exising global transaction.
+<br>another (superior) implementation is to make it possible for a
+connection to be transaction-less.  when a connection is first created by
+xaconnection.getconnection, or when a xaresource.end call detached a global
+transaction from the connection, it is left in a transaction-less state.
+if a xaresource.start call happens next, then the connection either start a
+new global transaction or it takes on an existing one.  if a call is made
+directly on the connection before xaresource.start call happens, then the
+connection starts a new local transaction.  this only affects connections
+that was gotten thru the xaconnection.getconnection().  connections gotten
+thru the drivermanager or a datasource will have a local transaction
+automatically started, as is the behavior today.  when a connection with a
+local transaction commits, the transaction is still around but it is chain
+to the next one - this is the current behavior.  this behavior is very
+desirable from a performance point of view, so it should be retained.
+however, a local transaction cannot "morph" into a global transaction,
+therefore when this connection is attached to a global transaction, the
+local transaction is thrown away and a global one started
+<p>the ra will need to keep track of all global transactions.  this is done
+by (yet another) transaction table that lives in the ra.  this transaction
+table maps xid to the contextmanager of the global transaction and whatever
+else a connection needs to talk to the transaction - i assume the
+connection object currently have tendrils into various contexts and objects
+and these are things that need to be detached and attached when a
+connection is hooked up with another transaction.  the reason for yet
+another transaction table instead of the one in store is because the one in
+store keeps track of local and internal transactions and is really quite
+overworked already.
+<p><b>detailed design</b>
+<br> first some ugly pictures.  some links are not shown to reduce
+clutter.  externally visible object is in <b>bold</b>.
+<p><pre>
+*
+* when user ask for an xaconnection via a xadatasource, the following objects
+* exists
+* <br>
+*
+*                                                     |-------------|
+*                                  |======= produces=>| <b>xaresource</b>  |
+*                                  ||                 |-------------|
+*                                  ||                       |
+*                                  ||                     has a
+*                                  ||                       |
+*                                  ||  |---------------------
+*                                  ||  v
+* |--------------| produces |--------------|
+* | <b>xadatasource</b> |=========>| <b>xaconnection</b>
+* |--------------|          |--------------|
+*       |                          |
+*     extends                    extends
+*       |                          |
+*       |                |-----------------------|   |----------------------|
+*       |                | db2jpooledconnection |==>| brokeredconnection |
+*       |                |-----------------------|   |----------------------|
+*       |                          |       ^                  |
+*       |                        has a     |               has a
+*       |                          |       |                  |
+* |-----------------|              |       --------------------
+* | embeddeddatasource |              |
+* |-----------------|              |
+*       |                          |
+*     has a                        |
+*       |                          |
+*       v                          v
+* |------------|           |----------------------|   |-----------------------|
+* | jdbcdriver |=produces=>| detachableconnection |==>| xatransactionresource |
+* | localdriver|           |----------------------|   |                       |
+* |------------|                   |                  |   points to :         |
+*                                  |                  |xatransactioncontroller|
+*                                  |                  | contextmanager        |
+*                                  |                  | lcc                   |
+*                                  |                  | .. etc ..             |
+*                                  |                  |-----------------------|
+*                                  |                            |
+*                                extends                     extends
+*                                  |                            |
+*                           |-----------------|       |-----------------------|
+*                           | embedconnection |-- ?-->|  transactionresource  |
+*                           |-----------------|       |-----------------------|
+*
+*
+* <br><br>
+* when user ask for a pooledconnection via a pooleddatasource, the following
+* objects exists
+* <br>
+* |-------------------------------|
+* | <b>embeddedconnectionpooldatasource</b> |
+* |-------------------------------|
+*       |                  ||
+*       |                  ||
+*     extends             produces
+*       |                  ||
+*       |                  \/
+*       |                |-----------------------|   |----------------------|
+*       |                | <b>db2jpooledconnection</b> |==>| <b>brokeredconnection</b> |
+*       |                |-----------------------|   |----------------------|
+*       |                          |       ^                  |
+*       |                        has a     |               has a
+*       |                          |       |                  |
+* |-----------------|              |       --------------------
+* | embeddeddatasource |              |
+* |-----------------|              |
+*       |                          |
+*     has a                        |
+*       |                          |
+*       v                          v
+* |------------|           |----------------------|   |-----------------------|
+* | jdbcdriver |=produces=>| embedconnection |==>|  transactionresource  |
+* | localdriver|           |----------------------|   |-----------------------|
+* |------------|
+*
+*
+*
+* <br><br>
+* when user ask for a (normal) connection via a datasource, the following
+* objects exists. the embeddeddatasource is just a wrapper for the jdbcdriver.
+* <br>
+* |-----------------|
+* | <b>embeddeddatasource</b> |
+* |-----------------|
+*       |
+*     has a
+*       |
+*       v
+* |------------|            |-----------------|     |-----------------------|
+* | jdbcdriver |==produces=>| <b>embedconnection</b> |- ?->| transactionresource   |
+* | localdriver|            |-----------------|     |-----------------------|
+* |------------|
+</pre>
+<p>xadatasource inherits datasource methods from embeddeddatasource.  it also
+implements resourceadapter, whose main job is to keep track of run time
+global transactions.  a global transaction table maps xids to
+xatransactionresource.  xadatasource also has a xaresourcemanager, which
+implements xaresource functionality in the store.
+<p>xaconnection is the one thing that unites a global connection and the
+xaresource that delineates the global transaction.  this is where the real
+xaresource functionality is implemented.  all xaresource calls to the
+xaresource object as well as connection call to the brokeredconnection
+channels thrus the xaconnection, which makes sure only one thread can be
+accessing the db2jpooledconnection at any given time.
+<p>xaresource and brokeredconnection[23]0 are the two objects we give back
+to the tm and the user application respectively to control a distributed
+transaction.  according to the xa spec, the app server is supposed to make
+sure that these objects are not used the same time by multiple threads, but
+we don't trust the app server.  therefore, we channel everthing back to the
+xaconnection.
+<p>the mt consideration is actually more complicated than this,
+because a xaresource is allowed to control any transaction, not just the
+one its xaconnection is current attached to.  so it is not sufficient to
+just synchronized on xaconnection to guarentee single thread access to the
+underlying transaction context.  to control some arbitrary global
+transaction, the tm can call xaresource to prepare any xid.  to do that,
+the xaresource pass the request to the xaconnection, the xaconnection ask
+the xadatasource to find the xatransactionresource, sets up the thread's
+context, and call ask the xatransactionresource to prepare.  the
+xatransactionresource is synchronized to prevent some other thread from
+attaching, commiting, and in any way calling on the the same transaction
+context.  if any error is thrown, it is handled with the context of the
+transaction being prepared.  after the error is handled, the old context
+(the one where the xaresource is really attached to), is restored.  while
+this monkey business is going on, the thread that holds the connection the
+xaconnection is supposed to be attached to is blocked out.  it can resume
+after its xaconnection restored its context.  (here is where i am not
+really sure what happens since that thread obviously doesn't know about all
+these hanky panky caused by the thread holding the xaresource commiting,
+preparing and rolling back some other irrelavant transactions, so how would
+its context be affected in any way?).
+<p>db2jpooledconnection implements pooledconnection, is hands out these
+connection handles which allows some app server to do connection pooling.
+this is a very thin layer.  a connection handle implements a connection by
+passing thru all calls to the underlaying connection.  in this case, it
+passes connection call thru the db2jpooledconnection to the
+detachableconnection underneath.
+<p>embeddeddatasource implements jndi and is a replacement for driver.
+<p>the localdriver can now produce a detachableconnection as well as a
+embedconnection (which is the pre-jta connection that cannot detach and
+attach to different transactions).  the way the localdriver knows to create
+a detachableconnection versus a embedconnection is thru some extremely
+hackish url settings.  this thing is very ugly and a more elegant way can
+(and should) no doubt be found.
+<p>detachableconnection is a connection which can detach and attach to
+different xatransactionresource, and can be totally unattached to any
+transaction.
+<p>xatransactionresource is a bundle of things that sets up a connection
+with all the stuff it needs to actually talk to the database, do error
+handling, etc.  it is also the object that lives in the transaction table
+managed by the resourceadapter (xadatasource).  a xaresource (which may or
+may not be attached to a transaction) can commit, prepare, or rollback any
+global transaction that is not attached to an xaconnection.  to do that,
+the resourceadapter fishes out the xatransactionresource, set up the
+context, and do the commit processing/error handling on the current
+thread.
+<p>local connection is the same old local connection except one
+difference.  pre-jta, a localconnection uses itself (or a root connection)
+as the object to synchronized upon so that multiple threads getting hold of
+the same connection object cannot simultaneously issue calls to the
+underlying transaction or context (since those things must be single thread
+access).  with jta, the object of synchronization is the
+transactionresource itself.  this part has not been well thought through
+and is probably wrong.
+<p>transactionresource is a base class for xatransactionresource.  for a
+local transaction which cannot be detached from a connection, there is no
+need to encapsulate a bundle of things to set up a connection, so a
+transactionresource (probably misnamed) has nothing and is used only for
+synchronization purposes.  this part has not been well thought throught and
+is probably wrong.
+<p>the non-xa pooledconnection is just a thin veneer over the normal
+connection.  i now have it over a detachable connection just to simplify
+the inheritence (xaconnection need to extend pooledconnection and xaconnect
+needs to be detachable.  however, pooledconnection itself need not be
+detachable).  it could be changed around to have localdriver producing
+either embedconnection or xaconnection, and have the xaconnection
+implements detachable.  but the current way is simpler.
+*/
+public interface resourceadapter
+/**
+if a run time global transaction exists, the resource adapter will find
+it and return a capsule of information so that a connection can be
+attached to the transaction.
+@param xid the global transaction id
+@return the transaction resource if the xid correspond to a run
+time transaction, otherwise return null
+*/
+//xatransactionresource findtransaction(xaxactid xid);
+/**
+start a run time global transaction.  add this to the list of
+transactions managed by this resource adapter.
+@return true if transaction can be added, otherwise false (dupid).
+*/
+//boolean addtransaction(xatransactionresource tr);
+/**
+terminates a run time global transction.  remove this from the list of
+transactions managed by this resource adapter.
+*/
+//void removetransaction(xatransactionresource tr);
+/**
+let a xaresource get the xaresourcemanager to commit or rollback an
+in-doubt transaction.
+*/
+xaresourcemanager getxaresourcemanager
+/**
+get the context service factory.
+*/
+//contextservice getcontextservicefactory();
+/**
+is the resource manager active
+*/
+boolean isactive
+public object findconnection xaxactid xid
+public boolean addconnection xaxactid xid  object conn
+public object removeconnection xaxactid xid

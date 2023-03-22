@@ -1,0 +1,1564 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq broker region
+import java io ioexception
+import java util arraylist
+import java util collection
+import java util collections
+import java util comparator
+import java util hashset
+import java util iterator
+import java util linkedhashmap
+import java util linkedhashset
+import java util linkedlist
+import java util list
+import java util map
+import java util set
+import java util concurrent cancellationexception
+import java util concurrent concurrentlinkedqueue
+import java util concurrent countdownlatch
+import java util concurrent delayqueue
+import java util concurrent delayed
+import java util concurrent executorservice
+import java util concurrent future
+import java util concurrent timeunit
+import java util concurrent atomic atomiclong
+import java util concurrent locks lock
+import java util concurrent locks reentrantlock
+import java util concurrent locks reentrantreadwritelock
+import javax jms invalidselectorexception
+import javax jms jmsexception
+import javax jms resourceallocationexception
+import org apache activemq broker brokerservice
+import org apache activemq broker connectioncontext
+import org apache activemq broker producerbrokerexchange
+import org apache activemq broker region cursors orderedpendinglist
+import org apache activemq broker region cursors pendinglist
+import org apache activemq broker region cursors pendingmessagecursor
+import org apache activemq broker region cursors prioritizedpendinglist
+import org apache activemq broker region cursors storequeuecursor
+import org apache activemq broker region cursors vmpendingmessagecursor
+import org apache activemq broker region group messagegrouphashbucketfactory
+import org apache activemq broker region group messagegroupmap
+import org apache activemq broker region group messagegroupmapfactory
+import org apache activemq broker region policy dispatchpolicy
+import org apache activemq broker region policy roundrobindispatchpolicy
+import org apache activemq broker util insertioncountlist
+import org apache activemq command activemqdestination
+import org apache activemq command activemqmessage
+import org apache activemq command consumerid
+import org apache activemq command exceptionresponse
+import org apache activemq command message
+import org apache activemq command messageack
+import org apache activemq command messagedispatchnotification
+import org apache activemq command messageid
+import org apache activemq command producerack
+import org apache activemq command producerinfo
+import org apache activemq command response
+import org apache activemq filter booleanexpression
+import org apache activemq filter messageevaluationcontext
+import org apache activemq filter noncachedmessageevaluationcontext
+import org apache activemq selector selectorparser
+import org apache activemq state producerstate
+import org apache activemq store messagerecoverylistener
+import org apache activemq store messagestore
+import org apache activemq thread task
+import org apache activemq thread taskrunner
+import org apache activemq thread taskrunnerfactory
+import org apache activemq transaction synchronization
+import org apache activemq usage usage
+import org apache activemq usage usagelistener
+import org apache activemq util brokersupport
+import org apache activemq util threadpoolutils
+import org slf4j logger
+import org slf4j loggerfactory
+import org slf4j mdc
+/**
+* the queue is a list of messageentry objects that are dispatched to matching
+* subscriptions.
+*/
+public class queue extends basedestination implements task  usagelistener
+protected static final logger log   loggerfactory getlogger queue class
+protected final taskrunnerfactory taskfactory
+protected taskrunner taskrunner
+private final reentrantreadwritelock consumerslock   new reentrantreadwritelock
+protected final list<subscription> consumers   new arraylist<subscription> 50
+private final reentrantreadwritelock messageslock   new reentrantreadwritelock
+protected pendingmessagecursor messages
+private final reentrantreadwritelock pagedinmessageslock   new reentrantreadwritelock
+private final linkedhashmap<messageid  queuemessagereference> pagedinmessages   new linkedhashmap<messageid  queuemessagereference>
+// messages that are paged in but have not yet been targeted at a
+// subscription
+private final reentrantreadwritelock pagedinpendingdispatchlock   new reentrantreadwritelock
+protected pendinglist pagedinpendingdispatch   new orderedpendinglist
+protected pendinglist redeliveredwaitingdispatch   new orderedpendinglist
+private messagegroupmap messagegroupowners
+private dispatchpolicy dispatchpolicy   new roundrobindispatchpolicy
+private messagegroupmapfactory messagegroupmapfactory   new messagegrouphashbucketfactory
+final lock sendlock   new reentrantlock
+private executorservice executor
+private final map<messageid  runnable> messageswaitingforspace   new linkedhashmap<messageid  runnable>
+private boolean useconsumerpriority   true
+private boolean strictorderdispatch   false
+private final queuedispatchselector dispatchselector
+private boolean optimizeddispatch   false
+private boolean iterationrunning   false
+private boolean firstconsumer   false
+private int timebeforedispatchstarts   0
+private int consumersbeforedispatchstarts   0
+private countdownlatch consumersbeforestartslatch
+private final atomiclong pendingwakeups   new atomiclong
+private boolean allconsumersexclusivebydefault   false
+private final runnable sendmessageswaitingforspacetask   new runnable
+public void run
+asyncwakeup
+private final runnable expiremessagestask   new runnable
+public void run
+expiremessages
+private final object iteratingmutex   new object
+class timeoutmessage implements delayed
+message message
+connectioncontext context
+long trigger
+public timeoutmessage message message  connectioncontext context  long delay
+this message   message
+this context   context
+this trigger   system currenttimemillis     delay
+public long getdelay timeunit unit
+long n   trigger   system currenttimemillis
+return unit convert n  timeunit milliseconds
+public int compareto delayed delayed
+long other     timeoutmessage  delayed  trigger
+int returnvalue
+if  this trigger < other
+returnvalue    1
+else if  this trigger > other
+returnvalue   1
+else
+returnvalue   0
+return returnvalue
+delayqueue<timeoutmessage> flowcontroltimeoutmessages   new delayqueue<timeoutmessage>
+class flowcontroltimeouttask extends thread
+@override
+public void run
+timeoutmessage timeout
+try
+while  true
+timeout   flowcontroltimeoutmessages take
+if  timeout    null
+synchronized  messageswaitingforspace
+if  messageswaitingforspace remove timeout message getmessageid       null
+exceptionresponse response   new exceptionresponse
+new resourceallocationexception
+timeout message getproducerid
+getactivemqdestination   getqualifiedname
+response setcorrelationid timeout message getcommandid
+timeout context getconnection   dispatchasync response
+catch  interruptedexception e
+if  log isdebugenabled
+log debug getname
+private final flowcontroltimeouttask flowcontroltimeouttask   new flowcontroltimeouttask
+private final comparator<subscription> orderedcompare   new comparator<subscription>
+public int compare subscription s1  subscription s2
+// we want the list sorted in descending order
+int val   s2 getconsumerinfo   getpriority     s1 getconsumerinfo   getpriority
+if  val    0    messagegroupowners    null
+// then ascending order of assigned message groups to favour less loaded consumers
+// long.compare in jdk7
+long x   s1 getconsumerinfo   getlastdeliveredsequenceid
+long y   s2 getconsumerinfo   getlastdeliveredsequenceid
+val    x < y  ?  1     x    y  ? 0   1
+return val
+public queue brokerservice brokerservice  final activemqdestination destination  messagestore store
+destinationstatistics parentstats  taskrunnerfactory taskfactory  throws exception
+super brokerservice  store  destination  parentstats
+this taskfactory   taskfactory
+this dispatchselector   new queuedispatchselector destination
+public list<subscription> getconsumers
+consumerslock readlock   lock
+try
+return new arraylist<subscription> consumers
+finally
+consumerslock readlock   unlock
+// make the queue easily visible in the debugger from its task runner
+// threads
+final class queuethread extends thread
+final queue queue
+public queuethread runnable runnable  string name  queue queue
+super runnable  name
+this queue   queue
+class batchmessagerecoverylistener implements messagerecoverylistener
+final linkedlist<message> toexpire   new linkedlist<message>
+final double totalmessagecount
+int recoveredaccumulator   0
+int currentbatchcount
+batchmessagerecoverylistener int totalmessagecount
+this totalmessagecount   totalmessagecount
+currentbatchcount   recoveredaccumulator
+public boolean recovermessage message message
+recoveredaccumulator
+if  log isinfoenabled       recoveredaccumulator % 10000     0
+log info     getactivemqdestination   getqualifiedname
+recoveredaccumulator
+int   recoveredaccumulator   100   totalmessagecount
+// message could have expired while it was being
+// loaded..
+if  message isexpired      broker isexpired message
+toexpire add message
+return true
+if  hasspace
+message setregiondestination queue this
+messageslock writelock   lock
+try
+try
+messages addmessagelast message
+catch  exception e
+log error    e
+finally
+messageslock writelock   unlock
+destinationstatistics getmessages   increment
+return true
+return false
+public boolean recovermessagereference messageid messagereference  throws exception
+throw new runtimeexception
+public boolean hasspace
+return true
+public boolean isduplicate messageid id
+return false
+public void reset
+currentbatchcount   recoveredaccumulator
+public void processexpired
+for  message message  toexpire
+messageexpired createconnectioncontext    createmessagereference message
+// drop message will decrement so counter
+// balance here
+destinationstatistics getmessages   increment
+toexpire clear
+public boolean done
+return currentbatchcount    recoveredaccumulator
+@override
+public void setprioritizedmessages boolean prioritizedmessages
+super setprioritizedmessages prioritizedmessages
+if  prioritizedmessages    this pagedinpendingdispatch instanceof orderedpendinglist
+pagedinpendingdispatch   new prioritizedpendinglist
+redeliveredwaitingdispatch   new prioritizedpendinglist
+else if pagedinpendingdispatch instanceof prioritizedpendinglist
+pagedinpendingdispatch   new orderedpendinglist
+redeliveredwaitingdispatch   new orderedpendinglist
+@override
+public void initialize   throws exception
+if  this messages    null
+if  destination istemporary      broker    null    store    null
+this messages   new vmpendingmessagecursor isprioritizedmessages
+else
+this messages   new storequeuecursor broker  this
+// if a vmpendingmessagecursor don't use the default producer system
+// usage
+// since it turns into a shared blocking queue which can lead to a
+// network deadlock.
+// if we are cursoring to disk..it's not and issue because it does not
+// block due
+// to large disk sizes.
+if  messages instanceof vmpendingmessagecursor
+this systemusage   brokerservice getsystemusage
+memoryusage setparent systemusage getmemoryusage
+this taskrunner   taskfactory createtaskrunner this      destination getphysicalname
+super initialize
+if  store    null
+// restore the persistent messages.
+messages setsystemusage systemusage
+messages setenableaudit isenableaudit
+messages setmaxauditdepth getmaxauditdepth
+messages setmaxproducerstoaudit getmaxproducerstoaudit
+messages setusecache isusecache
+messages setmemoryusagehighwatermark getcursormemoryhighwatermark
+final int messagecount   store getmessagecount
+if  messagecount > 0    messages isrecoveryrequired
+batchmessagerecoverylistener listener   new batchmessagerecoverylistener messagecount
+do
+listener reset
+store recovernextmessages getmaxpagesize    listener
+listener processexpired
+while   listener done
+else
+destinationstatistics getmessages   setcount messagecount
+/*
+* holder for subscription that needs attention on next iterate browser
+* needs access to existing messages in the queue that have already been
+* dispatched
+*/
+class browserdispatch
+queuebrowsersubscription browser
+public browserdispatch queuebrowsersubscription browsersubscription
+browser   browsersubscription
+browser incrementqueueref
+void done
+try
+browser decrementqueueref
+catch  exception e
+log warn     browser  e
+public queuebrowsersubscription getbrowser
+return browser
+concurrentlinkedqueue<browserdispatch> browserdispatches   new concurrentlinkedqueue<browserdispatch>
+public void addsubscription connectioncontext context  subscription sub  throws exception
+if  log isdebugenabled
+log debug getactivemqdestination   getqualifiedname         sub
+getdestinationstatistics   getdequeues   getcount
+getdestinationstatistics   getdispatched   getcount
+getdestinationstatistics   getinflight   getcount
+super addsubscription context  sub
+// synchronize with dispatch method so that no new messages are sent
+// while setting up a subscription. avoid out of order messages,
+// duplicates, etc.
+pagedinpendingdispatchlock writelock   lock
+try
+sub add context  this
+// needs to be synchronized - so no contention with dispatching
+// consumerslock.
+consumerslock writelock   lock
+try
+// set a flag if this is a first consumer
+if  consumers size      0
+firstconsumer   true
+if  consumersbeforedispatchstarts    0
+consumersbeforestartslatch   new countdownlatch consumersbeforedispatchstarts   1
+else
+if  consumersbeforestartslatch    null
+consumersbeforestartslatch countdown
+addtoconsumerlist sub
+if  sub getconsumerinfo   isexclusive      isallconsumersexclusivebydefault
+subscription exclusiveconsumer   dispatchselector getexclusiveconsumer
+if  exclusiveconsumer    null
+exclusiveconsumer   sub
+else if  sub getconsumerinfo   getpriority      byte max_value
+sub getconsumerinfo   getpriority   > exclusiveconsumer getconsumerinfo   getpriority
+exclusiveconsumer   sub
+dispatchselector setexclusiveconsumer exclusiveconsumer
+finally
+consumerslock writelock   unlock
+if  sub instanceof queuebrowsersubscription
+// tee up for dispatch in next iterate
+queuebrowsersubscription browsersubscription    queuebrowsersubscription  sub
+browserdispatch browserdispatch   new browserdispatch browsersubscription
+browserdispatches add browserdispatch
+if   this optimizeddispatch
+wakeup
+finally
+pagedinpendingdispatchlock writelock   unlock
+if  this optimizeddispatch
+// outside of dispatchlock() to maintain the lock hierarchy of
+// iteratingmutex -> dispatchlock. - see
+// https://issues.apache.org/activemq/browse/amq-1878
+wakeup
+public void removesubscription connectioncontext context  subscription sub  long lastdeiveredsequenceid
+throws exception
+super removesubscription context  sub  lastdeiveredsequenceid
+// synchronize with dispatch method so that no new messages are sent
+// while removing up a subscription.
+pagedinpendingdispatchlock writelock   lock
+try
+if  log isdebugenabled
+log debug getactivemqdestination   getqualifiedname         sub       lastdeiveredsequenceid
+getdestinationstatistics   getdequeues   getcount
+getdestinationstatistics   getdispatched   getcount
+getdestinationstatistics   getinflight   getcount
+consumerslock writelock   lock
+try
+removefromconsumerlist sub
+if  sub getconsumerinfo   isexclusive
+subscription exclusiveconsumer   dispatchselector getexclusiveconsumer
+if  exclusiveconsumer    sub
+exclusiveconsumer   null
+for  subscription s   consumers
+if  s getconsumerinfo   isexclusive
+exclusiveconsumer    null    s getconsumerinfo   getpriority   > exclusiveconsumer
+getconsumerinfo   getpriority
+exclusiveconsumer   s
+dispatchselector setexclusiveconsumer exclusiveconsumer
+else if  isallconsumersexclusivebydefault
+subscription exclusiveconsumer   null
+for  subscription s   consumers
+if  exclusiveconsumer    null
+s getconsumerinfo   getpriority   > exclusiveconsumer
+getconsumerinfo   getpriority
+exclusiveconsumer   s
+dispatchselector setexclusiveconsumer exclusiveconsumer
+consumerid consumerid   sub getconsumerinfo   getconsumerid
+getmessagegroupowners   removeconsumer consumerid
+// redeliver inflight messages
+boolean markasredelivered   false
+messagereference lastdeliveredref   null
+list<messagereference> unackedmessages   sub remove context  this
+// locate last redelivered in unconsumed list (list in delivery rather than seq order)
+if  lastdeiveredsequenceid    0
+for  messagereference ref   unackedmessages
+if  ref getmessageid   getbrokersequenceid      lastdeiveredsequenceid
+lastdeliveredref   ref
+markasredelivered   true
+if  log isdebugenabled
+log debug     lastdeiveredsequenceid       ref getmessageid
+break
+for  messagereference ref   unackedmessages
+queuemessagereference qmr    queuemessagereference  ref
+if  qmr getlockowner      sub
+qmr unlock
+// have no delivery information
+if  lastdeiveredsequenceid    0
+qmr incrementredeliverycounter
+else
+if  markasredelivered
+qmr incrementredeliverycounter
+if  ref    lastdeliveredref
+// all that follow were not redelivered
+markasredelivered   false
+redeliveredwaitingdispatch addmessagelast qmr
+if  sub instanceof queuebrowsersubscription
+queuebrowsersubscription sub  decrementqueueref
+browserdispatches remove sub
+if   redeliveredwaitingdispatch isempty
+dodispatch new orderedpendinglist
+finally
+consumerslock writelock   unlock
+if   this optimizeddispatch
+wakeup
+finally
+pagedinpendingdispatchlock writelock   unlock
+if  this optimizeddispatch
+// outside of dispatchlock() to maintain the lock hierarchy of
+// iteratingmutex -> dispatchlock. - see
+// https://issues.apache.org/activemq/browse/amq-1878
+wakeup
+public void send final producerbrokerexchange producerexchange  final message message  throws exception
+final connectioncontext context   producerexchange getconnectioncontext
+// there is delay between the client sending it and it arriving at the
+// destination.. it may have expired.
+message setregiondestination this
+producerstate state   producerexchange getproducerstate
+if  state    null
+log warn     message       producerexchange
+throw new jmsexception     getactivemqdestination
+final producerinfo producerinfo   producerexchange getproducerstate   getinfo
+final boolean sendproducerack    message isresponserequired      producerinfo getwindowsize   > 0
+context isinrecoverymode
+if  message isexpired
+// message not stored - or added to stats yet - so chuck here
+broker getroot   messageexpired context  message  null
+if  sendproducerack
+producerack ack   new producerack producerinfo getproducerid    message getsize
+context getconnection   dispatchasync ack
+return
+if  memoryusage isfull
+isfull context  memoryusage
+fastproducer context  producerinfo
+if  isproducerflowcontrol      context isproducerflowcontrol
+if  warnonproducerflowcontrol
+warnonproducerflowcontrol   false
+log
+info
+memoryusage getlimit
+getactivemqdestination   getqualifiedname
+if   context isnetworkconnection      systemusage issendfailifnospace
+throw new resourceallocationexception
+message getproducerid
+getactivemqdestination   getqualifiedname
+// we can avoid blocking due to low usage if the producer is
+// sending
+// a sync message or if it is using a producer window
+if  producerinfo getwindowsize   > 0    message isresponserequired
+// copy the exchange state since the context will be
+// modified while we are waiting
+// for space.
+final producerbrokerexchange producerexchangecopy   producerexchange copy
+synchronized  messageswaitingforspace
+// start flow control timeout task
+// prevent trying to start it multiple times
+if   flowcontroltimeouttask isalive
+flowcontroltimeouttask setname getname
+flowcontroltimeouttask start
+messageswaitingforspace put message getmessageid    new runnable
+public void run
+try
+// while waiting for space to free up... the
+// message may have expired.
+if  message isexpired
+log error
+broker messageexpired context  message  null
+destinationstatistics getexpired   increment
+else
+domessagesend producerexchangecopy  message
+if  sendproducerack
+producerack ack   new producerack producerinfo getproducerid    message
+getsize
+context getconnection   dispatchasync ack
+else
+response response   new response
+response setcorrelationid message getcommandid
+context getconnection   dispatchasync response
+catch  exception e
+if   sendproducerack     context isinrecoverymode
+exceptionresponse response   new exceptionresponse e
+response setcorrelationid message getcommandid
+context getconnection   dispatchasync response
+else
+log debug     message  e
+if   context isnetworkconnection      systemusage getsendfailifnospaceaftertimeout      0
+flowcontroltimeoutmessages add new timeoutmessage message  context  systemusage
+getsendfailifnospaceaftertimeout
+registercallbackfornotfullnotification
+context setdontsendreponse true
+return
+else
+if  memoryusage isfull
+waitforspace context  memoryusage
+message getproducerid
+getactivemqdestination   getqualifiedname
+// the usage manager could have delayed us by the time
+// we unblock the message could have expired..
+if  message isexpired
+if  log isdebugenabled
+log debug     message
+broker getroot   messageexpired context  message  null
+return
+domessagesend producerexchange  message
+if  sendproducerack
+producerack ack   new producerack producerinfo getproducerid    message getsize
+context getconnection   dispatchasync ack
+private void registercallbackfornotfullnotification
+// if the usage manager is not full, then the task will not
+// get called..
+if   memoryusage notifycallbackwhennotfull sendmessageswaitingforspacetask
+// so call it directly here.
+sendmessageswaitingforspacetask run
+void domessagesend final producerbrokerexchange producerexchange  final message message  throws ioexception
+exception
+final connectioncontext context   producerexchange getconnectioncontext
+future<object> result   null
+checkusage context  message
+sendlock lockinterruptibly
+try
+if  store    null    message ispersistent
+message getmessageid   setbrokersequenceid getdestinationsequenceid
+if  messages iscacheenabled
+result   store asyncaddqueuemessage context  message  isoptimizestorage
+else
+store addmessage context  message
+if  isreducememoryfootprint
+message clearmarshalledstate
+if  context isintransaction
+// if this is a transacted message.. increase the usage now so that
+// a big tx does not blow up
+// our memory. this increment is decremented once the tx finishes..
+message incrementreferencecount
+context gettransaction   addsynchronization new synchronization
+@override
+public void aftercommit   throws exception
+sendlock lockinterruptibly
+try
+// it could take while before we receive the commit
+// op, by that time the message could have expired..
+if  broker isexpired message
+broker messageexpired context  message  null
+destinationstatistics getexpired   increment
+return
+sendmessage message
+finally
+sendlock unlock
+message decrementreferencecount
+messagesent context  message
+@override
+public void afterrollback   throws exception
+message decrementreferencecount
+else
+// add to the pending list, this takes care of incrementing the
+// usage manager.
+sendmessage message
+finally
+sendlock unlock
+if   context isintransaction
+messagesent context  message
+if  result    null     result iscancelled
+try
+result get
+catch  cancellationexception e
+// ignore - the task has been cancelled if the message
+// has already been deleted
+private void checkusage connectioncontext context  message message  throws resourceallocationexception  ioexception  interruptedexception
+if  message ispersistent
+if  store    null    systemusage getstoreusage   isfull getstoreusagehighwatermark
+final string logmessage       getstoreusagehighwatermark
+systemusage getstoreusage   getlimit
+message getproducerid
+getactivemqdestination   getqualifiedname
+waitforspace context  systemusage getstoreusage    getstoreusagehighwatermark    logmessage
+else if  messages getsystemusage      null    systemusage gettempusage   isfull
+final string logmessage
+systemusage gettempusage   getpercentusage         systemusage gettempusage   getlimit
+message getproducerid
+getactivemqdestination   getqualifiedname
+waitforspace context  messages getsystemusage   gettempusage    logmessage
+private void expiremessages
+if  log isdebugenabled
+log debug getactivemqdestination   getqualifiedname
+// just track the insertion count
+list<message> browsedmessages   new insertioncountlist<message>
+dobrowse browsedmessages  this getmaxexpirepagesize
+asyncwakeup
+if  log isdebugenabled
+log debug getactivemqdestination   getqualifiedname
+public void gc
+public void acknowledge connectioncontext context  subscription sub  messageack ack  messagereference node
+throws ioexception
+messageconsumed context  node
+if  store    null    node ispersistent
+store removeasyncmessage context  converttononrangedack ack  node
+message loadmessage messageid messageid  throws ioexception
+message msg   null
+if  store    null       can be null for a temp q
+msg   store getmessage messageid
+if  msg    null
+msg setregiondestination this
+return msg
+@override
+public string tostring
+int size   0
+messageslock readlock   lock
+try
+size   messages size
+finally
+messageslock readlock   unlock
+return destination getqualifiedname         consumers size
+memoryusage getpercentusage         size
+messagegroupowners
+public void start   throws exception
+if  memoryusage    null
+memoryusage start
+if  systemusage getstoreusage      null
+systemusage getstoreusage   start
+systemusage getmemoryusage   addusagelistener this
+messages start
+if  getexpiremessagesperiod   > 0
+scheduler schedualperiodically expiremessagestask  getexpiremessagesperiod
+dopagein false
+public void stop   throws exception
+if  taskrunner    null
+taskrunner shutdown
+if  this executor    null
+threadpoolutils shutdownnow executor
+executor   null
+scheduler cancel expiremessagestask
+if  flowcontroltimeouttask isalive
+flowcontroltimeouttask interrupt
+if  messages    null
+messages stop
+systemusage getmemoryusage   removeusagelistener this
+if  memoryusage    null
+memoryusage stop
+if  store    null
+store stop
+// properties
+// -------------------------------------------------------------------------
+@override
+public activemqdestination getactivemqdestination
+return destination
+public messagegroupmap getmessagegroupowners
+if  messagegroupowners    null
+messagegroupowners   getmessagegroupmapfactory   createmessagegroupmap
+return messagegroupowners
+public dispatchpolicy getdispatchpolicy
+return dispatchpolicy
+public void setdispatchpolicy dispatchpolicy dispatchpolicy
+this dispatchpolicy   dispatchpolicy
+public messagegroupmapfactory getmessagegroupmapfactory
+return messagegroupmapfactory
+public void setmessagegroupmapfactory messagegroupmapfactory messagegroupmapfactory
+this messagegroupmapfactory   messagegroupmapfactory
+public pendingmessagecursor getmessages
+return this messages
+public void setmessages pendingmessagecursor messages
+this messages   messages
+public boolean isuseconsumerpriority
+return useconsumerpriority
+public void setuseconsumerpriority boolean useconsumerpriority
+this useconsumerpriority   useconsumerpriority
+public boolean isstrictorderdispatch
+return strictorderdispatch
+public void setstrictorderdispatch boolean strictorderdispatch
+this strictorderdispatch   strictorderdispatch
+public boolean isoptimizeddispatch
+return optimizeddispatch
+public void setoptimizeddispatch boolean optimizeddispatch
+this optimizeddispatch   optimizeddispatch
+public int gettimebeforedispatchstarts
+return timebeforedispatchstarts
+public void settimebeforedispatchstarts int timebeforedispatchstarts
+this timebeforedispatchstarts   timebeforedispatchstarts
+public int getconsumersbeforedispatchstarts
+return consumersbeforedispatchstarts
+public void setconsumersbeforedispatchstarts int consumersbeforedispatchstarts
+this consumersbeforedispatchstarts   consumersbeforedispatchstarts
+public void setallconsumersexclusivebydefault boolean allconsumersexclusivebydefault
+this allconsumersexclusivebydefault   allconsumersexclusivebydefault
+public boolean isallconsumersexclusivebydefault
+return allconsumersexclusivebydefault
+// implementation methods
+// -------------------------------------------------------------------------
+private queuemessagereference createmessagereference message message
+queuemessagereference result   new indirectmessagereference message
+return result
+public message browse
+list<message> browselist   new arraylist<message>
+dobrowse browselist  getmaxbrowsepagesize
+return browselist toarray new message
+public void dobrowse list<message> browselist  int max
+final connectioncontext connectioncontext   createconnectioncontext
+try
+pageinmessages true
+list<messagereference> toexpire   new arraylist<messagereference>
+pagedinpendingdispatchlock writelock   lock
+try
+addall pagedinpendingdispatch values    browselist  max  toexpire
+for  messagereference ref   toexpire
+pagedinpendingdispatch remove ref
+if  broker isexpired ref
+if  log isdebugenabled
+log debug     ref
+messageexpired connectioncontext  ref
+finally
+pagedinpendingdispatchlock writelock   unlock
+toexpire clear
+pagedinmessageslock readlock   lock
+try
+addall pagedinmessages values    browselist  max  toexpire
+finally
+pagedinmessageslock readlock   unlock
+for  messagereference ref   toexpire
+if  broker isexpired ref
+if  log isdebugenabled
+log debug     ref
+messageexpired connectioncontext  ref
+else
+pagedinmessageslock writelock   lock
+try
+pagedinmessages remove ref getmessageid
+finally
+pagedinmessageslock writelock   unlock
+if  browselist size   < getmaxbrowsepagesize
+messageslock writelock   lock
+try
+try
+messages reset
+while  messages hasnext      browselist size   < max
+messagereference node   messages next
+if  node isexpired
+if  broker isexpired node
+if  log isdebugenabled
+log debug     node
+messageexpired connectioncontext  createmessagereference node getmessage
+messages remove
+else
+messages rollback node getmessageid
+if  browselist contains node getmessage       false
+browselist add node getmessage
+node decrementreferencecount
+finally
+messages release
+finally
+messageslock writelock   unlock
+catch  exception e
+log error    e
+private void addall collection<? extends messagereference> refs  list<message> l  int maxbrowsepagesize
+list<messagereference> toexpire  throws exception
+for  iterator<? extends messagereference> i   refs iterator    i hasnext      l size   < getmaxbrowsepagesize
+queuemessagereference ref    queuemessagereference  i next
+if  ref isexpired
+toexpire add ref
+else if  l contains ref getmessage       false
+l add ref getmessage
+public queuemessagereference getmessage string id
+messageid msgid   new messageid id
+pagedinmessageslock readlock   lock
+try
+queuemessagereference ref   this pagedinmessages get msgid
+if  ref    null
+return ref
+finally
+pagedinmessageslock readlock   unlock
+messageslock readlock   lock
+try
+try
+messages reset
+while  messages hasnext
+messagereference mr   messages next
+queuemessagereference qmr   createmessagereference mr getmessage
+qmr decrementreferencecount
+messages rollback qmr getmessageid
+if  msgid equals qmr getmessageid
+return qmr
+finally
+messages release
+finally
+messageslock readlock   unlock
+return null
+public void purge   throws exception
+connectioncontext c   createconnectioncontext
+list<messagereference> list   null
+do
+dopagein true
+pagedinmessageslock readlock   lock
+try
+list   new arraylist<messagereference> pagedinmessages values
+finally
+pagedinmessageslock readlock   unlock
+for  messagereference ref   list
+try
+queuemessagereference r    queuemessagereference  ref
+removemessage c  r
+catch  ioexception e
+// don't spin/hang if stats are out and there is nothing left in the
+// store
+while   list isempty      this destinationstatistics getmessages   getcount   > 0
+if  this destinationstatistics getmessages   getcount   > 0
+log warn getactivemqdestination   getqualifiedname
+this destinationstatistics getmessages   getcount
+gc
+this destinationstatistics getmessages   setcount 0
+getmessages   clear
+public void clearpendingmessages
+messageslock writelock   lock
+try
+if  store    null
+store resetbatching
+messages gc
+messages reset
+asyncwakeup
+finally
+messageslock writelock   unlock
+/**
+* removes the message matching the given messageid
+*/
+public boolean removemessage string messageid  throws exception
+return removematchingmessages createmessageidfilter messageid   1  > 0
+/**
+* removes the messages matching the given selector
+*
+* @return the number of messages removed
+*/
+public int removematchingmessages string selector  throws exception
+return removematchingmessages selector   1
+/**
+* removes the messages matching the given selector up to the maximum number
+* of matched messages
+*
+* @return the number of messages removed
+*/
+public int removematchingmessages string selector  int maximummessages  throws exception
+return removematchingmessages createselectorfilter selector   maximummessages
+/**
+* removes the messages matching the given filter up to the maximum number
+* of matched messages
+*
+* @return the number of messages removed
+*/
+public int removematchingmessages messagereferencefilter filter  int maximummessages  throws exception
+int movedcounter   0
+set<messagereference> set   new linkedhashset<messagereference>
+connectioncontext context   createconnectioncontext
+do
+dopagein true
+pagedinmessageslock readlock   lock
+try
+set addall pagedinmessages values
+finally
+pagedinmessageslock readlock   unlock
+list<messagereference> list   new arraylist<messagereference> set
+for  messagereference ref   list
+indirectmessagereference r    indirectmessagereference  ref
+if  filter evaluate context  r
+removemessage context  r
+set remove r
+if    movedcounter >  maximummessages    maximummessages > 0
+return movedcounter
+while  set size   < this destinationstatistics getmessages   getcount
+return movedcounter
+/**
+* copies the message matching the given messageid
+*/
+public boolean copymessageto connectioncontext context  string messageid  activemqdestination dest
+throws exception
+return copymatchingmessages context  createmessageidfilter messageid   dest  1  > 0
+/**
+* copies the messages matching the given selector
+*
+* @return the number of messages copied
+*/
+public int copymatchingmessagesto connectioncontext context  string selector  activemqdestination dest
+throws exception
+return copymatchingmessagesto context  selector  dest   1
+/**
+* copies the messages matching the given selector up to the maximum number
+* of matched messages
+*
+* @return the number of messages copied
+*/
+public int copymatchingmessagesto connectioncontext context  string selector  activemqdestination dest
+int maximummessages  throws exception
+return copymatchingmessages context  createselectorfilter selector   dest  maximummessages
+/**
+* copies the messages matching the given filter up to the maximum number of
+* matched messages
+*
+* @return the number of messages copied
+*/
+public int copymatchingmessages connectioncontext context  messagereferencefilter filter  activemqdestination dest
+int maximummessages  throws exception
+int movedcounter   0
+int count   0
+set<messagereference> set   new linkedhashset<messagereference>
+do
+int oldmaxsize   getmaxpagesize
+setmaxpagesize  int  this destinationstatistics getmessages   getcount
+dopagein true
+setmaxpagesize oldmaxsize
+pagedinmessageslock readlock   lock
+try
+set addall pagedinmessages values
+finally
+pagedinmessageslock readlock   unlock
+list<messagereference> list   new arraylist<messagereference> set
+for  messagereference ref   list
+indirectmessagereference r    indirectmessagereference  ref
+if  filter evaluate context  r
+r incrementreferencecount
+try
+message m   r getmessage
+brokersupport resend context  m  dest
+if    movedcounter >  maximummessages    maximummessages > 0
+return movedcounter
+finally
+r decrementreferencecount
+count
+while  count < this destinationstatistics getmessages   getcount
+return movedcounter
+/**
+* move a message
+*
+* @param context
+*            connection context
+* @param m
+*            queuemessagereference
+* @param dest
+*            activemqdestination
+* @throws exception
+*/
+public boolean movemessageto connectioncontext context  queuemessagereference m  activemqdestination dest  throws exception
+brokersupport resend context  m getmessage    dest
+removemessage context  m
+messageslock writelock   lock
+try
+messages rollback m getmessageid
+finally
+messageslock writelock   unlock
+return true
+/**
+* moves the message matching the given messageid
+*/
+public boolean movemessageto connectioncontext context  string messageid  activemqdestination dest
+throws exception
+return movematchingmessagesto context  createmessageidfilter messageid   dest  1  > 0
+/**
+* moves the messages matching the given selector
+*
+* @return the number of messages removed
+*/
+public int movematchingmessagesto connectioncontext context  string selector  activemqdestination dest
+throws exception
+return movematchingmessagesto context  selector  dest  integer max_value
+/**
+* moves the messages matching the given selector up to the maximum number
+* of matched messages
+*/
+public int movematchingmessagesto connectioncontext context  string selector  activemqdestination dest
+int maximummessages  throws exception
+return movematchingmessagesto context  createselectorfilter selector   dest  maximummessages
+/**
+* moves the messages matching the given filter up to the maximum number of
+* matched messages
+*/
+public int movematchingmessagesto connectioncontext context  messagereferencefilter filter
+activemqdestination dest  int maximummessages  throws exception
+int movedcounter   0
+set<queuemessagereference> set   new linkedhashset<queuemessagereference>
+do
+dopagein true
+pagedinmessageslock readlock   lock
+try
+set addall pagedinmessages values
+finally
+pagedinmessageslock readlock   unlock
+list<queuemessagereference> list   new arraylist<queuemessagereference> set
+for  queuemessagereference ref   list
+if  filter evaluate context  ref
+// we should only move messages that can be locked.
+movemessageto context  ref  dest
+set remove ref
+if    movedcounter >  maximummessages    maximummessages > 0
+return movedcounter
+while  set size   < this destinationstatistics getmessages   getcount      set size   < maximummessages
+return movedcounter
+/**
+* @return true if we would like to iterate again
+* @see org.apache.activemq.thread.task#iterate()
+*/
+public boolean iterate
+mdc put    getname
+boolean pageinmoremessages   false
+synchronized  iteratingmutex
+// if optimize dispatch is on or this is a slave this method could be called recursively
+// we set this state value to short-circuit wakeup in those cases to avoid that as it
+// could lead to errors.
+iterationrunning   true
+// do early to allow dispatch of these waiting messages
+synchronized  messageswaitingforspace
+iterator<runnable> it   messageswaitingforspace values   iterator
+while  it hasnext
+if   memoryusage isfull
+runnable op   it next
+it remove
+op run
+else
+registercallbackfornotfullnotification
+break
+if  firstconsumer
+firstconsumer   false
+try
+if  consumersbeforedispatchstarts > 0
+int timeout   1000     wait one second by default if
+// consumer count isn't reached
+if  timebeforedispatchstarts > 0
+timeout   timebeforedispatchstarts
+if  consumersbeforestartslatch await timeout  timeunit milliseconds
+if  log isdebugenabled
+log debug consumers size
+else
+if  log isdebugenabled
+log debug timeout       consumers size
+if  timebeforedispatchstarts > 0    consumersbeforedispatchstarts <  0
+iteratingmutex wait timebeforedispatchstarts
+if  log isdebugenabled
+log debug timebeforedispatchstarts
+catch  exception e
+log error e tostring
+messageslock readlock   lock
+try
+pageinmoremessages     messages isempty
+finally
+messageslock readlock   unlock
+pagedinpendingdispatchlock readlock   lock
+try
+pageinmoremessages     pagedinpendingdispatch isempty
+finally
+pagedinpendingdispatchlock readlock   unlock
+// perhaps we should page always into the pagedinpendingdispatch
+// list if
+// !messages.isempty(), and then if
+// !pagedinpendingdispatch.isempty()
+// then we do a dispatch.
+boolean hasbrowsers   browserdispatches size   > 0
+if  pageinmoremessages    hasbrowsers     redeliveredwaitingdispatch isempty
+try
+pageinmessages hasbrowsers
+catch  throwable e
+log error    e
+if  hasbrowsers
+arraylist<queuemessagereference> alreadydispatchedmessages   null
+pagedinmessageslock readlock   lock
+try
+alreadydispatchedmessages   new arraylist<queuemessagereference> pagedinmessages values
+finally
+pagedinmessageslock readlock   unlock
+iterator<browserdispatch> browsers   browserdispatches iterator
+while  browsers hasnext
+browserdispatch browserdispatch   browsers next
+try
+messageevaluationcontext msgcontext   new noncachedmessageevaluationcontext
+msgcontext setdestination destination
+queuebrowsersubscription browser   browserdispatch getbrowser
+if  log isdebugenabled
+log debug     browser
+alreadydispatchedmessages size
+boolean added   false
+for  queuemessagereference node   alreadydispatchedmessages
+if   node isacked       browser getpending   getmessageaudit   isduplicate node getmessageid
+msgcontext setmessagereference node
+if  browser matches node  msgcontext
+browser add node
+added   true
+// are we done browsing? no new messages paged
+if   added
+browser decrementqueueref
+browserdispatches remove browserdispatch
+catch  exception e
+log warn     browserdispatch getbrowser    e
+if  pendingwakeups get   > 0
+pendingwakeups decrementandget
+mdc remove
+iterationrunning   false
+return pendingwakeups get   > 0
+protected messagereferencefilter createmessageidfilter final string messageid
+return new messagereferencefilter
+public boolean evaluate connectioncontext context  messagereference r
+return messageid equals r getmessageid   tostring
+@override
+public string tostring
+return     messageid
+protected messagereferencefilter createselectorfilter string selector  throws invalidselectorexception
+if  selector    null    selector isempty
+return new messagereferencefilter
+@override
+public boolean evaluate connectioncontext context  messagereference messagereference  throws jmsexception
+return true
+final booleanexpression selectorexpression   selectorparser parse selector
+return new messagereferencefilter
+public boolean evaluate connectioncontext context  messagereference r  throws jmsexception
+messageevaluationcontext messageevaluationcontext   context getmessageevaluationcontext
+messageevaluationcontext setmessagereference r
+if  messageevaluationcontext getdestination      null
+messageevaluationcontext setdestination getactivemqdestination
+return selectorexpression matches messageevaluationcontext
+protected void removemessage connectioncontext c  queuemessagereference r  throws ioexception
+removemessage c  null  r
+pagedinpendingdispatchlock writelock   lock
+try
+pagedinpendingdispatch remove r
+finally
+pagedinpendingdispatchlock writelock   unlock
+protected void removemessage connectioncontext c  subscription subs  queuemessagereference r  throws ioexception
+messageack ack   new messageack
+ack setacktype messageack standard_ack_type
+ack setdestination destination
+ack setmessageid r getmessageid
+removemessage c  subs  r  ack
+protected void removemessage connectioncontext context  subscription sub  final queuemessagereference reference
+messageack ack  throws ioexception
+reference setacked true
+// this sends the ack the the journal..
+if   ack isintransaction
+acknowledge context  sub  ack  reference
+getdestinationstatistics   getdequeues   increment
+dropmessage reference
+else
+try
+acknowledge context  sub  ack  reference
+finally
+context gettransaction   addsynchronization new synchronization
+@override
+public void aftercommit   throws exception
+getdestinationstatistics   getdequeues   increment
+dropmessage reference
+wakeup
+@override
+public void afterrollback   throws exception
+reference setacked false
+wakeup
+if  ack ispoisonack
+// message gone to dlq, is ok to allow redelivery
+messageslock writelock   lock
+try
+messages rollback reference getmessageid
+finally
+messageslock writelock   unlock
+private void dropmessage queuemessagereference reference
+reference drop
+destinationstatistics getmessages   decrement
+pagedinmessageslock writelock   lock
+try
+pagedinmessages remove reference getmessageid
+finally
+pagedinmessageslock writelock   unlock
+public void messageexpired connectioncontext context  messagereference reference
+messageexpired context  null  reference
+public void messageexpired connectioncontext context  subscription subs  messagereference reference
+if  log isdebugenabled
+log debug     reference
+broker messageexpired context  reference  subs
+destinationstatistics getexpired   increment
+try
+removemessage context  subs   queuemessagereference  reference
+catch  ioexception e
+log error    e
+final void sendmessage final message msg  throws exception
+messageslock writelock   lock
+try
+messages addmessagelast msg
+finally
+messageslock writelock   unlock
+final void messagesent final connectioncontext context  final message msg  throws exception
+destinationstatistics getenqueues   increment
+destinationstatistics getmessages   increment
+messagedelivered context  msg
+consumerslock readlock   lock
+try
+if  consumers isempty
+onmessagewithnoconsumers context  msg
+finally
+consumerslock readlock   unlock
+if  log isdebugenabled
+log debug broker getbrokername         msg getmessageid         this destination
+wakeup
+public void wakeup
+if  optimizeddispatch     iterationrunning
+iterate
+pendingwakeups incrementandget
+else
+asyncwakeup
+private void asyncwakeup
+try
+pendingwakeups incrementandget
+this taskrunner wakeup
+catch  interruptedexception e
+log warn    e
+private void dopagein boolean force  throws exception
+pendinglist newlypaged   dopageinfordispatch force
+pagedinpendingdispatchlock writelock   lock
+try
+if  pagedinpendingdispatch isempty
+pagedinpendingdispatch addall newlypaged
+else
+for  messagereference qmr   newlypaged
+if   pagedinpendingdispatch contains qmr
+pagedinpendingdispatch addmessagelast qmr
+finally
+pagedinpendingdispatchlock writelock   unlock
+private pendinglist dopageinfordispatch boolean force  throws exception
+list<queuemessagereference> result   null
+pendinglist resultlist   null
+int topagein   math min getmaxpagesize    messages size
+if  log isdebugenabled
+log debug destination getphysicalname         topagein
+destinationstatistics getinflight   getcount
+pagedinmessages size         destinationstatistics getenqueues   getcount
+destinationstatistics getdequeues   getcount
+if  islazydispatch       force
+// only page in the minimum number of messages which can be
+// dispatched immediately.
+topagein   math min getconsumermessagecountbeforefull    topagein
+int pagedinpendingsize   0
+pagedinpendingdispatchlock readlock   lock
+try
+pagedinpendingsize   pagedinpendingdispatch size
+finally
+pagedinpendingdispatchlock readlock   unlock
+if  topagein > 0     force      consumers isempty      pagedinpendingsize < getmaxpagesize
+int count   0
+result   new arraylist<queuemessagereference> topagein
+messageslock writelock   lock
+try
+try
+messages setmaxbatchsize topagein
+messages reset
+while  messages hasnext      count < topagein
+messagereference node   messages next
+messages remove
+queuemessagereference ref   createmessagereference node getmessage
+if  ref isexpired
+if  broker isexpired ref
+messageexpired createconnectioncontext    ref
+else
+ref decrementreferencecount
+else
+result add ref
+count
+finally
+messages release
+finally
+messageslock writelock   unlock
+// only add new messages, not already pagedin to avoid multiple
+// dispatch attempts
+pagedinmessageslock writelock   lock
+try
+if isprioritizedmessages
+resultlist   new prioritizedpendinglist
+else
+resultlist   new orderedpendinglist
+for  queuemessagereference ref   result
+if   pagedinmessages containskey ref getmessageid
+pagedinmessages put ref getmessageid    ref
+resultlist addmessagelast ref
+else
+ref decrementreferencecount
+finally
+pagedinmessageslock writelock   unlock
+else
+// avoid return null list, if condition is not validated
+resultlist   new orderedpendinglist
+return resultlist
+private void dodispatch pendinglist list  throws exception
+boolean dowakeup   false
+pagedinpendingdispatchlock writelock   lock
+try
+if   redeliveredwaitingdispatch isempty
+// try first to dispatch redelivered messages to keep an
+// proper order
+redeliveredwaitingdispatch   doactualdispatch redeliveredwaitingdispatch
+if   pagedinpendingdispatch isempty
+// next dispatch anything that had not been
+// dispatched before.
+pagedinpendingdispatch   doactualdispatch pagedinpendingdispatch
+// and now see if we can dispatch the new stuff.. and append to
+// the pending
+// list anything that does not actually get dispatched.
+if  list    null     list isempty
+if  pagedinpendingdispatch isempty
+pagedinpendingdispatch addall doactualdispatch list
+else
+for  messagereference qmr   list
+if   pagedinpendingdispatch contains qmr
+pagedinpendingdispatch addmessagelast qmr
+dowakeup   true
+finally
+pagedinpendingdispatchlock writelock   unlock
+if  dowakeup
+// avoid lock order contention
+asyncwakeup
+/**
+* @return list of messages that could get dispatched to consumers if they
+*         were not full.
+*/
+private pendinglist doactualdispatch pendinglist list  throws exception
+list<subscription> consumers
+consumerslock writelock   lock
+try
+if  this consumers isempty
+// slave dispatch happens in processdispatchnotification
+return list
+consumers   new arraylist<subscription> this consumers
+finally
+consumerslock writelock   unlock
+pendinglist rc
+if isprioritizedmessages
+rc   new prioritizedpendinglist
+else
+rc   new orderedpendinglist
+set<subscription> fullconsumers   new hashset<subscription> this consumers size
+for  iterator<messagereference> iterator   list iterator    iterator hasnext
+messagereference node    messagereference  iterator next
+subscription target   null
+int interestcount   0
+for  subscription s   consumers
+if  s instanceof queuebrowsersubscription
+interestcount
+continue
+if   fullconsumers contains s
+if   s isfull
+if  dispatchselector canselect s  node     assignmessagegroup s   queuemessagereference node        queuemessagereference  node  isacked
+// dispatch it.
+s add node
+target   s
+break
+else
+// no further dispatch of list to a full consumer to
+// avoid out of order message receipt
+fullconsumers add s
+log trace    s
+// make sure it gets dispatched again
+if   node isdropped
+interestcount
+if   target    null    interestcount > 0     consumers size      0
+// this means all subs were full or that there are no
+// consumers...
+rc addmessagelast  queuemessagereference  node
+// if it got dispatched, rotate the consumer list to get round robin
+// distribution.
+if  target    null     strictorderdispatch    consumers size   > 1
+dispatchselector isexclusiveconsumer target
+consumerslock writelock   lock
+try
+if  removefromconsumerlist target
+addtoconsumerlist target
+consumers   new arraylist<subscription> this consumers
+finally
+consumerslock writelock   unlock
+return rc
+protected boolean assignmessagegroup subscription subscription  queuemessagereference node  throws exception
+boolean result   true
+// keep message groups together.
+string groupid   node getgroupid
+int sequence   node getgroupsequence
+if  groupid    null
+messagegroupmap messagegroupowners   getmessagegroupowners
+// if we can own the first, then no-one else should own the
+// rest.
+if  sequence    1
+assigngroup subscription  messagegroupowners  node  groupid
+else
+// make sure that the previous owner is still valid, we may
+// need to become the new owner.
+consumerid groupowner
+groupowner   messagegroupowners get groupid
+if  groupowner    null
+assigngroup subscription  messagegroupowners  node  groupid
+else
+if  groupowner equals subscription getconsumerinfo   getconsumerid
+// a group sequence < 1 is an end of group signal.
+if  sequence < 0
+messagegroupowners removegroup groupid
+subscription getconsumerinfo   setlastdeliveredsequenceid subscription getconsumerinfo   getlastdeliveredsequenceid     1
+else
+result   false
+return result
+protected void assigngroup subscription subs  messagegroupmap messagegroupowners  messagereference n  string groupid  throws ioexception
+messagegroupowners put groupid  subs getconsumerinfo   getconsumerid
+message message   n getmessage
+if  message instanceof activemqmessage
+activemqmessage activemessage    activemqmessage  message
+try
+activemessage setbooleanproperty    true  false
+catch  jmsexception e
+log warn     e  e
+subs getconsumerinfo   setlastdeliveredsequenceid subs getconsumerinfo   getlastdeliveredsequenceid     1
+protected void pageinmessages boolean force  throws exception
+dodispatch dopageinfordispatch force
+private void addtoconsumerlist subscription sub
+if  useconsumerpriority
+consumers add sub
+collections sort consumers  orderedcompare
+else
+consumers add sub
+private boolean removefromconsumerlist subscription sub
+return consumers remove sub
+private int getconsumermessagecountbeforefull   throws exception
+int total   0
+boolean zeroprefetch   false
+consumerslock readlock   lock
+try
+for  subscription s   consumers
+zeroprefetch    s getprefetchsize      0
+int countbeforefull   s countbeforefull
+total    countbeforefull
+finally
+consumerslock readlock   unlock
+if  total    0    zeroprefetch
+total   1
+return total
+/*
+* in slave mode, dispatch is ignored till we get this notification as the
+* dispatch process is non deterministic between master and slave. on a
+* notification, the actual dispatch to the subscription (as chosen by the
+* master) is completed. (non-javadoc)
+* @see
+* org.apache.activemq.broker.region.basedestination#processdispatchnotification
+* (org.apache.activemq.command.messagedispatchnotification)
+*/
+@override
+public void processdispatchnotification messagedispatchnotification messagedispatchnotification  throws exception
+// do dispatch
+subscription sub   getmatchingsubscription messagedispatchnotification
+if  sub    null
+messagereference message   getmatchingmessage messagedispatchnotification
+sub add message
+sub processmessagedispatchnotification messagedispatchnotification
+private queuemessagereference getmatchingmessage messagedispatchnotification messagedispatchnotification
+throws exception
+queuemessagereference message   null
+messageid messageid   messagedispatchnotification getmessageid
+pagedinpendingdispatchlock writelock   lock
+try
+for  messagereference ref   pagedinpendingdispatch
+if  messageid equals ref getmessageid
+message    queuemessagereference ref
+pagedinpendingdispatch remove ref
+break
+finally
+pagedinpendingdispatchlock writelock   unlock
+if  message    null
+pagedinmessageslock readlock   lock
+try
+message   pagedinmessages get messageid
+finally
+pagedinmessageslock readlock   unlock
+if  message    null
+messageslock writelock   lock
+try
+try
+messages setmaxbatchsize getmaxpagesize
+messages reset
+while  messages hasnext
+messagereference node   messages next
+messages remove
+if  messageid equals node getmessageid
+message   this createmessagereference node getmessage
+break
+finally
+messages release
+finally
+messageslock writelock   unlock
+if  message    null
+message msg   loadmessage messageid
+if  msg    null
+message   this createmessagereference msg
+if  message    null
+throw new jmsexception
+messagedispatchnotification getmessageid
+messagedispatchnotification getdestination
+pagedinpendingdispatch size
+messagedispatchnotification getconsumerid
+return message
+/**
+* find a consumer that matches the id in the message dispatch notification
+*
+* @param messagedispatchnotification
+* @return sub or null if the subscription has been removed before dispatch
+* @throws jmsexception
+*/
+private subscription getmatchingsubscription messagedispatchnotification messagedispatchnotification
+throws jmsexception
+subscription sub   null
+consumerslock readlock   lock
+try
+for  subscription s   consumers
+if  messagedispatchnotification getconsumerid   equals s getconsumerinfo   getconsumerid
+sub   s
+break
+finally
+consumerslock readlock   unlock
+return sub
+public void onusagechanged @suppresswarnings    usage usage  int oldpercentusage  int newpercentusage
+if  oldpercentusage > newpercentusage
+asyncwakeup
+@override
+protected logger getlog
+return log
+protected boolean isoptimizestorage
+boolean result   false
+if  isdooptimzemessagestorage
+consumerslock readlock   lock
+try
+if  consumers isempty    false
+result   true
+for  subscription s   consumers
+if  s getprefetchsize    0
+result   false
+break
+if  s isslowconsumer
+result   false
+break
+if  s getinflightusage   > getoptimizemessagestoreinflightlimit
+result   false
+break
+finally
+consumerslock readlock   unlock
+return result

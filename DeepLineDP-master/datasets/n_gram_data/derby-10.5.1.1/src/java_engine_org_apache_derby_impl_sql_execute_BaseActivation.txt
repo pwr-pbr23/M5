@@ -1,0 +1,1291 @@
+/*
+derby - class org.apache.derby.impl.sql.execute.baseactivation
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl sql execute
+import java sql connection
+import java sql sqlexception
+import java sql sqlwarning
+import java util arraylist
+import java util hashset
+import java util hashtable
+import java util vector
+import	org apache derby catalog dependable
+import	org apache derby catalog dependablefinder
+import org apache derby catalog uuid
+import org apache derby iapi services uuid uuidfactory
+import org apache derby iapi services monitor monitor
+import org apache derby iapi sql depend provider
+import org apache derby iapi sql row
+import org apache derby iapi error standardexception
+import org apache derby iapi jdbc connectioncontext
+import org apache derby iapi reference property
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services context context
+import org apache derby iapi services context contextmanager
+import org apache derby iapi services io formatablebitset
+import org apache derby iapi services loader generatedbytecode
+import org apache derby iapi services loader generatedclass
+import org apache derby iapi services loader generatedmethod
+import org apache derby iapi services property propertyutil
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi sql activation
+import org apache derby iapi sql parametervalueset
+import org apache derby iapi sql resultdescription
+import org apache derby iapi sql resultset
+import org apache derby iapi sql compile optimizer
+import org apache derby iapi sql conn languageconnectioncontext
+import org apache derby iapi sql conn sqlsessioncontext
+import org apache derby iapi sql depend dependencymanager
+import org apache derby iapi sql dictionary tabledescriptor
+import org apache derby iapi sql execute constantaction
+import org apache derby iapi sql execute cursoractivation
+import org apache derby iapi sql execute cursorresultset
+import org apache derby iapi sql execute execpreparedstatement
+import org apache derby iapi sql execute execrow
+import org apache derby iapi sql execute executionfactory
+import org apache derby iapi sql execute noputresultset
+import org apache derby iapi sql execute resultsetfactory
+import org apache derby iapi sql execute temporaryrowholder
+import org apache derby iapi store access conglomeratecontroller
+import org apache derby iapi store access qualifier
+import org apache derby iapi store access scancontroller
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi types datatypedescriptor
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi types datavaluefactory
+import org apache derby iapi types numberdatavalue
+import org apache derby iapi types rowlocation
+import org apache derby iapi util reusefactory
+/**
+* baseactivation
+* provides the fundamental support we expect all activations to have.
+* doesn't actually implement any of the activation interface,
+* expects the subclasses to do that.
+*/
+public abstract class baseactivation implements cursoractivation  generatedbytecode
+private	languageconnectioncontext	lcc
+protected contextmanager			cm
+protected execpreparedstatement prestmt
+protected resultset resultset
+protected resultdescription resultdescription
+protected boolean closed
+private string cursorname
+protected int numsubqueries
+private boolean singleexecution
+// this flag is declared volatile to ensure it is
+// visible when it has been modified by the finalizer thread.
+private volatile boolean inuse
+private java sql resultset targetvti
+private sqlwarning warnings
+private generatedclass gc 	   my generated class object
+private boolean checkrowcounts
+private hashset rowcountscheckedthisexecution   new hashset 4  0 9f
+private static final long max_sqrt    long  math sqrt long max_value
+// when the row count exceeds this number, we should recompile if
+// the difference in row counts is greater than 10%.  if it's less
+// than this number, we use an entirely different technique to check
+// for recompilation.  see comments below, in informofrowcount()
+private static final int ten_percent_threshold   400
+/* performance optimization for update/delete - only
+* open heap conglomeratecontroller once when doing
+* index row to base row on search
+*/
+private conglomeratecontroller  updateheapcc
+private scancontroller			indexsc
+private long					indexconglomeratenumber    1
+private tabledescriptor ddltabledescriptor
+private int maxrows    1
+private boolean			forcreatetable
+private boolean			scrollable
+private boolean resultsetholdability
+//beetle 3865: updateable cursor using index.  a way of communication
+//between cursor activation and update activation.
+private cursorresultset forupdateindexscan
+//following three are used for jdbc3.0 auto-generated keys feature.
+//autogeneratedkeysresultsetmode will be set true if at the time of statement execution,
+//either statement.return_generated_keys was passed or an array of (column positions or
+//column names) was passed
+private boolean autogeneratedkeysresultsetmode
+private int autogeneratedkeyscolumnindexes
+private string autogeneratedkeyscolumnnames
+/**
+* by setting isvalid to false, we can force a new activation to be used
+* even if the prepared statement is still valid. this is used when
+* modifying the current role for a session, which may (if the statement
+* relies on privileges obtained via the current role) require rechecking
+* of privileges. the checking normally only happens the first time the
+* prepared statement is used in a session, when the activation is
+* constructed. forcing creation of a new activation achieves the purpose
+* of getting the check performed over again and is cheaper than
+* invalidating the prepared statement itself. also, the latter would
+* impact other sessions, forcing them to recreate their activations.
+*/
+private boolean isvalid
+/**
+* for dependency tracking
+*/
+protected string uuidstring
+/**
+* for dependency tracking
+*/
+protected uuid   uuidvalue
+/**
+* the 'parentactivation' of an activation of a statement executing in
+* the root connection is null.
+*
+* a non-null 'parentactivation' represents the activation of the calling
+* statement (if we are in a nested connection of a stored routine), or the
+* activation of the parent statement (if we are executing a substatement)
+*
+* 'parentactivation' is set when this activation is created (@see
+* genericpreparedstatement#getactivation) based on the top of the
+* dynamic call stack of execution, which is tracked by
+* statementcontext. the nested sql session context is initialized
+* by code generated for the call, after parameters are evaluated
+* or just substatement execution starts.
+* @see org.apache.derby.impl.sql.compile.staticmethodcallnode#generatesetupnestedsessioncontext
+* @see org.apache.derby.impl.sql.genericpreparedstatement#executesubstatement
+*
+*/
+private activation parentactivation
+/**
+* the sql session context to be used inside a nested connection in a
+* stored routine or in a substatement. in the latter case, it is an alias
+* to the superstatement's session context.
+*/
+private sqlsessioncontext sqlsessioncontextforchildren
+//following is the position of the session table names list in savedobjects in compiler context
+//this is updated to be the correct value at cursor generate time if the cursor references any session table names.
+//if the cursor does not reference any session table names, this will stay negative
+protected int indexofsessiontablenamesinsavedobjects    1
+// warning: these fields are accessed by code generated in the
+// expressionclassbuilder: don't change them unless you
+// make the appropriate changes there.
+protected execrow row
+protected parametervalueset pvs
+//
+// constructors
+//
+protected baseactivation
+super
+public final void initfromcontext context context
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert context  null
+this cm   context getcontextmanager
+lcc    languageconnectioncontext  cm getcontext languageconnectioncontext context_id
+if  sanitymanager debug
+if  lcc    null
+sanitymanager throwassert     getclass
+// mark in use
+inuse   true
+// add this activation to the pool for the connection.
+lcc addactivation this
+isvalid   true
+/* get the uuid for this activation */
+uuidfactory uuidfactory
+monitor getmonitor   getuuidfactory
+uuidvalue   uuidfactory createuuid
+uuidstring   uuidvalue tostring
+//
+// activation interface
+//
+public final execpreparedstatement getpreparedstatement
+return prestmt
+public constantaction getconstantaction
+return prestmt getconstantaction
+public final void checkstatementvalidity   throws standardexception
+if  prestmt    null
+return
+synchronized  prestmt
+if   gc    prestmt getactivationclass       prestmt uptodate
+return
+standardexception se   standardexception newexception sqlstate lang_statement_needs_recompile
+se setreport standardexception report_never
+throw se
+/**
+link this activation with its preparedstatement.
+it can be called with null to break the link with the
+preparedstatement.
+*/
+public final void setupactivation execpreparedstatement ps  boolean scrollable
+throws standardexception
+prestmt   ps
+if  ps    null
+// get the result set description
+resultdescription   ps getresultdescription
+this scrollable   scrollable
+// initialize the parameter set to have allocated
+// datavaluedescriptor objects for each parameter.
+if  pvs    null    pvs getparametercount      0
+pvs initialize ps getparametertypes
+else
+resultdescription   null
+this scrollable   false
+public resultset getresultset
+return resultset
+/**
+get the saved rowlocation.
+@param itemnumber	the saved item number.
+@return	a rowlocation template for the conglomerate
+*/
+public rowlocation getrowlocationtemplate int itemnumber
+if  sanitymanager debug
+sanitymanager assert itemnumber >  0
+if     getpreparedstatement   getsavedobject itemnumber  instanceof rowlocation
+sanitymanager throwassert
+getpreparedstatement   getsavedobject itemnumber  getclass   getname
+getpreparedstatement   getsource
+rowlocation rl    rowlocation  getpreparedstatement   getsavedobject itemnumber
+if     rl cloneobject   instanceof rowlocation
+sanitymanager throwassert
+rl getclass   getname
+getpreparedstatement   getsource
+/* we have to return a clone of the saved rowlocation due
+* to the shared cache of spss.
+*/
+return  rowlocation
+rowlocation  getpreparedstatement   getsavedobject itemnumber    cloneobject
+/*
+*/
+public resultdescription getresultdescription
+if  sanitymanager debug
+sanitymanager assert resultdescription    null
+return resultdescription
+/**
+this is a partial implementation of reset.
+subclasses will want to reset information
+they are aware of, such as parameters.
+<p>
+all subclasses must call super.reset() and
+then do their cleanup.
+<p>
+the execute call must set the resultset field
+to be the resultset that it has returned.
+@exception standardexception on error
+*/
+public void reset   throws standardexception
+if  resultset    null
+resultset close
+updateheapcc   null
+// remind: do we need to get them to stop input as well?
+if   issingleexecution
+clearwarnings
+/**
+closing an activation marks it as unusable. any other
+requests made on it will fail.  an activation should be
+marked closed when it is expected to not be used any longer,
+i.e. when the connection for it is closed, or it has suffered some
+sort of severe error.
+this should also remove it from the language connection context.
+@exception standardexception on error
+*/
+public final void close   throws standardexception
+if    closed
+// markunused();
+// we call reset so that if the actual type of "this"
+// is a subclass of baseactivation, its cleanup will
+// also happen -- reset in the actual type is called,
+// not reset in baseactivation.  subclass reset's
+// are supposed to call super.reset() as well.
+reset       get everything related to executing released
+if  resultset    null
+// finish the resultset, it will never be used again.
+resultset finish
+resultset   null
+closed   true
+languageconnectioncontext lcc   getlanguageconnectioncontext
+lcc removeactivation this
+if  prestmt    null
+prestmt finish lcc
+prestmt   null
+try
+closeactivationaction
+catch  throwable e
+throw standardexception plainwrapexception e
+/**
+a generated class can create its own closeactivationaction
+method to invoke special logic when the activation is closed.
+*/
+protected void closeactivationaction   throws exception
+// no code to be added here as generated code
+// will not call super.closeactivationaction()
+/**
+find out if the activation closed or not.
+@return true if the prepared statement has been closed.
+*/
+public boolean isclosed
+return closed
+/**
+set this activation for a single execution.
+@see activation#setsingleexecution
+*/
+public void setsingleexecution
+singleexecution   true
+/**
+returns true if this activation is only going to be used for
+one execution.
+@see activation#issingleexecution
+*/
+public boolean issingleexecution
+return singleexecution
+/**
+get the number of subqueries in the entire query.
+@return int	 the number of subqueries in the entire query.
+*/
+public int getnumsubqueries
+return numsubqueries
+/**
+* @see activation#iscursoractivation
+*/
+public boolean iscursoractivation
+return false
+//
+// generatedbytecode interface
+//
+public final void setgc generatedclass gc
+this gc   gc
+public final generatedclass getgc
+if  sanitymanager debug
+if  gc    null
+sanitymanager throwassert
+return gc
+public final generatedmethod getmethod string methodname  throws standardexception
+return getgc   getmethod methodname
+public object e0   throws standardexception   return null
+public object e1   throws standardexception   return null
+public object e2   throws standardexception   return null
+public object e3   throws standardexception   return null
+public object e4   throws standardexception   return null
+public object e5   throws standardexception   return null
+public object e6   throws standardexception   return null
+public object e7   throws standardexception   return null
+public object e8   throws standardexception   return null
+public object e9   throws standardexception   return null
+//
+// class interface
+//
+/**
+* temporary tables can be declared with on commit delete rows. but if the table has a held curosr open at
+* commit time, data should not be deleted from the table. this method, (gets called at commit time) checks if this
+* activation held cursor and if so, does that cursor reference the passed temp table name.
+*
+* @return	true if this activation has held cursor and if it references the passed temp table name
+*/
+public boolean checkifthisactivationhasholdcursor string tablename
+if   inuse
+return false
+if  resultsetholdability    false    if this activation is not held over commit  do not need to worry about it
+return false
+if  indexofsessiontablenamesinsavedobjects     1    if this activation does not refer to session schema tables  do not need to worry about it
+return false
+/* is there an open result set? */
+if   resultset    null      resultset isclosed      resultset returnsrows
+//if we came here, it means this activation is held over commit and it reference session table names
+//now let's check if it referneces the passed temporary table name which has on commit delete rows defined on it.
+return   arraylist getpreparedstatement   getsavedobject indexofsessiontablenamesinsavedobjects   contains tablename
+return false
+/**
+remember the cursor name
+*/
+public void	setcursorname string cursorname
+if  iscursoractivation
+this cursorname   cursorname
+/**
+get the cursor name.  for something that isn't
+a cursor, this is used as a string name of the
+result set for messages from things like the
+dependency manager.
+<p>
+activations that do support cursors will override
+this.
+*/
+public string getcursorname
+return iscursoractivation   ? cursorname   null
+public void setresultsetholdability boolean resultsetholdability
+this resultsetholdability   resultsetholdability
+public boolean getresultsetholdability
+return resultsetholdability
+/** @see activation#setautogeneratedkeysresultsetinfo */
+public void setautogeneratedkeysresultsetinfo int columnindexes  string columnnames
+autogeneratedkeysresultsetmode   true
+autogeneratedkeyscolumnindexes   columnindexes
+autogeneratedkeyscolumnnames   columnnames
+/** @see activation#getautogeneratedkeysresultsetmode */
+public boolean getautogeneratedkeysresultsetmode
+return autogeneratedkeysresultsetmode
+/** @see activation#getautogeneratedkeyscolumnindexes */
+public int getautogeneratedkeyscolumnindexes
+return autogeneratedkeyscolumnindexes
+/** @see activation#getautogeneratedkeyscolumnnames */
+public string getautogeneratedkeyscolumnnames
+return autogeneratedkeyscolumnnames
+//
+// class implementation
+//
+/**
+used in the execute method of activations for
+generating the result sets that they concatenate together.
+*/
+public final resultsetfactory getresultsetfactory
+return getexecutionfactory   getresultsetfactory
+/**
+used in activations for generating rows.
+*/
+public final executionfactory getexecutionfactory
+return getlanguageconnectioncontext
+getlanguageconnectionfactory   getexecutionfactory
+/**
+used in currentofresultset to get to the target result set
+for a cursor. overridden by activations generated for
+updatable cursors.  those activations capture the target
+result set in a field in their execute() method, and then
+return the value of that field in their version of this method.
+@return null.
+*/
+public cursorresultset gettargetresultset
+if  sanitymanager debug
+sanitymanager throwassert
+return null
+/**
+* called by generated code to compute the next autoincrement value.
+*
+* @return the next autoincrement value which should be inserted.
+* returns the correct number datatype.
+*/
+protected datavaluedescriptor
+getsetautoincrementvalue int columnposition  long increment
+throws standardexception
+datavaluedescriptor l
+insertresultset resultset  getsetautoincrementvalue columnposition  increment
+return l
+/**
+used in currentofresultset to get to the cursor result set
+for a cursor.  overridden by activations generated for
+updatable cursors.  those activations capture the cursor
+result set in a field in their execute() method, and then
+return the value of that field in their version of this method.
+@return null
+*/
+public cursorresultset getcursorresultset
+if  sanitymanager debug
+sanitymanager throwassert
+return null
+/**
+various activation methods need to disallow their
+invocation if the activation is closed. this lets them
+check and throw without generating alot of code.
+<p>
+the code to write to generate the call to this is approximately:
+<verbatim>
+// jf is a javafactory
+callableexpression ce = jf.newmethodcall(
+jf.thisexpression(),
+baseactivation.class_name,
+"throwifclosed",
+"void",
+acb.exprarray(jf.newstringliteral(...some literal here...)));
+//mb is a methodbuilder
+mb.addstatement(jf.newstatement(ce));
+</verbatim>
+the java code to write to call this is:
+<verbatim>
+this.throwifclosed(...some literal here...);
+</verbatim>
+in both cases, "...some literal here..." gets replaced with
+an expression of type string that evaluates to the name
+of the operation that is being checked, like "execute" or
+"reset".
+@exception standardexception thrown if closed
+*/
+public void throwifclosed string op  throws standardexception
+if  closed
+throw standardexception newexception sqlstate lang_activation_closed  op
+/**
+* set a column position in an array of column positions.
+*
+* @param columnpositions	the array of column positions
+* @param positiontoset		the place to put the column position
+* @param column			the column position
+*/
+public static void setcolumnposition
+int columnpositions
+int positiontoset
+int column
+columnpositions   column
+/**
+* allocate an array of qualifiers and initialize in qualifier[][]
+*
+* @param qualifiers	the array of qualifier arrays.
+* @param position		the position in the array to set
+* @param length		the array length of the qualifier array to allocate.
+*/
+public static void allocatequalarray
+qualifier   qualifiers
+int             position
+int             length
+qualifiers   new qualifier
+/**
+* set a qualifier in a 2 dimensional array of qualifiers.
+*
+* set a single qualifier into one slot of a 2 dimensional array of
+* qualifiers.  @see qualifier for detailed description of layout of
+* the 2-d array.
+*
+* @param qualifiers	the array of qualifiers
+* @param qualifier		the qualifier
+* @param position_1    the nth array index into qualifiers[n][m]
+* @param position_2    the nth array index into qualifiers[n][m]
+*/
+public static void setqualifier
+qualifier   qualifiers
+qualifier	    qualifier
+int			    position_1
+int             position_2
+qualifiers   qualifier
+/**
+* reinitialize all qualifiers in an array of qualifiers.
+*
+* @param qualifiers	the array of qualifiers
+*/
+public static void reinitializequalifiers qualifier qualifiers
+if  qualifiers    null
+for  int term   0  term < qualifiers length  term
+for  int i   0  i < qualifiers length  i
+qualifiers reinitialize
+/**
+* mark the activation as unused.
+*/
+public final void markunused
+if isinuse
+inuse   false
+lcc notifyunusedactivation
+/**
+* is the activation in use?
+*
+* @return true/false
+*/
+public final boolean isinuse
+return inuse
+/**
+@see org.apache.derby.iapi.sql.activation#addwarning
+*/
+public void addwarning sqlwarning w
+if  warnings    null
+warnings   w
+else
+warnings setnextwarning w
+/**
+@see org.apache.derby.iapi.sql.activation#getwarnings
+*/
+public sqlwarning getwarnings
+return warnings
+/**
+@see org.apache.derby.iapi.sql.activation#clearwarnings
+*/
+public void clearwarnings
+warnings   null
+/**
+* @exception standardexception on error
+*/
+protected static void nulltoprimitivetest datavaluedescriptor dvd  string primitivetype
+throws standardexception
+if  dvd isnull
+throw standardexception newexception sqlstate lang_null_to_primitive_parameter  primitivetype
+/**
+@see activation#informofrowcount
+@exception standardexception	thrown on error
+*/
+public void informofrowcount noputresultset resultset  long currentrowcount
+throws standardexception
+/* do we want to check the row counts during this execution? */
+if  checkrowcounts
+boolean significantchange   false
+int resultsetnumber   resultset resultsetnumber
+integer rsn   reusefactory getinteger resultsetnumber
+/* check each result set only once per execution */
+if  rowcountscheckedthisexecution add rsn
+synchronized  getpreparedstatement
+vector rowcountcheckvector   getrowcountcheckvector
+if  rowcountcheckvector    null
+rowcountcheckvector   new vector
+setrowcountcheckvector rowcountcheckvector
+long firstrowcount   null
+/*
+** check whether this resultset has been seen yet.
+*/
+if  resultsetnumber < rowcountcheckvector size
+firstrowcount
+long  rowcountcheckvector elementat resultsetnumber
+else
+rowcountcheckvector setsize resultsetnumber   1
+if  firstrowcount    null
+/*
+** this resultset has been seen - has the row count
+** changed significantly?
+*/
+long n1   firstrowcount longvalue
+if  currentrowcount    n1
+if  n1 >  ten_percent_threshold
+/*
+** for tables with more than
+** ten_percent_threshold rows, the
+** threshold is 10% of the size of the table.
+*/
+long changefactor   n1    currentrowcount   n1
+if  math abs changefactor  <  10
+significantchange   true
+else
+/*
+** for tables with less than
+** ten_percent_threshold rows, the threshold
+** is non-linear.  this is because we want
+** recompilation to happen sooner for small
+** tables that change size.  this formula
+** is for a second-order equation (a parabola).
+** the derivation is:
+**
+**   c * n1 = (difference in row counts) ** 2
+**				- or -
+**   c * n1 = (currentrowcount - n1) ** 2
+**
+** solving this for currentrowcount, we get:
+**
+**   currentrowcount = n1 + sqrt(c * n1)
+**
+**				- or -
+**
+**   difference in row counts = sqrt(c * n1)
+**
+**				- or -
+**
+**   (difference in row counts) ** 2 =
+**					c * n1
+**
+** which means that we should recompile when
+** the current row count exceeds n1 (the first
+** row count) by sqrt(c * n1), or when the
+** square of the difference exceeds c * n1.
+** a good value for c seems to be 4.
+**
+** we don't use this formula when c is greater
+** than ten_percent_threshold because we never
+** want to recompile unless the number of rows
+** changes by more than 10%, and this formula
+** is more sensitive than that for values of
+** n1 greater than ten_percent_threshold.
+*/
+long changediff   currentrowcount   n1
+/*
+** square changediff rather than take the square
+** root of (4 * n1), because multiplying is
+** faster than taking a square root.  also,
+** check to be sure that squaring changediff
+** will not cause an overflow by comparing it
+** with the square root of the maximum value
+** for a long (this square root is taken only
+** once, when the class is loaded, or during
+** compilation if the compiler is smart enough).
+*/
+if  math abs changediff  <  max_sqrt
+if   changediff   changediff  >
+math abs 4   n1
+significantchange   true
+else
+firstrowcount   new long currentrowcount
+rowcountcheckvector setelementat
+firstrowcount
+resultsetnumber
+/* invalidate outside of the critical section */
+if  significantchange
+prestmt makeinvalid dependencymanager internal_recompile_request  lcc
+/**
+* the subclass calls this method when it begins an execution.
+*
+* @exception standardexception		thrown on error
+*/
+public void startexecution   throws standardexception
+// determine if we should check row counts during this execution
+shouldwecheckrowcounts
+// if we are to check row counts, clear the hash table of row counts
+// we have checked.
+if  checkrowcounts
+rowcountscheckedthisexecution clear
+/**
+* @see activation#getheapconglomeratecontroller
+*/
+public conglomeratecontroller getheapconglomeratecontroller
+return updateheapcc
+/**
+* @see activation#setheapconglomeratecontroller
+*/
+public void setheapconglomeratecontroller conglomeratecontroller updateheapcc
+this updateheapcc   updateheapcc
+/**
+* @see activation#clearheapconglomeratecontroller
+*/
+public void clearheapconglomeratecontroller
+updateheapcc   null
+/**
+* @see activation#getindexscancontroller
+*/
+public scancontroller getindexscancontroller
+return indexsc
+/**
+* @see activation#setindexscancontroller
+*/
+public void setindexscancontroller scancontroller indexsc
+this indexsc   indexsc
+/**
+* @see activation#getindexconglomeratenumber
+*/
+public long getindexconglomeratenumber
+return indexconglomeratenumber
+/**
+* @see activation#setindexconglomeratenumber
+*/
+public void setindexconglomeratenumber long indexconglomeratenumber
+this indexconglomeratenumber   indexconglomeratenumber
+/**
+* @see activation#clearindexscaninfo
+*/
+public void clearindexscaninfo
+indexsc   null
+indexconglomeratenumber    1
+/**
+* @see activation#setforcreatetable()
+*/
+public void setforcreatetable
+forcreatetable   true
+/**
+* @see activation#getforcreatetable()
+*/
+public boolean getforcreatetable
+return forcreatetable
+/**
+* @see activation#setddltabledescriptor
+*/
+public void setddltabledescriptor tabledescriptor td
+ddltabledescriptor   td
+/**
+* @see activation#getddltabledescriptor
+*/
+public tabledescriptor getddltabledescriptor
+return ddltabledescriptor
+/**
+* @see activation#setmaxrows
+*/
+public void setmaxrows int maxrows
+this maxrows   maxrows
+/**
+* @see activation#getmaxrows
+*/
+public int getmaxrows
+return maxrows
+public void settargetvti java sql resultset targetvti
+this targetvti   targetvti
+public java sql resultset gettargetvti
+return targetvti
+private void shouldwecheckrowcounts   throws standardexception
+/*
+** check the row count only every n executions.  ok to check this
+** without synchronization, since the value of this number is not
+** critical.  the value of n is determined by the property
+** derby.language.staleplancheckinterval.
+*/
+int executioncount   getexecutioncount     1
+/*
+** always check row counts the first time, to establish the
+** row counts for each result set.  after that, don't check
+** if the execution count is below the minimum row count check
+** interval.  this saves us from checking a database property
+** when we don't have to (checking involves querying the store,
+** which can be expensive).
+*/
+if  executioncount    1
+checkrowcounts   true
+else if  executioncount <
+property min_language_stale_plan_check_interval
+checkrowcounts   false
+else
+int staleplancheckinterval   getstaleplancheckinterval
+/*
+** only query the database property once.  we can tell because
+** the minimum value of the property is greater than zero.
+*/
+if  staleplancheckinterval    0
+transactioncontroller tc   gettransactioncontroller
+staleplancheckinterval
+propertyutil getserviceint
+tc
+property language_stale_plan_check_interval
+property min_language_stale_plan_check_interval
+integer max_value
+property default_language_stale_plan_check_interval
+setstaleplancheckinterval staleplancheckinterval
+checkrowcounts    executioncount % staleplancheckinterval     1
+setexecutioncount executioncount
+/*
+** these accessor methods are provided by the sub-class to help figure
+** out whether to check row counts during this execution.
+*/
+abstract protected int getexecutioncount
+abstract protected void setexecutioncount int newvalue
+/*
+** these accessor methods are provided by the sub-class to help figure
+** out whether the row count for a particular result set has changed
+** enough to force recompilation.
+*/
+abstract protected vector getrowcountcheckvector
+abstract protected void setrowcountcheckvector vector newvalue
+/*
+** these accessor methods are provided by the sub-class to remember the
+** value of the stale plan check interval property, so that we only
+** have to query the database properties once (there is heavyweight
+** synchronization around the database properties).
+*/
+abstract protected int getstaleplancheckinterval
+abstract protected void setstaleplancheckinterval int newvalue
+public final boolean getscrollable
+return scrollable
+protected final void setparametervalueset int paramcount  boolean hasreturnparam
+pvs   lcc getlanguagefactory   newparametervalueset
+lcc getlanguageconnectionfactory   getclassfactory   getclassinspector
+paramcount  hasreturnparam
+/**
+* this method can help reduce the amount of generated code by changing
+* instances of this.pvs.getparameter(position) to this.getparameter(position)
+* @param position
+* @throws standardexception
+*/
+protected final datavaluedescriptor getparameter int position  throws standardexception
+return pvs getparameter position
+/**
+return the parameters.
+*/
+public parametervalueset	getparametervalueset
+if  pvs    null
+setparametervalueset 0  false
+return pvs
+// how do we do/do we want any sanity checking for
+// the number of parameters expected?
+public void	setparameters parametervalueset parametervalues  datatypedescriptor parametertypes  throws standardexception
+if   isclosed
+if  this pvs    null    parametertypes    null
+pvs   parametervalues
+return
+datatypedescriptor	newparamtypes   prestmt getparametertypes
+/*
+** if there are old parameters but not new ones,
+** they aren't compatible.
+*/
+boolean match   false
+if  newparamtypes    null
+if  newparamtypes length    parametertypes length
+/* check each parameter */
+match   true
+for  int i   0  i < parametertypes length  i
+datatypedescriptor	oldtype   parametertypes
+datatypedescriptor	newtype	  newparamtypes
+if   oldtype isexacttypeandlengthmatch newtype
+match   false
+break
+/*
+** we could probably get away without checking nullability,
+** since parameters are always nullable.
+*/
+if  oldtype isnullable      newtype isnullable
+match   false
+break
+if   match
+throw standardexception newexception sqlstate lang_obsolete_parameters
+parametervalues transferdatavalues pvs
+else if  sanitymanager debug
+sanitymanager throwassert
+/**
+throw an exception if any parameters are uninitialized.
+@exception standardexception	thrown if any parameters
+are unitialized
+*/
+public void throwifmissingparms   throws standardexception
+if  pvs    null     pvs allareset
+throw standardexception newexception sqlstate lang_missing_parms
+/**
+* remember the row for the specified resultset.
+*/
+public void setcurrentrow execrow currentrow  int resultsetnumber
+if  sanitymanager debug
+sanitymanager assert  isclosed
+if  row    null
+if    resultsetnumber > 0    resultsetnumber < row length
+sanitymanager throwassert     resultsetnumber
+row length
+if  row    null
+row   currentrow
+/**
+* clear the current row for the specified resultset.
+*/
+public void clearcurrentrow int resultsetnumber
+if  sanitymanager debug
+if  row    null
+if    resultsetnumber > 0    resultsetnumber < row length
+sanitymanager throwassert     resultsetnumber
+row length
+if  row    null
+row   null
+/**
+* get the current row at the given index.
+*/
+public row getcurrentrow int resultsetnumber
+return row
+/**
+* return the current sql session context for all immediately
+* nested connections stemming from the call or function
+* invocation of the statement corresponding to this activation.
+* @see org.apache.derby.iapi.sql.activation#getsqlsessioncontextforchildren
+*/
+public sqlsessioncontext getsqlsessioncontextforchildren
+if  sanitymanager debug
+sanitymanager assert
+sqlsessioncontextforchildren    null
+return sqlsessioncontextforchildren
+/**
+* @see org.apache.derby.iapi.sql.activation#setupsqlsessioncontextforchildren
+*/
+public sqlsessioncontext setupsqlsessioncontextforchildren boolean push
+if  push
+// nested connection, so need to push a new context: sql 2003,
+// 4.37.1: "an sql-session is associated with an
+// sql-connection.
+sqlsessioncontextforchildren   lcc createsqlsessioncontext
+else
+// substatement, so use current one
+if  parentactivation    null
+// the parent statement performing the substatement is
+// itself inside a nested connection (stored routine)
+sqlsessioncontextforchildren
+parentactivation getsqlsessioncontextforchildren
+else
+// the parent statement performing the substatement is on
+// top level
+sqlsessioncontextforchildren
+lcc gettoplevelsqlsessioncontext
+return sqlsessioncontextforchildren
+/**
+* this activation is created in a dynamic call context or a substatement
+* execution context, make note of its parent statements activation (a).
+*
+* @param a the caller's or superstatement's activation
+*/
+public void setparentactivation activation a
+parentactivation   a
+/**
+* get the activation of the calling statement or parent statement.
+*
+* @return the parent's activation
+*/
+public activation getparentactivation
+return parentactivation
+protected final datavaluedescriptor getcolumnfromrow int rsnumber  int colid
+throws standardexception
+return row getcolumn colid
+/**
+* check that a positioned statement is executing against a cursor
+* from the same preparedstatement (plan) that the positioned
+* statement was original compiled against.
+*
+* only called from generated code for positioned update and delete
+* statements. see currentofnode.
+*
+* @param cursorname name of the cursor
+* @param psname object name of the preparedstatement.
+* @throws standardexception
+*/
+protected void checkpositionedstatement string cursorname  string psname
+throws standardexception
+execpreparedstatement ps   getpreparedstatement
+if  ps    null
+return
+languageconnectioncontext lcc   getlanguageconnectioncontext
+cursoractivation cursoractivation   lcc lookupcursoractivation cursorname
+if  cursoractivation    null
+// check we are compiled against the correct cursor
+if   psname equals cursoractivation getpreparedstatement   getobjectname
+// our prepared statement is now invalid since there
+// exists another cursor with the same name but a different
+// statement.
+ps makeinvalid dependencymanager changed_cursor  lcc
+/* this method is used to materialize a resultset if can actually fit in the memory
+* specified by "maxmemorypertable" system property.  it converts the result set into
+* union(union(union...(union(row, row), row), ...row), row).  it returns this
+* in-memory converted resultset, or the original result set if not converted.
+* see beetle 4373 for details.
+*
+* optimization implemented as part of beetle: 4373 can cause severe stack overflow
+* problems. see jira entry derby-634. with default max_memory_per_table of 1mg, it is
+* possible that this optimization could attempt to cache upto 250k rows as nested
+* union results. at runtime, this would cause stack overflow.
+*
+* as jeff mentioned in derby-634, right way to optimize original problem would have been
+* to address subquery materialization during optimization phase, through hash joins.
+* recent army's optimizer work through debry-781 and related work introduced a way to
+* materialize subquery results correctly and needs to be extended to cover this case.
+* while his optimization needs to be made more generic and stable, i propose to avoid
+* this regression by limiting size of the materialized resultset created here to be
+* less than max_memory_per_table and max_dynamic_materialized_rows.
+*
+*	@param	rs	input result set
+*	@return	materialized resultset, or original rs if it can't be materialized
+*/
+public noputresultset materializeresultsetifpossible noputresultset rs
+throws standardexception
+rs opencore
+vector rowcache   new vector
+execrow arow
+int cachesize   0
+formatablebitset toclone   null
+int maxmemorypertable   getlanguageconnectioncontext   getoptimizerfactory   getmaxmemorypertable
+arow   rs getnextrowcore
+if  arow    null
+toclone   new formatablebitset arow ncolumns     1
+toclone set 1
+while  arow    null
+cachesize    arow getcolumn 1  getlength
+if  cachesize > maxmemorypertable
+rowcache size   > optimizer max_dynamic_materialized_rows
+break
+rowcache addelement arow getclone toclone
+arow   rs getnextrowcore
+rs close
+if  arow    null
+int rsnum   rs resultsetnumber
+int numrows   rowcache size
+if  numrows    0
+return new rowresultset
+this
+execrow  null
+true
+rsnum
+0
+0
+rowresultset rrs   new rowresultset
+unionresultset urs   new unionresultset
+for  int i   0  i < numrows  i
+rrs   new rowresultset
+this
+execrow  rowcache elementat i
+true
+rsnum
+1
+0
+if  i > 0
+urs   new unionresultset
+i > 1  ?  noputresultset urs    noputresultset rrs
+rrs
+this
+rsnum
+i   1
+0
+rs finish
+if  numrows    1
+return rrs
+else
+return urs
+return rs
+//warning : this field name is referred in the deletenode generate routines.
+protected cursorresultset raparentresultsets
+// maintain hash table of parent result set vector
+// a table can have more than one parent source.
+protected hashtable parentresultsets
+public void setparentresultset temporaryrowholder rs  string resultsetid
+vector  rsvector
+if parentresultsets    null
+parentresultsets   new hashtable
+rsvector    vector  parentresultsets get resultsetid
+if rsvector    null
+rsvector   new vector
+rsvector addelement rs
+else
+rsvector addelement rs
+parentresultsets put resultsetid   rsvector
+/**
+* get the reference to parent table resultsets, that will be needed by the
+* referential action dependent table scans.
+*/
+public vector getparentresultset string resultsetid
+return  vector  parentresultsets get resultsetid
+public hashtable getparentresultsets
+return parentresultsets
+/**
+** prepared statement use the same activation for
+** multiple execution. for each excution we create new
+** set of temporary resultsets, we should clear this hash table.
+** otherwise we will refer to the released resources.
+*/
+public void clearparentresultsets
+if parentresultsets    null
+parentresultsets clear
+/**
+* beetle 3865: updateable cursor using index.  a way of communication
+* between cursor activation and update activation.
+*/
+public void setforupdateindexscan cursorresultset forupdateindexscan
+this forupdateindexscan   forupdateindexscan
+public cursorresultset getforupdateindexscan
+return forupdateindexscan
+private java util calendar cal
+/**
+return a calendar for use by this activation.
+calendar objects are not thread safe, the one returned
+is purely for use by this activation and it is assumed
+that is it single threded through the single active
+thread in a connection model.
+*/
+protected java util calendar getcalendar
+if  cal    null
+cal   new java util gregoriancalendar
+return cal
+/*
+** code originally in the parent class baseexpressionactivation
+*/
+/**
+get the language connection factory associated with this connection
+*/
+public final languageconnectioncontext	getlanguageconnectioncontext
+return	lcc
+public final transactioncontroller gettransactioncontroller
+return lcc gettransactionexecute
+/**
+* get the current contextmanager.
+*
+* @return current contextmanager
+*/
+public contextmanager getcontextmanager
+return cm
+/**
+used by activations to generate data values.  most dml statements
+will use this method.  possibly some ddl statements will, as well.
+*/
+public datavaluefactory getdatavaluefactory
+return getlanguageconnectioncontext   getdatavaluefactory
+/**
+* used to get a proxy for the current connection.
+*
+* @exception sqlexception		thrown on failure to get connection
+*/
+public connection getcurrentconnection   throws sqlexception
+connectioncontext cc
+connectioncontext  getcontextmanager   getcontext connectioncontext context_id
+return cc getnestedconnection true
+/**
+real implementations of this method are provided by a generated class.
+*/
+public java sql resultset getdynamicresults
+return null
+/**
+real implementations of this method are provided by a generated class.
+*/
+public int getmaxdynamicresults
+return 0
+/**
+* compute the db2 compatible length of a value.
+*
+* @param value
+* @param constantlength the length, if it is a constant modulo null/not null. -1 if the length is not constant
+* @param reuse if non-null then re-use this as a container for the length
+*
+* @return the db2 compatible length, set to null if value is null.
+*/
+public numberdatavalue getdb2length  datavaluedescriptor value
+int constantlength
+numberdatavalue reuse
+throws standardexception
+if  reuse    null
+reuse   getdatavaluefactory   getnullinteger  null
+if  value isnull
+reuse settonull
+else
+if  constantlength >  0
+reuse setvalue  constantlength
+else
+reuse setvalue value getlength
+return reuse
+end of getdb2length
+/* dependable interface implementation */
+/**
+* @see dependable#getdependablefinder
+*/
+public dependablefinder getdependablefinder
+return null
+/**
+* @see dependable#getobjectname
+*/
+public string getobjectname
+return uuidstring
+/**
+* @see dependable#getobjectid
+*/
+public uuid getobjectid
+return uuidvalue
+/**
+* @see dependable#getclasstype
+*/
+public string getclasstype
+return dependable activation
+/**
+* @see dependable#ispersistent
+*/
+public boolean ispersistent
+/* activations are not persistent */
+return false
+/* dependent interface implementation */
+/**
+* @see org.apache.derby.iapi.sql.depend.dependent#isvalid
+*/
+public boolean isvalid
+return isvalid
+/**
+* @see org.apache.derby.iapi.sql.depend.dependent#makeinvalid
+*/
+public void makeinvalid int action
+languageconnectioncontext lcc
+throws standardexception
+switch  action
+case dependencymanager recheck_privileges
+// make ourselves invalid.
+isvalid   false
+/* clear out the old dependencies on this activation as we
+* will die shortly.
+*/
+dependencymanager dm
+lcc getdatadictionary   getdependencymanager
+dm cleardependencies lcc  this
+break
+case dependencymanager revoke_role
+// used by persistent objects (views, triggers, constraints)
+break
+case dependencymanager internal_recompile_request
+// used to recompile prepared statements
+break
+default
+if  sanitymanager debug
+sanitymanager debug_print        action
+sanitymanager notreached
+/**
+* @see org.apache.derby.iapi.sql.depend.dependent#preparetoinvalidate
+*/
+public void preparetoinvalidate provider p  int action
+languageconnectioncontext lcc
+throws standardexception

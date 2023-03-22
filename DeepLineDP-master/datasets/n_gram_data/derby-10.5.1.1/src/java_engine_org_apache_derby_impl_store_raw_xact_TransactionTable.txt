@@ -1,0 +1,641 @@
+/*
+derby - class org.apache.derby.impl.store.raw.xact.transactiontable
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store raw xact
+import org apache derby iapi services context contextmanager
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services io formatable
+import org apache derby iapi services io formatidutil
+import org apache derby iapi services io storedformatids
+import org apache derby iapi store access transactioninfo
+import org apache derby iapi store raw globaltransactionid
+import org apache derby iapi store raw log loginstant
+import org apache derby iapi store raw xact rawtransaction
+import org apache derby iapi store raw xact transactionid
+import org apache derby iapi error standardexception
+import org apache derby iapi services io compressednumber
+import java util hashtable
+import java util enumeration
+import java io objectoutput
+import java io objectinput
+import java io ioexception
+/**
+the transaction table is used by the transaction factory to keep track of
+all transactions that are in the system.
+<br> the transction table serves the following purposes: <ol>
+<li> checkpoint - when a checkpoint log record is written out, it writes
+out also all transactions that have updated the database.  resolve: this is
+actually not used right now - rather, the transaction table is
+reconstructed during the redo phase by traversing from the undo lwm.  it is
+a goal to use this transaction table (and traversing from the redolwm)
+instead of rebuilding it to speed up recovery.
+<li> quiesce state - when a  system enters the quiesce state, it needs to account
+for all transactions in the system, even those which are just started and
+are in their idle state.
+<li> transactiontable vti - we need to get a snapshot of all transactions
+in the system for diagnostic purposes.
+</ol>
+in order to speed up the time it takes to look up a transaction from the
+transaction table, each transaction must have a unique transaction id.
+this means newly coined transaction must also have a transaction id.
+<p>during recovery, there is only one real xact object doing all the
+recovery work, but there could be many outstanding transactions that are
+gleamed from the log.  each of these "recovery transactions" have its on
+entry into the transaction table but they all share the same xact object.
+<p>multithreading considerations:<br>
+transactiontable must be mt-safe it is called upon by many threads
+simultaneously (except during recovery)
+<p><b> this class depends on hashtable synchronization!! </b>
+*/
+public class transactiontable implements formatable
+/*
+* fields
+*/
+private hashtable trans
+private transactionid largestupdatexactid
+/**
+mt - not needed for constructor
+*/
+public transactiontable
+trans   new hashtable 17
+/*************************************************************
+* generic methods called by all clients of transaction table
+* must be mt -safe
+************************************************************/
+private transactiontableentry findtransactionentry transactionid id
+if  sanitymanager debug
+sanitymanager assert
+id    null
+// hashtable is synchronized
+return  transactiontableentry trans get id
+void add xact xact  boolean exclude
+transactionid id   xact getid
+synchronized this
+transactiontableentry ent   findtransactionentry id
+if  ent    null
+ent   new transactiontableentry
+xact  id  0
+exclude ? transactiontableentry exclude   0
+trans put id  ent
+if  sanitymanager debug
+if  sanitymanager debug_on
+sanitymanager debug
+id
+sanitymanager showtrace new throwable
+if  sanitymanager debug
+if  exclude    ent needexclusion
+sanitymanager throwassert
+exclude       ent needexclusion
+if  sanitymanager debug
+if  sanitymanager debug_on
+if  trans size   > 50
+system out println     trans size
+/**
+remove the transaction id an return false iff the transaction is found
+in the table and it doesn't need exclusion during quiesce state
+*/
+boolean remove transactionid id
+if  sanitymanager debug
+sanitymanager assert
+id    null
+if  sanitymanager debug
+if  sanitymanager debug_on
+sanitymanager debug
+id
+sanitymanager showtrace new throwable
+// hashtable is synchronized
+transactiontableentry ent    transactiontableentry trans remove id
+return  ent    null    ent needexclusion
+/**
+change a transaction to update or add an update transaction to this table.
+@param tid the transaction id
+@param tran the transaction to be added
+@param transactionstatus the transaction status that is stored in the
+beginxact log record
+*/
+public void addupdatetransaction transactionid tid  rawtransaction tran
+int transactionstatus
+// we need to synchronize on the transaction table because we have to
+// prevent this state change from happening when the transaction table
+// itself is written out to the checkpoint.  this is the only
+// protection the transactiontableentry has to prevent fields in myxact
+// from changing underneath it while it is being written out.
+synchronized this
+transactiontableentry ent   findtransactionentry tid
+if  ent    null
+// this happens during run time, when a transaction that is
+// already started changed status to an update transaction
+ent updatetransactionstatus  xact tran  transactionstatus
+transactiontableentry update
+else
+// this happens during recovery, that's why we haven't seen
+// this transaction before - it is added in the dome of the
+// beginxact log record.
+//
+// no matter what this transaction is, it won't need to be run
+// in quiesce state because we are in recovery.
+ent   new transactiontableentry  xact tran  tid  transactionstatus
+transactiontableentry update
+transactiontableentry exclude
+transactiontableentry recovery
+trans put tid  ent
+if  xactid compare ent getxid    largestupdatexactid  > 0
+largestupdatexactid   ent getxid
+/**
+change update transaction to non-update
+<p>mt - mt safe, since vector is mt-safe.
+@param id the transaction id
+*/
+void removeupdatetransaction transactionid id
+// we need to synchronize on the transaction table because we have to
+// prevent this state change from happening when the transaction table
+// itself is written out to the checkpoint.  this is the only
+// protection the transactiontableentry has to prevent fields in myxact
+// from changing underneath it while it is being written out.
+synchronized  this
+transactiontableentry ent   findtransactionentry id
+if  sanitymanager debug
+sanitymanager assert ent    null
+ent removeupdatetransaction
+// if we are committing a recovery transaction, remove it from the
+// transaction table.  the xact object which is doing the work is
+// not going to be closed even though the transaction is done.
+if  ent isrecovery
+remove id
+return
+/**************************************************************************
+* transaction table methods used by xa.
+**************************************************************************
+*/
+/**
+* return the hash table to the xa layer.
+* <p>
+* the xa code will do linear read-only operations on the hash table,
+* write operations are only done in this module.  it is a little ugly
+* to export the hash table, but i wanted to move the xa specific code
+* into the xa module, so that we could configure out the xa code if
+* necessary.
+* <p>
+*
+* must be mt -safe, depends on sync hash table, and must get
+*     synchronized(hash_table) for linear searches.
+*
+* @return the contextmanager of the transaction being searched for.
+*
+**/
+public hashtable gettableforxa
+return trans
+/**
+change transaction to prepared.
+<p>mt - unsafe, caller is recovery, which is single threaded.
+@param id the transaction id
+*/
+void preparetransaction transactionid id
+// we need to synchronize on the transaction table because we have to
+// prevent this state change from happening when the transaction table
+// itself is written out to the checkpoint.  this is the only
+// protection the transactiontableentry has to prevent fields in myxact
+// from changing underneath it while it is being written out.
+transactiontableentry ent   findtransactionentry id
+if  sanitymanager debug
+sanitymanager assert
+ent    null
+ent preparetransaction
+return
+/**
+* find a transaction in the table by global transaction id.
+* <p>
+* this routine use to be only called during offline recovery so performance
+* was not critical.  since that time more calls have been made, including
+* one in startglobaltransaction() so a linear search may no longer
+* be appropriate.  see derby-828.
+*
+* @return the contextmanager of the transaction being searched for.
+*
+* @param global_id the global transaction we are searching for.
+**/
+public contextmanager findtransactioncontextbyglobalid
+globalxactid global_id
+contextmanager cm                null
+// need to hold sync while linear searching the hash table.
+synchronized  trans
+for  enumeration e   trans elements    e hasmoreelements
+transactiontableentry entry
+transactiontableentry  e nextelement
+if  entry    null
+globaltransactionid entry_gid   entry getgid
+if  entry_gid    null    entry_gid equals global_id
+cm   entry getxact   getcontextmanager
+break
+return cm
+/***********************************************************
+* called when system is being quiesced, must be mt - safe
+***********************************************************/
+/**
+return true if there is no transaction actively updating the database.
+new transaction may be started or old transaction committed
+right afterward, the caller of this routine must have other ways to
+stop transactions from starting or ending.
+<p>mt - safe
+*/
+boolean hasactiveupdatetransaction
+synchronized  this
+for  enumeration e   trans elements    e hasmoreelements
+transactiontableentry ent    transactiontableentry e nextelement
+if  ent    null    ent isupdate
+return true
+return false
+/************************************************************
+* methods called only by checkpoint
+***********************************************************/
+/*
+* formatable methods
+*/
+/**
+return my format identifier.
+*/
+public int gettypeformatid
+return storedformatids raw_store_transaction_table
+/**
+@exception ioexception problem reading the transaction table
+*/
+public void writeexternal objectoutput out  throws ioexception
+//don't let the transactions status change while writing out(beetle:5533)
+//note: syncing both on trans and this variable could be avoided if
+//all the routines in this class are sycned on "this" and does not
+//depend on hash table synchronization. but that will be overkill
+//because this routine gets called only on checkpoints and others
+//are used more often.
+synchronized this
+// don't touch the transaction table when i am being written out
+synchronized trans
+int count   0
+int maxcount   trans size
+// first count up the number of active update transactions
+for  enumeration e   trans elements
+e hasmoreelements
+transactiontableentry ent    transactiontableentry e nextelement
+if  ent    null    ent isupdate
+count
+compressednumber writeint out  count
+// now write them out
+if  count > 0
+for  enumeration e   trans elements
+e hasmoreelements
+transactiontableentry ent    transactiontableentry e nextelement
+if  ent    null    ent isupdate
+// only writes out update transaction
+out writeobject ent
+/************************************************************
+* methods called only by recovery
+************************************************************/
+/**
+@exception ioexception problem reading the transaction table
+@exception classnotfoundexception problem reading the transaction table
+*/
+public void readexternal objectinput in
+throws ioexception  classnotfoundexception
+// resolve: this is only read in checkpoint record, but we have not
+// finish the work on using this transaction table to cut down on redo
+// so this transaction table is effectively and futilely thrown away!
+int count   compressednumber readint in
+if  count    0
+return
+for  int i   0  i < count  i
+transactiontableentry ent
+transactiontableentry in readobject
+if  sanitymanager debug
+sanitymanager assert
+ent getxid      null
+trans put ent getxid    ent
+if  ent isupdate
+xactid compare ent getxid    largestupdatexactid  > 0
+largestupdatexactid   ent getxid
+/**
+return the largest update transactionid i have seen so far.
+<p>mt - unsafe, caller is recovery, which is single threaded.
+*/
+public transactionid largestupdatexactid
+return largestupdatexactid
+/**
+is there an active internal transaction in the transaction table.
+<p>mt - unsafe, caller is recovery, which is single threaded.
+*/
+public boolean hasrollbackfirsttransaction
+for  enumeration e   trans elements
+e hasmoreelements
+transactiontableentry ent    transactiontableentry e nextelement
+if  ent    null    ent isrecovery
+ent gettransactionstatus
+xact recovery_rollback_first     0
+return true
+return false
+/**
+is there a prepared transaction that are recovered
+durring the recovery in the transaction table.
+<p>mt - unsafe, caller is recovery, which is single threaded.
+*/
+public boolean haspreparedrecoveredxact
+return haspreparedxact true
+/**
+is there a prepared transaction in the transaction table.
+<p>mt - unsafe, called during boot, which is single threaded.
+*/
+public boolean haspreparedxact
+return haspreparedxact false
+/**
+* is there a prepared transaction in the transaction table.
+*
+* <p>mt - unsafe, caller is recovery/at boot, which is single threaded.
+*
+* @param recovered  <code> true </code> to search  for transaction
+*                  that are in prepared during recovery.
+*                  recovered tranaction.
+*                  <code> false > to search for just prepared
+*                  transactons.
+* @return         <code> true if there is a prepared transaction and
+*                  recovered when <code> recovered </code> argument is
+*                  <code> true </code>
+*/
+private boolean haspreparedxact boolean recovered
+for  enumeration e   trans elements    e hasmoreelements
+transactiontableentry ent    transactiontableentry  e nextelement
+if  ent    null
+ent gettransactionstatus     xact end_prepared     0
+if  recovered
+if ent isrecovery
+return true
+else
+return true
+return false
+/**
+get the most recently added transaction that says it needs to be
+rolled back first (an internalxact) from the transaction table and make
+the passed in transaction assume its identity.
+<b> should only be used in recovery undo !! </b>
+resolve: (sku)i don't think even these internal transactions need to be
+rolled back in the reverse order, because they are physical in nature.
+but it won't hurt.
+<p>mt - unsafe, caller is recovery, which is single threaded.
+*/
+public boolean getmostrecentrollbackfirsttransaction rawtransaction tran
+if  trans isempty
+// set tranaction to idle
+return findandassumetransaction  transactionid null  tran
+transactionid id   null
+for  enumeration e   trans elements
+e hasmoreelements
+transactiontableentry ent    transactiontableentry e nextelement
+if  ent    null    ent isupdate      ent isrecovery
+ent gettransactionstatus     xact recovery_rollback_first     0
+// try to locate the most recent one
+if  id    null    xactid compare id  ent getxid    < 0
+id   ent getxid
+if  id    null 			   set transaction to idle
+return findandassumetransaction id  tran
+else
+// there is a rollback first transaction
+boolean found
+findandassumetransaction id  tran
+if  sanitymanager debug
+if   found
+sanitymanager throwassert
+id
+return true
+/**
+get the most recently non-prepared added transaction from the
+transaction table and make the passed in transaction assume its
+identity.  prepared transactions will not be undone.
+resolve: (sku) i don't think normal user transactions needs to be
+rolled back in order, but it won't hurt.
+<b> should only be used in recovery undo !! </b>
+<p>mt - unsafe, caller is recovery, which is single threaded.
+*/
+public boolean getmostrecenttransactionforrollback rawtransaction tran
+transactionid id   null
+if   trans isempty
+for  enumeration e   trans elements
+e hasmoreelements
+transactiontableentry ent
+transactiontableentry e nextelement
+if  ent    null
+ent isupdate
+ent isrecovery
+ent isprepared
+// try to locate the most recent one
+if  id    null    xactid compare id  ent getxid    < 0
+id   ent getxid
+if  sanitymanager debug
+if  ent    null
+ent isupdate
+ent isrecovery
+ent gettransactionstatus
+xact recovery_rollback_first     0
+sanitymanager throwassert
+if  sanitymanager debug
+// if all transactions are prepared then it is possible that
+// no transaction will be found, in that case id will be null.
+if  id    null
+sanitymanager assert findtransactionentry id     null
+else
+// all transactions in the table must be prepared.
+for  enumeration e   trans elements    e hasmoreelements
+transactiontableentry ent
+transactiontableentry e nextelement
+sanitymanager assert ent isprepared
+return findandassumetransaction id  tran
+/**
+get the most recently added transaction that says it is prepared during
+recovery the transaction table and make the passed in transaction
+assume its identity. this routine turns off the isrecovery() state
+<b> should only be used in recovery handle prepare after undo !! </b>
+<p>mt - unsafe, caller is recovery, which is single threaded.
+*/
+/**
+* get the most recent recovered prepared transaction.
+* <p>
+* get the most recently added transaction that says it is prepared during
+* recovery the transaction table and make the passed in transaction
+* assume its identity.
+* <p>
+* this routine, unlike the redo and rollback getmostrecent*() routines
+* expects a brand new transaction to be passed in.  if a candidate
+* transaction is found, then upon return the transaction table will
+* be altered such that the old entry no longer exists, and a new entry
+* will exist pointing to the transaction passed in.  the new entry will
+* look the same as if the prepared transaction had been created during
+* runtime rather than recovery.
+*
+* <b> should only be used in recovery handle prepare after undo !! </b>
+*
+* <p>mt - unsafe, caller is recovery, which is single threaded.
+*
+* @return true if a candidate transaction has been found.  false if no
+*         prepared/recovery transactions found in the table.
+*
+* @param tran   newly allocated transaction to add to link to a entry.
+*
+**/
+public boolean getmostrecentpreparedrecoveredxact
+rawtransaction tran
+transactiontableentry   found_ent     null
+if   trans isempty
+transactionid           id            null
+globaltransactionid     gid           null
+transactiontableentry   ent
+for  enumeration e   trans elements    e hasmoreelements
+ent    transactiontableentry e nextelement
+if  ent    null
+ent isrecovery
+ent isprepared
+// try to locate the most recent one
+if  id    null    xactid compare id  ent getxid    < 0
+found_ent   ent
+id          ent getxid
+gid         ent getgid
+if  sanitymanager debug
+if  found_ent    null
+// if no entry's were found then the transaction table
+// should have the passed in idle tran, and the rest should
+// be non-recover, prepared global transactions.
+for  enumeration e   trans elements    e hasmoreelements
+ent    transactiontableentry e nextelement
+if  xactid compare ent getxid    tran getid       0
+sanitymanager assert
+ent isrecovery      ent isprepared
+sanitymanager assert ent getgid      null
+if  found_ent    null
+// at this point there are 2 tt entries of interest:
+//     new_ent - the read only transaction entry that was
+//               created when we allocated a new transaction.
+//               we will just throw this one away after
+//               assuming the identity of the global xact.
+//     found_ent
+//             - the entry of the transaction that we are going
+//               to take over.
+transactiontableentry new_ent
+transactiontableentry  trans remove tran getid
+// at this point only the found_ent should be in the table.
+if  sanitymanager debug
+sanitymanager assert findtransactionentry id     found_ent
+xact  tran  assumeglobalxactidentity found_ent
+// transform this recovery entry, into a runtime entry.
+found_ent unsetrecoverystatus
+return found_ent    null
+/**
+get the least recently added (oldest) transaction
+@return the rawtransaction's first log instant
+<p>mt - safe, caller can be recovery or checkpoint
+*/
+public loginstant getfirstloginstant
+// assume for now that it is acceptable to return null if a transaction
+// starts right in the middle of this call.
+if  trans isempty
+return null
+else
+loginstant loginstant   null
+// bug 5632: need to sychronize so that another thread does not
+// come in and disrupt the for loop, we got an exception on next,
+// likely because hash table changed by another thread after
+// hasmoreelements() called, but before nextelement().
+synchronized  trans
+for  enumeration e   trans elements    e hasmoreelements
+transactiontableentry ent
+transactiontableentry e nextelement
+if  ent    null    ent isupdate
+if  loginstant    null
+ent getfirstlog   lessthan loginstant
+loginstant   ent getfirstlog
+return loginstant
+/**
+find a transaction using the transaction id, and make the passed in
+transaction assume the identity and properties of that transaction.
+<p>mt - unsafe, caller is recovery, which is single threaded.
+@param id transaction id
+@param tran the transaction that was made to assume the transactionid
+and all other relavent information stored in the transaction table
+@return true if transaction can be found, false otherwise
+*/
+boolean findandassumetransaction
+transactionid       id
+rawtransaction      tran
+// the only caller for this method right now is recovery.
+// no need to put in any concurrency control
+transactiontableentry ent   null
+if  id    null     trans isempty
+ent   findtransactionentry id
+if  sanitymanager debug
+if  ent    null
+sanitymanager assert ent isrecovery
+// if no transaction entry found, set transaction to idle
+xact tran  assumeidentity ent
+return ent    null
+/**********************************************************
+* transaction table vti and diagnostics
+* mt - unsafe, caller is getting a snap shot which may be inconsistent
+*********************************************************/
+/**
+get a printable version of the transaction table
+*/
+public transactioninfo gettransactioninfo
+if  trans isempty
+return null
+// while taking a snap shot, no adding or removing of transaction
+transactioninfo tinfo
+if  sanitymanager debug
+sanitymanager debug    tostring
+synchronized this
+int ntran   trans size
+tinfo   new transactiontableentry
+loginstant loginstant   null
+int i   0
+for  enumeration e   trans elements
+e hasmoreelements
+transactiontableentry ent
+transactiontableentry e nextelement
+if  ent    null
+tinfo    transactiontableentry ent clone
+if  sanitymanager debug
+sanitymanager assert ent    null
+return tinfo
+public string tostring
+if  sanitymanager debug
+stringbuffer str   new stringbuffer 1000
+append
+append super tostring
+append    append trans size
+append    append largestupdatexactid
+append
+boolean hasreadonlytransaction   false
+for  enumeration e   trans elements
+e hasmoreelements
+transactiontableentry ent
+transactiontableentry e nextelement
+if  ent    null    ent isupdate
+str append ent tostring
+if  ent    null     ent isupdate
+hasreadonlytransaction   true
+if  hasreadonlytransaction
+str append
+for  enumeration e   trans elements
+e hasmoreelements
+transactiontableentry ent
+transactiontableentry e nextelement
+if  ent    null     ent isupdate
+str append ent tostring
+str append
+return str tostring
+else
+return null

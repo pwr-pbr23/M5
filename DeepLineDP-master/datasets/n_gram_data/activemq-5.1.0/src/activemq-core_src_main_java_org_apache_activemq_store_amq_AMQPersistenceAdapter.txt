@@ -1,0 +1,698 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq store amq
+import java io file
+import java io ioexception
+import java io randomaccessfile
+import java nio channels filelock
+import java util date
+import java util hashset
+import java util iterator
+import java util map
+import java util set
+import java util concurrent concurrenthashmap
+import java util concurrent copyonwritearrayset
+import java util concurrent countdownlatch
+import java util concurrent atomic atomicboolean
+import java util concurrent atomic atomiclong
+import org apache activeio journal journal
+import org apache activemq broker brokerservice
+import org apache activemq broker brokerserviceaware
+import org apache activemq broker connectioncontext
+import org apache activemq command activemqdestination
+import org apache activemq command activemqqueue
+import org apache activemq command activemqtopic
+import org apache activemq command datastructure
+import org apache activemq command journalqueueack
+import org apache activemq command journaltopicack
+import org apache activemq command journaltrace
+import org apache activemq command journaltransaction
+import org apache activemq command message
+import org apache activemq filter noncachedmessageevaluationcontext
+import org apache activemq kaha impl async asyncdatamanager
+import org apache activemq kaha impl async location
+import org apache activemq kaha impl index hash hashindex
+import org apache activemq openwire openwireformat
+import org apache activemq store messagestore
+import org apache activemq store persistenceadapter
+import org apache activemq store referencestore
+import org apache activemq store referencestoreadapter
+import org apache activemq store topicmessagestore
+import org apache activemq store topicreferencestore
+import org apache activemq store transactionstore
+import org apache activemq store kahadaptor kahareferencestoreadapter
+import org apache activemq thread defaultthreadpools
+import org apache activemq thread scheduler
+import org apache activemq thread task
+import org apache activemq thread taskrunner
+import org apache activemq thread taskrunnerfactory
+import org apache activemq usage systemusage
+import org apache activemq usage usage
+import org apache activemq usage usagelistener
+import org apache activemq util bytesequence
+import org apache activemq util ioexceptionsupport
+import org apache activemq util iohelper
+import org apache activemq wireformat wireformat
+import org apache commons logging log
+import org apache commons logging logfactory
+/**
+* an implementation of {@link persistenceadapter} designed for use with a
+* {@link journal} and then check pointing asynchronously on a timeout with some
+* other long term persistent storage.
+*
+* @org.apache.xbean.xbean element="amqpersistenceadapter"
+* @version $revision: 1.17 $
+*/
+public class amqpersistenceadapter implements persistenceadapter  usagelistener  brokerserviceaware
+private static final log log   logfactory getlog amqpersistenceadapter class
+private final concurrenthashmap<activemqqueue  amqmessagestore> queues   new concurrenthashmap<activemqqueue  amqmessagestore>
+private final concurrenthashmap<activemqtopic  amqtopicmessagestore> topics   new concurrenthashmap<activemqtopic  amqtopicmessagestore>
+private static final string property_prefix
+private static final boolean broken_file_lock
+private static final boolean disable_locking
+private static final int journal_locked_wait_delay   10   1000
+private asyncdatamanager asyncdatamanager
+private referencestoreadapter referencestoreadapter
+private taskrunnerfactory taskrunnerfactory
+private wireformat wireformat   new openwireformat
+private systemusage usagemanager
+private long cleanupinterval   1000   30
+private long checkpointinterval   1000   60
+private int maxcheckpointmessageaddsize   1024   4
+private amqtransactionstore transactionstore   new amqtransactionstore this
+private taskrunner checkpointtask
+private countdownlatch nextcheckpointcountdownlatch   new countdownlatch 1
+private final atomicboolean started   new atomicboolean false
+private runnable periodiccheckpointtask
+private runnable periodiccleanuptask
+private boolean deleteallmessages
+private boolean synconwrite
+private string brokername
+private file directory
+private file directoryarchive
+private brokerservice brokerservice
+private atomiclong storesize   new atomiclong
+private boolean persistentindex true
+private boolean usenio   true
+private boolean archivedatalogs false
+private int maxfilelength   asyncdatamanager default_max_file_length
+private int indexbinsize   hashindex default_bin_size
+private int indexkeysize   hashindex default_key_size
+private int indexpagesize   hashindex default_page_size
+private int maxreferencefilelength asyncdatamanager default_max_file_length
+private map<amqmessagestore set<integer>> datafilesinprogress   new concurrenthashmap<amqmessagestore set<integer>>
+private string directorypath
+private randomaccessfile lockfile
+private filelock lock
+private boolean disablelocking   disable_locking
+private boolean failifjournalislocked
+public string getbrokername
+return this brokername
+public void setbrokername string brokername
+this brokername   brokername
+if  this referencestoreadapter    null
+this referencestoreadapter setbrokername brokername
+public brokerservice getbrokerservice
+return brokerservice
+public void setbrokerservice brokerservice brokerservice
+this brokerservice   brokerservice
+public synchronized void start   throws exception
+if   started compareandset false  true
+return
+if  this directory    null
+if  brokerservice    null
+this directory   brokerservice getbrokerdatadirectory
+else
+this directory   new file iohelper getdefaultdatadirectory    iohelper tofilesystemsafename brokername
+this directory   new file directory
+this directorypath directory getabsolutepath
+if  this directoryarchive    null
+this directoryarchive   new file this directory
+this directory mkdirs
+lockfile   new randomaccessfile new file directory
+lock
+log info     directory
+if  archivedatalogs
+this directoryarchive mkdirs
+if  this usagemanager    null
+this usagemanager getmemoryusage   addusagelistener this
+if  asyncdatamanager    null
+asyncdatamanager   createasyncdatamanager
+if  referencestoreadapter    null
+referencestoreadapter   createreferencestoreadapter
+referencestoreadapter setdirectory new file directory
+referencestoreadapter setbrokername getbrokername
+referencestoreadapter setusagemanager usagemanager
+referencestoreadapter setmaxdatafilelength getmaxreferencefilelength
+if  taskrunnerfactory    null
+taskrunnerfactory   createtaskrunnerfactory
+if  failifjournalislocked
+asyncdatamanager lock
+else
+while  true
+try
+asyncdatamanager lock
+break
+catch  ioexception e
+log info      journal_locked_wait_delay   1000
+try
+thread sleep journal_locked_wait_delay
+catch  interruptedexception e1
+asyncdatamanager start
+if  deleteallmessages
+asyncdatamanager delete
+try
+journaltrace trace   new journaltrace
+trace setmessage     new date
+location location   asyncdatamanager write wireformat marshal trace   false
+asyncdatamanager setmark location  true
+log info
+deleteallmessages   false
+catch  ioexception e
+throw e
+catch  throwable e
+throw ioexceptionsupport create e
+referencestoreadapter deleteallmessages
+referencestoreadapter start
+set<integer> files   referencestoreadapter getreferencefileidsinuse
+log info     files
+checkpointtask   taskrunnerfactory createtaskrunner new task
+public boolean iterate
+docheckpoint
+return false
+createtransactionstore
+//
+// the following was attempting to reduce startup times by avoiding the
+// log
+// file scanning that recovery performs. the problem with it is that xa
+// transactions
+// only live in transaction log and are not stored in the reference
+// store, but they still
+// need to be recovered when the broker starts up.
+if   referencestoreadapter isstorevalid
+log warn
+recover
+log info
+else
+location location   writetracemessage     new date    true
+asyncdatamanager setmark location  true
+// recover transactions
+gettransactionstore   setpreparedtransactions referencestoreadapter retrievepreparedstate
+// do a checkpoint periodically.
+periodiccheckpointtask   new runnable
+public void run
+checkpoint false
+scheduler executeperiodically periodiccheckpointtask  checkpointinterval
+periodiccleanuptask   new runnable
+public void run
+cleanup
+scheduler executeperiodically periodiccleanuptask  cleanupinterval
+public void stop   throws exception
+if   started compareandset true  false
+return
+unlock
+if  lockfile    null
+lockfile close
+lockfile   null
+this usagemanager getmemoryusage   removeusagelistener this
+synchronized  this
+scheduler cancel periodiccheckpointtask
+scheduler cancel periodiccleanuptask
+iterator<amqmessagestore> queueiterator   queues values   iterator
+while  queueiterator hasnext
+amqmessagestore ms   queueiterator next
+ms stop
+iterator<amqtopicmessagestore> topiciterator   topics values   iterator
+while  topiciterator hasnext
+final amqtopicmessagestore ms   topiciterator next
+ms stop
+// take one final checkpoint and stop checkpoint processing.
+checkpoint true
+synchronized  this
+checkpointtask shutdown
+referencestoreadapter savepreparedstate gettransactionstore   getpreparedtransactions
+queues clear
+topics clear
+ioexception firstexception   null
+referencestoreadapter stop
+try
+log debug
+asyncdatamanager close
+catch  exception e
+firstexception   ioexceptionsupport create     e  e
+if  firstexception    null
+throw firstexception
+/**
+* when we checkpoint we move all the journalled data to long term storage.
+*
+* @param sync
+*/
+public void checkpoint boolean sync
+try
+if  asyncdatamanager    null
+throw new illegalstateexception
+countdownlatch latch   null
+synchronized  this
+latch   nextcheckpointcountdownlatch
+checkpointtask wakeup
+if  sync
+if  log isdebugenabled
+log debug
+latch await
+referencestoreadapter checkpoint sync
+catch  interruptedexception e
+thread currentthread   interrupt
+log warn     e  e
+catch  ioexception e
+log error     e  e
+/**
+* this does the actual checkpoint.
+*
+* @return true if successful
+*/
+public boolean docheckpoint
+countdownlatch latch   null
+synchronized  this
+latch   nextcheckpointcountdownlatch
+nextcheckpointcountdownlatch   new countdownlatch 1
+try
+if  log isdebugenabled
+log debug
+location newmark   null
+iterator<amqmessagestore> queueiterator   queues values   iterator
+while  queueiterator hasnext
+final amqmessagestore ms   queueiterator next
+location mark    location ms getmark
+if  mark    null     newmark    null    newmark compareto mark  < 0
+newmark   mark
+iterator<amqtopicmessagestore> topiciterator   topics values   iterator
+while  topiciterator hasnext
+final amqtopicmessagestore ms   topiciterator next
+location mark    location ms getmark
+if  mark    null     newmark    null    newmark compareto mark  < 0
+newmark   mark
+try
+if  newmark    null
+if  log isdebugenabled
+log debug     newmark
+asyncdatamanager setmark newmark  false
+writetracemessage     new date    true
+catch  exception e
+log error     e  e
+if  log isdebugenabled
+log debug
+finally
+latch countdown
+return true
+/**
+* cleans up the data files
+* @throws ioexception
+*/
+public void cleanup
+try
+set<integer>inprogress   new hashset<integer>
+for  set<integer> set  datafilesinprogress values
+inprogress addall set
+integer lastdatafile   asyncdatamanager getcurrentdatafileid
+inprogress add lastdatafile
+set<integer> inuse   referencestoreadapter getreferencefileidsinuse
+asyncdatamanager consolidatedatafilesnotin inuse  inprogress
+catch  ioexception e
+log error     e  e
+public set<activemqdestination> getdestinations
+set<activemqdestination> destinations   new hashset<activemqdestination> referencestoreadapter getdestinations
+destinations addall queues keyset
+destinations addall topics keyset
+return destinations
+messagestore createmessagestore activemqdestination destination  throws ioexception
+if  destination isqueue
+return createqueuemessagestore  activemqqueue destination
+else
+return createtopicmessagestore  activemqtopic destination
+public messagestore createqueuemessagestore activemqqueue destination  throws ioexception
+amqmessagestore store   queues get destination
+if  store    null
+referencestore checkpointstore   referencestoreadapter createqueuereferencestore destination
+store   new amqmessagestore this  checkpointstore  destination
+try
+store start
+catch  exception e
+throw ioexceptionsupport create e
+queues put destination  store
+return store
+public topicmessagestore createtopicmessagestore activemqtopic destinationname  throws ioexception
+amqtopicmessagestore store   topics get destinationname
+if  store    null
+topicreferencestore checkpointstore   referencestoreadapter createtopicreferencestore destinationname
+store   new amqtopicmessagestore this checkpointstore  destinationname
+try
+store start
+catch  exception e
+throw ioexceptionsupport create e
+topics put destinationname  store
+return store
+public transactionstore createtransactionstore   throws ioexception
+return transactionstore
+public long getlastmessagebrokersequenceid   throws ioexception
+return referencestoreadapter getlastmessagebrokersequenceid
+public void begintransaction connectioncontext context  throws ioexception
+referencestoreadapter begintransaction context
+public void committransaction connectioncontext context  throws ioexception
+referencestoreadapter committransaction context
+public void rollbacktransaction connectioncontext context  throws ioexception
+referencestoreadapter rollbacktransaction context
+public boolean ispersistentindex
+return persistentindex
+public void setpersistentindex boolean persistentindex
+this persistentindex   persistentindex
+/**
+* @param location
+* @return
+* @throws ioexception
+*/
+public datastructure readcommand location location  throws ioexception
+try
+bytesequence packet   asyncdatamanager read location
+return  datastructure wireformat unmarshal packet
+catch  ioexception e
+throw createreadexception location  e
+/**
+* move all the messages that were in the journal into long term storage. we
+* just replay and do a checkpoint.
+*
+* @throws ioexception
+* @throws ioexception
+* @throws invalidlocationexception
+* @throws illegalstateexception
+*/
+private void recover   throws illegalstateexception  ioexception
+referencestoreadapter clearmessages
+referencestoreadapter recoverstate
+location pos   null
+int redocounter   0
+log info     asyncdatamanager
+long start   system currenttimemillis
+connectioncontext context   new connectioncontext new noncachedmessageevaluationcontext
+// while we have records in the journal.
+while   pos   asyncdatamanager getnextlocation pos      null
+bytesequence data   asyncdatamanager read pos
+datastructure c    datastructure wireformat unmarshal data
+if  c instanceof message
+message message    message c
+amqmessagestore store    amqmessagestore createmessagestore message getdestination
+if  message isintransaction
+transactionstore addmessage store  message  pos
+else
+if  store replayaddmessage context  message  pos
+redocounter
+else
+switch  c getdatastructuretype
+case journalqueueack data_structure_type
+journalqueueack command    journalqueueack c
+amqmessagestore store    amqmessagestore createmessagestore command getdestination
+if  command getmessageack   isintransaction
+transactionstore removemessage store  command getmessageack    pos
+else
+if  store replayremovemessage context  command getmessageack
+redocounter
+break
+case journaltopicack data_structure_type
+journaltopicack command    journaltopicack c
+amqtopicmessagestore store    amqtopicmessagestore createmessagestore command getdestination
+if  command gettransactionid      null
+transactionstore acknowledge store  command  pos
+else
+if  store replayacknowledge context  command getclientid    command getsubscritionname    command getmessageid
+redocounter
+break
+case journaltransaction data_structure_type
+journaltransaction command    journaltransaction c
+try
+// try to replay the packet.
+switch  command gettype
+case journaltransaction xa_prepare
+transactionstore replayprepare command gettransactionid
+break
+case journaltransaction xa_commit
+case journaltransaction local_commit
+amqtx tx   transactionstore replaycommit command gettransactionid    command getwasprepared
+if  tx    null
+break     we may be trying to replay a commit
+// that
+// was already committed.
+// replay the committed operations.
+tx getoperations
+for  iterator iter   tx getoperations   iterator    iter hasnext
+amqtxoperation op    amqtxoperation iter next
+if  op replay this  context
+redocounter
+break
+case journaltransaction local_rollback
+case journaltransaction xa_rollback
+transactionstore replayrollback command gettransactionid
+break
+default
+throw new ioexception     command gettype
+catch  ioexception e
+log error     c       e  e
+break
+case journaltrace data_structure_type
+journaltrace trace    journaltrace c
+log debug     trace getmessage
+break
+default
+log error     c
+location location   writetracemessage     new date    true
+asyncdatamanager setmark location  true
+long end   system currenttimemillis
+log info     redocounter         end   start    1000 0f
+private ioexception createreadexception location location  exception e
+return ioexceptionsupport create     location       e  e
+protected ioexception createwriteexception datastructure packet  exception e
+return ioexceptionsupport create     packet       e  e
+protected ioexception createwriteexception string command  exception e
+return ioexceptionsupport create     command       e  e
+protected ioexception createrecoveryfailedexception exception e
+return ioexceptionsupport create     e  e
+/**
+* @param command
+* @param synchint
+* @return
+* @throws ioexception
+*/
+public location writecommand datastructure command  boolean synchint  throws ioexception
+return asyncdatamanager write wireformat marshal command   synchint    synconwrite
+private location writetracemessage string message  boolean sync  throws ioexception
+journaltrace trace   new journaltrace
+trace setmessage message
+return writecommand trace  sync
+public void onusagechanged usage usage  int oldpercentusage  int newpercentusage
+newpercentusage    newpercentusage   10    10
+oldpercentusage    oldpercentusage   10    10
+if  newpercentusage >  70    oldpercentusage < newpercentusage
+checkpoint false
+public amqtransactionstore gettransactionstore
+return transactionstore
+public synchronized void deleteallmessages   throws ioexception
+deleteallmessages   true
+public string tostring
+return     directory
+// /////////////////////////////////////////////////////////////////
+// subclass overridables
+// /////////////////////////////////////////////////////////////////
+protected asyncdatamanager createasyncdatamanager
+asyncdatamanager manager   new asyncdatamanager storesize
+manager setdirectory new file directory
+manager setdirectoryarchive getdirectoryarchive
+manager setarchivedatalogs isarchivedatalogs
+manager setmaxfilelength maxfilelength
+manager setusenio usenio
+return manager
+protected kahareferencestoreadapter createreferencestoreadapter   throws ioexception
+kahareferencestoreadapter adaptor   new kahareferencestoreadapter storesize
+adaptor setpersistentindex ispersistentindex
+adaptor setindexbinsize getindexbinsize
+adaptor setindexkeysize getindexkeysize
+adaptor setindexpagesize getindexpagesize
+return adaptor
+protected taskrunnerfactory createtaskrunnerfactory
+return defaultthreadpools getdefaulttaskrunnerfactory
+// /////////////////////////////////////////////////////////////////
+// property accessors
+// /////////////////////////////////////////////////////////////////
+public asyncdatamanager getasyncdatamanager
+return asyncdatamanager
+public void setasyncdatamanager asyncdatamanager asyncdatamanager
+this asyncdatamanager   asyncdatamanager
+public referencestoreadapter getreferencestoreadapter
+return referencestoreadapter
+public taskrunnerfactory gettaskrunnerfactory
+return taskrunnerfactory
+public void settaskrunnerfactory taskrunnerfactory taskrunnerfactory
+this taskrunnerfactory   taskrunnerfactory
+/**
+* @return returns the wireformat.
+*/
+public wireformat getwireformat
+return wireformat
+public void setwireformat wireformat wireformat
+this wireformat   wireformat
+public systemusage getusagemanager
+return usagemanager
+public void setusagemanager systemusage usagemanager
+this usagemanager   usagemanager
+public int getmaxcheckpointmessageaddsize
+return maxcheckpointmessageaddsize
+/**
+* when set using xbean, you can use values such as: "20
+* mb", "1024 kb", or "1 gb"
+*
+* @org.apache.xbean.property propertyeditor="org.apache.activemq.util.memorypropertyeditor"
+*/
+public void setmaxcheckpointmessageaddsize int maxcheckpointmessageaddsize
+this maxcheckpointmessageaddsize   maxcheckpointmessageaddsize
+public synchronized file getdirectory
+return directory
+public synchronized void setdirectory file directory
+this directory   directory
+public boolean issynconwrite
+return this synconwrite
+public void setsynconwrite boolean synconwrite
+this synconwrite   synconwrite
+/**
+* @param referencestoreadapter the referencestoreadapter to set
+*/
+public void setreferencestoreadapter referencestoreadapter referencestoreadapter
+this referencestoreadapter   referencestoreadapter
+public long size
+return storesize get
+public boolean isusenio
+return usenio
+public void setusenio boolean usenio
+this usenio   usenio
+public int getmaxfilelength
+return maxfilelength
+/**
+* when set using xbean, you can use values such as: "20
+* mb", "1024 kb", or "1 gb"
+*
+* @org.apache.xbean.property propertyeditor="org.apache.activemq.util.memorypropertyeditor"
+*/
+public void setmaxfilelength int maxfilelength
+this maxfilelength   maxfilelength
+public long getcleanupinterval
+return cleanupinterval
+public void setcleanupinterval long cleanupinterval
+this cleanupinterval   cleanupinterval
+public long getcheckpointinterval
+return checkpointinterval
+public void setcheckpointinterval long checkpointinterval
+this checkpointinterval   checkpointinterval
+public int getindexbinsize
+return indexbinsize
+public void setindexbinsize int indexbinsize
+this indexbinsize   indexbinsize
+public int getindexkeysize
+return indexkeysize
+public void setindexkeysize int indexkeysize
+this indexkeysize   indexkeysize
+public int getindexpagesize
+return indexpagesize
+/**
+* when set using xbean, you can use values such as: "20
+* mb", "1024 kb", or "1 gb"
+*
+* @org.apache.xbean.property propertyeditor="org.apache.activemq.util.memorypropertyeditor"
+*/
+public void setindexpagesize int indexpagesize
+this indexpagesize   indexpagesize
+public int getmaxreferencefilelength
+return maxreferencefilelength
+/**
+* when set using xbean, you can use values such as: "20
+* mb", "1024 kb", or "1 gb"
+*
+* @org.apache.xbean.property propertyeditor="org.apache.activemq.util.memorypropertyeditor"
+*/
+public void setmaxreferencefilelength int maxreferencefilelength
+this maxreferencefilelength   maxreferencefilelength
+public file getdirectoryarchive
+return directoryarchive
+public void setdirectoryarchive file directoryarchive
+this directoryarchive   directoryarchive
+public boolean isarchivedatalogs
+return archivedatalogs
+public void setarchivedatalogs boolean archivedatalogs
+this archivedatalogs   archivedatalogs
+public boolean isdisablelocking
+return disablelocking
+public void setdisablelocking boolean disablelocking
+this disablelocking   disablelocking
+protected void addinprogressdatafile amqmessagestore store int datafileid
+set<integer>set   datafilesinprogress get store
+if  set    null
+set   new copyonwritearrayset<integer>
+datafilesinprogress put store  set
+set add datafileid
+protected void removeinprogressdatafile amqmessagestore store int datafileid
+set<integer>set   datafilesinprogress get store
+if  set    null
+set remove datafileid
+protected void lock   throws ioexception  interruptedexception
+boolean logged   false
+boolean aquiredlock   false
+do
+if  dolock
+aquiredlock   true
+else
+if   logged
+log warn     getdirectory
+logged   true
+thread sleep 1000
+if  aquiredlock    logged
+log info     getdirectory
+while   aquiredlock     disablelocking
+private synchronized void unlock   throws ioexception
+if   disablelocking     null    lock
+//clear property doesn't work on some platforms
+system getproperties   remove getpropertykey
+system clearproperty getpropertykey
+assert system getproperty getpropertykey     null
+if  lock isvalid
+lock release
+lock channel   close
+lock   null
+protected boolean dolock   throws ioexception
+boolean result   true
+if   disablelocking    directory    null    lock    null
+string key   getpropertykey
+string property   system getproperty key
+if  null    property
+if   broken_file_lock
+lock   lockfile getchannel   trylock
+if  lock    null
+result   false
+else
+system setproperty key  new date   tostring
+else      already locked
+result   false
+return result
+private string getpropertykey   throws ioexception
+return getclass   getname         directory getcanonicalpath
+static
+broken_file_lock     equals system getproperty property_prefix
+disable_locking     equals system getproperty property_prefix

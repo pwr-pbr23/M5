@@ -1,0 +1,357 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq broker region
+import java io ioexception
+import java util arraylist
+import java util linkedlist
+import java util list
+import java util concurrent atomic atomiclong
+import javax jms jmsexception
+import org apache activemq broker broker
+import org apache activemq broker connectioncontext
+import org apache activemq broker region cursors filependingmessagecursor
+import org apache activemq broker region cursors pendingmessagecursor
+import org apache activemq broker region cursors vmpendingmessagecursor
+import org apache activemq broker region policy messageevictionstrategy
+import org apache activemq broker region policy oldestmessageevictionstrategy
+import org apache activemq command consumercontrol
+import org apache activemq command consumerinfo
+import org apache activemq command message
+import org apache activemq command messageack
+import org apache activemq command messagedispatch
+import org apache activemq command messagedispatchnotification
+import org apache activemq command messagepull
+import org apache activemq command response
+import org apache activemq transaction synchronization
+import org apache activemq usage systemusage
+import org apache commons logging log
+import org apache commons logging logfactory
+public class topicsubscription extends abstractsubscription
+private static final log log   logfactory getlog topicsubscription class
+private static final atomiclong cursor_name_counter   new atomiclong 0
+protected pendingmessagecursor matched
+protected final systemusage usagemanager
+protected atomiclong dispatchedcounter   new atomiclong
+boolean singledestination   true
+destination destination
+private int maximumpendingmessages    1
+private messageevictionstrategy messageevictionstrategy   new oldestmessageevictionstrategy
+private int discarded
+private final object matchedlistmutex   new object
+private final atomiclong enqueuecounter   new atomiclong 0
+private final atomiclong dequeuecounter   new atomiclong 0
+private int memoryusagehighwatermark   95
+private boolean slowconsumer
+public topicsubscription broker broker connectioncontext context  consumerinfo info  systemusage usagemanager  throws exception
+super broker  context  info
+this usagemanager   usagemanager
+string matchedname       cursor_name_counter getandincrement         info getconsumerid   tostring
+if  info getdestination   istemporary      broker    null    broker gettempdatastore    null
+this matched   new vmpendingmessagecursor
+else
+this matched   new filependingmessagecursor broker matchedname
+public void init   throws exception
+this matched setsystemusage usagemanager
+this matched setmemoryusagehighwatermark getcursormemoryhighwatermark
+this matched start
+public void add messagereference node  throws exception
+enqueuecounter incrementandget
+node incrementreferencecount
+if   isfull      matched isempty        isslave
+// if maximumpendingmessages is set we will only discard messages
+// which
+// have not been dispatched (i.e. we allow the prefetch buffer to be
+// filled)
+dispatch node
+slowconsumer false
+else
+//we are slow
+if  slowconsumer
+slowconsumer true
+for  destination dest  destinations
+dest slowconsumer getcontext    this
+if  maximumpendingmessages    0
+synchronized  matchedlistmutex
+matched addmessagelast node
+// note - be careful about the slavebroker!
+if  maximumpendingmessages > 0
+// calculate the high water mark from which point we
+// will eagerly evict expired messages
+int max   messageevictionstrategy getevictexpiredmessageshighwatermark
+if  maximumpendingmessages > 0    maximumpendingmessages < max
+max   maximumpendingmessages
+if   matched isempty      matched size   > max
+removeexpiredmessages
+// lets discard old messages as we are a slow consumer
+while   matched isempty      matched size   > maximumpendingmessages
+int pageinsize   matched size     maximumpendingmessages
+// only page in a 1000 at a time - else we could
+// blow da memory
+pageinsize   math max 1000  pageinsize
+linkedlist list   null
+messagereference oldmessages null
+synchronized matched
+list   matched pageinlist pageinsize
+oldmessages   messageevictionstrategy evictmessages list
+int messagestoevict   0
+if  oldmessages    null
+messagestoevict   oldmessages length
+for  int i   0  i < messagestoevict  i
+messagereference oldmessage   oldmessages
+discard oldmessage
+// lets avoid an infinite loop if we are given a bad
+// eviction strategy
+// for a bad strategy lets just not evict
+if  messagestoevict    0
+log warn     messageevictionstrategy
+break
+dispatchmatched
+/**
+* discard any expired messages from the matched list. called from a
+* synchronized block.
+*
+* @throws ioexception
+*/
+protected void removeexpiredmessages   throws ioexception
+try
+matched reset
+while  matched hasnext
+messagereference node   matched next
+if  broker isexpired node
+matched remove
+dispatchedcounter incrementandget
+node decrementreferencecount
+node getregiondestination   getdestinationstatistics   getexpired   increment
+broker messageexpired getcontext    node
+break
+finally
+matched release
+public void processmessagedispatchnotification messagedispatchnotification mdn
+synchronized  matchedlistmutex
+try
+matched reset
+while  matched hasnext
+messagereference node   matched next
+if  node getmessageid   equals mdn getmessageid
+matched remove
+dispatchedcounter incrementandget
+node decrementreferencecount
+break
+finally
+matched release
+public synchronized void acknowledge final connectioncontext context  final messageack ack  throws exception
+// handle the standard acknowledgment case.
+if  ack isstandardack      ack ispoisonack      ack isindividualack
+if  context isintransaction
+context gettransaction   addsynchronization new synchronization
+public void aftercommit   throws exception
+synchronized  topicsubscription this
+if  singledestination    destination    null
+destination getdestinationstatistics   getdequeues   add ack getmessagecount
+dequeuecounter addandget ack getmessagecount
+dispatchmatched
+else
+if  singledestination    destination    null
+destination getdestinationstatistics   getdequeues   add ack getmessagecount
+destination getdestinationstatistics   getinflight   subtract ack getmessagecount
+dequeuecounter addandget ack getmessagecount
+dispatchmatched
+return
+else if  ack isdeliveredack
+// message was delivered but not acknowledged: update pre-fetch
+// counters.
+// also. get these for a consumer expired message.
+if  destination    null     ack isintransaction
+destination getdestinationstatistics   getdequeues   add ack getmessagecount
+destination getdestinationstatistics   getinflight   subtract ack getmessagecount
+dequeuecounter addandget ack getmessagecount
+dispatchmatched
+return
+throw new jmsexception     ack
+public response pullmessage connectioncontext context  messagepull pull  throws exception
+// not supported for topics
+return null
+public int getpendingqueuesize
+return matched
+public int getdispatchedqueuesize
+return  int  dispatchedcounter get     dequeuecounter get
+public int getmaximumpendingmessages
+return maximumpendingmessages
+public long getdispatchedcounter
+return dispatchedcounter get
+public long getenqueuecounter
+return enqueuecounter get
+public long getdequeuecounter
+return dequeuecounter get
+/**
+* @return the number of messages discarded due to being a slow consumer
+*/
+public int discarded
+synchronized  matchedlistmutex
+return discarded
+/**
+* @return the number of matched messages (messages targeted for the
+*         subscription but not yet able to be dispatched due to the
+*         prefetch buffer being full).
+*/
+public int matched
+synchronized  matchedlistmutex
+return matched size
+/**
+* sets the maximum number of pending messages that can be matched against
+* this consumer before old messages are discarded.
+*/
+public void setmaximumpendingmessages int maximumpendingmessages
+this maximumpendingmessages   maximumpendingmessages
+public messageevictionstrategy getmessageevictionstrategy
+return messageevictionstrategy
+/**
+* sets the eviction strategy used to decide which message to evict when the
+* slow consumer needs to discard messages
+*/
+public void setmessageevictionstrategy messageevictionstrategy messageevictionstrategy
+this messageevictionstrategy   messageevictionstrategy
+// implementation methods
+// -------------------------------------------------------------------------
+public boolean isfull
+return getdispatchedqueuesize    >  info getprefetchsize
+public int getinflightsize
+return getdispatchedqueuesize
+/**
+* @return true when 60% or more room is left for dispatching messages
+*/
+public boolean islowwatermark
+return getdispatchedqueuesize   <   info getprefetchsize      4
+/**
+* @return true when 10% or less room is left for dispatching messages
+*/
+public boolean ishighwatermark
+return getdispatchedqueuesize   >   info getprefetchsize      9
+/**
+* @param memoryusagehighwatermark the memoryusagehighwatermark to set
+*/
+public void setmemoryusagehighwatermark int memoryusagehighwatermark
+this memoryusagehighwatermark   memoryusagehighwatermark
+/**
+* @return the memoryusagehighwatermark
+*/
+public int getmemoryusagehighwatermark
+return this memoryusagehighwatermark
+/**
+* @return the usagemanager
+*/
+public systemusage getusagemanager
+return this usagemanager
+/**
+* @return the matched
+*/
+public pendingmessagecursor getmatched
+return this matched
+/**
+* @param matched the matched to set
+*/
+public void setmatched pendingmessagecursor matched
+this matched   matched
+/**
+* inform the messageconsumer on the client to change it's prefetch
+*
+* @param newprefetch
+*/
+public void updateconsumerprefetch int newprefetch
+if  context    null    context getconnection      null    context getconnection   ismanageable
+consumercontrol cc   new consumercontrol
+cc setconsumerid info getconsumerid
+cc setprefetch newprefetch
+context getconnection   dispatchasync cc
+private void dispatchmatched   throws ioexception
+synchronized  matchedlistmutex
+if   matched isempty       isfull
+try
+matched reset
+while  matched hasnext       isfull
+messagereference message    messagereference  matched
+next
+matched remove
+// message may have been sitting in the matched list a
+// while
+// waiting for the consumer to ak the message.
+if  message isexpired
+discard message
+continue     just drop it
+dispatch message
+finally
+matched release
+private void dispatch final messagereference node  throws ioexception
+message message    message node
+// make sure we can dispatch a message.
+messagedispatch md   new messagedispatch
+md setmessage message
+md setconsumerid info getconsumerid
+md setdestination node getregiondestination   getactivemqdestination
+dispatchedcounter incrementandget
+// keep track if this subscription is receiving messages from a single
+// destination.
+if  singledestination
+if  destination    null
+destination   node getregiondestination
+else
+if  destination    node getregiondestination
+singledestination   false
+if  info isdispatchasync
+md settransmitcallback new runnable
+public void run
+node getregiondestination   getdestinationstatistics   getdispatched   increment
+node getregiondestination   getdestinationstatistics   getinflight   increment
+node decrementreferencecount
+context getconnection   dispatchasync md
+else
+context getconnection   dispatchsync md
+node getregiondestination   getdestinationstatistics   getdispatched   increment
+node getregiondestination   getdestinationstatistics   getinflight   increment
+node decrementreferencecount
+private void discard messagereference message
+message decrementreferencecount
+matched remove message
+discarded
+if destination    null
+destination getdestinationstatistics   getdequeues   increment
+if  log isdebugenabled
+log debug     message
+destination dest   message getregiondestination
+if  dest    null
+dest messagediscarded getcontext    message
+broker getroot   sendtodeadletterqueue getcontext    message
+public string tostring
+return         info getconsumerid         destinations size         getdispatchedqueuesize
+getdequeuecounter         matched         discarded
+public void destroy
+synchronized  matchedlistmutex
+try
+matched destroy
+catch  exception e
+log warn    e
+public int getprefetchsize
+return  int info getprefetchsize
+/**
+* get the list of inflight messages
+* @return the list
+*/
+public synchronized list<messagereference> getinflightmessages
+list<messagereference> result   new arraylist<messagereference>
+synchronized matched
+result addall matched pageinlist 1000
+return result

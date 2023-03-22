@@ -1,0 +1,2038 @@
+/*
+derby - class org.apache.derby.client.am.statement
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby client am
+import java sql sqlexception
+import java util arrays
+import org apache derby shared common reference sqlstate
+import org apache derby shared common sanity sanitymanager
+public class statement implements java sql statement  statementcallbackinterface
+// jdbc 3 constant indicating that the current resultset object
+// should be closed when calling getmoreresults.
+// constant value matches that defined by jdbc 3 java.sql.statement.close_current_result
+public final static int close_current_result   1
+// jdbc 3 constant indicating that the current resultset object
+// should not be closed when calling getmoreresults.
+// constant value matches that defined by jdbc 3 java.sql.statement.keep_current_result
+public final static int keep_current_result   2
+// jdbc 3 constant indicating that all resultset objects that
+// have previously been kept open should be closed when calling getmoreresults.
+// constant value matches that defined by jdbc 3 java.sql.statement.close_all_results
+public final static int close_all_results   3
+//---------------------navigational members-----------------------------------
+public materialstatement materialstatement_   null
+connection connection_
+public section section_
+agent agent_
+/** the owner of this statement, if any. */
+private java sql statement owner   null
+resultset resultset_
+// use -1, if there is no update count returned, ie. when result set is returned. 0 is a valid update count for ddl.
+int updatecount_    1
+int returnvaluefromprocedure_
+// enumeration of the flavors of statement execute call used.
+static final int executequerymethod__   1
+static final int executeupdatemethod__   2
+static final int executemethod__   3
+// sqlmode_ will be moved to ps as soon as we remove the hack reference in completeexecute()
+// enumerated in statement: s.sqlisquery__, s.sqliscall__, s.sqlisupdate__
+// determines whether sql_ starts with select/values, call, or other (assumed to be an update).
+protected int sqlmode_   0
+// enum for sqlmode_:
+static final int isquery__   0x1     sql starts with select     or values
+static final int iscall__   0x2     sql starts with call
+static final int isupdate__   0x4     all other sql is categorized as a update dml or ddl
+// sqlupdatemode_ is only set when the sqlmode_ == isupdate__
+int sqlupdatemode_   0
+// enum for sqlupdatemode_:
+public final static int iscommitsql__   0x1
+public final static int isrollbacksql__   0x2
+final static int ispositionedupdatedeletesql__   0x10
+final static int isinsertsql__   0x20            used to recognize   for auto generated keys
+final static int isdeletesql__   0x40            used to recognize   for parsing cursorname
+final static int isupdatesql__   0x80            used to recognize   for parsing cursorname
+columnmetadata resultsetmetadata_     type information for output sqlda
+// these two are used during parsing of literals for call statement.
+// please add a comment desribing what why you can't reuse inputs_ and parametermetadata_
+// members for the literal inputs
+// caching the cursor object for reuse.
+public cursor cachedcursor_   null
+public cursor cachedsingletonrowdata_   null
+boolean ispreparedstatement_   false
+//---------------------navigational cheat-links-------------------------------
+// cheat-links are for convenience only, and are not part of the conceptual model.
+// warning:
+//   cheat-links should only be defined for invariant state data.
+//   that is, state data that is set by the constructor and never changes.
+//-----------------------------state------------------------------------------
+// jdbc 1 positioned updates are implemented via
+// sql scan for "...where current of <users-cursor-name>",
+// the addition of mappings from cursor names to query sections,
+// and the subtitution of <users-cursor-name> with <canned-cursor-name> in the pass-thru sql string
+// "...where current of <canned-cursor-name>" when user-defined cursor names are used.
+// both "canned" cursor names (from our jdbc package set) and user-defined cursor names are mapped.
+// statement.cursorname_ is initialized to null until the cursor name is requested or set.
+// s.setcursorname()) adds a user-defined name, but it is not
+// added to the cursor map until execution time (derby-1036);
+// when requested (rs.getcursorname()), if the cursor name is still null,
+// then is given the canned cursor name as defined by our jdbc package set.
+// still need to consider how positioned updates should interact with multiple result sets from a stored.
+string cursorname_   null
+// this means the client-side jdbc statement object is open.
+// this value is set to true when the statement object is constructed, and will not change
+// until statement.close() is called either directly or via connection.close(), finalizer, or other methods.
+boolean openonclient_   true
+// this means a derby server-side section for this statement is in the prepared state.
+// a client-side jdbc statement may remain open across commits (openonclient=true),
+// but the server-side derby section moves to an unprepared state (openonserver=false) across commits,
+// requiring an implicit re-prepare "under the covers" by the driver.
+// unprepared jdbc query statements still have prepared sections on the server.
+// this openonserver_ only has implications for preparedstatement
+boolean openonserver_   false
+//private int indexofcurrentresultset_ = -1;
+protected int indexofcurrentresultset_    1
+resultset resultsetlist_   null       array of resultset objects
+protected final static string timeout_statement
+protected java util arraylist timeoutarraylist   new java util arraylist 1
+protected boolean dowritetimeout   false
+int timeout_   0     for query timeout in seconds
+int maxrows_   0
+int maxfieldsize_   0     zero means that there is no limit to the size of a column
+// when this is false we skip autocommit for this preparedstatement.
+// this is needed when the preparedstatement object is used internally by
+// the driver and a commit is not desired, e.g., blob/clob api calls
+boolean isautocommittablestatement_   true
+// the user has no control over the statement that owns a catalog query, and has no ability to close that statement.
+// we need a special member variable on our internal catalog query statements so that
+// when the catalog query is closed, the result set will know to close it's owning statement.
+boolean iscatalogquery_   false
+// this collection is used for two different purposes:
+//   for statement batching it contains the batched sql strings.
+//   for prepared statement batching it contains the batched input rows.
+final java util arraylist batch_   new java util arraylist
+// scrollable cursor attributes
+public int resultsettype_   java sql resultset type_forward_only
+public int resultsetconcurrency_   java sql resultset concur_read_only
+public int resultsetholdability_
+// this is ignored by the driver if this is zero.
+// for the net forward-only result set, if fetchsize is unset, we let the server return however many rows will fit in a query block.
+// for the net scrollable result set, then we use a default of 64 rows.
+public int fetchsize_   0
+public int fetchdirection_   java sql resultset fetch_forward
+// conceptually this doesn't belong in statement, but belongs in preparedstatement,
+// since statement doesn't know about params, so we're just putting it here perhaps temporarily,
+// used for callable statement out paramters.
+public cursor singletonrowdata_   null
+// number of invisible result sets returned from a stored procedure.
+public int numinvisiblers_   0
+// this is a cache of the attributes to be sent on prepare.
+// think about caching the entire prepare ddm string for the re-prepares
+public string cursorattributestosendonprepare_   null
+// the following members are for the exclusive use of prepared statements that require auto-generated keys to be returned
+public preparedstatement preparedstatementforautogeneratedkeys_
+public resultset generatedkeysresultset_
+public string generatedkeyscolumnnames_
+public int generatedkeyscolumnindexes_
+public int autogeneratedkeys_   java sql statement no_generated_keys
+// this flag makes sure that only one copy of this statement
+// will be in connection_.commitlisteners_.
+private sqlwarning warnings_   null
+// a statement is not poolable by default. the constructor for
+// preparedstatement overrides this.
+protected boolean ispoolable   false
+//---------------------constructors/finalizer/accessors--------------------
+private statement
+initstatement
+private void resetstatement
+initstatement
+private void initstatement
+materialstatement_   null
+connection_   null
+agent_   null
+resultsettype_   java sql resultset type_forward_only
+resultsetconcurrency_   java sql resultset concur_read_only
+resultsetholdability_   0
+cursorattributestosendonprepare_   null
+if  timeoutarraylist size      0
+timeoutarraylist add null      make sure the list's length is 1
+initresetstatement
+private void initresetstatement
+initresetpreparedstatement
+//section_ = null; // don't set section to null because write piggyback command require a section
+if  section_    null
+section_ free
+if  setspecialregistersection_    null
+setspecialregistersection_ free
+setspecialregistersection_   null
+sqlmode_   0
+sqlupdatemode_   0
+resultsetmetadata_   null
+protected void initresetpreparedstatement
+warnings_   null
+//section_ = null;
+resultset_   null
+updatecount_    1
+returnvaluefromprocedure_   0
+openonclient_   true
+openonserver_   false
+indexofcurrentresultset_    1
+resultsetlist_   null
+iscatalogquery_   false
+isautocommittablestatement_   true
+batch_ clear
+singletonrowdata_   null
+numinvisiblers_   0
+preparedstatementforautogeneratedkeys_   null
+generatedkeysresultset_   null
+generatedkeyscolumnnames_   null
+generatedkeyscolumnindexes_   null
+autogeneratedkeys_   java sql statement no_generated_keys
+resetusercontrollableattributes
+/**
+* resets attributes that can be modified by the user through the
+* {@link java.sql.statement} interface to default values.
+*/
+private void resetusercontrollableattributes
+cursorname_   null     setcursorname
+timeout_   0     setquerytimeout
+dowritetimeout   false     setquerytimeout
+maxrows_   0     setmaxrows
+maxfieldsize_   0     setmaxfieldsize
+fetchsize_   0     setfetchsize
+fetchdirection_   java sql resultset fetch_forward     setfetchdirection
+ispoolable   ispreparedstatement_
+// calls to setescapeprocessing is currently a noop, nothing to reset.
+// if a datasource is passed into resetclientconnection(), then we will assume
+// properties on the datasource may have changed, and we will need to go through
+// the open-statement list on the connection and do a full reset on all statements,
+// including preparedstatement's and callablestatement's.  this is because property
+// change may influence the section we allocate for the preparedstatement, and
+// also the cursor attributes, i.e. setcursorsensitivity().
+// if no datasource is passed into resetclientconnection(), then we will do the
+// minimum reset required for preparedstatement's and callablestatement's.
+public void reset boolean fullreset  throws sqlexception
+if  fullreset
+connection_ resetstatement this
+else
+initresetstatement
+materialstatement_ reset_
+/**
+* resets the statement for reuse in a statement pool.
+* <p>
+* intended to be used only by prepared or callable statements, as
+* {@link java.sql.statement} objects aren't pooled.
+* <p>
+* the following actions are taken:
+* <ul> <li>batches are cleared.</li>
+*      <li>warnings are cleared.</li>
+*      <li>open result set are closed on the client and the server.</li>
+*      <li>cached cursor names are cleared.</li>
+*      <li>statement for fetching auto-generated keys is closed.</li>
+*      <li>special registers are reset.</li>
+*      <li>user controllable attributes are reset to defaults, for instance
+*          query timeout and max rows to fetch.</li>
+* </ul>
+*
+* @throws sqlexception if resetting the statement fails
+*/
+void resetforreuse
+throws sqlexception
+this batch_ clear
+clearwarningsx
+// close open resultsets.
+// regardless of whether or not this statement is in the prepared state,
+// we need to close any open cursors for this statement on the server.
+int numberofresultsetstoclose   0
+if  resultsetlist_    null
+numberofresultsetstoclose   resultsetlist_ length
+try
+if  willtickleserver
+numberofresultsetstoclose  connection_ autocommit_
+flowclose
+else
+flowcloseoutsideuow
+finally
+// if an exception is thrown above, the statement should not be put
+// back into the statement pool, as the state may not be consistent.
+markresultsetsclosed
+// in case a cursorname was set on the statement but the statement
+// was never used to execute a query, the cursorname will not be
+// remove when the resultsets are mark closed, so we need to remove
+// the cursorname from the cache.
+removeclientcursornamefromcache
+markpreparedstatementforautogeneratedkeysclosed
+if  setspecialregistersection_    null
+setspecialregistersection_ free
+setspecialregistersection_   null
+resetusercontrollableattributes
+public statement agent agent  connection connection  throws sqlexception
+this
+initstatement agent  connection
+public void resetstatement agent agent  connection connection  throws sqlexception
+resetstatement
+initstatement agent  connection
+private void initstatement agent agent  connection connection
+agent_   agent
+connection_   connection
+// for jdbc 2 statements with scroll attributes
+public statement agent agent  connection connection  int type  int concurrency  int holdability
+int autogeneratedkeys  string columnnames  int columnindexes  throws sqlexception
+this agent  connection
+initstatement type  concurrency  holdability  autogeneratedkeys  columnnames
+columnindexes
+public void resetstatement agent agent  connection connection  int type  int concurrency  int holdability
+int autogeneratedkeys  string columnnames  int columnindexes  throws sqlexception
+resetstatement agent  connection
+initstatement type  concurrency  holdability  autogeneratedkeys  columnnames  columnindexes
+private void initstatement int type  int concurrency  int holdability
+int autogeneratedkeys  string columnnames
+int columnindexes  throws sqlexception
+switch  type
+case java sql resultset type_forward_only
+case java sql resultset type_scroll_insensitive
+case java sql resultset type_scroll_sensitive
+resultsettype_   type
+break
+default
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate invalid_api_parameter
+new integer type
+switch  concurrency
+case java sql resultset concur_read_only
+case java sql resultset concur_updatable
+resultsetconcurrency_   concurrency
+break
+default
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate invalid_api_parameter
+new integer concurrency
+switch  holdability
+case resultset close_cursors_at_commit
+case resultset hold_cursors_over_commit
+resultsetholdability_   holdability
+break
+default
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate invalid_api_parameter
+new integer holdability
+switch  autogeneratedkeys
+case java sql statement no_generated_keys
+case java sql statement return_generated_keys
+autogeneratedkeys_   autogeneratedkeys
+break
+default
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate invalid_api_parameter
+new integer autogeneratedkeys
+generatedkeyscolumnnames_   columnnames
+generatedkeyscolumnindexes_   columnindexes
+/* (non-javadoc)
+* @see java.lang.object#finalize()
+*
+* this method cleans up client-side resources by calling markclosed().
+* it is different from close() method, which also does clean up on server.
+* changes done as part of derby-210.
+*/
+protected void finalize   throws java lang throwable
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this
+if  openonclient_
+markclosed
+super finalize
+/*
+* accessor to state variable warnings_
+*/
+protected sqlwarning getsqlwarnings
+return warnings_
+// ---------------------------jdbc 1------------------------------------------
+public java sql resultset executequery string sql  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     sql
+resultset resultset   executequeryx sql
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     resultset
+return resultset
+catch   sqlexception se
+throw se getsqlexception
+private resultset executequeryx string sql  throws sqlexception
+flowexecute executequerymethod__  sql
+return resultset_
+public int executeupdate string sql  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     sql
+int updatevalue   executeupdatex sql
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     updatevalue
+return updatevalue
+catch   sqlexception se
+throw se getsqlexception
+private int executeupdatex string sql  throws sqlexception
+flowexecute executeupdatemethod__  sql
+return updatecount_
+/**
+* returns false unless <code>iface</code> is implemented
+*
+* @param  iface                  a class defining an interface.
+* @return true                   if this implements the interface or
+*                                directly or indirectly wraps an object
+*                                that does.
+* @throws java.sql.sqlexception  if an error occurs while determining
+*                                whether this is a wrapper for an object
+*                                with the given interface.
+*/
+public boolean iswrapperfor class iface  throws sqlexception
+try
+checkforclosedstatement
+catch  sqlexception se
+throw se getsqlexception
+return iface isinstance this
+/**
+* tell whether the statement has been closed or not.
+*
+* @return <code>true</code> if closed, <code>false</code> otherwise.
+* @exception sqlexception if a database access error occurs (according to
+*                         spec). never thrown by this implementation.
+*/
+public boolean isclosed
+throws sqlexception
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this      openonclient_
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this      openonclient_
+return  openonclient_
+// the server holds statement resources until transaction end.
+public void close   throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this
+closex
+catch   sqlexception se
+throw se getsqlexception
+/**
+* an untraced version of <code>close</code>. this method cleans up
+* client-side resources and also sends commands to network server to
+* perform clean up. this should not be called in the finalizer.
+* difference between <code>finalize</code> and <code>close</code> is
+* that close method does these things additionally (changes done as
+* part of derby-210):
+* 1) sends commands to the server to close the result sets.
+* 2) sends commands to the server to close the result sets of the
+* generated keys query.
+* 3) sends a commit if autocommit is on and it is appropriate.
+* 4) explicitly removes the statement from connection_.openstatements_
+* and commitandrollbacklisteners_ by passing true to markclosed.
+*
+* we may need to do 1) in finalizer too. this is being tracked in
+* derby-1021
+*
+* @throws sqlexception
+*/
+public void closex   throws sqlexception
+if   openonclient_
+return
+// regardless of whether or not this statement is in the prepared state,
+// we need to close any open cursors for this statement on the server.
+int numberofresultsetstoclose    resultsetlist_    null  ? 0   resultsetlist_ length
+boolean willtickleserver   willtickleserver numberofresultsetstoclose  true
+try
+if  willtickleserver
+flowclose
+else
+flowcloseoutsideuow
+finally
+markclosed true
+/**
+* returns the value of the poolable hint, indicating whether
+* pooling is requested.
+*
+* @return the value of the poolable hint.
+* @throws sqlexception if the statement has been closed.
+*/
+public boolean ispoolable   throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this
+// assert the statement has not been closed
+checkforclosedstatement
+return ispoolable
+catch  sqlexception se
+throw se getsqlexception
+/**
+* requests that a statement be pooled or not.
+*
+* @param poolable requests that the statement be pooled if true
+* and not be pooled if false.
+* @throws sqlexception if the statement has been closed.
+*/
+public void setpoolable boolean poolable  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     poolable
+// assert the statement has not been closed
+checkforclosedstatement
+ispoolable   poolable
+catch  sqlexception se
+throw se getsqlexception
+public int getmaxfieldsize   throws sqlexception
+try
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this
+checkforclosedstatement
+return maxfieldsize_
+catch   sqlexception se
+throw se getsqlexception
+public void setmaxfieldsize int max  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     max
+checkforclosedstatement
+if  max < 0
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate invalid_maxfield_size
+new integer max
+maxfieldsize_   max
+catch   sqlexception se
+throw se getsqlexception
+public int getmaxrows   throws sqlexception
+try
+checkforclosedstatement
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     maxrows_
+return maxrows_
+catch   sqlexception se
+throw se getsqlexception
+public void setmaxrows int maxrows  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     maxrows
+checkforclosedstatement       per jdbc spec  see java sql statement close   javadoc
+if  maxrows < 0
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate invalid_max_rows_value
+new integer maxrows
+maxrows_   maxrows
+catch   sqlexception se
+throw se getsqlexception
+public void setescapeprocessing boolean enable  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     enable
+checkforclosedstatement       per jdbc spec  see java sql statement close   javadoc
+catch   sqlexception se
+throw se getsqlexception
+public int getquerytimeout   throws sqlexception
+try
+checkforclosedstatement
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     timeout_
+return timeout_
+catch   sqlexception se
+throw se getsqlexception
+public void setquerytimeout int seconds  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     seconds
+checkforclosedstatement       per jdbc spec  see java sql statement close   javadoc
+if  seconds < 0
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate invalid_querytimeout_value
+new integer seconds
+if  seconds    timeout_
+timeout_   seconds
+dowritetimeout   true
+catch   sqlexception se
+throw se getsqlexception
+public void cancel   throws sqlexception
+try
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this
+checkforclosedstatement       per jdbc spec  see java sql statement close   javadoc
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate cancel_not_supported_by_server
+catch   sqlexception se
+throw se getsqlexception
+public java sql sqlwarning getwarnings   throws sqlexception
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     warnings_
+try
+checkforclosedstatement
+catch  sqlexception se
+throw se getsqlexception
+return warnings_    null ? null   warnings_ getsqlwarning
+public void clearwarnings   throws sqlexception
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this
+try
+checkforclosedstatement
+catch  sqlexception se
+throw se getsqlexception
+clearwarningsx
+// an untraced version of clearwarnings()
+final void clearwarningsx
+warnings_   null
+// dnc statements are already associated with a unique cursor name as defined
+// by our canned dnc package set.
+// resultset.getcursorname() should be used to
+// obtain the for update cursor name to use when executing a positioned update statement.
+// see jdbc 3 spec section 14.2.4.4.
+public void setcursorname string name  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     name
+checkforclosedstatement       per jdbc spec  see java sql statement close   javadoc
+if  name    null    name equals
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate cursor_invalid_name
+name
+// invalid to set the cursor name if there are resultset's open on the statement.
+if  resultset_    null    resultset_ openonclient_
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate lang_cant_invalidate_open_result_set
+// derby-1036: duplicate cursor names not allowed, check
+// deferred till execute time.
+cursorname_   name
+catch   sqlexception se
+throw se getsqlexception
+//----------------------- multiple results --------------------------
+public boolean execute string sql  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     sql
+boolean b   executex sql
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     b
+return b
+catch   sqlexception se
+throw se getsqlexception
+boolean executex string sql  throws sqlexception
+flowexecute executemethod__  sql
+return resultset_    null
+public java sql resultset getresultset   throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this
+checkforclosedstatement       per jdbc spec  see java sql statement close   javadoc
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     resultset_
+return resultset_
+catch   sqlexception se
+throw se getsqlexception
+public int getupdatecount   throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this
+checkforclosedstatement       per jdbc spec  see java sql statement close   javadoc
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     updatecount_
+return updatecount_
+catch   sqlexception se
+throw se getsqlexception
+public boolean getmoreresults   throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this
+boolean resultisresultset   getmoreresultsx close_all_results
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     resultisresultset
+return resultisresultset
+catch   sqlexception se
+throw se getsqlexception
+//--------------------------jdbc 2.0-----------------------------
+public void setfetchdirection int direction  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     direction
+checkforclosedstatement       per jdbc spec  see java sql statement close   javadoc
+switch  direction
+case java sql resultset fetch_forward
+case java sql resultset fetch_reverse
+case java sql resultset fetch_unknown
+fetchdirection_   direction
+break
+default
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate invalid_fetch_direction
+new integer direction
+catch   sqlexception se
+throw se getsqlexception
+public int getfetchdirection   throws sqlexception
+try
+checkforclosedstatement
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     fetchdirection_
+return fetchdirection_
+catch   sqlexception se
+throw se getsqlexception
+public void setfetchsize int rows  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     rows
+checkforclosedstatement       per jdbc spec  see java sql statement close   javadoc
+if  rows < 0     maxrows_    0    rows > maxrows_
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate invalid_st_fetch_size
+new integer rows   getsqlexception
+fetchsize_   rows
+catch   sqlexception se
+throw se getsqlexception
+public int getfetchsize   throws sqlexception
+try
+checkforclosedstatement
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     fetchsize_
+return fetchsize_
+catch   sqlexception se
+throw se getsqlexception
+public int getresultsetconcurrency   throws sqlexception
+try
+checkforclosedstatement
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     resultsetconcurrency_
+return resultsetconcurrency_
+catch   sqlexception se
+throw se getsqlexception
+public int getresultsettype   throws sqlexception
+try
+checkforclosedstatement
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     resultsettype_
+return resultsettype_
+catch   sqlexception se
+throw se getsqlexception
+public void addbatch string sql  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     sql
+checkforclosedstatement
+sql   connection_ nativesqlx sql
+batch_ add sql
+catch   sqlexception se
+throw se getsqlexception
+public void clearbatch   throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this
+checkforclosedstatement
+batch_ clear
+catch   sqlexception se
+throw se getsqlexception
+public int executebatch   throws sqlexception  batchupdateexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this
+int updatecounts   executebatchx
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     updatecounts
+return updatecounts
+catch   sqlexception se
+throw se getsqlexception
+private int executebatchx   throws sqlexception  batchupdateexception
+checkforclosedstatement       per jdbc spec  see java sql statement close   javadoc
+clearwarningsx       per jdbc spec 0 7  and getwarnings   javadoc
+resultsetlist_   null
+// initialize all the updatecounts to indicate failure
+// this is done to account for "chain-breaking" errors where we cannot
+// read any more replies
+int updatecounts   new int
+arrays fill updatecounts   3
+flowexecutebatch updatecounts
+return updatecounts
+public java sql connection getconnection   throws sqlexception
+try
+checkforclosedstatement
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     connection_
+return connection_
+catch   sqlexception se
+throw se getsqlexception
+//--------------------------jdbc 3.0-----------------------------
+public boolean getmoreresults int current  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     current
+boolean resultisresultset   getmoreresultsx current
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     resultisresultset
+return resultisresultset
+catch   sqlexception se
+throw se getsqlexception
+private boolean getmoreresultsx int current  throws sqlexception
+checkforclosedstatement       per jdbc spec  see java sql statement close   javadoc
+boolean resultisresultset
+updatecount_    1
+if  resultsetlist_    null
+if  resultset_    null
+if  current    keep_current_result
+resultset_ closex
+resultset_   null
+resultisresultset   false
+else
+if  numinvisiblers_    0
+current    close_current_result
+resultsetlist_    null
+resultsetlist_ closex
+resultisresultset   indexofcurrentresultset_   1 < resultsetlist_ length
+if   current    close_all_results      numinvisiblers_    0
+int numberofresultsetstoclose    resultsetlist_    null  ? 0   indexofcurrentresultset_   1
+boolean willtickleserver   willtickleserver numberofresultsetstoclose  false
+if  willtickleserver
+flowcloseretrievedresultsets
+else
+flowcloseretrievedresultsetsoutsideuow
+if  resultisresultset
+resultset_   resultsetlist_
+else
+resultset_   null
+return resultisresultset
+public java sql resultset getgeneratedkeys   throws sqlexception
+try
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this
+checkforclosedstatement
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     generatedkeysresultset_
+return generatedkeysresultset_
+catch   sqlexception se
+throw se getsqlexception
+public int executeupdate string sql  int autogeneratedkeys  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     sql  autogeneratedkeys
+autogeneratedkeys_   autogeneratedkeys
+int updatevalue   executeupdatex sql
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     updatevalue
+return updatevalue
+catch   sqlexception se
+throw se getsqlexception
+public int executeupdate string sql  int columnindexes  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     sql  columnindexes
+if  columnindexes    null    columnindexes length > 0
+autogeneratedkeys_   statement return_generated_keys
+generatedkeyscolumnindexes_   columnindexes
+int updatevalue   executeupdatex sql
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     updatevalue
+return updatevalue
+catch   sqlexception se
+throw se getsqlexception
+public int executeupdate string sql  string columnnames  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     sql  columnnames
+if  columnnames    null    columnnames length > 0
+autogeneratedkeys_   statement return_generated_keys
+generatedkeyscolumnnames_   columnnames
+int updatevalue   executeupdatex sql
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     updatevalue
+return updatevalue
+catch   sqlexception se
+throw se getsqlexception
+public boolean execute string sql  int autogeneratedkeys  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     sql  autogeneratedkeys
+autogeneratedkeys_   autogeneratedkeys
+boolean b   executex sql
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     b
+return b
+catch   sqlexception se
+throw se getsqlexception
+public boolean execute string sql  int columnindexes  throws sqlexception
+try
+synchronized connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     sql  columnindexes
+if  columnindexes    null    columnindexes length > 0
+autogeneratedkeys_   statement return_generated_keys
+generatedkeyscolumnindexes_   columnindexes
+boolean b   executex sql
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     b
+return b
+catch   sqlexception se
+throw se getsqlexception
+public boolean execute string sql  string columnnames  throws sqlexception
+try
+synchronized  connection_
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this     sql  columnnames
+if  columnnames    null    columnnames length > 0
+autogeneratedkeys_   statement return_generated_keys
+generatedkeyscolumnnames_   columnnames
+boolean b   executex sql
+if  agent_ loggingenabled
+agent_ logwriter_ traceexit this     b
+return b
+catch   sqlexception se
+throw se getsqlexception
+public int getresultsetholdability   throws sqlexception
+try
+if  agent_ loggingenabled
+agent_ logwriter_ traceentry this
+checkforclosedstatement
+return resultsetholdability_
+catch   sqlexception se
+throw se getsqlexception
+// ----------------------- box car and callback methods ---------------------
+// all callbacks must be client-side only operations.
+// use of materialstatement interface is necessary to avoid multiple inheritance problem in java.
+/**
+* this variable keeps track of a section dediacted to
+* writespecialregister. it gets initialized the first time a
+* section is needed, and freed when the statement is closed.
+*/
+private section setspecialregistersection_   null
+public void writesetspecialregister java util arraylist sqlsttlist
+throws sqlexception
+if  setspecialregistersection_    null
+setspecialregistersection_
+agent_ sectionmanager_ getdynamicsection
+java sql resultset hold_cursors_over_commit
+materialstatement_ writesetspecialregister_ setspecialregistersection_
+sqlsttlist
+public void readsetspecialregister   throws sqlexception
+if  sanitymanager debug
+sanitymanager assert setspecialregistersection_    null
+materialstatement_ readsetspecialregister_
+public void writeexecuteimmediate string sql
+section section  throws sqlexception
+materialstatement_ writeexecuteimmediate_ sql  section
+public void readexecuteimmediate   throws sqlexception
+materialstatement_ readexecuteimmediate_
+public void completeexecuteimmediate sqlca sqlca
+int sqlcode   completesqlca sqlca
+if  sqlcode < 0
+return
+if  sqlca    null
+updatecount_   sqlca getupdatecount
+public void readexecuteimmediateforbatch string sql  throws sqlexception
+materialstatement_ readexecuteimmediateforbatch_ sql
+public void writepreparedescribeoutput string sql
+section section  throws sqlexception
+materialstatement_ writepreparedescribeoutput_ sql  section
+public void readpreparedescribeoutput   throws sqlexception
+materialstatement_ readpreparedescribeoutput_
+public void completepreparedescribeoutput columnmetadata resultsetmetadata
+sqlca sqlca
+completeprepare sqlca
+resultsetmetadata_   resultsetmetadata
+if  agent_ loggingenabled
+agent_ logwriter_ traceresultsetmetadata this  resultsetmetadata_
+// used for re-prepares across commit only
+public void writeprepare string sql  section section  throws sqlexception
+materialstatement_ writeprepare_ sql  section
+public void readprepare   throws sqlexception
+materialstatement_ readprepare_
+public void completeprepare sqlca sqlca
+int sqlcode   completesqlca sqlca
+if  sqlcode < 0
+return
+markprepared
+public void writeopenquery section section
+int fetchsize
+int resultsettype  throws sqlexception
+materialstatement_ writeopenquery_ section
+fetchsize
+resultsettype
+public void readopenquery   throws sqlexception
+materialstatement_ readopenquery_
+public void completeopenquery sqlca sqlca  resultset resultset
+completesqlca sqlca
+resultset_   resultset
+// for net, resultset_ == null when open query fails and receives opnqflrm.
+// then, in netstatementreply.parseopenqueryfailure(), completeopenquery() is
+// invoked with resultset explicitly set to null.
+if  resultset    null
+return
+resultset resultsetmetadata_   resultsetmetadata_
+resultset resultsetmetadata_ resultsetconcurrency_   resultset resultsetconcurrency_
+// create tracker for lob locator columns.
+resultset createlobcolumntracker
+// only cache the cursor object for a preparedstatement and if a cursor object is
+// not already cached.
+if  cachedcursor_    null    ispreparedstatement_
+cachedcursor_   resultset_ cursor_
+// the following two assignments should have already happened via prepareevent(),
+// but are included here for safety for the time being.
+if  sqlca    null    sqlca getsqlcode   < 0
+return
+openonserver_   true
+resultset cursor_ rowsread_   0
+// set fetchsize_ to the default(64) if not set by the user if the resultset is scrollable.
+// this fetchsize_ is used to check for a complete rowset when rowsets are parsed.
+// for scrollable cursors when the fetchsize_ is not set, (fetchsize_ == 0), a default
+// fetchsize of 64 is sent on behalf of the application, so we need to update the fetchsize_
+// here to 64.
+if  resultset_ fetchsize_    0
+resultset_ resultsettype_    java sql resultset type_scroll_insensitive
+resultset_ resultsettype_    java sql resultset type_scroll_sensitive
+resultset_ setfetchsize_ org apache derby client am
+configuration defaultfetchsize
+public void completeexecutecallopenquery sqlca sqlca  resultset resultset  columnmetadata resultsetmetadata  section generatedsection
+resultset completesqlca sqlca
+// for callablestatements we can't just clobber the resultset_ here, must use setresultsetevent() separately
+resultset resultsetmetadata_   resultsetmetadata
+// create tracker for lob locator columns.
+resultset createlobcolumntracker
+// the following two assignments should have already happened via prepareevent(),
+// but are included here for safety for the time being.
+if  sqlca    null    sqlca getsqlcode   < 0
+return
+openonserver_   true
+resultset cursor_ rowsread_   0
+resultset generatedsection_   generatedsection
+// we are always sending the default fetchsize of 64 if not set for stored procedure calls.
+// this is different from the "normal" cursor case for forward_only cursors, where if
+// fetchsize_ is not set, we do not send any default value.  here since we always send
+// the fetchsize_, we need to set it to what we sent.
+if  resultset fetchsize_    0
+resultset fetchsize_   org apache derby client am configuration defaultfetchsize
+public void writeexecutecall boolean outputexpected
+string procedurename
+section section
+int fetchsize
+boolean suppressresultsets     for batch updates    true
+int resultsettype
+columnmetadata parametermetadata
+object inputs  throws sqlexception
+materialstatement_ writeexecutecall_ outputexpected
+procedurename
+section
+fetchsize
+suppressresultsets
+resultsettype
+parametermetadata
+inputs
+public void readexecutecall   throws sqlexception
+materialstatement_ readexecutecall_
+public void completeexecutecall sqlca sqlca  cursor singletonparams  resultset resultsets
+completeexecutecall sqlca  singletonparams
+resultsetlist_   resultsets
+if  resultsets    null
+resultset_   resultsets
+indexofcurrentresultset_   0
+public void completeexecutecall sqlca sqlca  cursor singletonparams     no result sets returned
+completeexecute sqlca
+//if ((sqlca != null) && ((sqlca.getsqlcode() < 0) || (sqlca.getsqlcode() == 100)))
+if  sqlca    null    sqlca getsqlcode   < 0
+singletonrowdata_   null
+else
+singletonrowdata_   singletonparams
+if  cachedsingletonrowdata_    null    ispreparedstatement_
+cachedsingletonrowdata_   singletonrowdata_
+// callback for calls, and preparedstatement updates.
+public void completeexecute sqlca sqlca
+if  sqlca    null
+return
+int sqlcode   sqlca getsqlcode
+if  sqlcode < 0
+agent_ accumulatereadexception new sqlexception agent_ logwriter_  sqlca
+returnvaluefromprocedure_   sqlcode
+else
+updatecount_   sqlca getupdatecount
+// sometime for call statement, protocol will return updatecount_, we will always set that to 0
+// sqlmode_ is not set for statements, only for prepared statements
+if  sqlmode_    iscall__
+updatecount_    1
+returnvaluefromprocedure_   sqlca getsqlerrd         what is this for??
+// sqlcode 466 indicates a call statement has issued and result sets returned.
+// this is a good place to set some state variable to indicate result sets are open
+// for call, so that when autocommit is true, commit will not be issued until the
+// result sets are closed.
+// currently, commit is not issued even there is no result set.
+// do not externalize sqlcode +100
+if  sqlcode > 0    sqlcode    466    sqlcode    100
+accumulatewarning new sqlwarning agent_ logwriter_  sqlca
+public void setupdatecount int updatecount
+updatecount_   updatecount
+/**
+* designates the owner of this statement, typically a logical statement.
+*
+* @param owner the owning statement, if any
+*/
+protected final void setowner java sql statement owner
+this owner   owner
+/**
+* returns the owner of this statement, if any.
+*
+* @return the designated owner of this statement, or {@code null} if none.
+*/
+final java sql statement getowner
+return this owner
+private boolean willtickleserver int number  boolean allowautocommits  throws sqlexception
+boolean requiresautocommit   false
+if  resultsetlist_    null
+for  int i   0  i < number  i
+if  resultsetlist_    null
+if  resultsetlist_ openonserver_
+return true     for the writeclose flow
+if   resultsetlist_ autocommitted_    allowautocommits
+requiresautocommit   true     for the commit flow
+else if  generatedkeysresultset_    null    generatedkeysresultset_ openonserver_
+generatedkeysresultset_ writeclose
+else if  resultset_    null
+if  resultset_ openonserver_
+return true     for the writeclose flow
+if   resultset_ autocommitted_    allowautocommits
+requiresautocommit   true
+if  connection_ autocommit_    requiresautocommit       for the auto commit
+if  connection_ isxaconnection_
+return  connection_ getxastate      connection xa_t0_not_associated
+else
+return true
+return false
+private void flowclose   throws sqlexception
+agent_ beginwritechain this
+writeclose true       true means permit auto commits
+agent_ flow this
+readclose true       true means permit auto commits
+agent_ endreadchain
+private void flowcloseoutsideuow   throws sqlexception
+agent_ beginwritechainoutsideuow
+writeclose true       true means permit auto commits
+agent_ flowoutsideuow
+readclose true       true means permit auto commits
+agent_ endreadchain
+final void writeclose boolean allowautocommits  throws sqlexception
+writecloseresultsets allowautocommits
+final void readclose boolean allowautocommits  throws sqlexception
+readcloseresultsets allowautocommits
+final boolean writecloseresultsets boolean allowautocommits  throws sqlexception
+int numberofresultsetstoclose    resultsetlist_    null  ? 0   resultsetlist_ length
+return writecloseresultsets numberofresultsetstoclose  allowautocommits
+// the connection close processing passes allowautocommits=false because if we drove an
+// autocommits after each statement close, then when we issue close requests on non-held cursors
+// the server would complain that the non-held cursor was already closed from the previous statement's auto-commit.
+// so the solution is to never autocommit statements during connection close processing.
+//
+// here's the operative explanation:
+// given a sequence of open statements s1, s2, .... a logic problem is occuring after s1 close-query
+// drives an auto-commit, and s2 close-query is driven against a non-held cursor.
+// the first auto-commit driven by s1 triggers a callback that closes s2's non-held cursor,
+// and so the subsequent s2 close-query request generates an error from the server saying
+// that the cursor is already closed.
+//
+// this is fixed by passing a flag to our statement close processing that prevents
+// driving additional auto-commits after each statement close.
+// connectino close drives its own final auto-commit.
+//
+boolean writecloseresultsets int number  boolean allowautocommits  throws sqlexception
+boolean requiresautocommit   false
+if  resultsetlist_    null
+for  int i   0  i < number  i
+if  resultsetlist_    null
+if  resultsetlist_ openonserver_
+resultsetlist_ writeclose
+if   resultsetlist_ autocommitted_    allowautocommits
+requiresautocommit   true
+else if  generatedkeysresultset_    null    generatedkeysresultset_ openonserver_
+generatedkeysresultset_ writeclose
+else if  resultset_    null
+if  resultset_ openonserver_
+resultset_ writeclose
+if   resultset_ autocommitted_    allowautocommits
+requiresautocommit   true
+if  connection_ autocommit_    requiresautocommit    isautocommittablestatement_
+connection_ writeautocommit
+if  connection_ isxaconnection_
+return  connection_ getxastate      connection xa_t0_not_associated
+else
+return true
+return false
+// helper method for s.flowcloseresultsets() and ps.flowexecute()
+final void readcloseresultsets boolean allowautocommits  throws sqlexception
+int numberofresultsetstoclose    resultsetlist_    null  ? 0   resultsetlist_ length
+readcloseresultsets numberofresultsetstoclose  allowautocommits
+void readcloseresultsets int number  boolean allowautocommits  throws sqlexception
+boolean requiredautocommit   false
+if  resultsetlist_    null
+for  int i   0  i < number  i
+if  resultsetlist_    null
+if  resultsetlist_ openonserver_
+resultsetlist_ readclose
+else
+resultsetlist_ markclosed
+if   resultsetlist_ autocommitted_    allowautocommits
+requiredautocommit   true
+else if  generatedkeysresultset_    null
+if  generatedkeysresultset_ openonserver_
+generatedkeysresultset_ readclose
+else
+generatedkeysresultset_ markclosed
+else if  resultset_    null
+if  resultset_ openonserver_
+resultset_ readclose
+else
+resultset_ markclosed
+if   resultset_ autocommitted_    allowautocommits
+requiredautocommit   true
+// we only commit when auto commit is turned on and at least one result set needed closing on server.
+if  connection_ autocommit_    requiredautocommit    isautocommittablestatement_
+connection_ readautocommit
+private void flowcloseretrievedresultsets   throws sqlexception
+int numberofresultsetstoclose    resultsetlist_    null  ? 0   indexofcurrentresultset_   1
+agent_ beginwritechain this
+// need to refactor the resultset.readclose() path to check if we are the
+// last result set closed in a set of multiple result sets of the owning statement,
+// if so, we need to flow the auto-commit (but only then).
+// currently, the code to do this is only in the closex() path, which isn't called here
+writecloseresultsets numberofresultsetstoclose  false
+agent_ flow this
+readcloseresultsets numberofresultsetstoclose  false       true means permit auto commits
+agent_ endreadchain
+private void flowcloseretrievedresultsetsoutsideuow   throws sqlexception
+int numberofresultsetstoclose    resultsetlist_    null  ? 0   indexofcurrentresultset_   1
+agent_ beginwritechainoutsideuow
+// need to refactor the resultset.readclose() path to check if we are the
+// last result set closed in a set of multiple result sets of the owning statement,
+// if so, we need to flow the auto-commit (but only then).
+// currently, the code to do this is only in the closex() path, which isn't called here
+writecloseresultsets numberofresultsetstoclose  false
+agent_ flowoutsideuow
+readcloseresultsets numberofresultsetstoclose  false       true means permit auto commits
+agent_ endreadchain
+public int completesqlca sqlca sqlca
+if  sqlca    null
+return 0
+int sqlcode   sqlca getsqlcode
+if  sqlcode < 0
+connection_ agent_ accumulatereadexception new sqlexception agent_ logwriter_  sqlca
+else if  sqlcode > 0
+accumulatewarning new sqlwarning agent_ logwriter_  sqlca
+return sqlcode
+public void completeexecutesetstatement sqlca sqlca
+void markclosedonserver
+if  section_    null
+section_ free
+section_   null
+openonserver_   false
+// if an error occurs during the middle of the reset, before the statement
+// has a chance to reset its materialstatement_, and agent.disconnectevent() is called,
+// then the materialstatement_ here can be null.
+if  materialstatement_    null
+materialstatement_ markclosedonserver_
+/**
+* this method cleans up client-side resources held by this statement.
+* the statement will not be removed from the open statements list and
+* preparedstatement will also not be removed from the commit and rollback
+* listeners list in <code>org.apache.derby.client.am.connection</code>.
+*
+* this method is called from:
+* 1. finalize() - for the finaizer to be called, the statement
+* should not have any references and so it should have been already
+* removed from the lists.
+*
+* 2. <code>org.apache.derby.client.am.connection#markstatementsclosed</code>
+* this method explicitly removes the statement from open statements list.
+*
+* 3. to close positioned update statements - these statements are not
+* added to the list of open statements.
+*/
+void markclosed
+markclosed false
+/**
+* this method cleans up client-side resources held by this statement.
+* if removelistener is true, the statement is removed from open statements
+* list and preparedstatement is also removed from commit and rollback
+* listeners list. this is called from the close methods.
+*
+* @param removelistener if true the statement will be removed
+* from the open statements list and preparedstatement will also be removed
+* from commit and rollback listeners list in
+* <code>org.apache.derby.client.am.connection</code>.
+*/
+void markclosed boolean removelistener
+openonclient_   false
+markresultsetsclosed
+// in case a cursorname was set on the statement but the statement was
+// never used to execute a query, the cursorname will not be removed
+// when the resultsets are mark closed, so we need to remove the
+// cursorname form the cache.
+removeclientcursornamefromcache
+markpreparedstatementforautogeneratedkeysclosed
+markclosedonserver
+// mark close resultsetmetadata
+if  resultsetmetadata_    null
+resultsetmetadata_ markclosed
+resultsetmetadata_   null
+if removelistener
+connection_ openstatements_ remove this
+if  setspecialregistersection_    null
+setspecialregistersection_ free
+setspecialregistersection_   null
+void markpreparedstatementforautogeneratedkeysclosed
+if  preparedstatementforautogeneratedkeys_    null
+preparedstatementforautogeneratedkeys_ markclosed
+/**
+* mark all resultsets associated with this statement as
+* closed. the resultsets will not be removed from the commit and
+* rollback listeners list in
+* <code>org.apache.derby.client.am.connection</code>.
+*/
+void markresultsetsclosed
+markresultsetsclosed false
+/**
+* mark all resultsets associated with this statement as
+* closed.
+*
+* @param removelistener if true the resultsets will be removed
+* from the commit and rollback listeners list in
+* <code>org.apache.derby.client.am.connection</code>.
+*/
+final void markresultsetsclosed boolean removelistener
+if  resultsetlist_    null
+for  int i   0  i < resultsetlist_ length  i
+if  resultsetlist_    null
+resultsetlist_ markclosed removelistener
+resultsetlist_   null
+if  generatedkeysresultset_    null
+generatedkeysresultset_ markclosed removelistener
+if  resultset_    null
+resultset_ markclosed removelistener
+resultset_   null
+resultsetlist_   null
+generatedkeysresultset_   null
+private void flowexecute int executetype  string sql  throws sqlexception
+checkforclosedstatement       per jdbc spec  see java sql statement close   javadoc
+clearwarningsx       per jdbc spec 0 7  and getwarnings   javadoc
+sql   escape sql
+parsesqlandsetsqlmodes sql
+checkautogeneratedkeysparameters
+if  sqlmode_    isupdate__
+updatecount_   0
+else
+updatecount_    1
+checkforappropriatesqlmode executetype  sqlmode_
+// derby-1036: moved check till execute time to comply with embedded
+// behavior. since we check here and not in setcursorname, several
+// statements can have the same cursor name as long as their result
+// sets are not simultaneously open.
+if  sqlmode_    isquery__
+checkforduplicatecursorname
+boolean timeoutsent   false
+agent_ beginwritechain this
+boolean piggybackedautocommit   writecloseresultsets true       true means permit auto commits
+resultset scrollablers   null
+section newsection   null
+boolean repositionedcursor   false
+// derby-1692: statement objects need to send the timeout value for
+// each execution since the server will create a new statement
+// object each time. since the server forgets the timeout value,
+// dowritetimeout should not be reset, and it is ok not to send the
+// timeout value when it is zero.
+if  dowritetimeout     timeout_ > 0
+timeoutarraylist set 0  timeout_statement   timeout_
+writesetspecialregister timeoutarraylist
+timeoutsent   true
+switch  sqlmode_
+case isquery__
+newsection   agent_ sectionmanager_ getdynamicsection resultsetholdability_
+writepreparedescribeoutput sql  newsection
+writeopenquery newsection
+fetchsize_
+resultsettype_
+break
+case isupdate__
+string cursorname   null
+if  sqlupdatemode_    isdeletesql__    sqlupdatemode_    isupdatesql__
+string sqlandcursorname   extractcursornamefromwherecurrentof sql
+if  sqlandcursorname    null
+cursorname   sqlandcursorname
+sql   sqlandcursorname
+if  cursorname    null
+newsection   agent_ sectionmanager_ getpositionedupdatesection cursorname  true      true means get an execute immediate section
+if  newsection    null
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate cursor_invalid_name
+cursorname
+scrollablers   agent_ sectionmanager_ getpositionedupdateresultset cursorname
+// do not need to reposition for rowset cursors
+if  scrollablers    null     scrollablers isrowsetcursor_
+repositionedcursor
+scrollablers repositionscrollableresultsetbeforejdbc1positionedupdatedelete
+if   repositionedcursor
+scrollablers   null
+// if client's cursor name is set, and the cursor name in the positioned update
+// string is the same as the client's cursor name, replace client's cursor name
+// with the server's cursor name.
+if  newsection getclientcursorname      null
+cursorname compareto newsection getclientcursorname       0
+// substitute cusor name in pass thru sql string
+sql   substituteclientcursornamewithservercursorname sql  newsection
+writeexecuteimmediate sql  newsection
+else
+newsection   agent_ sectionmanager_ getdynamicsection resultsetholdability_
+writeexecuteimmediate sql  newsection
+if  sqlupdatemode_    isinsertsql__    autogeneratedkeys_    return_generated_keys
+// chain a "select from identity_val_local()" to the insert statement
+prepareautogeneratedkeysstatement
+writeopenquery preparedstatementforautogeneratedkeys_ section_
+preparedstatementforautogeneratedkeys_ fetchsize_
+preparedstatementforautogeneratedkeys_ resultsettype_
+// maybe duplicate a commit here if the sql is a "commit"
+if  connection_ autocommit_
+connection_ writeautocommit
+break
+case iscall__
+newsection   writeexecutecall sql  false
+break
+agent_ flow this
+readcloseresultsets true       true means permit auto commits
+if  timeoutsent
+readsetspecialregister       read response to the excsqlset
+// turn inunitofwork_ flag back on and add statement
+// back on commitlisteners_ list if they were off
+// by an autocommit chained to a close cursor.
+if  piggybackedautocommit
+connection_ completetransactionstart
+markresultsetsclosed true      true means remove from list of commit and rollback listeners
+markclosedonserver
+section_   newsection
+switch  sqlmode_
+case isquery__
+// parse out the reply to a chained prepare and open request
+readpreparedescribeoutput
+// this establishes statement.resultset
+readopenquery
+// resultset_ is null if open query failed.
+// check for null resultset_ before using it.
+// the first rowset comes back on open for static non-rowset cursors.
+// no row is returned on open for rowset cursors.
+if  resultset_    null
+resultset_ parsescrollablerowset
+// derby-1183: if we set it up it earlier, the entry in
+// clientcursornamecache_ gets wiped out by the closing of
+// result sets happening during readcloseresultsets above
+// because resultset#markclosed calls
+// statement#removeclientcursornamefromcache.
+setupcursornamecacheandmappings
+break
+case isupdate__
+// do not need to reposition for rowset cursors.
+if  scrollablers    null     scrollablers isrowsetcursor_
+scrollablers readpositioningfetch_
+readexecuteimmediate
+if  sqlupdatemode_    isinsertsql__    autogeneratedkeys_    return_generated_keys
+readprepareautogeneratedkeysstatement
+preparedstatementforautogeneratedkeys_ readopenquery
+generatedkeysresultset_   preparedstatementforautogeneratedkeys_ resultset_
+preparedstatementforautogeneratedkeys_ resultset_   null
+if  connection_ autocommit_
+connection_ readautocommit
+break
+case iscall__
+readprepare
+readexecutecall
+break
+// in the case the stored procedure call is uncatalogued, we need to catch that
+// kind exception and changed the call from dynamic to static
+agent_ endreadchain
+//  if we hear from sun that we can just set a warning for this, then move this code to the resultset constructor.
+// throw an exception if holdability returned by the server is different from requested.
+if  resultset_    null    resultset_ resultsetholdability_    resultsetholdability_    sqlmode_    iscall__
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate unable_to_open_rs_with_requested_holdability
+new integer resultsetholdability_
+// in the case of executing a call to a stored procedure.
+if  sqlmode_    iscall__
+parsestorprocreturnedscrollablerowset
+checkforstoredprocresultsetcount executetype
+// when there is no result sets back, we will commit immediately when autocommit is true.
+if  connection_ autocommit_    resultset_    null    resultsetlist_    null
+connection_ flowautocommit
+// the jdbc spec says that executeupdate() should return 0
+// when no row count is returned.
+if  executetype    executeupdatemethod__    updatecount_ < 0
+updatecount_   0
+void flowexecutebatch int updatecounts  throws sqlexception  batchupdateexception
+sqlexception chainbreaker   null
+boolean iscallcataloguedbestguess   true
+agent_ beginbatchedwritechain this
+for  int i   0  i < batch_ size    i
+boolean flowsql   true
+string sql    string  batch_ get i
+parsesqlandsetsqlmodes sql
+try
+checkforinvalidbatchedsql sql
+catch  sqlexception e
+flowsql   false
+// if you have a length mismatch for a lob flow, then we need to return a -3
+// need to trap the exceptions coming back from writeexecuteimmediate and continue on with a -3
+// net will need to be able to reset the send buffer
+if  flowsql
+if  section_    null
+section_ free
+if  sqlmode_    iscall__
+section_
+agent_ sectionmanager_ getdynamicsection resultsetholdability_
+writeexecuteimmediate sql  section_
+else
+section_   writeexecutecall sql  true
+if  connection_ autocommit_
+connection_ writeautocommit
+agent_ flowbatch this  batch_ size
+try
+for  int i   0  i < batch_ size    i
+agent_ setbatchedexceptionlabelindex i
+sqlexception invalidsqlcaughtbyclient   null
+string sql    string  batch_ get i
+parsesqlandsetsqlmodes sql
+try
+checkforinvalidbatchedsql sql
+catch  sqlexception e
+invalidsqlcaughtbyclient   e
+if  invalidsqlcaughtbyclient    null
+updatecount_    1
+if  sqlmode_    iscall__
+readexecuteimmediateforbatch sql
+else
+if  iscallcataloguedbestguess
+readprepare
+readexecutecall
+else
+agent_ accumulatereadexception invalidsqlcaughtbyclient
+updatecount_   java sql statement execute_failed
+invalidsqlcaughtbyclient   null
+updatecounts   updatecount_
+// derby doesn't return an update count for ddl statements, so we need to
+// remap our initial value of -1 (represents invalid update count) to a
+// valid update count of zero.
+if  updatecounts     1
+updatecounts   0
+agent_ disablebatchedexceptiontracking       to prvent the following readcommit   from getting a batch label
+if  connection_ autocommit_
+connection_ readautocommit       this could throw a chainbreaker too
+// for chain-breaking exception only, all read() methods do their own accumulation
+// this catches the entire accumulated chain, we need to be careful not to
+// reaccumulate it on the agent since the batch labels will be overwritten if
+// batch exception tracking is enabled.
+catch  sqlexception e
+chainbreaker   e
+chainbreaker setnextexception new sqlexception agent_ logwriter_
+new clientmessageid sqlstate batch_chain_breaking_exception
+// we need to clear the batch before any exception is thrown from agent_.endbatchedreadchain().
+batch_ clear
+agent_ endbatchedreadchain updatecounts  chainbreaker
+private section writeexecutecall string sql
+boolean isbatch  throws sqlexception
+section newsection   null
+newsection   agent_ sectionmanager_ getdynamicsection resultsetholdability_
+// this code is beneficial only if there is literal in the sql call statement
+writeprepare sql  newsection
+writeexecutecall false     no out parameters  outputexpected   false
+null     sql is prepared  procedurename   null
+newsection
+fetchsize_
+isbatch     do not suppress resultsets for regular calls
+resultsettype_
+null     no parameters  parametermetadata   null
+null      no parameters  inputs   null
+return newsection
+//------------------material layer event callbacks follow---------------------
+// all callbacks are client-side only operations
+public void listentounitofwork
+do nothing for now
+public void completelocalcommit java util iterator listeneriterator
+do nothing for now
+public void completelocalrollback java util iterator listeneriterator
+do nothing for now
+// this method will not work if e is chained.
+// it is assumed that e is a single warning and is not chained.
+public void accumulatewarning sqlwarning e
+if  warnings_    null
+warnings_   e
+else
+warnings_ setnextwarning e
+private void markprepared
+//openonclient_ = true;
+openonserver_   true
+listentounitofwork
+//-------------------------------helper methods-------------------------------
+/**
+* returns the name of the java.sql interface implemented by this class.
+* @return name of java.sql interface
+*/
+protected string getjdbcstatementinterfacename
+return
+// should investigate if it can be optimized..  if we can avoid this parsing..
+//
+void parsesqlandsetsqlmodes string sql  throws sqlexception
+string delims
+java util stringtokenizer tokenizer   null
+string firsttoken   null
+// see if the statement starts with a comment; if so, move
+// past the comment and get the first token of the actual
+// statement to be executed.  note: must use "startswith"
+// when looking for the comment delimiters instead of
+// "equals" because there may not be whitespace between the
+// the delimiter and the comment itself, ex "--my comment".
+if  sql trim   startswith
+// read each line of the statement until we find a
+// line that is not a comment.
+int lastendline    1
+string endline
+tokenizer   new java util stringtokenizer sql  endline  true
+while  tokenizer hasmoretokens
+firsttoken   tokenizer nexttoken
+if  endline indexof firsttoken      1
+// this is some sort of newline ("\n", "\r", or "\f").
+lastendline   sql indexof firsttoken  lastendline 1
+else if   firsttoken trim   startswith
+break
+if  firsttoken startswith
+// entire statement was just one or more comments; pass it as
+// a query to the server and let the server deal with it.
+sqlmode_   isquery__
+return
+else
+// we have a non-comment line; get a tokenizer for the
+// statement beginning at the start of this line.
+tokenizer   new java util stringtokenizer
+sql substring lastendline 1   delims
+else
+// there aren't any leading comments, so just get the first token
+// in the sql statement.
+tokenizer   new java util stringtokenizer sql  delims
+if   tokenizer hasmoretokens
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate no_tokens_in_sql_text   sql
+sqlupdatemode_   0
+firsttoken   tokenizer nexttoken
+if  firsttoken equalsignorecase          captures <subselect> production
+firsttoken equalsignorecase        captures <values clause> production
+sqlmode_   isquery__
+else if  firsttoken equalsignorecase        captures call   and ? call
+sqlmode_   iscall__
+else
+parseupdatesql firsttoken
+private void parseupdatesql string firsttoken  throws sqlexception
+sqlmode_   isupdate__
+if  firsttoken equalsignorecase
+sqlupdatemode_   isinsertsql__
+if  firsttoken equalsignorecase
+sqlupdatemode_   isdeletesql__
+if  firsttoken equalsignorecase
+sqlupdatemode_   isupdatesql__
+// the sql is assumed to start with call... or ?=call...
+string getprocedurename string sql  throws sqlexception
+java util stringtokenizer tokenizer   new java util stringtokenizer sql
+if   tokenizer hasmoretokens
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate no_tokens_in_sql_text   sql
+string firsttoken   tokenizer nexttoken
+if   firsttoken equalsignorecase
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate lang_invalid_call_statement
+if   tokenizer hasmoretokens
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate lang_invalid_call_statement
+return tokenizer nexttoken
+// try to enforce the use of this method later.
+public static string uppercaseprocedurename string procedurename  throws sqlexception
+// upper case the parts of a 3-part procedure name unless the part is in a double quotes
+// loop thru every character, if we're in double quotes just echo it,
+// if we're not in double quotes, upper case it.
+char chararray   null
+if  procedurename indexof  "      1
+return procedurename touppercase
+else
+chararray   procedurename tochararray
+boolean instringliteral   false
+for  int i   0  i < chararray length  i
+if  chararray
+instringliteral    instringliteral
+else if   instringliteral    chararray
+chararray   character touppercase chararray
+return new string chararray
+final void checkforappropriatesqlmode int executetype  int sqlmode  throws sqlexception
+if  executetype    executequerymethod__    sqlmode    isupdate__
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate cant_use_exec_query_for_update
+if  executetype    executeupdatemethod__    sqlmode    isquery__
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate lang_invalid_call_to_execute_update
+/**
+* checks that the number of result sets returned by the statement
+* is consistent with the executed type. <code>executequery()</code>
+* should return exactly one result set and <code>executeupdate()</code>
+* none. raises an exception if the result set count does not match the
+* execute type.
+*
+* @param executetype one of <code>executequerymethod__</code>,
+* <code>executeupdatemethod__</code> and <code>executemethod__</code>
+* @exception sqlexception if the number of result sets does not
+*                         match the execute type
+*/
+private void checkresultsetcount int executetype  throws sqlexception
+switch  executetype
+case executequerymethod__
+// we'll just rely on finalizers to close the dangling result sets.
+if  resultsetlist_    null    resultsetlist_ length > 1
+throw new
+sqlexception agent_ logwriter_
+new clientmessageid
+sqlstate multiple_results_on_execute_query
+getjdbcstatementinterfacename
+getjdbcstatementinterfacename
+if  resultset_    null    resultsetlist_ length    0
+clientmessageid messageid
+new clientmessageid
+sqlstate use_execute_update_with_no_results
+throw new sqlexception agent_ logwriter_  messageid
+getjdbcstatementinterfacename
+getjdbcstatementinterfacename
+break
+case executeupdatemethod__
+// we'll just rely on finalizers to close the dangling result sets.
+if  resultset_    null    resultsetlist_ length > 0
+clientmessageid messageid
+new clientmessageid
+sqlstate lang_invalid_call_to_execute_update
+throw new sqlexception agent_ logwriter_  messageid
+break
+/**
+* checks that a stored procedure returns the correct number of
+* result sets given its execute type. if the number is incorrect,
+* make sure the transaction is rolled back when auto commit is
+* enabled.
+*
+* @param executetype one of <code>executequerymethod__</code>,
+* <code>executeupdatemethod__</code> and <code>executemethod__</code>
+* @exception sqlexception if the number of result sets does not
+*                         match the execute type
+* @see #checkresultsetcount(int)
+*/
+protected final void checkforstoredprocresultsetcount int executetype
+throws sqlexception
+try
+checkresultsetcount executetype
+catch  sqlexception se
+if  connection_ autocommit_
+connection_ flowrollback
+throw se
+final void checkforclosedstatement   throws sqlexception
+// for some odd reason, there was a jvm hotspot error with sun's 1.4 jdk
+// when the code was written like this:
+// agent_checkfordeferredexceptions();
+// if (!openonclient_)
+//   throw new sqlexception (agent_.logwriter_, "invalid operation: statement closed");
+//
+if   this connection_    null    this connection_ isclosed
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate no_current_connection
+if   openonclient_
+agent_ checkfordeferredexceptions
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate already_closed
+else
+agent_ checkfordeferredexceptions
+// precondition: parsesqlandsetsqlmodes() must be called on the supplied sql string before invoking this method
+void checkforinvalidbatchedsql string sql  throws sqlexception
+if  sql    null
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate null_sql_text
+if  sqlmode_    iscall__
+sqlmode_    isupdate__
+sqlupdatemode_    isinsertsql__
+sqlupdatemode_    isdeletesql__
+sqlupdatemode_    isupdatesql__
+sqlupdatemode_    0      for any undefined pass thru statement like drop create
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate lang_invalid_sql_in_batch   sql
+// two open result sets can not have the same cursor name.
+protected void checkforduplicatecursorname   throws sqlexception
+if  cursorname_    null     connection_ clientcursornamecache_
+containskey cursorname_
+throw new sqlexception
+agent_ logwriter_
+new clientmessageid sqlstate cursor_duplicate_name
+cursorname_
+// set up information to be able to handle cursor names:
+// canned or user named (via setcursorname).
+protected void setupcursornamecacheandmappings
+if  cursorname_    null
+// the user has set a cursor name for this statement.
+// this means we must subtitute the <users-cursor-name>
+// with the <canned-cursor-name> in the pass-thru sql
+// string "...where current of <canned-cursor-name>"
+// whenever the result set produced by this statement
+// is referenced in a positioned update/delete statement.
+agent_ sectionmanager_ mapcursornametoquerysection
+cursorname_  section_
+section_ setclientcursorname cursorname_
+// update cache to avoid duplicates of user set cursor name.
+connection_ clientcursornamecache_ put cursorname_
+cursorname_
+else
+// canned cursor name
+agent_ sectionmanager_ mapcursornametoquerysection
+section_ getservercursorname    section_
+// if client's cursor name is set, map the client's cursor name to the
+// result set, else map the server's cursor name to the result set.
+mapcursornametoresultset
+string extractcursornamefromwherecurrentof string sql
+string lowersql   sql tolowercase
+int currentindex   lowersql lastindexof
+if  currentindex     1
+int whereindex   lowersql lastindexof
+if  whereindex     1
+string wherecurrentof
+java util stringtokenizer st   new java util stringtokenizer sql substring whereindex
+while  st hasmoretokens
+if  st nexttoken   equalsignorecase wherecurrentof
+st nexttoken   equalsignorecase wherecurrentof
+st nexttoken   equalsignorecase wherecurrentof
+string cursorname   st nexttoken
+string oldcursorname   cursorname
+int originalcursornamelength   cursorname length
+int index   sql lastindexof cursorname
+if  cursorname charat 0
+cursorname   cursorname substring 1  cursorname length     1
+else
+cursorname   cursorname touppercase
+// we cannot assume "where current of cursorname" is always the end of the sql string
+// with rowset cursors, it can be "where current of cursorname for row x of rowset"
+if  sql length   > index   originalcursornamelength
+sql   sql substring 0  index    cursorname   sql substring index   oldcursorname length    sql length
+else
+sql   sql substring 0  index    cursorname
+return new string cursorname  sql      delimited name  so just extract the name
+return null
+// substitute the client cursor name in the sql string with the server's cursor name.
+// only called on positioned update statements.
+protected string substituteclientcursornamewithservercursorname string sql
+section section  throws sqlexception
+string clientcursorname   section getclientcursorname
+int index   sql lastindexof clientcursorname
+if  sql length   > index   clientcursorname length
+return sql substring 0  index    section getservercursornameforpositionedupdate
+sql substring index   clientcursorname length    sql length
+else
+return sql substring 0  index    section getservercursornameforpositionedupdate
+public connectioncallbackinterface getconnectioncallbackinterface
+return connection_
+// this was being called only on positioned update statements. when working
+// on derby-210, it was found that result sets of all statements (not just
+// positioned update statements) get added to the table. so, this is called
+// for all statements. otherwise, this will cause memory leaks when statements
+// are not explicitly closed in the application.
+void resetcursornameandremovefromwherecurrentofmappings
+// remove client/server cursorname -> resultset mapping from the hashtable.
+// if statement.close() is called before resultset.close(), then statement_.section is null.
+if  section_    null
+agent_ sectionmanager_ removecursornametoresultsetmapping cursorname_
+section_ getservercursornameforpositionedupdate
+// remove resultset mapping for other cursors (other than positioned
+// update statements) - derby-210
+agent_ sectionmanager_ removecursornametoresultsetmapping cursorname_
+section_ getservercursorname
+// remove client and server cursorname -> querysection mapping from the hashtable
+// if one exists
+agent_ sectionmanager_ removecursornametoquerysectionmapping cursorname_
+section_ getservercursornameforpositionedupdate
+// client cursor name will be set to null when it is removed from the
+// clientcursornamecache.
+//cursorname_ = null;
+void mapcursornametoresultset
+if  cursorname_    null
+agent_ sectionmanager_ mapcursornametoresultset cursorname_  resultset_
+else
+agent_ sectionmanager_ mapcursornametoresultset section_ getservercursorname    resultset_
+void parsestorprocreturnedscrollablerowset   throws sqlexception
+if  resultsetlist_    null
+for  int i   0  i < resultsetlist_ length  i
+if  resultsetlist_ scrollable_    resultsetlist_ cursor_ databufferhasunprocesseddata
+resultsetlist_ parsescrollablerowset
+if  resultsetlist_ rowcountisunknown
+resultsetlist_ getrowcount
+string escape string sql  throws sqlexception
+string nativesql   sql
+nativesql   connection_ nativesqlx sql
+return nativesql
+// called by statement constructor only for jdbc 2 statements with scroll attributes.
+// this method is not in the statementrequest class because it is not building into
+// the request buffer directly, it is building into a cache to be written into the request
+// buffer at prepare-time.
+string cachecursorattributestosendonprepare   throws sqlexception
+stringbuffer cursorattributes   new stringbuffer
+if  resultsettype_    java sql resultset type_scroll_sensitive
+// append "sensitive static scroll"
+cursorattributes append configuration cursorattribute_sensitivestatic
+else if  resultsettype_    java sql resultset type_scroll_insensitive
+// if "insensitve, updatable" cursor is asked, then server sends back error
+// and we will pass that error back to the user.
+// we will not try to catch any errors/warnings here.
+// append "insensitive scroll"
+cursorattributes append configuration cursorattribute_insensitive
+// default is read-only, forward-only.  no attribute needs to be sent.
+if  resultsetconcurrency_    java sql resultset concur_updatable
+cursorattributes append configuration cursorattribute_forupdate      for update
+if   resultsetholdability_    java sql resultset hold_cursors_over_commit
+cursorattributes append configuration cursorattribute_withhold      with hold
+return
+cursorattributes    null    cursorattributes tostring   equals
+? null
+cursorattributes tostring
+void getpreparedstatementforautogeneratedkeys   throws sqlexception
+if  preparedstatementforautogeneratedkeys_    null
+string s
+preparedstatementforautogeneratedkeys_
+connection_ newpreparedstatement_ s
+java sql resultset type_forward_only
+java sql resultset concur_read_only
+java sql resultset hold_cursors_over_commit
+java sql statement no_generated_keys
+null  null
+// need a special case for derby, since the attribute has to go through the wire.
+// this same special casing for derby is already in place in method ps.cachecursorattributestosendonprepare() as called by preparestatementx().
+//  we need to figure how some way to get code reuse here, ie. to consolidate to just one special casing rather than two?
+// maybe just call preparestatementx() or use some special purpose prepare method like the ones in connection.
+// something more abstract so that we don't have to special case the with hold thing twice.
+stringbuffer cursorattributes   new stringbuffer
+cursorattributes append configuration cursorattribute_withhold
+preparedstatementforautogeneratedkeys_ cursorattributestosendonprepare_   cursorattributes tostring
+void prepareautogeneratedkeysstatement   throws sqlexception
+getpreparedstatementforautogeneratedkeys
+if   preparedstatementforautogeneratedkeys_ openonserver_
+preparedstatementforautogeneratedkeys_ materialpreparedstatement_ writepreparedescribeoutput_ preparedstatementforautogeneratedkeys_ sql_
+preparedstatementforautogeneratedkeys_ section_
+void readprepareautogeneratedkeysstatement   throws sqlexception
+if   preparedstatementforautogeneratedkeys_ openonserver_
+preparedstatementforautogeneratedkeys_ materialpreparedstatement_ readpreparedescribeoutput_
+void checkautogeneratedkeysparameters   throws sqlexception
+if  autogeneratedkeys_    java sql statement no_generated_keys
+autogeneratedkeys_    java sql statement return_generated_keys
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate invalid_api_parameter
+new integer autogeneratedkeys_
+if  sqlupdatemode_    isinsertsql__
+if  generatedkeyscolumnnames_    null
+generatedkeyscolumnnames_ length > 1
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate invalid_column_array_length
+new integer generatedkeyscolumnnames_ length
+if  generatedkeyscolumnindexes_    null
+generatedkeyscolumnindexes_ length > 1
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate invalid_column_array_length
+new integer generatedkeyscolumnindexes_ length
+public columnmetadata getguessedresultsetmetadata
+return resultsetmetadata_
+public boolean isquerymode
+if  this sqlmode_    this isquery__
+return true
+else
+return false
+protected void removeclientcursornamefromcache
+if  cursorname_    null
+connection_ clientcursornamecache_ containskey cursorname_
+connection_ clientcursornamecache_ remove cursorname_
+/**
+* convenience method for resultsetcommitting(resultset, boolean)
+*
+* @see statement#resultsetcommitting(resultset, boolean)
+* @param closingrs the resultset to be closed
+* @throws sqlexception
+*/
+public void resultsetcommitting resultset closingrs  throws sqlexception
+resultsetcommitting closingrs  false
+/**
+* method that checks to see if any other resultsets are open. if not
+* proceeds with the autocommit.
+*
+* @param closingrs the resultset to be closed
+* @param writechain a boolean indicating whether this method
+* is part of a chain of write from client to server
+* @throws sqlexception
+*/
+public boolean resultsetcommitting resultset closingrs  boolean writechain  throws sqlexception
+// if the connection is not in auto commit then this statement completion
+// cannot cause a commit.
+if   connection_ autocommit_    closingrs autocommitted_
+return false
+// if we have multiple results, see if there is another result set open.
+// if so, then no commit. the last result set to close will close the statement.
+if  resultsetlist_    null
+for  int i   0  i < resultsetlist_ length  i
+resultset crs   resultsetlist_
+if  crs    null
+continue
+if   crs openonclient_
+continue
+if  crs    closingrs
+continue
+// at least one still open so no commit now.
+return false
+if  writechain
+connection_ writeautocommit
+return true
+else
+if  connection_ flowautocommit
+markautocommitted
+return true
+return false
+/**
+* mark all resultsets associated with this statement as auto-committed.
+*/
+public void markautocommitted
+if  resultsetlist_    null
+for  int i   0  i < resultsetlist_ length  i
+if  resultsetlist_    null
+resultsetlist_ markautocommitted
+else if  resultset_    null
+resultset_ markautocommitted
+protected sqlexception jdbc3featurenotsupported boolean checkstatement
+throws sqlexception
+try
+if   checkstatement
+checkforclosedstatement
+throw new sqlexception agent_ logwriter_
+new clientmessageid sqlstate jdbc_method_not_implemented
+catch   sqlexception se
+throw se getsqlexception
+protected sqlexception jdbc3featurenotsupported   throws sqlexception
+return jdbc3featurenotsupported true

@@ -1,0 +1,362 @@
+/*
+derby - class org.apache.derby.impl.store.raw.data.rafcontainer4
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store raw data
+import org apache derby iapi error standardexception
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi store raw containerkey
+import java io eofexception
+import java io ioexception
+import java io randomaccessfile
+import java nio bytebuffer
+import java nio channels filechannel
+import java nio channels closedchannelexception
+import org apache derby io storagerandomaccessfile
+/**
+* rafcontainer4 overrides a few methods in rafcontainer in an attempt to use
+* filechannel from java 1.4's new io framework to issue multiple io operations
+* to the same file concurrently instead of strictly serializing io operations
+* using a mutex on the container object.
+* <p>
+* note that our requests for multiple concurrent ios may be serialized further
+* down in the io stack - this is entirely up to the jvm and os. however, at
+* least in linux on sun's 1.4.2_09 jvm we see the desired behavior:
+* the filechannel.read/write(bytebuffer buf, long position) calls map to
+* pread/pwrite system calls, which enable efficient io to the same file
+* descriptor by multiple threads.
+* <p>
+* this whole class should be merged back into rafcontainer when derby
+* officially stops supporting java 1.3.
+* <p>
+* significant behavior changes from rafcontainer:
+* <ol>
+* <li> multiple concurrent ios permitted.
+* <li> state changes to the container (create, open, close) can now happen while
+*      io is in progress due to the lack of locking. closing a container while
+*      io is in progress will cause ioexceptions in the thread calling readpage
+*      or writepage. if this happens something is probably amiss anyway.
+*      the iosinprogress variable is used in an attempt to detect this should it
+*      happen while running a debug build.
+* </ol>
+*
+* @see java.nio.channels.filechannel
+*/
+class rafcontainer4 extends rafcontainer
+/**
+* this channel will be retrieved from rafcontainer's filedata
+* member when filedata is set. we wrap a couple of rafcontainer's methods
+* to accomplish this.
+*/
+private filechannel ourchannel   null
+/**
+* for debugging - will be incremented when an io is started, decremented
+* when it is done. should be == 0 when container state is changed.
+*/
+private int iosinprogress   0
+public rafcontainer4 basedatafilefactory factory
+super factory
+/**
+* return the {@code filechannel} for the specified
+* {@code storagerandomaccessfile} if it is a {@code randomaccessfile}.
+* otherwise, return {@code null}.
+*
+* @param file the file to get the channel for
+* @return a {@code filechannel} if {@code file} is an instance of
+* {@code randomaccessfile}, {@code null} otherwise
+*/
+private filechannel getchannel storagerandomaccessfile file
+if  file instanceof randomaccessfile
+/** xxx - this cast isn't testing friendly.
+* a testing class that implements storagerandomaccessfile but isn't
+* a randomaccessfile will be "worked around" by this class. an
+* example of such a class is
+* functiontests/util/corruptio/corruptrandomaccessfile.java.
+* an interface rework may be necessary.
+*/
+return   randomaccessfile  file  getchannel
+return null
+/**
+* <p>
+* return the file channel for the current value of the {@code filedata}
+* field. if {@code filedata} doesn't support file channels, return
+* {@code null}.
+* </p>
+*
+* <p>
+* callers of this method must synchronize on the container object since
+* two shared fields ({@code filedata} and {@code ourchannel}) are
+* accessed.
+* </p>
+*
+* @return a {@code filechannel} object, if supported, or {@code null}
+*/
+private filechannel getchannel
+if  ourchannel    null
+ourchannel   getchannel filedata
+return ourchannel
+/*
+* wrapping methods that retrieve the filechannel from rafcontainer's
+* filedata after calling the real methods in rafcontainer.
+*/
+synchronized boolean opencontainer containerkey newidentity
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert iosinprogress    0
+sanitymanager assert filedata    null
+sanitymanager assert ourchannel    null
+return super opencontainer newidentity
+synchronized void createcontainer containerkey newidentity
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert iosinprogress    0
+sanitymanager assert filedata    null
+sanitymanager assert ourchannel    null
+super createcontainer newidentity
+synchronized void closecontainer
+if  sanitymanager debug
+// any ios in progress to a container being dropped will be
+// ignored, so we should not complain about starting a close
+// while there are ios in progress if it is being dropped
+// anyway.
+sanitymanager assert   iosinprogress    0
+getcommitteddropstate
+if ourchannel    null
+try
+ourchannel close
+catch  ioexception e
+// nevermind.
+finally
+ourchannel null
+super closecontainer
+/**
+* these are the methods that were rewritten to use filechannel.
+**/
+/**
+*  read a page into the supplied array.
+*
+*  <br> mt - thread safe
+*  @exception ioexception exception reading page
+*  @exception standardexception standard derby error policy
+*/
+protected void readpage long pagenumber  byte pagedata
+throws ioexception  standardexception
+// if this is the first alloc page, there may be another thread
+// accessing the container information in the borrowed space on the
+// same page. in that case, we synchronize the entire method call, just
+// like rafcontainer.readpage() does, in order to avoid conflicts. for
+// all other pages it is safe to skip the synchronization, since
+// concurrent threads will access different pages and therefore don't
+// interfere with each other.
+if  pagenumber    first_alloc_page_number
+synchronized  this
+readpage0 pagenumber  pagedata
+else
+readpage0 pagenumber  pagedata
+private void readpage0 long pagenumber  byte pagedata
+throws ioexception  standardexception
+filechannel iochannel
+synchronized  this
+if  sanitymanager debug
+sanitymanager assert  getcommitteddropstate
+iochannel   getchannel
+if iochannel    null
+long pageoffset   pagenumber   pagesize
+bytebuffer pagebuf   bytebuffer wrap pagedata
+// i hope the try/finally is optimized away by the
+// compiler/jvm when sanitymanager.debug == false?
+try
+if  sanitymanager debug
+synchronized this
+iosinprogress
+readfull pagebuf  iochannel  pageoffset
+finally
+if  sanitymanager debug
+synchronized this
+iosinprogress
+if  datafactory databaseencrypted
+pagenumber    first_alloc_page_number
+decryptpage pagedata  pagesize
+else
+iochannel was not initialized  fall back to original method
+super readpage pagenumber  pagedata
+/**
+*  write a page from the supplied array.
+*
+*  <br> mt - thread safe
+*
+*  @exception standardexception standard derby error policy
+*  @exception ioexception io error accessing page
+*/
+protected void writepage long pagenumber  byte pagedata  boolean syncpage
+throws ioexception  standardexception
+// if this is the first alloc page, there may be another thread
+// accessing the container information in the borrowed space on the
+// same page. in that case, we synchronize the entire method call, just
+// like rafcontainer.writepage() does, in order to avoid conflicts. for
+// all other pages it is safe to skip the synchronization, since
+// concurrent threads will access different pages and therefore don't
+// interfere with each other.
+if  pagenumber    first_alloc_page_number
+synchronized  this
+writepage0 pagenumber  pagedata  syncpage
+else
+writepage0 pagenumber  pagedata  syncpage
+private void writepage0 long pagenumber  byte pagedata  boolean syncpage
+throws ioexception  standardexception
+filechannel iochannel
+synchronized  this
+// committed and dropped, do nothing.
+// this file container may only be a stub
+if  getcommitteddropstate
+return
+iochannel   getchannel
+if iochannel    null
+///////////////////////////////////////////////////
+//
+// resolve: right now, no logical -> physical mapping.
+// we can calculate the offset.  in the future, we may need to
+// look at the allocation page or the in memory translation table
+// to figure out where the page should go
+//
+/////////////////////////////////////////////////
+long pageoffset   pagenumber   pagesize
+byte encryptionbuf   null
+// we only need to allocate the encryptionbuf if updatepagearray is
+// actually going to use it.
+if  datafactory databaseencrypted
+encryptionbuf   new byte
+byte datatowrite   updatepagearray pagenumber
+pagedata
+encryptionbuf
+false
+if  sanitymanager debug
+sanitymanager assert datatowrite    null
+bytebuffer writebuffer   bytebuffer wrap datatowrite
+datafactory writeinprogress
+try
+if  sanitymanager debug
+synchronized this
+iosinprogress
+writefull writebuffer  iochannel  pageoffset
+catch  closedchannelexception ioe
+synchronized this
+/* if the write failed because the container has been closed
+* for deletion between the start of this method and the
+* write, we'll just ignore that, as this container is going
+* away anyway.
+* this could possibly happen if the cache is cleaning this
+* container while it is dropped - basedatafilefactory holds
+* an exclusive lock on the container while dropping it to
+* avoid other interference.
+* see the getcommitteddropstate() check at the top of this
+* method.
+*/
+if  getcommitteddropstate
+if  sanitymanager debug
+sanitymanager debug_print
+return
+else
+// this should not happen, better let the exception
+// hurt where it's supposed to.
+throw ioe
+finally
+if  sanitymanager debug
+synchronized this
+iosinprogress
+datafactory writefinished
+/* note that the original "try {write} catch ioexception { pad file,
+* write again }" in rafcontainer is removed here, because the
+* filechannel javadoc specifies that the file will be grown to
+* accommodate the new bytes.
+*/
+if  syncpage
+datafactory writeinprogress
+try
+if  sanitymanager debug
+synchronized this
+iosinprogress
+if   datafactory datanotsyncedatallocation
+iochannel force false
+finally
+if  sanitymanager debug
+synchronized this
+iosinprogress
+datafactory writefinished
+else
+synchronized this
+needssync   true
+else      iochannel was not initialized  fall back to original method
+super writepage pagenumber  pagedata  syncpage
+/**
+* write a sequence of bytes at the given offset in a file.
+*
+* @param file the file to write to
+* @param bytes the bytes to write
+* @param offset the offset to start writing at
+* @throws ioexception if an i/o error occurs while writing
+*/
+void writeatoffset storagerandomaccessfile file  byte bytes  long offset
+throws ioexception
+filechannel iochannel   getchannel file
+if  iochannel    null
+writefull bytebuffer wrap bytes   iochannel  offset
+else
+super writeatoffset file  bytes  offset
+/**
+* read an embryonic page (that is, a section of the first alloc page that
+* is so large that we know all the borrowed space is included in it) from
+* the specified offset in a {@code storagerandomaccessfile}.
+*
+* @param file the file to read from
+* @param offset where to start reading (normally
+* {@code filecontainer.first_alloc_page_offset})
+* @return a byte array containing the embryonic page
+* @throws ioexception if an i/o error occurs while reading
+*/
+byte getembryonicpage storagerandomaccessfile file  long offset
+throws ioexception
+filechannel iochannel   getchannel file
+if  iochannel    null
+bytebuffer buffer
+bytebuffer allocate allocpage max_borrowed_space
+readfull buffer  iochannel  offset
+return buffer array
+else
+return super getembryonicpage file  offset
+/**
+* attempts to fill buf completely from start until it's full.
+* <p>
+* filechannel has no readfull() method, so we roll our own.
+*/
+private final void readfull bytebuffer dstbuffer
+filechannel srcchannel
+long position
+throws ioexception
+while dstbuffer remaining   > 0
+if  srcchannel read dstbuffer  position   dstbuffer position
+1
+throw new eofexception
+/**
+* attempts to write buf completely from start until end, at the given
+* position in the destination filechannel.
+* <p>
+* filechannel has no writefull() method, so we roll our own.
+*/
+private final void writefull bytebuffer srcbuffer
+filechannel dstchannel
+long position
+throws ioexception
+while srcbuffer remaining   > 0
+dstchannel write srcbuffer  position   srcbuffer position

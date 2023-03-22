@@ -1,0 +1,650 @@
+/*
+derby - class org.apache.derby.impl.store.access.conglomerate.openconglomerate
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store access conglomerate
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby iapi store access conglomerate conglomerate
+import org apache derby iapi store access conglomerate transactionmanager
+import org apache derby iapi store access conglompropertyqueryable
+import org apache derby iapi store access conglomeratecontroller
+import org apache derby iapi store access dynamiccompiledopenconglominfo
+import org apache derby iapi store access qualifier
+import org apache derby iapi store access rowutil
+import org apache derby iapi store access spaceinfo
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi store raw containerhandle
+import org apache derby iapi store raw fetchdescriptor
+import org apache derby iapi store raw lockingpolicy
+import org apache derby iapi store raw page
+import org apache derby iapi store raw recordhandle
+import org apache derby iapi store raw transaction
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi types rowlocation
+import java util properties
+/**
+a generic class which implements the basic functionality needed to operate
+on an "open" conglomerate.  this class assumes the following general things
+about the access method.
+<p>
+the access method is page based and contained in a single container maintained
+by raw store.
+**/
+public abstract class openconglomerate
+/**************************************************************************
+* fields of the class
+**************************************************************************
+*/
+/**
+* the following group of fields are all basic input parameters which are
+* provided by the calling code when doing any sort of operation requiring
+* an open conglomerate (openscan(), open(), opencostcontroller(), ...).
+* these are just saved values from what was initially input.
+**/
+private conglomerate                    init_conglomerate
+private transactionmanager              init_xact_manager
+private transaction                     init_rawtran
+private int                             init_openmode
+private int                             init_lock_level
+private dynamiccompiledopenconglominfo  init_dynamic_info
+private boolean                         init_hold
+private lockingpolicy                   init_locking_policy
+/**
+* convenience boolean's for various mode's
+**/
+private boolean useupdatelocks
+private boolean forupdate
+private boolean getbasetablelocks
+/**
+* scratch space used for stuff like templates, export rows, ...
+**/
+private openconglomeratescratchspace  runtime_mem
+/*
+* the open raw store container associated with this open conglomerate
+**/
+private containerhandle container
+/**************************************************************************
+* constructors for this class:
+**************************************************************************
+*/
+/**************************************************************************
+* private methods for this class:
+**************************************************************************
+*/
+/**************************************************************************
+* abstract methods of this class:
+**************************************************************************
+*/
+/**
+* return an "empty" row location object of the correct type.
+* <p>
+*
+* @return the empty rowlocation.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected abstract rowlocation newrowlocationtemplate
+throws standardexception
+abstract public int getformatids
+/**************************************************************************
+* public methods implementing standard store row locking interfaces:
+*     latchpage(rowposition)
+*     latchpageandrepositionscan(rowposition)
+*     lockpositionforread(rowposition, aux_pos, moveforwardifrowdisappears)
+*     lockpositionforwrite(rowposition, forinsert, wait)
+*     unlockpositionafterread(rowposition)
+**************************************************************************
+*/
+/**
+* latch the page containing the current rowposition, and reposition scan.
+* <p>
+* upon return the scan will hold a latch on the page to continue the
+* scan on.  the scan will positioned on the record, just before the
+* next record to return.
+*
+* note that for both hold cursor and read uncommitted support this routine
+* handles all cases of either the current position "dissappearing" (either
+* the row and/or page).  the row and/or page can disappear by deleted
+* space being reclaimed post commit of that delete, and for some reason
+* the code requesting the reposition does not have locks which prevented
+* the space reclamation.  both hold cursor and read uncommitted scans are
+* examples of ways the caller will not prevent space reclamation from
+* claiming the position.
+*
+* this implementation also automatically updates the rowposition to
+* point at the slot containing the current rowposition.  this slot
+* value is only valid while the latch is held.
+*
+* @return true if scan had to reposition because a row disappeared.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public boolean latchpageandrepositionscan rowposition pos
+throws standardexception
+boolean scan_repositioned   false
+// get the page the record handle refers to.
+pos current_page   null
+try
+if  pos current_rh    null
+pos current_page
+container getpage pos current_rh getpagenumber
+catch  throwable t
+// assume all errors are caused by the page "disappearing", will
+// handle this by positioning on next page in code below.
+// note that in most cases if the page does not exist, getpage()
+// will return null rather than throw an exception, so this path
+// is hard to reach.
+// just continue on first record of the next page.
+// this should only happen if the page on which the scan was
+// positioned had all of it's row deleted and the page was
+// purged.
+// this can happen in a cursor held across a commit, where the
+// scan needs to be repositioned after the first "next()" in the
+// subsequent reopen() of the held cursor.
+if  pos current_page    null
+try
+// reposition scan at the old position, now that latch is held.
+pos current_slot
+pos current_page getslotnumber pos current_rh
+catch  standardexception se
+scan_repositioned   true
+// the record that the scan was positioned on, no longer exists.
+// the normal way this happens is if we were positioned on
+// a deleted row, without holding a lock on it, and while
+// the scan did not hold the latch on the page a post commit
+// job purged the row as part of space reclamation.   this can
+// happen in all isolation level scans below serializable.
+pos current_slot
+pos current_page getnextslotnumber pos current_rh
+if  pos current_slot     1
+// in this case we there are no more rows on this page
+// to visit, so position on the next page.  in this case
+// the row that the scan was positioned on was purged,
+// and there exists no rows now which are greater than this
+// record id.
+pos current_page unlatch
+pos current_page   null
+else
+// the way scans work, need to position on the row just
+// before the one to return "next".  the first thing the
+// next loop will do is move the scan forward one row.
+pos current_slot
+if  pos current_page    null
+// position on the next page.
+long current_pageno
+if  pos current_rh    null
+current_pageno   pos current_rh getpagenumber
+else if  pos current_pageno    containerhandle invalid_page_number
+current_pageno   pos current_pageno
+else
+// no valid position, return a null page
+return false
+pos current_page   container getnextpage current_pageno
+pos current_slot     page first_slot_number   1
+// now position is tracked by active page
+pos current_pageno   containerhandle invalid_page_number
+scan_repositioned   true
+if  scan_repositioned
+pos current_rh   null
+return scan_repositioned
+/**
+* latch the page containing the current rowposition.
+* <p>
+* this implementation also automatically updates the rowposition to
+* point at the slot containing the current rowposition.  this slot
+* value is only valid while the latch is held.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public boolean latchpage rowposition pos
+throws standardexception
+pos current_page   null
+try
+pos current_page
+container getpage pos current_rh getpagenumber
+catch  throwable t
+// assume all errors are caused by the page "disappearing", will
+// handle this by returning false indicating that row can't be
+// found.  this can easily happen when using read uncommitted
+// isolation level.
+if  pos current_page    null
+try
+pos current_slot
+pos current_page getslotnumber pos current_rh
+return true
+catch  throwable t
+// assume all errors are caused by the row "disappearing",
+// will handle this by returning false indicating that row
+// can't be found.  this can easily happen when using read
+// uncommitted isolation level.
+pos current_page unlatch
+pos current_page   null
+return false
+/**
+* lock row at given row position for read.
+* <p>
+* this routine requests a row lock nowait on the row located at the given
+* rowposition.  if the lock is granted nowait the
+* routine will return true.  if the lock cannot be granted nowait, then
+* the routine will release the latch on "page" and then it will request
+* a wait lock on the row.
+* <p>
+* this implementation:
+* assumes latch held on current_page.
+* if the current_rh field of rowposition is non-null it is assumed that
+* we want to lock that record handle and that we don't have a slot number.
+* if the current_rh field of rowposition is null, it is assumed the we
+* want to lock the indicated current_slot.  upon return current_rh will
+* point to the record handle associated with current_slot.
+* <p>
+* after waiting and getting the lock on the row, this routine will fix up
+* rowposition to point at the row locked.  this means it will get the
+* page latch again, and it will fix the current_slot to point at the
+* waited for record handle - it may have moved while waiting on the lock.
+*
+* @param pos       position to lock.
+* @param aux_pos   if you have to give up latch to get lock, then also
+*                  unlock this position if it is non-null.
+* @param moveforwardifrowdisappears
+*                  if true, then this routine must handle the case where
+*                  the row id we are waiting on disappears when the latch
+*                  is released.  if false an exception will be thrown if
+*                  the row disappears.
+* @param waitforlock
+*                  if true wait for lock, if lock can't be granted nowait,
+*                  else if false, throw a lock timeout exception if the
+*                  lock can't be granted without waiting.
+*
+* @return true if lock granted without releasing the latch, else return
+*              false.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public boolean lockpositionforread
+rowposition pos
+rowposition aux_pos
+boolean     moveforwardifrowdisappears
+boolean     waitforlock
+throws standardexception
+if  pos current_rh    null
+if  sanitymanager debug
+sanitymanager assert
+pos current_page    null
+pos current_slot    page invalid_slot_number
+// work around for lockmanager problem with lock/latch releasing.
+// get recordhandle to lock.
+pos current_rh
+pos current_page getrecordhandleatslot pos current_slot
+if  sanitymanager debug
+// make sure current_rh and current_slot are in sync
+if  pos current_slot
+pos current_page getslotnumber pos current_rh
+sanitymanager throwassert
+pos current_slot
+pos current_rh
+pos current_page getslotnumber pos current_rh
+if  sanitymanager debug
+sanitymanager assert pos current_rh    null
+boolean lock_granted_with_latch_held
+this container getlockingpolicy   lockrecordforread
+init_rawtran  container  pos current_rh
+false    nowait     forupdate
+if   lock_granted_with_latch_held
+// could not get the lock nowait, release latch and wait for lock.
+pos current_page unlatch
+pos current_page   null
+if  aux_pos    null
+aux_pos current_page unlatch
+aux_pos current_page   null
+if   waitforlock
+// throw lock timeout error.
+throw standardexception newexception sqlstate lock_timeout
+this container getlockingpolicy   lockrecordforread
+init_rawtran  container  pos current_rh
+true    wait     forupdate
+if  moveforwardifrowdisappears
+if  latchpageandrepositionscan pos
+if  pos current_slot     1
+// if scan was repositioned to just before a valid row
+// on the current page, then move forward and lock and
+// return that row (slot != -1).
+//
+// let the caller handle the "-1"
+// case, which may be one of 3 cases - need to go to
+// slot 1 on current page, need to go to next page,
+// need to end scan as there is no "next" page.  all
+// 3 cases are handled by the generic scan loop in
+// genericscancontroller.fetchrows().
+pos positionatnextslot
+lockpositionforread pos  aux_pos  true  true
+else
+latchpage pos
+return lock_granted_with_latch_held
+public boolean lockpositionforwrite
+rowposition pos
+boolean     forinsert
+boolean     waitforlock
+throws standardexception
+if  pos current_rh    null
+if  sanitymanager debug
+sanitymanager assert pos current_page    null
+sanitymanager assert
+pos current_slot    page invalid_slot_number
+// work around for lockmanager problem with lock/latch releasing.
+// get recordhandle to lock.
+pos current_rh
+pos current_page fetchfromslot
+
+pos current_slot
+rowutil empty_row
+rowutil empty_row_fetch_descriptor
+true
+if  sanitymanager debug
+// make sure current_rh and current_slot are in sync
+if  pos current_slot
+pos current_page getslotnumber pos current_rh
+sanitymanager throwassert
+pos current_slot
+pos current_rh
+pos current_page getslotnumber pos current_rh
+if  sanitymanager debug
+sanitymanager assert pos current_rh    null
+boolean lock_granted_with_latch_held
+this container getlockingpolicy
+lockrecordforwrite
+init_rawtran  pos current_rh
+forinsert  false    nowait
+if   lock_granted_with_latch_held
+if   waitforlock
+// throw lock timeout error.
+throw standardexception newexception sqlstate lock_timeout
+// could not get the lock nowait, release latch and wait for lock.
+pos current_page unlatch
+pos current_page   null
+if   waitforlock
+// throw lock timeout error.
+throw standardexception newexception sqlstate lock_timeout
+this container getlockingpolicy
+lockrecordforwrite
+init_rawtran  pos current_rh  forinsert  true    wait
+latchpage pos
+return lock_granted_with_latch_held
+/**
+* unlock the record after a previous request to lock it.
+* <p>
+* unlock the record after a previous call to lockrecordforread().  it is
+* expected that rowposition contains information used to lock the record,
+* thus it is important if using a single rowposition to track a scan to
+* call unlock before you move the position forward to the next record.
+* <p>
+* note that this routine assumes that the row was locked forupdate if
+* the openconglomerate is forupdate, else it assumes the record was
+* locked for read.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void unlockpositionafterread
+rowposition pos
+throws standardexception
+if   isclosed
+container getlockingpolicy
+unlockrecordafterread
+init_rawtran  container  pos current_rh  forupdate
+pos current_rh_qualified
+/**************************************************************************
+* public methods implementing conglompropertyqueryable interface:
+**************************************************************************
+*/
+/**
+* request set of properties associated with a table.
+* <p>
+* returns a property object containing all properties that the store
+* knows about, which are stored persistently by the store.  this set
+* of properties may vary from implementation to implementation of the
+* store.
+* <p>
+* this call is meant to be used only for internal query of the properties
+* by jbms, for instance by language during bulk insert so that it can
+* create a new conglomerate which exactly matches the properties that
+* the original container was created with.  this call should not be used
+* by the user interface to present properties to users as it may contain
+* properties that are meant to be internal to jbms.  some properties are
+* meant only to be specified by jbms code and not by users on the command
+* line.
+* <p>
+* note that not all properties passed into createconglomerate() are stored
+* persistently, and that set may vary by store implementation.
+*
+* @param prop   property list to add properties to.  if null, routine will
+*               create a new properties object, fill it in and return it.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public properties getinternaltablepropertyset properties prop
+throws standardexception
+properties  ret_properties
+conglomerateutil createrawstorepropertyset prop
+gettableproperties ret_properties
+return ret_properties
+/**
+* request the system properties associated with a table.
+* <p>
+* request the value of properties that are associated with a table.  the
+* following properties can be requested:
+*     derby.storage.pagesize
+*     derby.storage.pagereservedspace
+*     derby.storage.minimumrecordsize
+*     derby.storage.initialpages
+* <p>
+* to get the value of a particular property add it to the property list,
+* and on return the value of the property will be set to it's current
+* value.  for example:
+*
+* get_prop(conglomeratecontroller cc)
+* {
+*     properties prop = new properties();
+*     prop.put("derby.storage.pagesize", "");
+*     cc.gettableproperties(prop);
+*
+*     system.out.println(
+*         "table's page size = " +
+*         prop.getproperty("derby.storage.pagesize");
+* }
+*
+* @param prop   property list to fill in.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void gettableproperties properties prop
+throws standardexception
+container getcontainerproperties prop
+return
+/**************************************************************************
+* public accessors of this class:
+**************************************************************************
+*/
+public final transactionmanager getxactmgr
+return init_xact_manager
+public final transaction getrawtran
+return init_rawtran
+public final containerhandle getcontainer
+return container
+public final int getopenmode
+return init_openmode
+public final conglomerate getconglomerate
+return init_conglomerate
+public final boolean gethold
+return init_hold
+public final boolean isforupdate
+return forupdate
+public final boolean isclosed
+return container    null
+public final boolean isuseupdatelocks
+return useupdatelocks
+public final openconglomeratescratchspace getruntimemem
+return runtime_mem
+/**************************************************************************
+* public methods implementing some conglomeratecontroller interfaces:
+**************************************************************************
+*/
+/**
+* check consistency of a conglomerate.
+* <p>
+* checks the consistency of the data within a given conglomerate, does not
+* check consistency external to the conglomerate (ie. does not check that
+* base table row pointed at by a secondary index actually exists).
+* <p>
+* there is no checking in the default implementation, you must override
+* to get conglomerate specific consistency checking.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void checkconsistency
+throws standardexception
+return
+public void debugconglomerate
+throws standardexception
+if  sanitymanager debug
+sanitymanager debug_print
+container getid
+// get a template.
+datavaluedescriptor row   runtime_mem get_row_for_export
+// print pages of the heap.
+page page   container getfirstpage
+while  page    null
+sanitymanager debug_print
+conglomerateutil debugpage page  0  false  row
+long pageid   page getpagenumber
+page unlatch
+page   container getnextpage pageid
+return
+/**
+get information about space used by the conglomerate.
+**/
+public spaceinfo getspaceinfo
+throws standardexception
+return container getspaceinfo
+protected boolean iskeyed
+return false
+/**
+* is the open btree table locked?
+**/
+protected boolean istablelocked
+return init_lock_level    transactioncontroller mode_table
+/**************************************************************************
+* public methods of this class:
+**************************************************************************
+*/
+/**
+* open the container.
+* <p>
+* open the container, obtaining necessary locks.  most work is actually
+* done by rawstore.opencontainer().
+*
+* @exception  standardexception  standard exception policy.
+**/
+public containerhandle init
+containerhandle                 open_container
+conglomerate                    conglomerate
+int                           format_ids
+transactionmanager              xact_manager
+transaction                     rawtran
+boolean                         hold
+int                             openmode
+int                             lock_level
+lockingpolicy                   locking_policy
+dynamiccompiledopenconglominfo  dynamic_info
+throws standardexception
+// save state of all inputs.
+init_conglomerate         conglomerate
+init_xact_manager         xact_manager
+init_rawtran              rawtran
+init_openmode             openmode
+init_lock_level           lock_level
+init_dynamic_info         dynamic_info
+init_hold                 hold
+init_locking_policy       locking_policy
+// either use passed in "compiled" runtime scratch space, or create
+// new space.
+this runtime_mem
+dynamic_info    null ?
+openconglomeratescratchspace  dynamic_info
+new openconglomeratescratchspace format_ids
+// is this an open for update or read?  this will
+// be passed down to the raw store fetch methods, which allows
+// it to do the appropriate locking.
+this forupdate
+openmode   containerhandle mode_forupdate     0
+// keep track of whether this open conglomerate should use update locks.
+this useupdatelocks
+openmode   containerhandle mode_use_update_locks     0
+// if this flag is set, then the client has already locked the row
+// by accessing it through the secondary index and has already locked
+// the row, so the base conglomerate need not re-lock the row.
+this getbasetablelocks
+openmode   containerhandle mode_secondary_locked     0
+// if the conglomerate is temporary, open with is_kept set.
+// resolve(mikem): track 1825
+// don't want to open temp cantainer with is_kept always.
+if  conglomerate istemporary
+init_openmode    containerhandle mode_temp_is_kept
+if   getbasetablelocks
+init_locking_policy   null
+// open the container.
+this container
+open_container    null ?
+open_container
+rawtran opencontainer
+conglomerate getid    init_locking_policy  init_openmode
+return this container
+/**
+* open the container.
+* <p>
+* open the container, obtaining necessary locks.  most work is actually
+* done by rawstore.opencontainer().  will only reopen() if the container
+* is not already open.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public containerhandle reopen
+throws standardexception
+// reget transaction from context manager, in the case of xa
+// transaction this may have changed.
+//
+/* todo - xa transactions my change the current transaction on the
+* context stack.  will want to something like:
+*
+* init_rawtran = context_manager.getcurrenttransaction()
+*/
+if  this container    null
+this container
+init_rawtran opencontainer
+init_conglomerate getid
+init_locking_policy
+init_openmode
+return this container
+/**
+* close the container.
+* <p>
+* handles being closed more than once.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void close
+throws standardexception
+if  container    null
+container close
+container   null

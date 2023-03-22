@@ -1,0 +1,524 @@
+/*
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+* http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase coprocessor
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase coprocessor
+import org apache hadoop hbase coprocessorenvironment
+import org apache hadoop hbase donotretryioexception
+import org apache hadoop hbase hbaseconfiguration
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase client
+import org apache hadoop hbase client coprocessor batch
+import org apache hadoop hbase ipc coprocessorprotocol
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util sortedcopyonwriteset
+import org apache hadoop hbase util versioninfo
+import org apache hadoop hbase server
+import org apache hadoop io ioutils
+import java io file
+import java io fileoutputstream
+import java io ioexception
+import java net url
+import java net urlclassloader
+import java util
+import java util jar jarentry
+import java util jar jarfile
+/**
+* provides the common setup framework and runtime services for coprocessor
+* invocation from hbase services.
+* @param <e> the specific environment extension that a concrete implementation
+* provides
+*/
+public abstract class coprocessorhost<e extends coprocessorenvironment>
+public static final string region_coprocessor_conf_key
+public static final string user_region_coprocessor_conf_key
+public static final string master_coprocessor_conf_key
+public static final string wal_coprocessor_conf_key
+private static final log log   logfactory getlog coprocessorhost class
+/** ordered set of loaded coprocessors with lock */
+protected sortedset<e> coprocessors
+new sortedcopyonwriteset<e> new environmentprioritycomparator
+protected configuration conf
+// unique file prefix to use for local copies of jars when classloading
+protected string pathprefix
+protected volatile int loadsequence
+public coprocessorhost
+pathprefix   uuid randomuuid   tostring
+/**
+* not to be confused with the per-object _coprocessors_ (above),
+* coprocessornames is static and stores the set of all coprocessors ever
+* loaded by any thread in this jvm. it is strictly additive: coprocessors are
+* added to coprocessornames, by loadinstance() but are never removed, since
+* the intention is to preserve a history of all loaded coprocessors for
+* diagnosis in case of server crash (hbase-4014).
+*/
+private static set<string> coprocessornames
+collections synchronizedset new hashset<string>
+public static set<string> getloadedcoprocessors
+return coprocessornames
+/**
+* used to create a parameter to the hserverload constructor so that
+* hserverload can provide information about the coprocessors loaded by this
+* regionserver.
+* (hbase-4070: improve region server metrics to report loaded coprocessors
+* to master).
+*/
+public set<string> getcoprocessors
+set<string> returnvalue   new treeset<string>
+for coprocessorenvironment e  coprocessors
+returnvalue add e getinstance   getclass   getsimplename
+return returnvalue
+/**
+* load system coprocessors. read the class names from configuration.
+* called by constructor.
+*/
+protected void loadsystemcoprocessors configuration conf  string confkey
+class<?> implclass   null
+// load default coprocessors from configure file
+string defaultcpclasses   conf getstrings confkey
+if  defaultcpclasses    null    defaultcpclasses length    0
+return
+int priority   coprocessor priority_system
+list<e> configured   new arraylist<e>
+for  string classname   defaultcpclasses
+classname   classname trim
+if  findcoprocessor classname     null
+continue
+classloader cl   this getclass   getclassloader
+thread currentthread   setcontextclassloader cl
+try
+implclass   cl loadclass classname
+configured add loadinstance implclass  coprocessor priority_system  conf
+log info     classname
+priority
+catch  classnotfoundexception e
+log warn     classname
+e getmessage
+catch  ioexception e
+log warn     classname
+e getmessage
+// add entire set to the collection for cow efficiency
+coprocessors addall configured
+/**
+* load a coprocessor implementation into the host
+* @param path path to implementation jar
+* @param classname the main class name
+* @param priority chaining priority
+* @param conf configuration for coprocessor
+* @throws java.io.ioexception exception
+*/
+@suppresswarnings
+public e load path path  string classname  int priority
+configuration conf  throws ioexception
+class<?> implclass   null
+// have we already loaded the class, perhaps from an earlier region open
+// for the same table?
+try
+implclass   getclass   getclassloader   loadclass classname
+catch  classnotfoundexception e
+log info     classname
+path tostring
+// go ahead to load from file system.
+// if not, load
+if  implclass    null
+// copy the jar to the local filesystem
+if   path tostring   endswith
+throw new ioexception path tostring
+filesystem fs   path getfilesystem hbaseconfiguration create
+path dst   new path system getproperty
+java io file separator      pathprefix
+classname       system currenttimemillis
+fs copytolocalfile path  dst
+fs deleteonexit dst
+// todo: code weaving goes here
+// todo: wrap heap allocations and enforce maximum usage limits
+/* todo: inject code into loop headers that monitors cpu use and
+aborts runaway user code */
+// load the jar and get the implementation main class
+string cp   system getproperty
+// note: path.tourl is deprecated (touri instead) but the urlclassloader
+// unsurprisingly wants urls, not uris; so we will use the deprecated
+// method which returns urls for as long as it is available
+list<url> paths   new arraylist<url>
+paths add new file dst tostring    getcanonicalfile   tourl
+jarfile jarfile   new jarfile dst tostring
+enumeration<jarentry> entries   jarfile entries
+while  entries hasmoreelements
+jarentry entry   entries nextelement
+if  entry getname   matches
+file file   new file system getproperty
+java io file separator      pathprefix
+classname       system currenttimemillis         entry getname   substring 5
+ioutils copybytes jarfile getinputstream entry   new fileoutputstream file   conf  true
+file deleteonexit
+paths add file tourl
+stringtokenizer st   new stringtokenizer cp  file pathseparator
+while  st hasmoretokens
+paths add  new file st nexttoken     getcanonicalfile   tourl
+classloader cl   new urlclassloader paths toarray new url
+this getclass   getclassloader
+thread currentthread   setcontextclassloader cl
+try
+implclass   cl loadclass classname
+catch  classnotfoundexception e
+throw new ioexception e
+return loadinstance implclass  priority  conf
+/**
+* @param implclass implementation class
+* @param priority priority
+* @param conf configuration
+* @throws java.io.ioexception exception
+*/
+public void load class<?> implclass  int priority  configuration conf
+throws ioexception
+e env   loadinstance implclass  priority  conf
+coprocessors add env
+/**
+* @param implclass implementation class
+* @param priority priority
+* @param conf configuration
+* @throws java.io.ioexception exception
+*/
+public e loadinstance class<?> implclass  int priority  configuration conf
+throws ioexception
+// create the instance
+coprocessor impl
+object o   null
+try
+o   implclass newinstance
+impl    coprocessor o
+catch  instantiationexception e
+throw new ioexception e
+catch  illegalaccessexception e
+throw new ioexception e
+// create the environment
+e env   createenvironment implclass  impl  priority    loadsequence  conf
+if  env instanceof environment
+environment env  startup
+// hbase-4014: maintain list of loaded coprocessors for later crash analysis
+// if server (master or regionserver) aborts.
+coprocessornames add implclass getname
+return env
+/**
+* called when a new coprocessor class is loaded
+*/
+public abstract e createenvironment class<?> implclass  coprocessor instance
+int priority  int sequence  configuration conf
+public void shutdown coprocessorenvironment e
+if  e instanceof environment
+environment e  shutdown
+else
+log warn
+e getclass   getname
+/**
+* find a coprocessor implementation by class name
+* @param classname the class name
+* @return the coprocessor, or null if not found
+*/
+public coprocessor findcoprocessor string classname
+// initialize the coprocessors
+for  e env  coprocessors
+if  env getinstance   getclass   getname   equals classname
+env getinstance   getclass   getsimplename   equals classname
+return env getinstance
+return null
+/**
+* find a coprocessor environment by class name
+* @param classname the class name
+* @return the coprocessor, or null if not found
+*/
+public coprocessorenvironment findcoprocessorenvironment string classname
+// initialize the coprocessors
+for  e env  coprocessors
+if  env getinstance   getclass   getname   equals classname
+env getinstance   getclass   getsimplename   equals classname
+return env
+return null
+/**
+* environment priority comparator.
+* coprocessors are chained in sorted order.
+*/
+static class environmentprioritycomparator
+implements comparator<coprocessorenvironment>
+public int compare final coprocessorenvironment env1
+final coprocessorenvironment env2
+if  env1 getpriority   < env2 getpriority
+return  1
+else if  env1 getpriority   > env2 getpriority
+return 1
+if  env1 getloadsequence   < env2 getloadsequence
+return  1
+else if  env1 getloadsequence   > env2 getloadsequence
+return 1
+return 0
+/**
+* encapsulation of the environment of each coprocessor
+*/
+public static class environment implements coprocessorenvironment
+/**
+* a wrapper for htable. can be used to restrict privilege.
+*
+* currently it just helps to track tables opened by a coprocessor and
+* facilitate close of them if it is aborted.
+*
+* we also disallow row locking.
+*
+* there is nothing now that will stop a coprocessor from using htable
+* objects directly instead of this api, but in the future we intend to
+* analyze coprocessor implementations as they are loaded and reject those
+* which attempt to use objects and methods outside the environment
+* sandbox.
+*/
+class htablewrapper implements htableinterface
+private byte tablename
+private htable table
+public htablewrapper byte tablename  throws ioexception
+this tablename   tablename
+this table   new htable conf  tablename
+opentables add this
+void internalclose   throws ioexception
+table close
+public configuration getconfiguration
+return table getconfiguration
+public void close   throws ioexception
+try
+internalclose
+finally
+opentables remove this
+public result getroworbefore byte row  byte family
+throws ioexception
+return table getroworbefore row  family
+public result get get get  throws ioexception
+return table get get
+public boolean exists get get  throws ioexception
+return table exists get
+public void put put put  throws ioexception
+table put put
+public void put list<put> puts  throws ioexception
+table put puts
+public void delete delete delete  throws ioexception
+table delete delete
+public void delete list<delete> deletes  throws ioexception
+table delete deletes
+public boolean checkandput byte row  byte family  byte qualifier
+byte value  put put  throws ioexception
+return table checkandput row  family  qualifier  value  put
+public boolean checkanddelete byte row  byte family  byte qualifier
+byte value  delete delete  throws ioexception
+return table checkanddelete row  family  qualifier  value  delete
+public long incrementcolumnvalue byte row  byte family
+byte qualifier  long amount  throws ioexception
+return table incrementcolumnvalue row  family  qualifier  amount
+public long incrementcolumnvalue byte row  byte family
+byte qualifier  long amount  boolean writetowal
+throws ioexception
+return table incrementcolumnvalue row  family  qualifier  amount
+writetowal
+@override
+public result append append append  throws ioexception
+return table append append
+@override
+public result increment increment increment  throws ioexception
+return table increment increment
+public void flushcommits   throws ioexception
+table flushcommits
+public boolean isautoflush
+return table isautoflush
+public resultscanner getscanner scan scan  throws ioexception
+return table getscanner scan
+public resultscanner getscanner byte family  throws ioexception
+return table getscanner family
+public resultscanner getscanner byte family  byte qualifier
+throws ioexception
+return table getscanner family  qualifier
+public htabledescriptor gettabledescriptor   throws ioexception
+return table gettabledescriptor
+public byte gettablename
+return tablename
+public rowlock lockrow byte row  throws ioexception
+throw new runtimeexception
+public void unlockrow rowlock rl  throws ioexception
+throw new runtimeexception
+@override
+public void batch list<? extends row> actions  object results
+throws ioexception  interruptedexception
+table batch actions  results
+@override
+public object batch list<? extends row> actions
+throws ioexception  interruptedexception
+return table batch actions
+@override
+public result get list<get> gets  throws ioexception
+return table get gets
+@override
+public <t extends coprocessorprotocol  r> void coprocessorexec class<t> protocol
+byte startkey  byte endkey  batch call<t  r> callable
+batch callback<r> callback  throws ioexception  throwable
+table coprocessorexec protocol  startkey  endkey  callable  callback
+@override
+public <t extends coprocessorprotocol  r> map<byte  r> coprocessorexec
+class<t> protocol  byte startkey  byte endkey  batch call<t  r> callable
+throws ioexception  throwable
+return table coprocessorexec protocol  startkey  endkey  callable
+@override
+public <t extends coprocessorprotocol> t coprocessorproxy class<t> protocol
+byte row
+return table coprocessorproxy protocol  row
+@override
+public void mutaterow rowmutations rm  throws ioexception
+table mutaterow rm
+/** the coprocessor */
+public coprocessor impl
+/** chaining priority */
+protected int priority   coprocessor priority_user
+/** current coprocessor state */
+coprocessor state state   coprocessor state uninstalled
+/** accounting for tables opened by the coprocessor */
+protected list<htableinterface> opentables
+collections synchronizedlist new arraylist<htableinterface>
+private int seq
+private configuration conf
+/**
+* constructor
+* @param impl the coprocessor instance
+* @param priority chaining priority
+*/
+public environment final coprocessor impl  final int priority
+final int seq  final configuration conf
+this impl   impl
+this priority   priority
+this state   coprocessor state installed
+this seq   seq
+this conf   conf
+/** initialize the environment */
+public void startup
+if  state    coprocessor state installed
+state    coprocessor state stopped
+state   coprocessor state starting
+try
+impl start this
+state   coprocessor state active
+catch  ioexception ioe
+log error   impl getclass   getname    ioe
+else
+log warn   impl getclass   getname
+state tostring
+/** clean up the environment */
+protected void shutdown
+if  state    coprocessor state active
+state   coprocessor state stopping
+try
+impl stop this
+state   coprocessor state stopped
+catch  ioexception ioe
+log error   impl getclass   getname    ioe
+else
+log warn   impl getclass   getname
+state tostring
+// clean up any table references
+for  htableinterface table  opentables
+try
+htablewrapper table  internalclose
+catch  ioexception e
+// nothing can be done here
+log warn
+bytes tostringbinary table gettablename     e
+@override
+public coprocessor getinstance
+return impl
+@override
+public int getpriority
+return priority
+@override
+public int getloadsequence
+return seq
+/** @return the coprocessor environment version */
+@override
+public int getversion
+return coprocessor version
+/** @return the hbase release */
+@override
+public string gethbaseversion
+return versioninfo getversion
+@override
+public configuration getconfiguration
+return conf
+/**
+* open a table from within the coprocessor environment
+* @param tablename the table name
+* @return an interface for manipulating the table
+* @exception java.io.ioexception exception
+*/
+@override
+public htableinterface gettable byte tablename  throws ioexception
+return new htablewrapper tablename
+protected void abortserver final string service
+final server server
+final coprocessorenvironment environment
+final throwable e
+string coprocessorname    environment getinstance    tostring
+server abort     service
+server getservername
+coprocessorname      e
+protected void abortserver final coprocessorenvironment environment
+final throwable e
+string coprocessorname    environment getinstance    tostring
+log error     coprocessorname
+e
+/**
+* this is used by coprocessor hooks which are declared to throw ioexception
+* (or its subtypes). for such hooks, we should handle throwable objects
+* depending on the throwable's type. those which are instances of
+* ioexception should be passed on to the client. this is in conformance with
+* the hbase idiom regarding ioexception: that it represents a circumstance
+* that should be passed along to the client for its own handling. for
+* example, a coprocessor that implements access controls would throw a
+* subclass of ioexception, such as accessdeniedexception, in its preget()
+* method to prevent an unauthorized client's performing a get on a particular
+* table.
+* @param env coprocessor environment
+* @param e throwable object thrown by coprocessor.
+* @exception ioexception exception
+*/
+protected void handlecoprocessorthrowable final coprocessorenvironment env
+final throwable e
+throws ioexception
+if  e instanceof ioexception
+throw  ioexception e
+// if we got here, e is not an ioexception. a loaded coprocessor has a
+// fatal bug, and the server (master or regionserver) should remove the
+// faulty coprocessor from its set of active coprocessors. setting
+// 'hbase.coprocessor.abortonerror' to true will cause abortserver(),
+// which may be useful in development and testing environments where
+// 'failing fast' for error analysis is desired.
+if  env getconfiguration   getboolean   false
+// server is configured to abort.
+abortserver env  e
+else
+log error     env tostring
+e e
+coprocessors remove env
+throw new donotretryioexception     env tostring
+e
+e

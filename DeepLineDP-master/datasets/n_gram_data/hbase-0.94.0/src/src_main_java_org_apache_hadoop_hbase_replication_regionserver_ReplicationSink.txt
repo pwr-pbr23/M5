@@ -1,0 +1,157 @@
+/*
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase replication regionserver
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase client delete
+import org apache hadoop hbase client htableinterface
+import org apache hadoop hbase client htablepool
+import org apache hadoop hbase client put
+import org apache hadoop hbase client row
+import org apache hadoop hbase regionserver wal hlog
+import org apache hadoop hbase regionserver wal waledit
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase stoppable
+import java io ioexception
+import java util arraylist
+import java util list
+import java util map
+import java util treemap
+/**
+* this class is responsible for replicating the edits coming
+* from another cluster.
+* <p/>
+* this replication process is currently waiting for the edits to be applied
+* before the method can return. this means that the replication of edits
+* is synchronized (after reading from hlogs in replicationsource) and that a
+* single region server cannot receive edits from two sources at the same time
+* <p/>
+* this class uses the native hbase client in order to replicate entries.
+* <p/>
+*
+* todo make this class more like replicationsource wrt log handling
+*/
+public class replicationsink
+private static final log log   logfactory getlog replicationsink class
+// name of the hdfs directory that contains the temporary rep logs
+public static final string replication_log_dir
+private final configuration conf
+// pool used to replicated
+private final htablepool pool
+private final replicationsinkmetrics metrics
+/**
+* create a sink for replication
+*
+* @param conf                conf object
+* @param stopper             boolean to tell this thread to stop
+* @throws ioexception thrown when hdfs goes bad or bad file name
+*/
+public replicationsink configuration conf  stoppable stopper
+throws ioexception
+this conf   conf
+this pool   new htablepool this conf
+conf getint    10
+this metrics   new replicationsinkmetrics
+/**
+* replicate this array of entries directly into the local cluster
+* using the native client.
+*
+* @param entries
+* @throws ioexception
+*/
+public void replicateentries hlog entry entries
+throws ioexception
+if  entries length    0
+return
+// very simple optimization where we batch sequences of rows going
+// to the same table.
+try
+long totalreplicated   0
+// map of table => list of rows, we only want to flushcommits once per
+// invocation of this method per table.
+map<byte  list<row>> rows   new treemap<byte  list<row>> bytes bytes_comparator
+for  hlog entry entry   entries
+waledit edit   entry getedit
+byte table   entry getkey   gettablename
+put put   null
+delete del   null
+keyvalue lastkv   null
+list<keyvalue> kvs   edit getkeyvalues
+for  keyvalue kv   kvs
+if  lastkv    null    lastkv gettype      kv gettype       lastkv matchingrow kv
+if  kv isdelete
+del   new delete kv getrow
+del setclusterid entry getkey   getclusterid
+addtomultimap rows  table  del
+else
+put   new put kv getrow
+put setclusterid entry getkey   getclusterid
+addtomultimap rows  table  put
+if  kv isdelete
+del adddeletemarker kv
+else
+put add kv
+lastkv   kv
+totalreplicated
+for byte  table   rows keyset
+batch table  rows get table
+this metrics setageoflastappliedop
+entries getkey   getwritetime
+this metrics appliedbatchesrate inc 1
+log info     totalreplicated
+catch  ioexception ex
+log error    ex
+throw ex
+/**
+* simple helper to a map from key to (a list of) values
+* todo: make a general utility method
+* @param map
+* @param key
+* @param value
+* @return
+*/
+private <k  v> list<v> addtomultimap map<k  list<v>> map  k key  v value
+list<v> values   map get key
+if  values    null
+values   new arraylist<v>
+map put key  values
+values add value
+return values
+/**
+* do the changes and handle the pool
+* @param tablename table to insert into
+* @param rows list of actions
+* @throws ioexception
+*/
+private void batch byte tablename  list<row> rows  throws ioexception
+if  rows isempty
+return
+htableinterface table   null
+try
+table   this pool gettable tablename
+table batch rows
+this metrics appliedopsrate inc rows size
+catch  interruptedexception ix
+throw new ioexception ix
+finally
+if  table    null
+table close

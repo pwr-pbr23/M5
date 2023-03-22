@@ -1,0 +1,491 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache kahadb journal
+import java io file
+import java io filenamefilter
+import java io ioexception
+import java io unsupportedencodingexception
+import java util
+import java util concurrent concurrenthashmap
+import java util concurrent atomic atomiclong
+import java util concurrent atomic atomicreference
+import java util zip adler32
+import java util zip checksum
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache kahadb journal datafileappender writecommand
+import org apache kahadb journal datafileappender writekey
+import org apache kahadb util
+/**
+* manages datafiles
+*
+* @version $revision$
+*/
+public class journal
+private static final int max_batch_size   32 1024 1024
+// item_head_space = length + type+ reserved space + sor
+public static final int record_head_space   4   1
+public static final byte user_record_type   1
+public static final byte batch_control_record_type   2
+// batch control item holds a 4 byte size of the batch and a 8 byte checksum of the batch.
+public static final byte batch_control_record_magic   bytes
+public static final int batch_control_record_size   record_head_space batch_control_record_magic length 4 8
+public static final byte batch_control_record_header   createbatchcontrolrecordheader
+private static byte createbatchcontrolrecordheader
+try
+databytearrayoutputstream os   new databytearrayoutputstream
+os writeint batch_control_record_size
+os writebyte batch_control_record_type
+os write batch_control_record_magic
+bytesequence sequence   os tobytesequence
+sequence compact
+return sequence getdata
+catch  ioexception e
+throw new runtimeexception
+public static final string default_directory
+public static final string default_archive_directory
+public static final string default_file_prefix
+public static final string default_file_suffix
+public static final int default_max_file_length   1024   1024   32
+public static final int default_cleanup_interval   1000   30
+public static final int prefered_diff   1024   512
+public static final int default_max_write_batch_size   1024   1024   4
+private static final log log   logfactory getlog journal class
+protected final map<writekey  writecommand> inflightwrites   new concurrenthashmap<writekey  writecommand>
+protected file directory   new file default_directory
+protected file directoryarchive   new file default_archive_directory
+protected string fileprefix   default_file_prefix
+protected string filesuffix   default_file_suffix
+protected boolean started
+protected int maxfilelength   default_max_file_length
+protected int preferedfilelength   default_max_file_length   prefered_diff
+protected int writebatchsize   default_max_write_batch_size
+protected datafileappender appender
+protected datafileaccessorpool accessorpool
+protected map<integer  datafile> filemap   new hashmap<integer  datafile>
+protected map<file  datafile> filebyfilemap   new linkedhashmap<file  datafile>
+protected linkednodelist<datafile> datafiles   new linkednodelist<datafile>
+protected final atomicreference<location> lastappendlocation   new atomicreference<location>
+protected runnable cleanuptask
+protected final atomiclong totallength   new atomiclong
+protected boolean archivedatalogs
+private replicationtarget replicationtarget
+protected boolean checksum
+protected boolean checkforcorruptiononstartup
+public synchronized void start   throws ioexception
+if  started
+return
+long start   system currenttimemillis
+accessorpool   new datafileaccessorpool this
+started   true
+preferedfilelength   math max prefered_diff  getmaxfilelength     prefered_diff
+appender   new datafileappender this
+file files   directory listfiles new filenamefilter
+public boolean accept file dir  string n
+return dir equals directory     n startswith fileprefix     n endswith filesuffix
+if  files    null
+for  int i   0  i < files length  i
+try
+file file   files
+string n   file getname
+string numstr   n substring fileprefix length    n length   filesuffix length
+int num   integer parseint numstr
+datafile datafile   new datafile file  num  preferedfilelength
+filemap put datafile getdatafileid    datafile
+totallength addandget datafile getlength
+catch  numberformatexception e
+// ignore file that do not match the pattern.
+// sort the list so that we can link the datafiles together in the
+// right order.
+list<datafile> l   new arraylist<datafile> filemap values
+collections sort l
+for  datafile df   l
+datafiles addlast df
+filebyfilemap put df getfile    df
+if  ischeckforcorruptiononstartup
+lastappendlocation set recoverycheck df
+getcurrentwritefile
+if  lastappendlocation get    null
+datafile df   datafiles gettail
+lastappendlocation set recoverycheck df
+cleanuptask   new runnable
+public void run
+cleanup
+scheduler executeperiodically cleanuptask  default_cleanup_interval
+long end   system currenttimemillis
+log trace    end start
+private static byte bytes string string
+try
+return string getbytes
+catch  unsupportedencodingexception e
+throw new runtimeexception e
+protected location recoverycheck datafile datafile  throws ioexception
+location location   new location
+location setdatafileid datafile getdatafileid
+location setoffset 0
+datafileaccessor reader   accessorpool opendatafileaccessor datafile
+try
+while  true
+int size   checkbatchrecord reader  location getoffset
+if   size> 0
+location setoffset location getoffset   batch_control_record_size size
+else
+// perhaps it's just some corruption... scan through the file to find the next valid batch record.  we
+// may have subsequent valid batch records.
+int nextoffset   findnextbatchrecord reader  location getoffset   1
+if  nextoffset > 0
+sequence sequence   new sequence location getoffset    nextoffset   1
+log info   datafile getfile     sequence
+datafile corruptedblocks add sequence
+location setoffset nextoffset
+else
+break
+catch  ioexception e
+finally
+accessorpool closedatafileaccessor reader
+datafile setlength location getoffset
+if   datafile corruptedblocks isempty
+// is the end of the data file corrupted?
+if  datafile corruptedblocks gettail   getlast   1    location getoffset
+datafile setlength  int  datafile corruptedblocks removelastsequence   getfirst
+return location
+private int findnextbatchrecord datafileaccessor reader  int offset  throws ioexception
+bytesequence header   new bytesequence batch_control_record_header
+byte data   new byte
+bytesequence bs   new bytesequence data  0  reader read offset  data
+int pos   0
+while  true
+pos   bs indexof header  pos
+if  pos >  0
+return offset pos
+else
+// need to load the next data chunck in..
+if  bs length    data length
+// if we had a short read then we were at eof
+return  1
+offset    bs length batch_control_record_header length
+bs   new bytesequence data  0  reader read offset  data
+pos 0
+public int checkbatchrecord datafileaccessor reader  int offset  throws ioexception
+byte controlrecord   new byte
+databytearrayinputstream controlis   new databytearrayinputstream controlrecord
+reader readfully offset  controlrecord
+// assert that it's  a batch record.
+for  int i 0  i < batch_control_record_header length  i
+if  controlis readbyte      batch_control_record_header
+return  1
+int size   controlis readint
+if  size > max_batch_size
+return  1
+if  ischecksum
+long expectedchecksum   controlis readlong
+if  expectedchecksum    0
+// checksuming was not enabled when the record was stored.
+// we can't validate the record :(
+return size
+byte data   new byte
+reader readfully offset batch_control_record_size  data
+checksum checksum   new adler32
+checksum update data  0  data length
+if  expectedchecksum  checksum getvalue
+return  1
+return size
+void addtototallength int size
+totallength addandget size
+synchronized datafile getcurrentwritefile   throws ioexception
+if  datafiles isempty
+rotatewritefile
+return datafiles gettail
+synchronized datafile rotatewritefile
+int nextnum    datafiles isempty   ? datafiles gettail   getdatafileid   intvalue     1   1
+file file   getfile nextnum
+datafile nextwritefile   new datafile file  nextnum  preferedfilelength
+// actually allocate the disk space
+filemap put nextwritefile getdatafileid    nextwritefile
+filebyfilemap put file  nextwritefile
+datafiles addlast nextwritefile
+return nextwritefile
+public file getfile int nextnum
+string filename   fileprefix   nextnum   filesuffix
+file file   new file directory  filename
+return file
+synchronized datafile getdatafile location item  throws ioexception
+integer key   integer valueof item getdatafileid
+datafile datafile   filemap get key
+if  datafile    null
+log error     key       filemap
+throw new ioexception     getfile item getdatafileid
+return datafile
+synchronized file getfile location item  throws ioexception
+integer key   integer valueof item getdatafileid
+datafile datafile   filemap get key
+if  datafile    null
+log error     key       filemap
+throw new ioexception     getfile item getdatafileid
+return datafile getfile
+private datafile getnextdatafile datafile datafile
+return datafile getnext
+public synchronized void close   throws ioexception
+if   started
+return
+scheduler cancel cleanuptask
+accessorpool close
+appender close
+filemap clear
+filebyfilemap clear
+datafiles clear
+lastappendlocation set null
+started   false
+synchronized void cleanup
+if  accessorpool    null
+accessorpool disposeunused
+public synchronized boolean delete   throws ioexception
+// close all open file handles...
+appender close
+accessorpool close
+boolean result   true
+for  iterator<datafile> i   filemap values   iterator    i hasnext
+datafile datafile   i next
+totallength addandget  datafile getlength
+result    datafile delete
+filemap clear
+filebyfilemap clear
+lastappendlocation set null
+datafiles   new linkednodelist<datafile>
+// reopen open file handles...
+accessorpool   new datafileaccessorpool this
+appender   new datafileappender this
+return result
+public synchronized void removedatafiles set<integer> files  throws ioexception
+for  integer key   files
+// can't remove the data file (or subsequent files) that is currently being written to.
+if  key >  lastappendlocation get   getdatafileid
+continue
+datafile datafile   filemap get key
+if  datafile  null
+forceremovedatafile datafile
+private synchronized void forceremovedatafile datafile datafile  throws ioexception
+accessorpool disposedatafileaccessors datafile
+filebyfilemap remove datafile getfile
+filemap remove datafile getdatafileid
+totallength addandget  datafile getlength
+datafile unlink
+if  archivedatalogs
+datafile move getdirectoryarchive
+log debug     datafile       getdirectoryarchive
+else
+if   datafile delete
+log debug     datafile
+else
+log warn     datafile getfile
+/**
+* @return the maxfilelength
+*/
+public int getmaxfilelength
+return maxfilelength
+/**
+* @param maxfilelength the maxfilelength to set
+*/
+public void setmaxfilelength int maxfilelength
+this maxfilelength   maxfilelength
+public string tostring
+return directory tostring
+public synchronized void appendedexternally location loc  int length  throws ioexception
+datafile datafile   null
+if  datafiles gettail   getdatafileid      loc getdatafileid
+// it's an update to the current log file..
+datafile   datafiles gettail
+datafile incrementlength length
+else if  datafiles gettail   getdatafileid   1    loc getdatafileid
+// it's an update to the next log file.
+int nextnum   loc getdatafileid
+file file   getfile nextnum
+datafile   new datafile file  nextnum  preferedfilelength
+// actually allocate the disk space
+filemap put datafile getdatafileid    datafile
+filebyfilemap put file  datafile
+datafiles addlast datafile
+else
+throw new ioexception
+public synchronized location getnextlocation location location  throws ioexception  illegalstateexception
+location cur   null
+while  true
+if  cur    null
+if  location    null
+datafile head   datafiles gethead
+if  head    null
+return null
+cur   new location
+cur setdatafileid head getdatafileid
+cur setoffset 0
+else
+// set to the next offset..
+if  location getsize       1
+cur   new location location
+else
+cur   new location location
+cur setoffset location getoffset     location getsize
+else
+cur setoffset cur getoffset     cur getsize
+datafile datafile   getdatafile cur
+// did it go into the next file??
+if  datafile getlength   <  cur getoffset
+datafile   getnextdatafile datafile
+if  datafile    null
+return null
+else
+cur setdatafileid datafile getdatafileid   intvalue
+cur setoffset 0
+// load in location size and type.
+datafileaccessor reader   accessorpool opendatafileaccessor datafile
+try
+reader readlocationdetails cur
+finally
+accessorpool closedatafileaccessor reader
+if  cur gettype      0
+return null
+else if  cur gettype      user_record_type
+// only return user records.
+return cur
+public synchronized location getnextlocation file file  location lastlocation  boolean thisfileonly  throws illegalstateexception  ioexception
+datafile df   filebyfilemap get file
+return getnextlocation df  lastlocation  thisfileonly
+public synchronized location getnextlocation datafile datafile  location lastlocation  boolean thisfileonly  throws ioexception  illegalstateexception
+location cur   null
+while  true
+if  cur    null
+if  lastlocation    null
+datafile head   datafile getheadnode
+cur   new location
+cur setdatafileid head getdatafileid
+cur setoffset 0
+else
+// set to the next offset..
+cur   new location lastlocation
+cur setoffset cur getoffset     cur getsize
+else
+cur setoffset cur getoffset     cur getsize
+// did it go into the next file??
+if  datafile getlength   <  cur getoffset
+if  thisfileonly
+return null
+else
+datafile   getnextdatafile datafile
+if  datafile    null
+return null
+else
+cur setdatafileid datafile getdatafileid   intvalue
+cur setoffset 0
+// load in location size and type.
+datafileaccessor reader   accessorpool opendatafileaccessor datafile
+try
+reader readlocationdetails cur
+finally
+accessorpool closedatafileaccessor reader
+if  cur gettype      0
+return null
+else if  cur gettype   > 0
+// only return user records.
+return cur
+public synchronized bytesequence read location location  throws ioexception  illegalstateexception
+datafile datafile   getdatafile location
+datafileaccessor reader   accessorpool opendatafileaccessor datafile
+bytesequence rc   null
+try
+rc   reader readrecord location
+finally
+accessorpool closedatafileaccessor reader
+return rc
+public synchronized location write bytesequence data  boolean sync  throws ioexception  illegalstateexception
+location loc   appender storeitem data  location user_type  sync
+return loc
+public synchronized location write bytesequence data  runnable oncomplete  throws ioexception  illegalstateexception
+location loc   appender storeitem data  location user_type  oncomplete
+return loc
+public void update location location  bytesequence data  boolean sync  throws ioexception
+datafile datafile   getdatafile location
+datafileaccessor updater   accessorpool opendatafileaccessor datafile
+try
+updater updaterecord location  data  sync
+finally
+accessorpool closedatafileaccessor updater
+public file getdirectory
+return directory
+public void setdirectory file directory
+this directory   directory
+public string getfileprefix
+return fileprefix
+public void setfileprefix string fileprefix
+this fileprefix   fileprefix
+public map<writekey  writecommand> getinflightwrites
+return inflightwrites
+public location getlastappendlocation
+return lastappendlocation get
+public void setlastappendlocation location lastsyncedlocation
+this lastappendlocation set lastsyncedlocation
+public file getdirectoryarchive
+return directoryarchive
+public void setdirectoryarchive file directoryarchive
+this directoryarchive   directoryarchive
+public boolean isarchivedatalogs
+return archivedatalogs
+public void setarchivedatalogs boolean archivedatalogs
+this archivedatalogs   archivedatalogs
+synchronized public integer getcurrentdatafileid
+if  datafiles isempty
+return null
+return datafiles gettail   getdatafileid
+/**
+* get a set of files - only valid after start()
+*
+* @return files currently being used
+*/
+public set<file> getfiles
+return filebyfilemap keyset
+public map<integer  datafile> getfilemap
+return new treemap<integer  datafile> filemap
+public long getdisksize
+long taillength 0
+synchronized  this
+if   datafiles isempty
+taillength   datafiles gettail   getlength
+long rc   totallength get
+// the last file is actually at a minimum preferedfilelength big.
+if  taillength < preferedfilelength
+rc    taillength
+rc    preferedfilelength
+return rc
+public void setreplicationtarget replicationtarget replicationtarget
+this replicationtarget   replicationtarget
+public replicationtarget getreplicationtarget
+return replicationtarget
+public string getfilesuffix
+return filesuffix
+public void setfilesuffix string filesuffix
+this filesuffix   filesuffix
+public boolean ischecksum
+return checksum
+public void setchecksum boolean checksumwrites
+this checksum   checksumwrites
+public boolean ischeckforcorruptiononstartup
+return checkforcorruptiononstartup
+public void setcheckforcorruptiononstartup boolean checkforcorruptiononstartup
+this checkforcorruptiononstartup   checkforcorruptiononstartup
+public void setwritebatchsize int writebatchsize
+this writebatchsize   writebatchsize
+public int getwritebatchsize
+return writebatchsize

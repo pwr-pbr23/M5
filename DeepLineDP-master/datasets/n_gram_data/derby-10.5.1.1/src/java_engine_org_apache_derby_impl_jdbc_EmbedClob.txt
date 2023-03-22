@@ -1,0 +1,661 @@
+/*
+derby - class org.apache.derby.impl.jdbc.embedclob
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl jdbc
+import org apache derby iapi reference sqlstate
+import org apache derby iapi error standardexception
+import org apache derby iapi jdbc enginelob
+import org apache derby iapi jdbc characterstreamdescriptor
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi types resetable
+import org apache derby iapi types stringdatavalue
+import java io reader
+import java io ioexception
+import java io eofexception
+import java sql sqlexception
+import java sql clob
+/**
+implements java.sql.clob (see the jdbc 2.0 spec).
+a clob sits on top of a char, varchar or long varchar column.
+if its data is small (less than 1 page) it is a byte array taken from
+the sqlchar class. if it is large (more than 1 page) it is a long column
+in the database. the long column is accessed as a stream, and is implemented
+in store as an overflowinputstream. the resetable interface allows sending
+messages to that stream to initialize itself (reopen its container and
+lock the corresponding row) and to reset itself to the beginning.
+<p>
+note: in the case that the data is large, it is represented as a stream.
+this stream can be returned to the user in the getasciistream() method.
+this means that we have limited control over the state of the stream,
+since the user can read bytes from it at any time.  thus all methods
+here reset the stream to the beginning before doing any work.
+caveat: the methods may not behave correctly if a user sets up
+multiple threads and sucks data from the stream (returned from
+getasciistream()) at the same time as calling the clob methods.
+<p><b>supports</b>
+<ul>
+<li> jsr169 - no subsetting for java.sql.clob
+<li> jdbc 2.0
+<li> jdbc 3.0 - no new dependencies on new jdbc 3.0 or jdk 1.4 classes,
+new update methods can safely be added into implementation.
+</ul>
+*/
+final class embedclob extends connectionchild implements clob  enginelob
+/**
+* the underlying clob object, which may change depending on what the user
+* does with the clob.
+*/
+private internalclob clob
+/** tells whether the clob has been freed or not. */
+private boolean isvalid   true
+private int locator
+/**
+* creates an empty clob object.
+*
+* @param con the connection object associated with this embedclob object.
+* @throws sqlexception
+*
+*/
+embedclob embedconnection con  throws sqlexception
+super con
+this clob   new temporaryclob  this
+con addlobreference  this
+/**
+* creates a clob on top of a data value descriptor.
+* <p>
+* this constructor should only be called by {@link embedresultset#getclob}.
+* the data value descriptor may provide a <code>string</code> or a stream
+* as the source of the clob.
+*
+* @param dvd string data value descriptor providing the clob source
+* @param con associated connection for the clob
+* @throws standardexception
+*/
+protected embedclob embedconnection con  stringdatavalue dvd
+throws standardexception
+super con
+// if the underlying column is null, resultset.getclob will return null,
+// never should get this far
+if  sanitymanager debug
+sanitymanager assert  dvd isnull
+characterstreamdescriptor csd   dvd getstreamwithdescriptor
+// see if a string or a stream will be the source of the clob.
+if  csd    null
+try
+clob   new temporaryclob dvd getstring
+this
+catch  sqlexception sqle
+throw standardexception newexception  sqle getsqlstate    sqle
+catch  ioexception e
+throw standardexception newexception
+sqlstate set_stream_failure  e
+else
+/*
+we are expecting this stream to be a formatidinputstream with an
+overflowinputstream inside. formatidinputstream implements
+resetable, as does overflowinputstream. this should be the case
+when retrieving data from a long column. however, sqlchar, which is
+the class implementing the getstream() method for dvd.getstream(),
+does not guarantee this for us. in particular, the logging system
+(see storedpage.logcolumn) calls setstream with an argument that
+is sometimes a rememberbytesinputstream on a sqlchar object
+(e.g. see test repstreaming.sql). however, such a sqlchar
+object is going to the log buffer, not back to the user, so it
+should not break the assert below.
+*/
+if  sanitymanager debug
+sanitymanager assert csd getstream   instanceof resetable
+try
+this clob   new storestreamclob csd  this
+catch  standardexception se
+if  se getmessageid   equals sqlstate data_container_closed
+throw standardexception
+newexception sqlstate blob_accessed_after_commit
+throw se
+con addlobreference  this
+/**
+* returns the number of characters in the <code>clob</code> value
+* designated by this <code>clob</code> object.
+*
+* @return the length of the <code>clob</code> in number of characters.
+* @exception sqlexception if obtaining the length fails
+*/
+public long length   throws sqlexception
+//call checkvalidity to exit by throwing a sqlexception if
+//the clob object has been freed by calling free() on it
+checkvalidity
+try
+return this clob getcharlength
+catch  ioexception e
+throw util setstreamfailure e
+/**
+* returns a copy of the specified substring in the <code>clob</code> value
+* designated by this <code>clob</code> object.
+* <p>
+* the substring begins at position <code>pos</code> and has up to
+* * <code>length</code> consecutive characters. the starting position must
+* be between 1 and the length of the clob plus 1. this allows for
+* zero-length clob values, from which only zero-length substrings can be
+* returned.
+* <p>
+* if a larger length is requested than there are characters available,
+* characters from the start position to the end of the clob are returned.
+* <p>
+* <em>note</em>: if the starting position is the length of the clob plus 1,
+* zero characters are returned regardless of the length requested.
+*
+* @param pos the first character of the substring to be extracted.
+*    the first character is at position 1.
+* @param length the number of consecutive characters to be copied
+* @return a <code>string</code> that is the specified substring in the
+*    <code>clob</code> value designated by this <code>clob</code> object
+* @exception sqlexception if there is an error accessing the
+*    <code>clob</code>
+*/
+public string getsubstring long pos  int length  throws sqlexception
+//call checkvalidity to exit by throwing a sqlexception if
+//the clob object has been freed by calling free() on it
+checkvalidity
+if  pos < 1
+throw util generatecssqlexception
+sqlstate blob_bad_position  new long pos
+if  length < 0
+throw util generatecssqlexception
+sqlstate blob_nonpositive_length  new integer length
+string result
+// an exception will be thrown if the position is larger than the clob.
+reader reader
+try
+try
+reader   this clob getinternalreader pos
+catch  eofexception eofe
+throw util generatecssqlexception
+sqlstate blob_position_too_large  new long pos   eofe
+char chars   new char
+int charsread   0
+// read all the characters requested, or until eof is reached.
+while  charsread < length
+int read   reader read chars  charsread  length   charsread
+if  read     1
+break
+charsread    read
+reader close
+// if we have an empty clob or requested length is zero, return "".
+if  charsread    0
+result
+else
+result   string copyvalueof chars  0  charsread
+catch  ioexception ioe
+throw util setstreamfailure ioe
+return result
+/**
+* gets the <code>clob</code> contents as a stream of characters.
+* @return a character stream containing the <code>clob</code> data.
+* @exception sqlexception if there is an error accessing the
+*    <code>clob</code>
+*/
+public java io reader getcharacterstream   throws sqlexception
+//call checkvalidity to exit by throwing a sqlexception if
+//the clob object has been freed by calling free() on it
+checkvalidity
+try
+return new clobupdatablereader  this
+catch  ioexception ioe
+throw util setstreamfailure ioe
+/**
+* gets the <code>clob</code> value designated by this <code>clob</code>
+* object as a stream of ascii bytes.
+* @return an ascii stream containing the <code>clob</code> data. valid
+*      values in the stream are 0 - 255.
+* @exception sqlexception if there is an error accessing the
+*    <code>clob</code> value
+*/
+public java io inputstream getasciistream   throws sqlexception
+// validity is checked in getcharacterstream().
+return new readertoascii getcharacterstream
+/**
+* determines the character position at which the specified substring
+* <code>searchstr</code> appears in the <code>clob</code> value.
+* <p>
+* the search begins at position <code>start</code>. the method uses the
+* following algorithm for the search:
+* <p>
+* if the <code>clob</code> value is materialized as a string, use
+* <code>string.indexof</code>.
+* <p>
+* if the <code>clob</code> value is represented as a stream, read a block
+* of chars from the start position and compare the chars with
+* <code>searchstr</code>. then:
+* <ul> <li>if a matching char is found, increment <code>matchcount</code>.
+*      <li>if <code>matchcount</code> is equal to the length of
+*          <code>searchstr</code>, return with the current start position.
+*      <li>if no match is found, and there is more data, restart search
+*          (see below).
+*      <li>if no match is found, return <code>-1</code>.
+* </ul>
+* <p>
+* the position where the stream has a char equal to the first char of
+* <code>searchstr</code> will be remembered and used as the starting
+* position for the next search-iteration if the current match fails.
+* if a non-matching char is found, start a fresh search from the position
+* remembered. if there is no such position, next search will start at the
+* current position <code>+1</code>.
+*
+* @param searchstr the substring for which to search
+* @param start the position at which to begin searching; the first position
+*    is <code>1</code>
+* @return the position at which the substring appears, <code>-1</code> if
+*    it does not appear in the <code>clob</code> value. the first position
+*    is <code>1</code>.
+* @exception sqlexception if there is an error accessing the
+*    <code>clob</code> value
+*/
+public long position string searchstr  long start
+throws sqlexception
+//call checkvalidity to exit by throwing a sqlexception if
+//the clob object has been freed by calling free() on it
+checkvalidity
+if  start < 1
+throw util generatecssqlexception
+sqlstate blob_bad_position  new long start
+if  searchstr    null
+throw util generatecssqlexception
+sqlstate blob_null_pattern_or_search_str
+if  searchstr
+return start     match db2's sql locate function
+boolean pushstack   false
+try
+object synchronization   getconnectionsynchronization
+synchronized  synchronization
+pushstack    getembedconnection   isclosed
+if  pushstack
+setupcontextstack
+int matchcount   0
+long pos   start
+long newstart    1
+reader reader   this clob getinternalreader start
+char  tmpclob   new char
+boolean reset
+for
+reset   false
+int readcount   reader read  tmpclob
+if  readcount     1
+return  1
+for  int cloboffset   0
+cloboffset < readcount  cloboffset
+if  tmpclob
+searchstr charat matchcount
+//find the new starting position in
+// case this match is unsuccessful
+if  matchcount    0    newstart     1
+tmpclob
+searchstr charat 0
+newstart   pos   cloboffset   1
+matchcount
+if  matchcount    searchstr length
+return pos   cloboffset
+searchstr length     1
+else
+if  matchcount > 0
+if  newstart     1
+if  matchcount > 1
+//compensate for increment in the "for"
+cloboffset
+matchcount   0
+continue
+matchcount   0
+if  newstart < pos
+pos   newstart
+reader close
+reader   this clob getinternalreader
+newstart
+newstart    1
+reset   true
+break
+cloboffset    int   newstart   pos    1
+newstart    1
+continue
+if   reset
+pos    readcount
+catch  eofexception eofe
+throw util generatecssqlexception
+sqlstate blob_position_too_large  eofe
+catch  ioexception ioe
+throw util setstreamfailure ioe
+finally
+if  pushstack
+restorecontextstack
+/**
+* determines the character position at which the specified
+* <code>clob</code> object <code>searchstr</code> appears in this
+* <code>clob</code> object.  the search begins at position
+* <code>start</code>.
+* @param searchclob the <code>clob</code> object for which to search
+* @param start the position at which to begin searching; the first
+*              position is 1
+* @return the position at which the <code>clob</code> object appears,
+* else -1; the first position is 1
+* @exception sqlexception if there is an error accessing the
+* <code>clob</code> value
+*/
+public long position clob searchclob  long start
+throws sqlexception
+//call checkvalidity to exit by throwing a sqlexception if
+//the clob object has been freed by calling free() on it
+checkvalidity
+if  start < 1
+throw util generatecssqlexception
+sqlstate blob_bad_position  new long start
+if  searchclob    null
+throw util generatecssqlexception
+sqlstate blob_null_pattern_or_search_str
+boolean pushstack   false
+try
+synchronized  getconnectionsynchronization
+char subpatternchar   new char
+boolean seenonecharacter   false
+restartscan
+for
+long firstposition    1
+reader patternreader   searchclob getcharacterstream
+for
+int read   patternreader read subpatternchar  0
+subpatternchar length
+if  read     1
+//empty pattern
+if   seenonecharacter
+// matches db2 sql locate function
+return start
+return firstposition
+if  read    0
+continue
+seenonecharacter   true
+string subpattern
+new string subpatternchar  0  read
+long position   position subpattern  start
+if  position     1
+// never seen any match
+if  firstposition     1
+return  1
+start   firstposition   1
+continue restartscan
+if  firstposition     1
+firstposition   position
+else if  position    start
+// must match at the first character of segment
+start   firstposition   1
+continue restartscan
+// read is the length of the subpattern string
+start   position   read
+end inner for loop
+end outer for loop
+end synchronized block
+catch  ioexception ioe
+throw util setstreamfailure ioe
+finally
+if  pushstack
+restorecontextstack
+/**
+following methods are for the new jdbc 3.0 methods in java.sql.clob
+(see the jdbc 3.0 spec). we have the jdbc 3.0 methods in local20
+package, so we don't have to have a new class in local30.
+the new jdbc 3.0 methods don't make use of any new jdbc3.0 classes and
+so this will work fine in jdbc2.0 configuration.
+*/
+/////////////////////////////////////////////////////////////////////////
+//
+//    jdbc 3.0    -    new public methods
+//
+/////////////////////////////////////////////////////////////////////////
+/**
+* jdbc 3.0
+*
+* writes the given java string to the clob value that this clob object
+* designates at the position pos.
+*
+* @param pos the position at which to start writing to the clob value that
+*      this clob object represents
+* @return the number of characters written
+* @throws sqlexception if writing the string fails
+*/
+public int setstring long pos  string str  throws sqlexception
+return setstring  pos  str  0  str length
+/**
+* jdbc 3.0
+*
+* writes len characters of str, starting at character offset, to the clob
+* value that this clob represents.
+*
+* @param pos the position at which to start writing to this clob object
+* @param str the string to be written to the clob value that this clob
+*      designates
+* @param offset the offset into str to start reading the characters to be
+*      written
+* @param len the number of characters to be written
+* @return the number of characters written
+* @exception sqlexception if writing the string fails
+*/
+public int setstring long pos  string str  int offset  int len
+throws sqlexception
+checkvalidity
+if  pos < 1
+throw util generatecssqlexception
+sqlstate blob_bad_position  new long pos
+try
+if   this clob iswritable
+makewritableclobclone
+// note that clob.length() +1 is a valid position for setstring.
+// if the position is larger than this, an eofexception will be
+// thrown. this is cheaper then getting the length up front.
+this clob insertstring str substring offset   offset   len
+pos
+catch  eofexception eofe
+throw util generatecssqlexception
+sqlstate blob_position_too_large
+new long pos
+catch  ioexception e
+throw util setstreamfailure e
+return str length
+/**
+* jdbc 3.0
+*
+* retrieves a stream to be used to write ascii characters to the clob
+* value that this clob object represents, starting at position pos.
+*
+* @param pos the position at which to start writing to this clob object
+* @return the stream to which ascii encoded characters can be written
+* @exception sqlexception if obtaining the stream fails
+*/
+public java io outputstream setasciistream long pos  throws sqlexception
+checkvalidity
+try
+return new clobasciistream  this clob getwriter pos
+catch  ioexception e
+throw util setstreamfailure e
+/**
+* jdbc 3.0
+*
+* retrieves a stream to be used to write a stream of characters to the clob
+* value that this clob object represents, starting at position pos.
+*
+* @param pos the position at which to start writing to this clob object
+* @return the stream to which unicode encoded characters can be written
+* @exception sqlexception if obtaining the stream fails
+*/
+public java io writer setcharacterstream long pos  throws sqlexception
+checkvalidity
+try
+if   this clob iswritable
+makewritableclobclone
+return this clob getwriter pos
+catch  ioexception ioe
+throw util setstreamfailure ioe
+/**
+* jdbc 3.0
+*
+* truncates the clob value that this clob designates to have a length of
+* len characters
+*
+* @param len the length, in characters, to which the clob value should be
+*      truncated
+* @exception sqlexception if truncating the clob value fails
+*/
+public void truncate long len  throws sqlexception
+checkvalidity
+if  len < 1
+throw util generatecssqlexception
+sqlstate blob_bad_position  new long len
+try
+if   clob iswritable
+makewritableclobclone len
+else
+clob truncate  len
+catch  eofexception eofe
+throw util generatecssqlexception
+sqlstate blob_length_too_long
+new long len   eofe
+catch  ioexception e
+throw util setstreamfailure e
+/////////////////////////////////////////////////////////////////////////
+//
+//    jdbc 4.0    -    new public methods
+//
+/////////////////////////////////////////////////////////////////////////
+/**
+* frees the <code>clob</code> and releases the resources that it holds.
+* <p>
+* the object is invalid once the <code>free</code> method
+* is called. if <code>free</code> is called multiple times, the
+* subsequent calls to <code>free</code> are treated as a no-op.
+*
+* @throws sqlexception if an error occurs releasing the clobs resources
+*/
+public void free
+throws sqlexception
+if  this isvalid
+this isvalid   false
+// release and nullify the internal clob.
+try
+this clob release
+catch  ioexception e
+throw util setstreamfailure e
+finally
+localconn removelobmapping locator
+this clob   null
+/**
+* returns a <code>reader</code> object that contains a partial
+* <code>clob</code> value, starting with the character specified by pos,
+* which is length characters in length.
+*
+* @param pos the offset to the first character of the partial value to
+* be retrieved.  the first character in the clob is at position 1.
+* @param length the length in characters of the partial value to be
+* retrieved.
+* @return <code>reader</code> through which the partial <code>clob</code>
+* value can be read.
+* @throws sqlexception if pos is less than 1 or if pos is greater than the
+* number of
+* characters in the {@code clob} or if {@code pos + length} is greater than
+* {@code clob.length() +1}
+*/
+public java io reader getcharacterstream long pos  long length
+throws sqlexception
+//call checkvalidity to exit by throwing a sqlexception if
+//the clob object has been freed by calling free() on it
+checkvalidity
+if  pos <  0
+throw util generatecssqlexception
+sqlstate blob_bad_position
+new long pos
+if  length < 0
+throw util generatecssqlexception
+sqlstate blob_nonpositive_length
+new long length
+if  length >  this length      pos  1
+throw util generatecssqlexception
+sqlstate pos_and_length_greater_than_lob
+new long pos   new long length
+try
+return new clobupdatablereader this  pos  length
+catch  ioexception ioe
+throw util setstreamfailure ioe
+/*
+* checks if the clob is valid.
+* <p>
+* a clob is invalidated when {@link #free} is called or if the parent
+* connection is closed.
+*
+* @throws sqlexception if the clob is not valid
+*/
+private void checkvalidity   throws sqlexception
+localconn checkifclosed
+if  isvalid
+throw newsqlexception sqlstate lob_object_invalid
+/**
+* makes a writable clone of the current clob.
+* <p>
+* this is called when we have a {@link storestreamclob} and the user calls
+* a method updating the content of the clob. a temporary clob will then be
+* created to hold the updated content.
+*
+* @throws ioexception if accessing underlying i/o resources fail
+* @throws sqlexception if accessing underlying resources fail
+*/
+private void makewritableclobclone
+throws ioexception  sqlexception
+internalclob tobeabandoned   this clob
+this clob   temporaryclob cloneclobcontent
+getembedconnection   getdbname
+this  tobeabandoned
+tobeabandoned release
+/**
+* makes a writable clone of the current clob.
+* <p>
+* this is called when we have a {@link storestreamclob} and the user calls
+* a method updating the content of the clob. a temporary clob will then be
+* created to hold the updated content.
+*
+* @param len number of characters to be cloned (should be smaller
+*      than clob length)
+* @throws ioexception if accessing underlying i/o resources fail
+* @throws sqlexception if accessing underlying resources fail
+*/
+private void makewritableclobclone long len
+throws ioexception  sqlexception
+internalclob tobeabandoned   this clob
+this clob   temporaryclob cloneclobcontent
+getembedconnection   getdbname
+this  tobeabandoned  len
+tobeabandoned release
+/**
+* returns the current internal clob representation.
+* <p>
+* care should be taken, as the representation can change when the user
+* performs operations on the clob. an example is if the clob content is
+* served from a store stream and the user updates the content. the
+* internal representation will then be changed to a temporary clob copy
+* that allows updates.
+*
+* @return the current internal clob representation.
+*/
+internalclob getinternalclob
+return this clob
+/**
+* @return locator value for this clob.
+*/
+public int getlocator
+if  locator    0
+locator   localconn addlobmapping this
+return locator

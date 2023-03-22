@@ -1,0 +1,187 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase procedure
+import java io closeable
+import java io ioexception
+import java util collection
+import java util concurrent concurrentmap
+import java util concurrent executorservice
+import java util concurrent future
+import java util concurrent rejectedexecutionexception
+import java util concurrent synchronousqueue
+import java util concurrent threadpoolexecutor
+import java util concurrent timeunit
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop classification interfacestability
+import org apache hadoop hbase daemonthreadfactory
+import org apache hadoop hbase errorhandling foreignexception
+import com google common collect mapmaker
+/**
+* process to kick off and manage a running {@link subprocedure} on a member. this is the
+* specialized part of a {@link procedure} that actually does procedure type-specific work
+* and reports back to the coordinator as it completes each phase.
+* <p>
+* if there is a connection error ({@link #controllerconnectionfailure(string, ioexception)}), all
+* currently running subprocedures are notify to failed since there is no longer a way to reach any
+* other members or coordinators since the rpcs are down.
+*/
+@interfaceaudience public
+@interfacestability evolving
+public class proceduremember implements closeable
+private static final log log   logfactory getlog proceduremember class
+private final subprocedurefactory builder
+private final procedurememberrpcs rpcs
+private final concurrentmap<string subprocedure> subprocs
+new mapmaker   concurrencylevel 4  weakvalues   makemap
+private final executorservice pool
+/**
+* instantiate a new proceduremember.  this is a slave that executes subprocedures.
+*
+* @param rpcs controller used to send notifications to the procedure coordinator
+* @param pool thread pool to submit subprocedures
+* @param factory class that creates instances of a subprocedure.
+*/
+public proceduremember procedurememberrpcs rpcs  threadpoolexecutor pool
+subprocedurefactory factory
+this pool   pool
+this rpcs   rpcs
+this builder   factory
+public static threadpoolexecutor defaultpool long wakefrequency  long keepalive
+int procthreads  string membername
+return new threadpoolexecutor 1  procthreads  keepalive  timeunit seconds
+new synchronousqueue<runnable>
+new daemonthreadfactory     membername
+/**
+* package exposed.  not for public use.
+*
+* @return reference to the procedure member's rpcs object
+*/
+procedurememberrpcs getrpcs
+return rpcs
+/**
+* this is separated from execution so that we can detect and handle the case where the
+* subprocedure is invalid and inactionable due to bad info (like disabled snapshot type being
+* sent here)
+* @param opname
+* @param data
+* @return subprocedure
+*/
+public subprocedure createsubprocedure string opname  byte data
+return builder buildsubprocedure opname  data
+/**
+* submit an subprocedure for execution.  this starts the local acquire phase.
+* @param subproc the subprocedure to execute.
+* @return <tt>true</tt> if the subprocedure was started correctly, <tt>false</tt> if it
+*         could not be started. in the latter case, the subprocedure holds a reference to
+*         the exception that caused the failure.
+*/
+public boolean submitsubprocedure subprocedure subproc
+// if the submitted subprocedure was null, bail.
+if  subproc    null
+log warn
+return false
+string procname   subproc getname
+if  procname    null    procname length      0
+log error
+return false
+// make sure we aren't already running an subprocedure of that name
+subprocedure rsub
+synchronized  subprocs
+rsub   subprocs get procname
+if  rsub    null
+if   rsub iscomplete
+log error     procname
+return false
+log warn       procname
+subprocs remove procname
+log debug     procname
+// kick off the subprocedure
+future<void> future   null
+try
+future   this pool submit subproc
+synchronized  subprocs
+subprocs put procname  subproc
+return true
+catch  rejectedexecutionexception e
+// the thread pool is full and we can't run the subprocedure
+string msg
+subproc cancel msg  e getcause
+// cancel all subprocedures proactively
+if  future    null
+future cancel true
+log error     procname
+return false
+/**
+* notification that procedure coordinator has reached the global barrier
+* @param procname name of the subprocedure that should start running the the in-barrier phase
+*/
+public void receivedreachedglobalbarrier string procname
+subprocedure subproc   subprocs get procname
+if  subproc    null
+log warn     procname
+return
+subproc receivereachedglobalbarrier
+/**
+* best effort attempt to close the threadpool via thread.interrupt.
+*/
+@override
+public void close   throws ioexception
+// have to use shutdown now to break any latch waiting
+pool shutdownnow
+/**
+* shutdown the threadpool, and wait for upto timeoutms millis before bailing
+* @param timeoutms timeout limit in millis
+* @return true if successfully, false if bailed due to timeout.
+* @throws interruptedexception
+*/
+boolean closeandwait long timeoutms  throws interruptedexception
+pool shutdown
+return pool awaittermination timeoutms  timeunit milliseconds
+/**
+* the connection to the rest of the procedure group (member and coordinator) has been
+* broken/lost/failed. this should fail any interested subprocedure, but not attempt to notify
+* other members since we cannot reach them anymore.
+* @param message description of the error
+* @param cause the actual cause of the failure
+*
+* todo i'm tempted to just remove this code completely and treat it like any other abort.
+* implementation wise, if this happens it is a zk failure which means the rs will abort.
+*/
+public void controllerconnectionfailure final string message  final ioexception cause
+collection<subprocedure> tonotify   subprocs values
+log error message  cause
+for  subprocedure sub   tonotify
+// todo notify the elements, if they aren't null
+sub cancel message  cause
+/**
+* send abort to the specified procedure
+* @param procname name of the procedure to about
+* @param ee exception information about the abort
+*/
+public void receiveabortprocedure string procname  foreignexception ee
+log debug     procname  ee
+// if we know about the procedure, notify it
+subprocedure sub   subprocs get procname
+if  sub    null
+log info     procname
+ee
+return     procedure has already completed
+log error     sub getname    ee
+sub monitor receive ee

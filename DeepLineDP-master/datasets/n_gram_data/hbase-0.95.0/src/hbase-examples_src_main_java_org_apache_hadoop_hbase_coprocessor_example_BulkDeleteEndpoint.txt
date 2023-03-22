@@ -1,0 +1,238 @@
+/*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+* http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase coprocessor example
+import java io ioexception
+import java util arraylist
+import java util hashset
+import java util list
+import java util set
+import java util treeset
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop hbase coprocessor
+import org apache hadoop hbase coprocessorenvironment
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase hconstants operationstatuscode
+import org apache hadoop hbase client delete
+import org apache hadoop hbase client mutation
+import org apache hadoop hbase client scan
+import org apache hadoop hbase exceptions coprocessorexception
+import org apache hadoop hbase coprocessor coprocessorservice
+import org apache hadoop hbase coprocessor regioncoprocessorenvironment
+import org apache hadoop hbase coprocessor example generated bulkdeleteprotos bulkdeleterequest
+import org apache hadoop hbase coprocessor example generated bulkdeleteprotos bulkdeleteresponse
+import org apache hadoop hbase coprocessor example generated bulkdeleteprotos bulkdeleteservice
+import org apache hadoop hbase coprocessor example generated bulkdeleteprotos bulkdeleterequest deletetype
+import org apache hadoop hbase coprocessor example generated bulkdeleteprotos bulkdeleteresponse builder
+import org apache hadoop hbase filter firstkeyonlyfilter
+import org apache hadoop hbase protobuf protobufutil
+import org apache hadoop hbase protobuf responseconverter
+import org apache hadoop hbase regionserver hregion
+import org apache hadoop hbase regionserver operationstatus
+import org apache hadoop hbase regionserver regionscanner
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util pair
+import com google protobuf rpccallback
+import com google protobuf rpccontroller
+import com google protobuf service
+/**
+* defines a protocol to delete data in bulk based on a scan. the scan can be range scan or with
+* conditions(filters) etc.this can be used to delete rows, column family(s), column qualifier(s)
+* or version(s) of columns.when delete type is family or column, which all family(s) or column(s)
+* getting deleted will be determined by the scan. scan need to select all the families/qualifiers
+* which need to be deleted.when delete type is version, which column(s) and version(s) to be
+* deleted will be determined by the scan. scan need to select all the qualifiers and its versions
+* which needs to be deleted.when a timestamp is passed only one version at that timestamp will be
+* deleted(even if scan fetches many versions). when timestamp passed as null, all the versions
+* which the scan selects will get deleted.
+*
+* </br> example: <code><pre>
+* scan scan = new scan();
+* // set scan properties(rowkey range, filters, timerange etc).
+* htable ht = ...;
+* long noofdeletedrows = 0l;
+* batch.call&lt;bulkdeleteservice, bulkdeleteresponse&gt; callable =
+*     new batch.call&lt;bulkdeleteservice, bulkdeleteresponse&gt;() {
+*   serverrpccontroller controller = new serverrpccontroller();
+*   blockingrpccallback&lt;bulkdeleteresponse&gt; rpccallback =
+*     new blockingrpccallback&lt;bulkdeleteresponse&gt;();
+*
+*   public bulkdeleteresponse call(bulkdeleteservice service) throws ioexception {
+*     builder builder = bulkdeleterequest.newbuilder();
+*     builder.setscan(protobufutil.toscan(scan));
+*     builder.setdeletetype(deletetype.version);
+*     builder.setrowbatchsize(rowbatchsize);
+*     // set optional timestamp if needed
+*     builder.settimestamp(timestamp);
+*     service.delete(controller, builder.build(), rpccallback);
+*     return rpccallback.get();
+*   }
+* };
+* map&lt;byte[], bulkdeleteresponse&gt; result = ht.coprocessorservice(bulkdeleteservice.class, scan
+*     .getstartrow(), scan.getstoprow(), callable);
+* for (bulkdeleteresponse response : result.values()) {
+*   noofdeletedrows += response.getrowsdeleted();
+* }
+* </pre></code>
+*/
+public class bulkdeleteendpoint extends bulkdeleteservice implements coprocessorservice
+coprocessor
+private static final string no_of_versions_to_delete
+private static final log log   logfactory getlog bulkdeleteendpoint class
+private regioncoprocessorenvironment env
+@override
+public service getservice
+return this
+@override
+public void delete rpccontroller controller  bulkdeleterequest request
+rpccallback<bulkdeleteresponse> done
+long totalrowsdeleted   0l
+long totalversionsdeleted   0l
+hregion region   env getregion
+int rowbatchsize   request getrowbatchsize
+long timestamp   null
+if  request hastimestamp
+timestamp   request gettimestamp
+deletetype deletetype   request getdeletetype
+boolean hasmore   true
+regionscanner scanner   null
+try
+scan scan   protobufutil toscan request getscan
+if  scan getfilter      null    deletetype    deletetype row
+// what we need is just the rowkeys. so only 1st kv from any row is enough.
+// only when it is a row delete, we can apply this filter.
+// in other types we rely on the scan to know which all columns to be deleted.
+scan setfilter new firstkeyonlyfilter
+// here by assume that the scan is perfect with the appropriate
+// filter and having necessary column(s).
+scanner   region getscanner scan
+while  hasmore
+list<list<keyvalue>> deleterows   new arraylist<list<keyvalue>> rowbatchsize
+for  int i   0  i < rowbatchsize  i
+list<keyvalue> results   new arraylist<keyvalue>
+hasmore   scanner next results
+if  results size   > 0
+deleterows add results
+if   hasmore
+// there are no more rows.
+break
+if  deleterows size   > 0
+pair<mutation  integer> deletewithlockarr   new pair
+int i   0
+for  list<keyvalue> deleterow   deleterows
+delete delete   createdeletemutation deleterow  deletetype  timestamp
+deletewithlockarr   new pair<mutation  integer> delete  null
+operationstatus opstatus   region batchmutate deletewithlockarr
+for  i   0  i < opstatus length  i
+if  opstatus getoperationstatuscode      operationstatuscode success
+break
+totalrowsdeleted
+if  deletetype    deletetype version
+byte versionsdeleted   deletewithlockarr getfirst   getattribute
+no_of_versions_to_delete
+if  versionsdeleted    null
+totalversionsdeleted    bytes toint versionsdeleted
+catch  ioexception ioe
+log error ioe
+// call serverrpccontroller#getfailedon() to retrieve this ioexception at client side.
+responseconverter setcontrollerexception controller  ioe
+finally
+if  scanner    null
+try
+scanner close
+catch  ioexception ioe
+log error ioe
+builder responsebuilder   bulkdeleteresponse newbuilder
+responsebuilder setrowsdeleted totalrowsdeleted
+if  deletetype    deletetype version
+responsebuilder setversionsdeleted totalversionsdeleted
+bulkdeleteresponse result   responsebuilder build
+done run result
+private delete createdeletemutation list<keyvalue> deleterow  deletetype deletetype
+long timestamp
+long ts
+if  timestamp    null
+ts   hconstants latest_timestamp
+else
+ts   timestamp
+// we just need the rowkey. get it from 1st kv.
+byte row   deleterow get 0  getrow
+delete delete   new delete row  ts
+if  deletetype    deletetype family
+set<byte> families   new treeset<byte> bytes bytes_comparator
+for  keyvalue kv   deleterow
+if  families add kv getfamily
+delete deletefamily kv getfamily    ts
+else if  deletetype    deletetype column
+set<column> columns   new hashset<column>
+for  keyvalue kv   deleterow
+column column   new column kv getfamily    kv getqualifier
+if  columns add column
+// making deletecolumns() calls more than once for the same cf:qualifier is not correct
+// every call to deletecolumns() will add a new kv to the familymap which will finally
+// get written to the memstore as part of delete().
+delete deletecolumns column family  column qualifier  ts
+else if  deletetype    deletetype version
+// when some timestamp was passed to the delete() call only one version of the column (with
+// given timestamp) will be deleted. if no timestamp passed, it will delete n versions.
+// how many versions will get deleted depends on the scan being passed. all the kvs that
+// the scan fetched will get deleted.
+int noofversionstodelete   0
+if  timestamp    null
+for  keyvalue kv   deleterow
+delete deletecolumn kv getfamily    kv getqualifier    kv gettimestamp
+noofversionstodelete
+else
+set<column> columns   new hashset<column>
+for  keyvalue kv   deleterow
+column column   new column kv getfamily    kv getqualifier
+// only one version of particular column getting deleted.
+if  columns add column
+delete deletecolumn column family  column qualifier  ts
+noofversionstodelete
+delete setattribute no_of_versions_to_delete  bytes tobytes noofversionstodelete
+return delete
+private static class column
+private byte family
+private byte qualifier
+public column byte family  byte qualifier
+this family   family
+this qualifier   qualifier
+@override
+public boolean equals object other
+if    other instanceof column
+return false
+column column    column  other
+return bytes equals this family  column family
+bytes equals this qualifier  column qualifier
+@override
+public int hashcode
+int h   31
+h   h   13   bytes hashcode this family
+h   h   13   bytes hashcode this qualifier
+return h
+@override
+public void start coprocessorenvironment env  throws ioexception
+if  env instanceof regioncoprocessorenvironment
+this env    regioncoprocessorenvironment  env
+else
+throw new coprocessorexception
+@override
+public void stop coprocessorenvironment env  throws ioexception
+// nothing to do

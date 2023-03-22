@@ -1,0 +1,860 @@
+package org apache lucene index
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+import java io ioexception
+import java io filenotfoundexception
+import java util arrays
+import java util collection
+import java util hashmap
+import java util hashset
+import java util iterator
+import java util map
+import java util set
+import java util collections
+import java util arraylist
+import org apache lucene document document
+import org apache lucene document fieldselector
+import org apache lucene search defaultsimilarity
+import org apache lucene store directory
+import org apache lucene store lock
+import org apache lucene store lockobtainfailedexception
+import org apache lucene store alreadyclosedexception
+/**
+* an indexreader which reads indexes with multiple segments.
+*/
+class directoryreader extends indexreader implements cloneable
+protected directory directory
+protected boolean readonly
+indexwriter writer
+private indexdeletionpolicy deletionpolicy
+private final hashset synced   new hashset
+private lock writelock
+private segmentinfos segmentinfos
+private boolean stale
+private final int terminfosindexdivisor
+private boolean rollbackhaschanges
+private segmentinfos rollbacksegmentinfos
+private segmentreader subreaders
+private int starts                               1st docno for each segment
+private map normscache   new hashmap
+private int maxdoc   0
+private int numdocs    1
+private boolean hasdeletions   false
+static indexreader open final directory directory  final indexdeletionpolicy deletionpolicy  final indexcommit commit  final boolean readonly
+final int terminfosindexdivisor  throws corruptindexexception  ioexception
+return  indexreader  new segmentinfos findsegmentsfile directory
+protected object dobody string segmentfilename  throws corruptindexexception  ioexception
+segmentinfos infos   new segmentinfos
+infos read directory  segmentfilename
+if  readonly
+return new readonlydirectoryreader directory  infos  deletionpolicy  terminfosindexdivisor
+else
+return new directoryreader directory  infos  deletionpolicy  false  terminfosindexdivisor
+run commit
+/** construct reading the named set of readers. */
+directoryreader directory directory  segmentinfos sis  indexdeletionpolicy deletionpolicy  boolean readonly  int terminfosindexdivisor  throws ioexception
+this directory   directory
+this readonly   readonly
+this segmentinfos   sis
+this deletionpolicy   deletionpolicy
+this terminfosindexdivisor   terminfosindexdivisor
+if   readonly
+// we assume that this segments_n was previously
+// properly sync'd:
+synced addall sis files directory  true
+// to reduce the chance of hitting filenotfound
+// (and having to retry), we open segments in
+// reverse because indexwriter merges & deletes
+// the newest segments first.
+segmentreader readers   new segmentreader
+for  int i   sis size   1  i >  0  i
+boolean success   false
+try
+readers   segmentreader get readonly  sis info i   terminfosindexdivisor
+success   true
+finally
+if   success
+// close all readers we had opened:
+for i   i<sis size   i
+try
+readers close
+catch  throwable ignore
+// keep going - we want to clean up as much as possible
+initialize readers
+// used by near real-time search
+directoryreader indexwriter writer  segmentinfos infos  int terminfosindexdivisor  throws ioexception
+this directory   writer getdirectory
+this readonly   true
+this segmentinfos   infos
+this terminfosindexdivisor   terminfosindexdivisor
+if   readonly
+// we assume that this segments_n was previously
+// properly sync'd:
+synced addall infos files directory  true
+// indexwriter synchronizes externally before calling
+// us, which ensures infos will not change; so there's
+// no need to process segments in reverse order
+final int numsegments   infos size
+segmentreader readers   new segmentreader
+final directory dir   writer getdirectory
+int upto   0
+for  int i 0 i<numsegments i
+boolean success   false
+try
+final segmentinfo info   infos info upto
+if  info dir    dir
+readers   writer readerpool getreadonlyclone info  true  terminfosindexdivisor
+success   true
+finally
+if   success
+// close all readers we had opened:
+for upto   upto> 0 upto
+try
+readers close
+catch  throwable ignore
+// keep going - we want to clean up as much as possible
+this writer   writer
+if  upto < readers length
+// this means some segments were in a foreign directory
+segmentreader newreaders   new segmentreader
+system arraycopy readers  0  newreaders  0  upto
+readers   newreaders
+initialize readers
+/** this constructor is only used for {@link #reopen()} */
+directoryreader directory directory  segmentinfos infos  segmentreader oldreaders  int oldstarts
+map oldnormscache  boolean readonly  boolean doclone  int terminfosindexdivisor  throws ioexception
+this directory   directory
+this readonly   readonly
+this segmentinfos   infos
+this terminfosindexdivisor   terminfosindexdivisor
+if   readonly
+// we assume that this segments_n was previously
+// properly sync'd:
+synced addall infos files directory  true
+// we put the old segmentreaders in a map, that allows us
+// to lookup a reader using its segment name
+map segmentreaders   new hashmap
+if  oldreaders    null
+// create a map segmentname->segmentreader
+for  int i   0  i < oldreaders length  i
+segmentreaders put oldreaders getsegmentname    new integer i
+segmentreader newreaders   new segmentreader
+// remember which readers are shared between the old and the re-opened
+// directoryreader - we have to incref those readers
+boolean readershared   new boolean
+for  int i   infos size     1  i> 0  i
+// find segmentreader for this segment
+integer oldreaderindex    integer  segmentreaders get infos info i  name
+if  oldreaderindex    null
+// this is a new segment, no old segmentreader can be reused
+newreaders   null
+else
+// there is an old reader for this segment - we'll try to reopen it
+newreaders   oldreaders
+boolean success   false
+try
+segmentreader newreader
+if  newreaders    null    infos info i  getusecompoundfile      newreaders getsegmentinfo   getusecompoundfile
+// we should never see a totally new segment during cloning
+assert  doclone
+// this is a new reader; in case we hit an exception we can close it safely
+newreader   segmentreader get readonly  infos info i   terminfosindexdivisor
+else
+newreader   newreaders reopensegment infos info i   doclone  readonly
+if  newreader    newreaders
+// this reader will be shared between the old and the new one,
+// so we must incref it
+readershared   true
+newreader incref
+else
+readershared   false
+newreaders   newreader
+success   true
+finally
+if   success
+for  i    i < infos size    i
+if  newreaders    null
+try
+if   readershared
+// this is a new subreader that is not used by the old one,
+// we can close it
+newreaders close
+else
+// this subreader is also used by the old reader, so instead
+// closing we must decref it
+newreaders decref
+catch  ioexception ignore
+// keep going - we want to clean up as much as possible
+// initialize the readers to calculate maxdoc before we try to reuse the old normscache
+initialize newreaders
+// try to copy unchanged norms from the old normscache to the new one
+if  oldnormscache    null
+iterator it   oldnormscache entryset   iterator
+while  it hasnext
+map entry entry    map entry  it next
+string field    string  entry getkey
+if   hasnorms field
+continue
+byte oldbytes    byte  entry getvalue
+byte bytes   new byte
+for  int i   0  i < subreaders length  i
+integer oldreaderindex     integer  segmentreaders get subreaders getsegmentname
+// this segmentreader was not re-opened, we can copy all of its norms
+if  oldreaderindex    null
+oldreaders    subreaders
+oldreaders norms get field     subreaders norms get field
+// we don't have to synchronize here: either this constructor is called from a segmentreader,
+// in which case no old norms cache is present, or it is called from multireader.reopen(),
+// which is synchronized
+system arraycopy oldbytes  oldstarts  bytes  starts  starts   starts
+else
+subreaders norms field  bytes  starts
+normscache put field  bytes           update cache
+private void initialize segmentreader subreaders
+this subreaders   subreaders
+starts   new int        build starts array
+for  int i   0  i < subreaders length  i
+starts   maxdoc
+maxdoc    subreaders maxdoc            compute maxdocs
+if  subreaders hasdeletions
+hasdeletions   true
+starts   maxdoc
+public final synchronized object clone
+try
+return clone readonly      preserve current readonly
+catch  exception ex
+throw new runtimeexception ex
+public final synchronized indexreader clone boolean openreadonly  throws corruptindexexception  ioexception
+directoryreader newreader   doreopen  segmentinfos  segmentinfos clone    true  openreadonly
+if  this    newreader
+newreader deletionpolicy   deletionpolicy
+newreader writer   writer
+// if we're cloning a non-readonly reader, move the
+// writelock (if there is one) to the new reader:
+if   openreadonly    writelock    null
+// in near real-time search, reader is always readonly
+assert writer    null
+newreader writelock   writelock
+newreader haschanges   haschanges
+newreader hasdeletions   hasdeletions
+writelock   null
+haschanges   false
+return newreader
+public final synchronized indexreader reopen   throws corruptindexexception  ioexception
+// preserve current readonly
+return doreopen readonly  null
+public final synchronized indexreader reopen boolean openreadonly  throws corruptindexexception  ioexception
+return doreopen openreadonly  null
+public final synchronized indexreader reopen final indexcommit commit  throws corruptindexexception  ioexception
+return doreopen true  commit
+private synchronized indexreader doreopen final boolean openreadonly  indexcommit commit  throws corruptindexexception  ioexception
+ensureopen
+assert commit    null    openreadonly
+// if we were obtained by writer.getreader(), re-ask the
+// writer to get a new reader.
+if  writer    null
+assert readonly
+if   openreadonly
+throw new illegalargumentexception
+if  commit    null
+throw new illegalargumentexception
+if   writer isopen true
+throw new alreadyclosedexception
+// todo: right now we *always* make a new reader; in
+// the future we could have write make some effort to
+// detect that no changes have occurred
+indexreader reader   writer getreader
+reader setdisablefakenorms getdisablefakenorms
+return reader
+if  commit    null
+if  haschanges
+// we have changes, which means we are not readonly:
+assert readonly    false
+// and we hold the write lock:
+assert writelock    null
+// so no other writer holds the write lock, which
+// means no changes could have been done to the index:
+assert iscurrent
+if  openreadonly
+return  indexreader  clone openreadonly
+else
+return this
+else if  iscurrent
+if  openreadonly    readonly
+// just fallback to clone
+return  indexreader  clone openreadonly
+else
+return this
+else
+if  directory    commit getdirectory
+throw new ioexception
+if  segmentinfos    null    commit getsegmentsfilename   equals segmentinfos getcurrentsegmentfilename
+if  readonly    openreadonly
+// just fallback to clone
+return  indexreader  clone openreadonly
+else
+return this
+return  indexreader  new segmentinfos findsegmentsfile directory
+protected object dobody string segmentfilename  throws corruptindexexception  ioexception
+segmentinfos infos   new segmentinfos
+infos read directory  segmentfilename
+return doreopen infos  false  openreadonly
+run commit
+private synchronized directoryreader doreopen segmentinfos infos  boolean doclone  boolean openreadonly  throws corruptindexexception  ioexception
+directoryreader reader
+if  openreadonly
+reader   new readonlydirectoryreader directory  infos  subreaders  starts  normscache  doclone  terminfosindexdivisor
+else
+reader   new directoryreader directory  infos  subreaders  starts  normscache  false  doclone  terminfosindexdivisor
+reader setdisablefakenorms getdisablefakenorms
+return reader
+/** version number when this indexreader was opened. */
+public long getversion
+ensureopen
+return segmentinfos getversion
+public termfreqvector gettermfreqvectors int n  throws ioexception
+ensureopen
+int i   readerindex n             find segment num
+return subreaders gettermfreqvectors n   starts      dispatch to segment
+public termfreqvector gettermfreqvector int n  string field
+throws ioexception
+ensureopen
+int i   readerindex n             find segment num
+return subreaders gettermfreqvector n   starts  field
+public void gettermfreqvector int docnumber  string field  termvectormapper mapper  throws ioexception
+ensureopen
+int i   readerindex docnumber             find segment num
+subreaders gettermfreqvector docnumber   starts  field  mapper
+public void gettermfreqvector int docnumber  termvectormapper mapper  throws ioexception
+ensureopen
+int i   readerindex docnumber             find segment num
+subreaders gettermfreqvector docnumber   starts  mapper
+/**
+* checks is the index is optimized (if it has a single segment and no deletions)
+* @return <code>true</code> if the index is optimized; <code>false</code> otherwise
+*/
+public boolean isoptimized
+ensureopen
+return segmentinfos size      1     hasdeletions
+public synchronized int numdocs
+// don't call ensureopen() here (it could affect performance)
+if  numdocs     1              check cache
+int n   0                    cache miss  recompute
+for  int i   0  i < subreaders length  i
+n    subreaders numdocs            sum from readers
+numdocs   n
+return numdocs
+public int maxdoc
+// don't call ensureopen() here (it could affect performance)
+return maxdoc
+// inherit javadoc
+public document document int n  fieldselector fieldselector  throws corruptindexexception  ioexception
+ensureopen
+int i   readerindex n                               find segment num
+return subreaders document n   starts  fieldselector         dispatch to segment reader
+public boolean isdeleted int n
+// don't call ensureopen() here (it could affect performance)
+final int i   readerindex n                                find segment num
+return subreaders isdeleted n   starts         dispatch to segment reader
+public boolean hasdeletions
+// don't call ensureopen() here (it could affect performance)
+return hasdeletions
+protected void dodelete int n  throws corruptindexexception  ioexception
+numdocs    1                                 invalidate cache
+int i   readerindex n                        find segment num
+subreaders deletedocument n   starts           dispatch to segment reader
+hasdeletions   true
+protected void doundeleteall   throws corruptindexexception  ioexception
+for  int i   0  i < subreaders length  i
+subreaders undeleteall
+hasdeletions   false
+numdocs    1                                     invalidate cache
+private int readerindex int n          find reader for doc n
+return readerindex n  this starts  this subreaders length
+final static int readerindex int n  int starts  int numsubreaders          find reader for doc n
+int lo   0                                          search starts array
+int hi   numsubreaders   1                      for first element less
+while  hi >  lo
+int mid    lo   hi  >>> 1
+int midvalue   starts
+if  n < midvalue
+hi   mid   1
+else if  n > midvalue
+lo   mid   1
+else                                           found a match
+while  mid 1 < numsubreaders    starts    midvalue
+mid                                        scan to last match
+return mid
+return hi
+public boolean hasnorms string field  throws ioexception
+ensureopen
+for  int i   0  i < subreaders length  i
+if  subreaders hasnorms field   return true
+return false
+private byte ones
+private byte fakenorms
+if  ones  null  ones segmentreader createfakenorms maxdoc
+return ones
+public synchronized byte norms string field  throws ioexception
+ensureopen
+byte bytes    byte normscache get field
+if  bytes    null
+return bytes              cache hit
+if   hasnorms field
+return getdisablefakenorms   ? null   fakenorms
+bytes   new byte
+for  int i   0  i < subreaders length  i
+subreaders norms field  bytes  starts
+normscache put field  bytes           update cache
+return bytes
+public synchronized void norms string field  byte result  int offset
+throws ioexception
+ensureopen
+byte bytes    byte normscache get field
+if  bytes  null     hasnorms field
+arrays fill result  offset  result length  defaultsimilarity encodenorm 1 0f
+else if  bytes    null                                 cache hit
+system arraycopy bytes  0  result  offset  maxdoc
+else
+for  int i   0  i < subreaders length  i              read from segments
+subreaders norms field  result  offset   starts
+protected void dosetnorm int n  string field  byte value
+throws corruptindexexception  ioexception
+synchronized  normscache
+normscache remove field                              clear cache
+int i   readerindex n                                find segment num
+subreaders setnorm n starts  field  value      dispatch
+public termenum terms   throws ioexception
+ensureopen
+return new multitermenum this  subreaders  starts  null
+public termenum terms term term  throws ioexception
+ensureopen
+return new multitermenum this  subreaders  starts  term
+public int docfreq term t  throws ioexception
+ensureopen
+int total   0              sum freqs in segments
+for  int i   0  i < subreaders length  i
+total    subreaders docfreq t
+return total
+public termdocs termdocs   throws ioexception
+ensureopen
+return new multitermdocs this  subreaders  starts
+public termpositions termpositions   throws ioexception
+ensureopen
+return new multitermpositions this  subreaders  starts
+/**
+* tries to acquire the writelock on this directory. this method is only valid if this indexreader is directory
+* owner.
+*
+* @throws stalereaderexception  if the index has changed since this reader was opened
+* @throws corruptindexexception if the index is corrupt
+* @throws org.apache.lucene.store.lockobtainfailedexception
+*                               if another writer has this index open (<code>write.lock</code> could not be
+*                               obtained)
+* @throws ioexception           if there is a low-level io error
+*/
+protected void acquirewritelock   throws stalereaderexception  corruptindexexception  lockobtainfailedexception  ioexception
+if  readonly
+// note: we should not reach this code w/ the core
+// indexreader classes; however, an external subclass
+// of indexreader could reach this.
+readonlysegmentreader nowrite
+if  segmentinfos    null
+ensureopen
+if  stale
+throw new stalereaderexception
+if  writelock    null
+lock writelock   directory makelock indexwriter write_lock_name
+if   writelock obtain indexwriter write_lock_timeout      obtain write lock
+throw new lockobtainfailedexception     writelock
+this writelock   writelock
+// we have to check whether index has changed since this reader was opened.
+// if so, this reader is no longer valid for deletion
+if  segmentinfos readcurrentversion directory  > segmentinfos getversion
+stale   true
+this writelock release
+this writelock   null
+throw new stalereaderexception
+/** @deprecated  */
+protected void docommit   throws ioexception
+docommit null
+/**
+* commit changes resulting from delete, undeleteall, or setnorm operations
+* <p/>
+* if an exception is hit, then either no changes or all changes will have been committed to the index (transactional
+* semantics).
+*
+* @throws ioexception if there is a low-level io error
+*/
+protected void docommit map commituserdata  throws ioexception
+if  haschanges
+segmentinfos setuserdata commituserdata
+// default deleter (for backwards compatibility) is
+// keeponlylastcommitdeleter:
+indexfiledeleter deleter   new indexfiledeleter directory
+deletionpolicy    null ? new keeponlylastcommitdeletionpolicy     deletionpolicy
+segmentinfos  null  null
+// checkpoint the state we are about to change, in
+// case we have to roll back:
+startcommit
+boolean success   false
+try
+for  int i   0  i < subreaders length  i
+subreaders commit
+// sync all files we just wrote
+iterator it   segmentinfos files directory  false  iterator
+while  it hasnext
+final string filename    string  it next
+if   synced contains filename
+assert directory fileexists filename
+directory sync filename
+synced add filename
+segmentinfos commit directory
+success   true
+finally
+if   success
+// rollback changes that were made to
+// segmentinfos but failed to get [fully]
+// committed.  this way this reader instance
+// remains consistent (matched to what's
+// actually in the index):
+rollbackcommit
+// recompute deletable files & remove them (so
+// partially written .del files, etc, are
+// removed):
+deleter refresh
+// have the deleter remove any now unreferenced
+// files due to this commit:
+deleter checkpoint segmentinfos  true
+deleter close
+if  writelock    null
+writelock release        release write lock
+writelock   null
+haschanges   false
+void startcommit
+rollbackhaschanges   haschanges
+rollbacksegmentinfos    segmentinfos  segmentinfos clone
+for  int i   0  i < subreaders length  i
+subreaders startcommit
+void rollbackcommit
+haschanges   rollbackhaschanges
+for  int i   0  i < segmentinfos size    i
+// rollback each segmentinfo.  because the
+// segmentreader holds a reference to the
+// segmentinfo we can't [easily] just replace
+// segmentinfos, so we reset it in place instead:
+segmentinfos info i  reset rollbacksegmentinfos info i
+rollbacksegmentinfos   null
+for  int i   0  i < subreaders length  i
+subreaders rollbackcommit
+public map getcommituserdata
+ensureopen
+return segmentinfos getuserdata
+/**
+* check whether this indexreader is still using the current (i.e., most recently committed) version of the index.  if
+* a writer has committed any changes to the index since this reader was opened, this will return <code>false</code>,
+* in which case you must open a new indexreader in order to see the changes.  see the description of the <a
+* href="indexwriter.html#autocommit"><code>autocommit</code></a> flag which controls when the {@link indexwriter}
+* actually commits changes to the index.
+*
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception           if there is a low-level io error
+*/
+public boolean iscurrent   throws corruptindexexception  ioexception
+ensureopen
+return segmentinfos readcurrentversion directory     segmentinfos getversion
+protected synchronized void doclose   throws ioexception
+ioexception ioe   null
+normscache   null
+for  int i   0  i < subreaders length  i
+// try to close each reader, even if an exception is thrown
+try
+subreaders decref
+catch  ioexception e
+if  ioe    null  ioe   e
+// throw the first exception
+if  ioe    null  throw ioe
+public collection getfieldnames  indexreader fieldoption fieldnames
+ensureopen
+return getfieldnames fieldnames  this subreaders
+static collection getfieldnames  indexreader fieldoption fieldnames  indexreader subreaders
+// maintain a unique set of field names
+set fieldset   new hashset
+for  int i   0  i < subreaders length  i
+indexreader reader   subreaders
+collection names   reader getfieldnames fieldnames
+fieldset addall names
+return fieldset
+public indexreader getsequentialsubreaders
+return subreaders
+public void setdisablefakenorms boolean disablefakenorms
+super setdisablefakenorms disablefakenorms
+for  int i   0  i < subreaders length  i
+subreaders setdisablefakenorms disablefakenorms
+/** returns the directory this index resides in. */
+public directory directory
+// don't ensureopen here -- in certain cases, when a
+// cloned/reopened reader needs to commit, it may call
+// this method on the closed original reader
+return directory
+public int getterminfosindexdivisor
+return terminfosindexdivisor
+/**
+* expert: return the indexcommit that this reader has opened.
+* <p/>
+* <p><b>warning</b>: this api is new and experimental and may suddenly change.</p>
+*/
+public indexcommit getindexcommit   throws ioexception
+return new readercommit segmentinfos  directory
+/** @see org.apache.lucene.index.indexreader#listcommits */
+public static collection listcommits directory dir  throws ioexception
+final string files   dir listall
+collection commits   new arraylist
+segmentinfos latest   new segmentinfos
+latest read dir
+final long currentgen   latest getgeneration
+commits add new readercommit latest  dir
+for int i 0 i<files length i
+final string filename   files
+if  filename startswith indexfilenames segments
+filename equals indexfilenames segments_gen
+segmentinfos generationfromsegmentsfilename filename  < currentgen
+segmentinfos sis   new segmentinfos
+try
+// ioexception allowed to throw there, in case
+// segments_n is corrupt
+sis read dir  filename
+catch  filenotfoundexception fnfe
+// lucene-948: on nfs (and maybe others), if
+// you have writers switching back and forth
+// between machines, it's very likely that the
+// dir listing will be stale and will claim a
+// file segments_x exists when in fact it
+// doesn't.  so, we catch this and handle it
+// as if the file does not exist
+sis   null
+if  sis    null
+commits add new readercommit sis  dir
+return commits
+private static final class readercommit extends indexcommit
+private string segmentsfilename
+collection files
+directory dir
+long generation
+long version
+final boolean isoptimized
+final map userdata
+readercommit segmentinfos infos  directory dir  throws ioexception
+segmentsfilename   infos getcurrentsegmentfilename
+this dir   dir
+userdata   infos getuserdata
+files   collections unmodifiablecollection infos files dir  true
+version   infos getversion
+generation   infos getgeneration
+isoptimized   infos size      1     infos info 0  hasdeletions
+public boolean isoptimized
+return isoptimized
+public string getsegmentsfilename
+return segmentsfilename
+public collection getfilenames
+return files
+public directory getdirectory
+return dir
+public long getversion
+return version
+public long getgeneration
+return generation
+public boolean isdeleted
+return false
+public map getuserdata
+return userdata
+static class multitermenum extends termenum
+indexreader topreader     used for matching termenum to termdocs
+private segmentmergequeue queue
+private term term
+private int docfreq
+final segmentmergeinfo matchingsegments     null terminated array of matching segments
+public multitermenum indexreader topreader  indexreader readers  int starts  term t
+throws ioexception
+this topreader   topreader
+queue   new segmentmergequeue readers length
+matchingsegments   new segmentmergeinfo
+for  int i   0  i < readers length  i
+indexreader reader   readers
+termenum termenum
+if  t    null
+termenum   reader terms t
+else
+termenum   reader terms
+segmentmergeinfo smi   new segmentmergeinfo starts  termenum  reader
+smi ord   i
+if  t    null ? smi next     termenum term      null
+queue put smi               initialize queue
+else
+smi close
+if  t    null    queue size   > 0
+next
+public boolean next   throws ioexception
+for  int i 0  i<matchingsegments length  i
+segmentmergeinfo smi   matchingsegments
+if  smi  null  break
+if  smi next
+queue put smi
+else
+smi close       done with segment
+int nummatchingsegments   0
+matchingsegments   null
+segmentmergeinfo top    segmentmergeinfo queue top
+if  top    null
+term   null
+return false
+term   top term
+docfreq   0
+while  top    null    term compareto top term     0
+matchingsegments   top
+queue pop
+docfreq    top termenum docfreq          increment freq
+top    segmentmergeinfo queue top
+matchingsegments   null
+return true
+public term term
+return term
+public int docfreq
+return docfreq
+public void close   throws ioexception
+queue close
+static class multitermdocs implements termdocs
+indexreader topreader      used for matching termenum to termdocs
+protected indexreader readers
+protected int starts
+protected term term
+protected int base   0
+protected int pointer   0
+private termdocs readertermdocs
+protected termdocs current                     readertermdocs
+private multitermenum tenum      the term enum used for seeking    can be null
+int matchingsegmentpos      position into the matching segments from tenum
+segmentmergeinfo smi         current segment mere info    can be null
+public multitermdocs indexreader topreader  indexreader r  int s
+this topreader   topreader
+readers   r
+starts   s
+readertermdocs   new termdocs
+public int doc
+return base   current doc
+public int freq
+return current freq
+public void seek term term
+this term   term
+this base   0
+this pointer   0
+this current   null
+this tenum   null
+this smi   null
+this matchingsegmentpos   0
+public void seek termenum termenum  throws ioexception
+seek termenum term
+if  termenum instanceof multitermenum
+tenum    multitermenum termenum
+if  topreader    tenum topreader
+tenum   null
+public boolean next   throws ioexception
+for
+if  current  null    current next
+return true
+else if  pointer < readers length
+if  tenum    null
+smi   tenum matchingsegments
+if  smi  null
+pointer   readers length
+return false
+pointer   smi ord
+base   starts
+current   termdocs pointer
+else
+return false
+/** optimized implementation. */
+public int read final int docs  final int freqs  throws ioexception
+while  true
+while  current    null
+if  pointer < readers length            try next segment
+if  tenum    null
+smi   tenum matchingsegments
+if  smi  null
+pointer   readers length
+return 0
+pointer   smi ord
+base   starts
+current   termdocs pointer
+else
+return 0
+int end   current read docs  freqs
+if  end    0                none left in segment
+current   null
+else                 got some
+final int b   base            adjust doc numbers
+for  int i   0  i < end  i
+docs    b
+return end
+/* a possible future optimization could skip entire segments */
+public boolean skipto int target  throws ioexception
+for
+if  current    null    current skipto target base
+return true
+else if  pointer < readers length
+if  tenum    null
+segmentmergeinfo smi   tenum matchingsegments
+if  smi  null
+pointer   readers length
+return false
+pointer   smi ord
+base   starts
+current   termdocs pointer
+else
+return false
+private termdocs termdocs int i  throws ioexception
+termdocs result   readertermdocs
+if  result    null
+result   readertermdocs   termdocs readers
+if  smi    null
+assert smi ord    i
+assert smi termenum term   equals term
+result seek smi termenum
+else
+result seek term
+return result
+protected termdocs termdocs indexreader reader
+throws ioexception
+return term  null ? reader termdocs null    reader termdocs
+public void close   throws ioexception
+for  int i   0  i < readertermdocs length  i
+if  readertermdocs    null
+readertermdocs close
+static class multitermpositions extends multitermdocs implements termpositions
+public multitermpositions indexreader topreader  indexreader r  int s
+super topreader r s
+protected termdocs termdocs indexreader reader  throws ioexception
+return  termdocs reader termpositions
+public int nextposition   throws ioexception
+return   termpositions current  nextposition
+public int getpayloadlength
+return   termpositions current  getpayloadlength
+public byte getpayload byte data  int offset  throws ioexception
+return   termpositions current  getpayload data  offset
+// todo: remove warning after api has been finalized
+public boolean ispayloadavailable
+return   termpositions  current  ispayloadavailable

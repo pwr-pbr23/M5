@@ -1,0 +1,828 @@
+/*
+* copyright 2011 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase io hfile
+import java io datainput
+import java io ioexception
+import java nio bytebuffer
+import java util arraylist
+import java util list
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop fs fsdatainputstream
+import org apache hadoop fs path
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase fs hfilesystem
+import org apache hadoop hbase io encoding datablockencoder
+import org apache hadoop hbase io encoding datablockencoding
+import org apache hadoop hbase io hfile blocktype blockcategory
+import org apache hadoop hbase io hfile hfile fileinfo
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util idlock
+import org apache hadoop io writableutils
+/**
+* {@link hfile} reader for version 2.
+*/
+public class hfilereaderv2 extends abstracthfilereader
+private static final log log   logfactory getlog hfilereaderv2 class
+/**
+* the size of a (key length, value length) tuple that prefixes each entry in
+* a data block.
+*/
+private static int key_value_len_size   2   bytes sizeof_int
+private boolean includesmemstorets   false
+private boolean shouldincludememstorets
+return includesmemstorets
+/**
+* a "sparse lock" implementation allowing to lock on a particular block
+* identified by offset. the purpose of this is to avoid two clients loading
+* the same block, and have all but one client wait to get the block from the
+* cache.
+*/
+private idlock offsetlock   new idlock
+/**
+* blocks read from the load-on-open section, excluding data root index, meta
+* index, and file info.
+*/
+private list<hfileblock> loadonopenblocks   new arraylist<hfileblock>
+/** minimum minor version supported by this hfile format */
+static final int min_minor_version   0
+/** maximum minor version supported by this hfile format */
+static final int max_minor_version   1
+/**
+* opens a hfile. you must load the index before you can use it by calling
+* {@link #loadfileinfo()}.
+*
+* @param path path to hfile.
+* @param trailer file trailer.
+* @param fsdis input stream. caller is responsible for closing the passed
+*          stream.
+* @param size length of the stream.
+* @param closeistream whether to close the stream.
+* @param cacheconf cache configuration.
+* @param preferredencodingincache the encoding to use in cache in case we
+*          have a choice. if the file is already encoded on disk, we will
+*          still use its on-disk encoding in cache.
+*/
+public hfilereaderv2 path path  fixedfiletrailer trailer
+final fsdatainputstream fsdis  final fsdatainputstream fsdisnofschecksum
+final long size
+final boolean closeistream  final cacheconfig cacheconf
+datablockencoding preferredencodingincache  final hfilesystem hfs
+throws ioexception
+super path  trailer  fsdis  fsdisnofschecksum  size
+closeistream  cacheconf  hfs
+trailer expectmajorversion 2
+validateminorversion path  trailer getminorversion
+hfileblock fsreaderv2 fsblockreaderv2   new hfileblock fsreaderv2 fsdis
+fsdisnofschecksum
+compressalgo  filesize  trailer getminorversion    hfs  path
+this fsblockreader   fsblockreaderv2     upcast
+// comparator class name is stored in the trailer in version 2.
+comparator   trailer createcomparator
+datablockindexreader   new hfileblockindex blockindexreader comparator
+trailer getnumdataindexlevels    this
+metablockindexreader   new hfileblockindex blockindexreader
+bytes bytes_rawcomparator  1
+// parse load-on-open data.
+hfileblock blockiterator blockiter   fsblockreaderv2 blockrange
+trailer getloadonopendataoffset
+filesize   trailer gettrailersize
+// data index. we also read statistics about the block index written after
+// the root level.
+datablockindexreader readmultilevelindexroot
+blockiter nextblockwithblocktype blocktype root_index
+trailer getdataindexcount
+// meta index.
+metablockindexreader readrootindex
+blockiter nextblockwithblocktype blocktype root_index
+trailer getmetaindexcount
+// file info
+fileinfo   new fileinfo
+fileinfo readfields blockiter nextblockwithblocktype blocktype file_info  getbytestream
+lastkey   fileinfo get fileinfo lastkey
+avgkeylen   bytes toint fileinfo get fileinfo avg_key_len
+avgvaluelen   bytes toint fileinfo get fileinfo avg_value_len
+byte  keyvalueformatversion
+fileinfo get hfilewriterv2 key_value_version
+includesmemstorets   keyvalueformatversion    null
+bytes toint keyvalueformatversion
+hfilewriterv2 key_value_ver_with_memstore
+fsblockreaderv2 setincludesmemstorets includesmemstorets
+// read data block encoding algorithm name from file info.
+datablockencoder   hfiledatablockencoderimpl createfromfileinfo fileinfo
+preferredencodingincache
+fsblockreaderv2 setdatablockencoder datablockencoder
+// store all other load-on-open blocks for further consumption.
+hfileblock b
+while   b   blockiter nextblock       null
+loadonopenblocks add b
+/**
+* create a scanner on this file. no seeks or reads are done on creation. call
+* {@link hfilescanner#seekto(byte[])} to position an start the read. there is
+* nothing to clean up in a scanner. letting go of your references to the
+* scanner is sufficient.
+*
+* @param cacheblocks true if we should cache blocks read in by this scanner.
+* @param pread use positional read rather than seek+read if true (pread is
+*          better for random reads, seek+read is better scanning).
+* @param iscompaction is scanner being used for a compaction?
+* @return scanner on this file.
+*/
+@override
+public hfilescanner getscanner boolean cacheblocks  final boolean pread
+final boolean iscompaction
+// check if we want to use data block encoding in memory
+if  datablockencoder useencodedscanner iscompaction
+return new encodedscannerv2 this  cacheblocks  pread  iscompaction
+includesmemstorets
+return new scannerv2 this  cacheblocks  pread  iscompaction
+/**
+* @param metablockname
+* @param cacheblock add block to cache, if found
+* @return block wrapped in a bytebuffer, with header skipped
+* @throws ioexception
+*/
+@override
+public bytebuffer getmetablock string metablockname  boolean cacheblock
+throws ioexception
+if  trailer getmetaindexcount      0
+return null     there are no meta blocks
+if  metablockindexreader    null
+throw new ioexception
+byte mbname   bytes tobytes metablockname
+int block   metablockindexreader rootblockcontainingkey mbname  0
+mbname length
+if  block     1
+return null
+long blocksize   metablockindexreader getrootblockdatasize block
+long starttimens   system nanotime
+// per meta key from any given file, synchronize reads for said block. this
+// is ok to do for meta blocks because the meta block index is always
+// single-level.
+synchronized  metablockindexreader getrootblockkey block
+metaloads incrementandget
+// check cache for block. if found return.
+long metablockoffset   metablockindexreader getrootblockoffset block
+blockcachekey cachekey   new blockcachekey name  metablockoffset
+datablockencoding none  blocktype meta
+cacheblock    cacheconf shouldcachedataonread
+if  cacheconf isblockcacheenabled
+hfileblock cachedblock
+hfileblock  cacheconf getblockcache   getblock cachekey  cacheblock
+if  cachedblock    null
+// return a distinct 'shallow copy' of the block,
+// so pos does not get messed by the scanner
+cachehits incrementandget
+getschemametrics   updateoncachehit blockcategory meta  false
+return cachedblock getbufferwithoutheader
+// cache miss, please load.
+hfileblock metablock   fsblockreader readblockdata metablockoffset
+blocksize   1  true
+passschemametricsto metablock
+final long delta   system nanotime     starttimens
+hfile offerreadlatency delta  true
+getschemametrics   updateoncachemiss blockcategory meta  false  delta
+// cache the block
+if  cacheblock
+cacheconf getblockcache   cacheblock cachekey  metablock
+cacheconf isinmemory
+return metablock getbufferwithoutheader
+/**
+* read in a file block.
+* @param datablockoffset offset to read.
+* @param ondiskblocksize size of the block
+* @param cacheblock
+* @param pread use positional read instead of seek+read (positional is
+*          better doing random reads whereas seek+read is better scanning).
+* @param iscompaction is this block being read as part of a compaction
+* @param expectedblocktype the block type we are expecting to read with this
+*          read operation, or null to read whatever block type is available
+*          and avoid checking (that might reduce caching efficiency of
+*          encoded data blocks)
+* @return block wrapped in a bytebuffer.
+* @throws ioexception
+*/
+@override
+public hfileblock readblock long datablockoffset  long ondiskblocksize
+final boolean cacheblock  boolean pread  final boolean iscompaction
+blocktype expectedblocktype
+throws ioexception
+if  datablockindexreader    null
+throw new ioexception
+if  datablockoffset < 0
+datablockoffset >  trailer getloadonopendataoffset
+throw new ioexception
+datablockoffset
+trailer getlastdatablockoffset
+// for any given block from any given file, synchronize reads for said
+// block.
+// without a cache, this synchronizing is needless overhead, but really
+// the other choice is to duplicate work (which the cache would prevent you
+// from doing).
+blockcachekey cachekey
+new blockcachekey name  datablockoffset
+datablockencoder geteffectiveencodingincache iscompaction
+expectedblocktype
+idlock entry lockentry   offsetlock getlockentry datablockoffset
+try
+blockloads incrementandget
+// check cache for block. if found return.
+if  cacheconf isblockcacheenabled
+hfileblock cachedblock    hfileblock
+cacheconf getblockcache   getblock cachekey  cacheblock
+if  cachedblock    null
+blockcategory blockcategory
+cachedblock getblocktype   getcategory
+cachehits incrementandget
+getschemametrics   updateoncachehit blockcategory  iscompaction
+if  cachedblock getblocktype      blocktype data
+hfile datablockreadcnt incrementandget
+validateblocktype cachedblock  expectedblocktype
+// validate encoding type for encoded blocks. we include encoding
+// type in the cache key, and we expect it to match on a cache hit.
+if  cachedblock getblocktype      blocktype encoded_data
+cachedblock getdatablockencoding
+datablockencoder getencodingincache
+throw new ioexception     cachekey
+cachedblock getdatablockencoding
+datablockencoder getencodingincache
+return cachedblock
+// carry on, please load.
+// load block from filesystem.
+long starttimens   system nanotime
+hfileblock hfileblock   fsblockreader readblockdata datablockoffset
+ondiskblocksize   1  pread
+hfileblock   datablockencoder disktocacheformat hfileblock
+iscompaction
+validateblocktype hfileblock  expectedblocktype
+passschemametricsto hfileblock
+blockcategory blockcategory   hfileblock getblocktype   getcategory
+final long delta   system nanotime     starttimens
+hfile offerreadlatency delta  pread
+getschemametrics   updateoncachemiss blockcategory  iscompaction  delta
+// cache the block if necessary
+if  cacheblock    cacheconf shouldcacheblockonread
+hfileblock getblocktype   getcategory
+cacheconf getblockcache   cacheblock cachekey  hfileblock
+cacheconf isinmemory
+if  hfileblock getblocktype      blocktype data
+hfile datablockreadcnt incrementandget
+return hfileblock
+finally
+offsetlock releaselockentry lockentry
+/**
+* compares the actual type of a block retrieved from cache or disk with its
+* expected type and throws an exception in case of a mismatch. expected
+* block type of {@link blocktype#data} is considered to match the actual
+* block type [@link {@link blocktype#encoded_data} as well.
+* @param block a block retrieved from cache or disk
+* @param expectedblocktype the expected block type, or null to skip the
+*          check
+*/
+private void validateblocktype hfileblock block
+blocktype expectedblocktype  throws ioexception
+if  expectedblocktype    null
+return
+blocktype actualblocktype   block getblocktype
+if  actualblocktype    blocktype encoded_data
+expectedblocktype    blocktype data
+// we consider data to match encoded_data for the purpose of this
+// verification.
+return
+if  actualblocktype    expectedblocktype
+throw new ioexception     expectedblocktype
+actualblocktype       block
+/**
+* @return last key in the file. may be null if file has no entries. note that
+*         this is not the last row key, but rather the byte form of the last
+*         keyvalue.
+*/
+@override
+public byte getlastkey
+return datablockindexreader isempty   ? null   lastkey
+/**
+* @return midkey for this file. we work with block boundaries only so
+*         returned midkey is an approximation only.
+* @throws ioexception
+*/
+@override
+public byte midkey   throws ioexception
+return datablockindexreader midkey
+@override
+public void close   throws ioexception
+close cacheconf shouldevictonclose
+public void close boolean evictonclose  throws ioexception
+if  evictonclose    cacheconf isblockcacheenabled
+int numevicted   cacheconf getblockcache   evictblocksbyhfilename name
+if  log istraceenabled
+log trace     name       numevicted
+if  closeistream
+if  istream    istreamnofschecksum    istreamnofschecksum    null
+istreamnofschecksum close
+istreamnofschecksum   null
+if  istream    null
+istream close
+istream   null
+protected abstract static class abstractscannerv2
+extends abstracthfilereader scanner
+protected hfileblock block
+public abstractscannerv2 hfilereaderv2 r  boolean cacheblocks
+final boolean pread  final boolean iscompaction
+super r  cacheblocks  pread  iscompaction
+/**
+* an internal api function. seek to the given key, optionally rewinding to
+* the first key of the block before doing the seek.
+*
+* @param key key byte array
+* @param offset key offset in the key byte array
+* @param length key length
+* @param rewind whether to rewind to the first key of the block before
+*        doing the seek. if this is false, we are assuming we never go
+*        back, otherwise the result is undefined.
+* @return -1 if the key is earlier than the first key of the file,
+*         0 if we are at the given key, and 1 if we are past the given key
+* @throws ioexception
+*/
+protected int seekto byte key  int offset  int length  boolean rewind
+throws ioexception
+hfileblockindex blockindexreader indexreader
+reader getdatablockindexreader
+hfileblock seektoblock   indexreader seektodatablock key  offset  length
+block  cacheblocks  pread  iscompaction
+if  seektoblock    null
+// this happens if the key e.g. falls before the beginning of the file.
+return  1
+return loadblockandseektokey seektoblock  rewind  key  offset  length
+false
+protected abstract bytebuffer getfirstkeyinblock hfileblock curblock
+protected abstract int loadblockandseektokey hfileblock seektoblock
+boolean rewind  byte key  int offset  int length  boolean seekbefore
+throws ioexception
+@override
+public int seekto byte key  int offset  int length  throws ioexception
+// always rewind to the first key of the block, because the given key
+// might be before or after the current key.
+return seekto key  offset  length  true
+@override
+public int reseekto byte key  int offset  int length  throws ioexception
+if  isseeked
+bytebuffer bb   getkey
+int compared   reader getcomparator   compare key  offset
+length  bb array    bb arrayoffset    bb limit
+if  compared < 1
+// if the required key is less than or equal to current key, then
+// don't do anything.
+return compared
+// don't rewind on a reseek operation, because reseek implies that we are
+// always going forward in the file.
+return seekto key  offset  length  false
+@override
+public boolean seekbefore byte key  int offset  int length
+throws ioexception
+hfileblock seektoblock
+reader getdatablockindexreader   seektodatablock key  offset  length
+block  cacheblocks  pread  iscompaction
+if  seektoblock    null
+return false
+bytebuffer firstkey   getfirstkeyinblock seektoblock
+if  reader getcomparator   compare firstkey array
+firstkey arrayoffset    firstkey limit    key  offset  length     0
+long previousblockoffset   seektoblock getprevblockoffset
+// the key we are interested in
+if  previousblockoffset     1
+// we have a 'problem', the key we want is the first of the file.
+return false
+// it is important that we compute and pass ondisksize to the block
+// reader so that it does not have to read the header separately to
+// figure out the size.
+seektoblock   reader readblock previousblockoffset
+seektoblock getoffset     previousblockoffset  cacheblocks
+pread  iscompaction  blocktype data
+// todo shortcut: seek forward in this block to the last key of the
+// block.
+loadblockandseektokey seektoblock  true  key  offset  length  true
+return true
+/**
+* scans blocks in the "scanned" section of the {@link hfile} until the next
+* data block is found.
+*
+* @return the next block, or null if there are no more data blocks
+* @throws ioexception
+*/
+protected hfileblock readnextdatablock   throws ioexception
+long lastdatablockoffset   reader gettrailer   getlastdatablockoffset
+if  block    null
+return null
+hfileblock curblock   block
+do
+if  curblock getoffset   >  lastdatablockoffset
+return null
+if  curblock getoffset   < 0
+throw new ioexception     block
+// we are reading the next block without block type validation, because
+// it might turn out to be a non-data block.
+curblock   reader readblock curblock getoffset
+curblock getondisksizewithheader
+curblock getnextblockondisksizewithheader    cacheblocks  pread
+iscompaction  null
+while    curblock getblocktype   equals blocktype data
+curblock getblocktype   equals blocktype encoded_data
+return curblock
+/**
+* implementation of {@link hfilescanner} interface.
+*/
+protected static class scannerv2 extends abstractscannerv2
+private hfilereaderv2 reader
+public scannerv2 hfilereaderv2 r  boolean cacheblocks
+final boolean pread  final boolean iscompaction
+super r  cacheblocks  pread  iscompaction
+this reader   r
+@override
+public keyvalue getkeyvalue
+if   isseeked
+return null
+keyvalue ret   new keyvalue blockbuffer array
+blockbuffer arrayoffset     blockbuffer position
+if  this reader shouldincludememstorets
+ret setmemstorets currmemstorets
+return ret
+@override
+public bytebuffer getkey
+assertseeked
+return bytebuffer wrap
+blockbuffer array
+blockbuffer arrayoffset     blockbuffer position
+key_value_len_size  currkeylen  slice
+@override
+public bytebuffer getvalue
+assertseeked
+return bytebuffer wrap
+blockbuffer array
+blockbuffer arrayoffset     blockbuffer position
+key_value_len_size   currkeylen  currvaluelen  slice
+private void setnonseekedstate
+block   null
+blockbuffer   null
+currkeylen   0
+currvaluelen   0
+currmemstorets   0
+currmemstoretslen   0
+/**
+* go to the next key/value in the block section. loads the next block if
+* necessary. if successful, {@link #getkey()} and {@link #getvalue()} can
+* be called.
+*
+* @return true if successfully navigated to the next key/value
+*/
+@override
+public boolean next   throws ioexception
+assertseeked
+try
+blockbuffer position blockbuffer position     key_value_len_size
+currkeylen   currvaluelen   currmemstoretslen
+catch  illegalargumentexception e
+log error     blockbuffer position
+currkeylen
+currvaluelen       blockbuffer limit
+reader getname
+block getoffset
+throw e
+if  blockbuffer remaining   <  0
+long lastdatablockoffset
+reader gettrailer   getlastdatablockoffset
+if  block getoffset   >  lastdatablockoffset
+setnonseekedstate
+return false
+// read the next block
+hfileblock nextblock   readnextdatablock
+if  nextblock    null
+setnonseekedstate
+return false
+updatecurrblock nextblock
+return true
+// we are still in the same block.
+readkeyvaluelen
+return true
+/**
+* positions this scanner at the start of the file.
+*
+* @return false if empty file; i.e. a call to next would return false and
+*         the current key and value are undefined.
+* @throws ioexception
+*/
+@override
+public boolean seekto   throws ioexception
+if  reader    null
+return false
+if  reader gettrailer   getentrycount      0
+// no data blocks.
+return false
+long firstdatablockoffset
+reader gettrailer   getfirstdatablockoffset
+if  block    null    block getoffset      firstdatablockoffset
+blockbuffer rewind
+readkeyvaluelen
+return true
+block   reader readblock firstdatablockoffset   1  cacheblocks  pread
+iscompaction  blocktype data
+if  block getoffset   < 0
+throw new ioexception     block getoffset
+updatecurrblock block
+return true
+@override
+protected int loadblockandseektokey hfileblock seektoblock  boolean rewind
+byte key  int offset  int length  boolean seekbefore
+throws ioexception
+if  block    null    block getoffset      seektoblock getoffset
+updatecurrblock seektoblock
+else if  rewind
+blockbuffer rewind
+return blockseek key  offset  length  seekbefore
+/**
+* updates the current block to be the given {@link hfileblock}. seeks to
+* the the first key/value pair.
+*
+* @param newblock the block to make current
+*/
+private void updatecurrblock hfileblock newblock
+block   newblock
+// sanity check
+if  block getblocktype      blocktype data
+throw new illegalstateexception
+block getblocktype
+reader name
+reader datablockencoder
+iscompaction
+blockbuffer   block getbufferwithoutheader
+readkeyvaluelen
+blockfetches
+private final void readkeyvaluelen
+blockbuffer mark
+currkeylen   blockbuffer getint
+currvaluelen   blockbuffer getint
+blockbuffer reset
+if  this reader shouldincludememstorets
+try
+int memstoretsoffset   blockbuffer arrayoffset
+blockbuffer position     key_value_len_size   currkeylen
+currvaluelen
+currmemstorets   bytes readvlong blockbuffer array
+memstoretsoffset
+currmemstoretslen   writableutils getvintsize currmemstorets
+catch  exception e
+throw new runtimeexception    e
+if  currkeylen < 0    currvaluelen < 0
+currkeylen > blockbuffer limit
+currvaluelen > blockbuffer limit
+throw new illegalstateexception     currkeylen
+currvaluelen
+block getoffset         blockbuffer limit
+blockbuffer position
+/**
+* within a loaded block, seek looking for the last key that is smaller
+* than (or equal to?) the key we are interested in.
+*
+* a note on the seekbefore: if you have seekbefore = true, and the first
+* key in the block = key, then you'll get thrown exceptions. the caller has
+* to check for that case and load the previous block as appropriate.
+*
+* @param key the key to find
+* @param seekbefore find the key before the given key in case of exact
+*          match.
+* @return 0 in case of an exact key match, 1 in case of an inexact match
+*/
+private int blockseek byte key  int offset  int length
+boolean seekbefore
+int klen  vlen
+long memstorets   0
+int memstoretslen   0
+int lastkeyvaluesize    1
+do
+blockbuffer mark
+klen   blockbuffer getint
+vlen   blockbuffer getint
+blockbuffer reset
+if  this reader shouldincludememstorets
+try
+int memstoretsoffset   blockbuffer arrayoffset
+blockbuffer position     key_value_len_size   klen   vlen
+memstorets   bytes readvlong blockbuffer array
+memstoretsoffset
+memstoretslen   writableutils getvintsize memstorets
+catch  exception e
+throw new runtimeexception    e
+int keyoffset   blockbuffer arrayoffset     blockbuffer position
+key_value_len_size
+int comp   reader getcomparator   compare key  offset  length
+blockbuffer array    keyoffset  klen
+if  comp    0
+if  seekbefore
+if  lastkeyvaluesize < 0
+throw new illegalstateexception
+bytes tostringbinary key
+block getoffset
+block getondisksizewithheader
+blockbuffer position blockbuffer position     lastkeyvaluesize
+readkeyvaluelen
+return 1     non exact match
+currkeylen   klen
+currvaluelen   vlen
+if  this reader shouldincludememstorets
+currmemstorets   memstorets
+currmemstoretslen   memstoretslen
+return 0     indicate exact match
+if  comp < 0
+if  lastkeyvaluesize > 0
+blockbuffer position blockbuffer position     lastkeyvaluesize
+readkeyvaluelen
+return 1
+// the size of this key/value tuple, including key/value length fields.
+lastkeyvaluesize   klen   vlen   memstoretslen   key_value_len_size
+blockbuffer position blockbuffer position     lastkeyvaluesize
+while  blockbuffer remaining   > 0
+// seek to the last key we successfully read. this will happen if this is
+// the last key/value pair in the file, in which case the following call
+// to next() has to return false.
+blockbuffer position blockbuffer position     lastkeyvaluesize
+readkeyvaluelen
+return 1     didn't exactly find it
+@override
+protected bytebuffer getfirstkeyinblock hfileblock curblock
+bytebuffer buffer   curblock getbufferwithoutheader
+// it is safe to manipulate this buffer because we own the buffer object.
+buffer rewind
+int klen   buffer getint
+buffer getint
+bytebuffer keybuff   buffer slice
+keybuff limit klen
+keybuff rewind
+return keybuff
+@override
+public string getkeystring
+return bytes tostringbinary blockbuffer array
+blockbuffer arrayoffset     blockbuffer position
+key_value_len_size  currkeylen
+@override
+public string getvaluestring
+return bytes tostring blockbuffer array    blockbuffer arrayoffset
+blockbuffer position     key_value_len_size   currkeylen
+currvaluelen
+/**
+* scannerv2 that operates on encoded data blocks.
+*/
+protected static class encodedscannerv2 extends abstractscannerv2
+private datablockencoder encodedseeker seeker   null
+private datablockencoder datablockencoder   null
+private final boolean includesmemstorets
+public encodedscannerv2 hfilereaderv2 reader  boolean cacheblocks
+boolean pread  boolean iscompaction  boolean includesmemstorets
+super reader  cacheblocks  pread  iscompaction
+this includesmemstorets   includesmemstorets
+private void setdatablockencoder datablockencoder datablockencoder
+this datablockencoder   datablockencoder
+seeker   datablockencoder createseeker reader getcomparator
+includesmemstorets
+/**
+* updates the current block to be the given {@link hfileblock}. seeks to
+* the the first key/value pair.
+*
+* @param newblock the block to make current
+*/
+private void updatecurrentblock hfileblock newblock
+block   newblock
+// sanity checks
+if  block getblocktype      blocktype encoded_data
+throw new illegalstateexception
+short datablockencoderid   block getdatablockencodingid
+if  datablockencoder    null
+datablockencoding iscorrectencoder datablockencoder
+datablockencoderid
+datablockencoder encoder
+datablockencoding getdatablockencoderbyid datablockencoderid
+setdatablockencoder encoder
+seeker setcurrentbuffer getencodedbuffer newblock
+blockfetches
+private bytebuffer getencodedbuffer hfileblock newblock
+bytebuffer origblock   newblock getbufferreadonly
+bytebuffer encodedblock   bytebuffer wrap origblock array
+origblock arrayoffset     newblock headersize
+datablockencoding id_size
+newblock getuncompressedsizewithoutheader
+datablockencoding id_size  slice
+return encodedblock
+@override
+public boolean seekto   throws ioexception
+if  reader    null
+return false
+if  reader gettrailer   getentrycount      0
+// no data blocks.
+return false
+long firstdatablockoffset
+reader gettrailer   getfirstdatablockoffset
+if  block    null    block getoffset      firstdatablockoffset
+seeker rewind
+return true
+block   reader readblock firstdatablockoffset   1  cacheblocks  pread
+iscompaction  blocktype data
+if  block getoffset   < 0
+throw new ioexception     block getoffset
+updatecurrentblock block
+return true
+@override
+public boolean next   throws ioexception
+boolean isvalid   seeker next
+if   isvalid
+block   readnextdatablock
+isvalid   block    null
+if  isvalid
+updatecurrentblock block
+return isvalid
+@override
+public bytebuffer getkey
+assertvalidseek
+return seeker getkeydeepcopy
+@override
+public bytebuffer getvalue
+assertvalidseek
+return seeker getvalueshallowcopy
+@override
+public keyvalue getkeyvalue
+if  block    null
+return null
+return seeker getkeyvalue
+@override
+public string getkeystring
+bytebuffer keybuffer   getkey
+return bytes tostringbinary keybuffer array
+keybuffer arrayoffset    keybuffer limit
+@override
+public string getvaluestring
+bytebuffer valuebuffer   getvalue
+return bytes tostringbinary valuebuffer array
+valuebuffer arrayoffset    valuebuffer limit
+private void assertvalidseek
+if  block    null
+throw new notseekedexception
+@override
+protected bytebuffer getfirstkeyinblock hfileblock curblock
+return datablockencoder getfirstkeyinblock getencodedbuffer curblock
+@override
+protected int loadblockandseektokey hfileblock seektoblock  boolean rewind
+byte key  int offset  int length  boolean seekbefore
+throws ioexception
+if  block    null    block getoffset      seektoblock getoffset
+updatecurrentblock seektoblock
+else if  rewind
+seeker rewind
+return seeker seektokeyinblock key  offset  length  seekbefore
+/**
+* returns a buffer with the bloom filter metadata. the caller takes
+* ownership of the buffer.
+*/
+@override
+public datainput getgeneralbloomfiltermetadata   throws ioexception
+return this getbloomfiltermetadata blocktype general_bloom_meta
+@override
+public datainput getdeletebloomfiltermetadata   throws ioexception
+return this getbloomfiltermetadata blocktype delete_family_bloom_meta
+private datainput getbloomfiltermetadata blocktype blocktype
+throws ioexception
+if  blocktype    blocktype general_bloom_meta
+blocktype    blocktype delete_family_bloom_meta
+throw new runtimeexception     blocktype tostring
+for  hfileblock b   loadonopenblocks
+if  b getblocktype      blocktype
+return b getbytestream
+return null
+@override
+public boolean isfileinfoloaded
+return true     we load file info in constructor in version 2
+/**
+* validates that the minor version is within acceptable limits.
+* otherwise throws an runtime exception
+*/
+private void validateminorversion path path  int minorversion
+if  minorversion < min_minor_version
+minorversion > max_minor_version
+string msg       path
+min_minor_version       max_minor_version
+minorversion
+log error msg
+throw new runtimeexception msg

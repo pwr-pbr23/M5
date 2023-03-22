@@ -1,0 +1,428 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache camel impl
+import java util arraylist
+import java util collections
+import java util comparator
+import java util linkedhashset
+import java util list
+import java util locale
+import java util set
+import java util concurrent executionexception
+import java util concurrent executorservice
+import java util concurrent future
+import java util concurrent timeunit
+import java util concurrent timeoutexception
+import org apache camel camelcontext
+import org apache camel camelcontextaware
+import org apache camel consumer
+import org apache camel route
+import org apache camel service
+import org apache camel shutdownroute
+import org apache camel shutdownrunningtask
+import org apache camel suspendableservice
+import org apache camel spi routestartuporder
+import org apache camel spi shutdownaware
+import org apache camel spi shutdownprepared
+import org apache camel spi shutdownstrategy
+import org apache camel support servicesupport
+import org apache camel util eventhelper
+import org apache camel util objecthelper
+import org apache camel util servicehelper
+import org apache camel util stopwatch
+import org slf4j logger
+import org slf4j loggerfactory
+/**
+* default {@link org.apache.camel.spi.shutdownstrategy} which uses graceful shutdown.
+* <p/>
+* graceful shutdown ensures that any inflight and pending messages will be taken into account
+* and it will wait until these exchanges has been completed.
+* <p/>
+* this strategy will perform graceful shutdown in two steps:
+* <ul>
+*     <li>graceful - by suspending/stopping consumers, and let any in-flight exchanges complete</li>
+*     <li>forced - after a given period of time, a timeout occurred and if there are still pending
+*     exchanges to complete, then a more aggressive forced strategy is performed.</li>
+* </ul>
+* the idea by the <tt>graceful</tt> shutdown strategy, is to stop taking in more new messages,
+* and allow any existing inflight messages to complete. then when there is no more inflight messages
+* then the routes can be fully shutdown. this mean that if there is inflight messages then we will have
+* to wait for these messages to complete. if they do not complete after a period of time, then a
+* timeout triggers. and then a more aggressive strategy takes over.
+* <p/>
+* the idea by the <tt>forced</tt> shutdown strategy, is to stop continue processing messages.
+* and force routes and its services to shutdown now. there is a risk when shutting down now,
+* that some resources is not properly shutdown, which can cause side effects. the timeout value
+* is by default 300 seconds, but can be customized.
+* <p/>
+* as this strategy will politely wait until all exchanges has been completed it can potential wait
+* for a long time, and hence why a timeout value can be set. when the timeout triggers you can also
+* specify whether the remainder consumers should be shutdown now or ignore.
+* <p/>
+* will by default use a timeout of 300 seconds (5 minutes) by which it will shutdown now the remaining consumers.
+* this ensures that when shutting down camel it at some point eventually will shutdown.
+* this behavior can of course be configured using the {@link #settimeout(long)} and
+* {@link #setshutdownnowontimeout(boolean)} methods.
+* <p/>
+* routes will by default be shutdown in the reverse order of which they where started.
+* you can customize this using the {@link #setshutdownroutesinreverseorder(boolean)} method.
+* <p/>
+* after route consumers have been shutdown, then any {@link shutdownprepared} services on the routes
+* is being prepared for shutdown, by invoking {@link shutdownprepared#prepareshutdown(boolean)} which
+* <tt>force=false</tt>.
+* <p/>
+* then if a timeout occurred and the strategy has been configured with shutdown-now on timeout, then
+* the strategy performs a more aggressive forced shutdown, by forcing all consumers to shutdown
+* and then invokes {@link shutdownprepared#prepareshutdown(boolean)} with <tt>force=true</tt>
+* on the services. this allows the services to know they should force shutdown now.
+*
+* @version
+*/
+public class defaultshutdownstrategy extends servicesupport implements shutdownstrategy  camelcontextaware
+private static final transient logger log   loggerfactory getlogger defaultshutdownstrategy class
+private camelcontext camelcontext
+private executorservice executor
+private long timeout   5   60
+private timeunit timeunit   timeunit seconds
+private boolean shutdownnowontimeout   true
+private boolean shutdownroutesinreverseorder   true
+private volatile boolean forceshutdown
+public defaultshutdownstrategy
+public defaultshutdownstrategy camelcontext camelcontext
+this camelcontext   camelcontext
+public void shutdown camelcontext context  list<routestartuporder> routes  throws exception
+shutdown context  routes  gettimeout    gettimeunit
+@override
+public void shutdownforced camelcontext context  list<routestartuporder> routes  throws exception
+doshutdown context  routes  gettimeout    gettimeunit    false  false  true
+public void suspend camelcontext context  list<routestartuporder> routes  throws exception
+doshutdown context  routes  gettimeout    gettimeunit    true  false  false
+public void shutdown camelcontext context  list<routestartuporder> routes  long timeout  timeunit timeunit  throws exception
+doshutdown context  routes  timeout  timeunit  false  false  false
+public boolean shutdown camelcontext context  routestartuporder route  long timeout  timeunit timeunit  boolean abortaftertimeout  throws exception
+list<routestartuporder> routes   new arraylist<routestartuporder> 1
+routes add route
+return doshutdown context  routes  timeout  timeunit  false  abortaftertimeout  false
+public void suspend camelcontext context  list<routestartuporder> routes  long timeout  timeunit timeunit  throws exception
+doshutdown context  routes  timeout  timeunit  true  false  false
+protected boolean doshutdown camelcontext context  list<routestartuporder> routes  long timeout  timeunit timeunit
+boolean suspendonly  boolean abortaftertimeout  boolean forceshutdown  throws exception
+// just return if no routes to shutdown
+if  routes isempty
+return true
+stopwatch watch   new stopwatch
+// at first sort according to route startup order
+list<routestartuporder> routesordered   new arraylist<routestartuporder> routes
+collections sort routesordered  new comparator<routestartuporder>
+public int compare routestartuporder o1  routestartuporder o2
+return o1 getstartuporder     o2 getstartuporder
+if  shutdownroutesinreverseorder
+collections reverse routesordered
+if  timeout > 0
+log info     routesordered size         timeout       timeunit tostring   tolowercase locale english
+else
+log info     routesordered size
+// use another thread to perform the shutdowns so we can support timeout
+future<?> future   getexecutorservice   submit new shutdowntask context  routesordered  timeout  timeunit  suspendonly  abortaftertimeout
+try
+if  timeout > 0
+future get timeout  timeunit
+else
+future get
+catch  timeoutexception e
+// timeout then cancel the task
+future cancel true
+// signal we are forcing shutdown now, since timeout occurred
+this forceshutdown   forceshutdown
+// if set, stop processing and return false to indicate that the shutdown is aborting
+if   forceshutdown    abortaftertimeout
+log warn
+return false
+else
+if  forceshutdown    shutdownnowontimeout
+log warn
+// force the routes to shutdown now
+shutdownroutesnow routesordered
+// now the route consumers has been shutdown, then prepare route services for shutdown now (forced)
+for  routestartuporder order   routes
+for  service service   order getservices
+prepareshutdown service  true  true
+else
+log warn
+catch  executionexception e
+// unwrap execution exception
+throw objecthelper wrapruntimecamelexception e getcause
+// convert to seconds as its easier to read than a big milli seconds number
+long seconds   timeunit seconds convert watch stop    timeunit milliseconds
+log info     routesordered size         seconds
+return true
+@override
+public boolean forceshutdown service service
+return forceshutdown
+public void settimeout long timeout
+this timeout   timeout
+public long gettimeout
+return timeout
+public void settimeunit timeunit timeunit
+this timeunit   timeunit
+public timeunit gettimeunit
+return timeunit
+public void setshutdownnowontimeout boolean shutdownnowontimeout
+this shutdownnowontimeout   shutdownnowontimeout
+public boolean isshutdownnowontimeout
+return shutdownnowontimeout
+public boolean isshutdownroutesinreverseorder
+return shutdownroutesinreverseorder
+public void setshutdownroutesinreverseorder boolean shutdownroutesinreverseorder
+this shutdownroutesinreverseorder   shutdownroutesinreverseorder
+public camelcontext getcamelcontext
+return camelcontext
+public void setcamelcontext camelcontext camelcontext
+this camelcontext   camelcontext
+/**
+* shutdown all the consumers immediately.
+*
+* @param routes the routes to shutdown
+*/
+protected void shutdownroutesnow list<routestartuporder> routes
+for  routestartuporder order   routes
+// set the route to shutdown as fast as possible by stopping after
+// it has completed its current task
+shutdownrunningtask current   order getroute   getroutecontext   getshutdownrunningtask
+if  current    shutdownrunningtask completecurrenttaskonly
+log debug      shutdownrunningtask completecurrenttaskonly
+current  order getroute   getid
+order getroute   getroutecontext   setshutdownrunningtask shutdownrunningtask completecurrenttaskonly
+for  consumer consumer   order getinputs
+shutdownnow consumer
+/**
+* shutdown all the consumers immediately.
+*
+* @param consumers the consumers to shutdown
+*/
+protected void shutdownnow list<consumer> consumers
+for  consumer consumer   consumers
+shutdownnow consumer
+/**
+* shutdown the consumer immediately.
+*
+* @param consumer the consumer to shutdown
+*/
+protected static void shutdownnow consumer consumer
+log trace    consumer
+// allow us to do custom work before delegating to service helper
+try
+servicehelper stopservice consumer
+catch  throwable e
+log warn     consumer      e
+// fire event
+eventhelper notifyservicestopfailure consumer getendpoint   getcamelcontext    consumer  e
+log trace    consumer
+/**
+* suspends/stops the consumer immediately.
+*
+* @param consumer the consumer to suspend
+*/
+protected static void suspendnow consumer consumer
+log trace    consumer
+// allow us to do custom work before delegating to service helper
+try
+servicehelper suspendservice consumer
+catch  throwable e
+log warn     consumer      e
+// fire event
+eventhelper notifyservicestopfailure consumer getendpoint   getcamelcontext    consumer  e
+log trace    consumer
+private executorservice getexecutorservice
+if  executor    null
+executor   camelcontext getexecutorservicemanager   newsinglethreadexecutor this
+return executor
+@override
+protected void dostart   throws exception
+objecthelper notnull camelcontext
+// reset option
+forceshutdown   false
+@override
+protected void dostop   throws exception
+// noop
+@override
+protected void doshutdown   throws exception
+if  executor    null
+// force shutting down as we are shutting down camel
+camelcontext getexecutorservicemanager   shutdownnow executor
+// should clear executor so we can restart by creating a new thread pool
+executor   null
+/**
+* prepares the services for shutdown, by invoking the {@link shutdownprepared#prepareshutdown(boolean)} method
+* on the service if it implement this interface.
+*
+* @param service the service
+* @param forced  whether to force shutdown
+* @param includechildren whether to prepare the child of the service as well
+*/
+private static void prepareshutdown service service  boolean forced  boolean includechildren
+set<service> list
+if  includechildren
+// include error handlers as we want to prepare them for shutdown as well
+list   servicehelper getchildservices service  true
+else
+list   new linkedhashset<service> 1
+list add service
+for  service child   list
+if  child instanceof shutdownprepared
+try
+log trace    forced ?        child
+shutdownprepared  child  prepareshutdown forced
+catch  exception e
+log warn     child      e
+/**
+* holder for deferred consumers
+*/
+static class shutdowndeferredconsumer
+private final route route
+private final consumer consumer
+shutdowndeferredconsumer route route  consumer consumer
+this route   route
+this consumer   consumer
+route getroute
+return route
+consumer getconsumer
+return consumer
+/**
+* shutdown task which shutdown all the routes in a graceful manner.
+*/
+static class shutdowntask implements runnable
+private final camelcontext context
+private final list<routestartuporder> routes
+private final boolean suspendonly
+private final boolean abortaftertimeout
+private final long timeout
+private final timeunit timeunit
+public shutdowntask camelcontext context  list<routestartuporder> routes  long timeout  timeunit timeunit
+boolean suspendonly  boolean abortaftertimeout
+this context   context
+this routes   routes
+this suspendonly   suspendonly
+this abortaftertimeout   abortaftertimeout
+this timeout   timeout
+this timeunit   timeunit
+public void run
+// the strategy in this run method is to
+// 1) go over the routes and shutdown those routes which can be shutdown asap
+//    some routes will be deferred to shutdown at the end, as they are needed
+//    by other routes so they can complete their tasks
+// 2) wait until all inflight and pending exchanges has been completed
+// 3) shutdown the deferred routes
+log debug    routes size    suspendonly ?
+// list of deferred consumers to shutdown when all exchanges has been completed routed
+// and thus there are no more inflight exchanges so they can be safely shutdown at that time
+list<shutdowndeferredconsumer> deferredconsumers   new arraylist<shutdowndeferredconsumer>
+for  routestartuporder order   routes
+shutdownroute shutdownroute   order getroute   getroutecontext   getshutdownroute
+shutdownrunningtask shutdownrunningtask   order getroute   getroutecontext   getshutdownrunningtask
+if  log istraceenabled
+log trace
+new object suspendonly ?
+order getroute   getid    shutdownroute  shutdownrunningtask
+for  consumer consumer   order getinputs
+boolean suspend   false
+// assume we should shutdown if we are not deferred
+boolean shutdown   shutdownroute    shutdownroute defer
+if  shutdown
+// if we are to shutdown then check whether we can suspend instead as its a more
+// gentle way to graceful shutdown
+// some consumers do not support shutting down so let them decide
+// if a consumer is suspendable then prefer to use that and then shutdown later
+if  consumer instanceof shutdownaware
+shutdown      shutdownaware  consumer  defershutdown shutdownrunningtask
+if  shutdown    consumer instanceof suspendableservice
+// we prefer to suspend over shutdown
+suspend   true
+// log at info level when a route has been shutdown (otherwise log at debug level to not be too noisy)
+if  suspend
+// only suspend it and then later shutdown it
+suspendnow consumer
+// add it to the deferred list so the route will be shutdown later
+deferredconsumers add new shutdowndeferredconsumer order getroute    consumer
+log debug    order getroute   getid    order getroute   getendpoint
+else if  shutdown
+shutdownnow consumer
+log info    order getroute   getid    order getroute   getendpoint
+else
+// we will stop it later, but for now it must run to be able to help all inflight messages
+// be safely completed
+deferredconsumers add new shutdowndeferredconsumer order getroute    consumer
+log debug     order getroute   getid      suspendonly ?
+// notify the services we intend to shutdown
+for  routestartuporder order   routes
+for  service service   order getservices
+// skip the consumer as we handle that specially
+if  service instanceof consumer
+continue
+prepareshutdown service  false  true
+// wait till there are no more pending and inflight messages
+boolean done   false
+long loopdelayseconds   1
+long loopcount   0
+while   done
+int size   0
+for  routestartuporder order   routes
+int inflight   context getinflightrepository   size order getroute   getid
+for  consumer consumer   order getinputs
+// include any additional pending exchanges on some consumers which may have internal
+// memory queues such as seda
+if  consumer instanceof shutdownaware
+inflight      shutdownaware  consumer  getpendingexchangessize
+if  inflight > 0
+size    inflight
+log trace    inflight  order getroute   getid
+if  size > 0
+try
+log info     size
+timeunit seconds convert timeout  timeunit     loopcount     loopdelayseconds
+thread sleep loopdelayseconds   1000
+catch  interruptedexception e
+if  abortaftertimeout
+log warn
+return
+else
+log warn
+break
+else
+done   true
+// prepare for shutdown
+for  shutdowndeferredconsumer deferred   deferredconsumers
+consumer consumer   deferred getconsumer
+if  consumer instanceof shutdownaware
+log trace    deferred getroute   getid
+boolean forced   context getshutdownstrategy   forceshutdown consumer
+prepareshutdown consumer  forced  false
+log debug    deferred getroute   getid
+// now all messages has been completed then stop the deferred consumers
+for  shutdowndeferredconsumer deferred   deferredconsumers
+consumer consumer   deferred getconsumer
+if  suspendonly
+suspendnow consumer
+log info    deferred getroute   getid    deferred getconsumer   getendpoint
+else
+shutdownnow consumer
+log info    deferred getroute   getid    deferred getconsumer   getendpoint
+// now the route consumers has been shutdown, then prepare route services for shutdown
+for  routestartuporder order   routes
+for  service service   order getservices
+boolean forced   context getshutdownstrategy   forceshutdown service
+prepareshutdown service  forced  true

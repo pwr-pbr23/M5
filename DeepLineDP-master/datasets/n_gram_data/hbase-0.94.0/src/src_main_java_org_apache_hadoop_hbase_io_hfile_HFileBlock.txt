@@ -1,0 +1,1652 @@
+/*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase io hfile
+import static org apache hadoop hbase io hfile blocktype magic_length
+import static org apache hadoop hbase io hfile compression algorithm none
+import java io bufferedinputstream
+import java io bytearrayinputstream
+import java io bytearrayoutputstream
+import java io datainputstream
+import java io dataoutput
+import java io dataoutputstream
+import java io ioexception
+import java io inputstream
+import java nio bytebuffer
+import org apache hadoop fs fsdatainputstream
+import org apache hadoop fs fsdataoutputstream
+import org apache hadoop fs path
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase fs hfilesystem
+import org apache hadoop hbase io encoding datablockencoding
+import org apache hadoop hbase io hfile compression algorithm
+import org apache hadoop hbase regionserver memstore
+import org apache hadoop hbase regionserver metrics schemaconfigured
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util checksumtype
+import org apache hadoop hbase util classsize
+import org apache hadoop hbase util compoundbloomfilter
+import org apache hadoop hbase util pair
+import org apache hadoop hbase util writables
+import org apache hadoop io ioutils
+import org apache hadoop io writable
+import org apache hadoop io compress compressionoutputstream
+import org apache hadoop io compress compressor
+import org apache hadoop io compress decompressor
+import com google common base preconditions
+/**
+* reading {@link hfile} version 1 and 2 blocks, and writing version 2 blocks.
+* <ul>
+* <li>in version 1 all blocks are always compressed or uncompressed, as
+* specified by the {@link hfile}'s compression algorithm, with a type-specific
+* magic record stored in the beginning of the compressed data (i.e. one needs
+* to uncompress the compressed block to determine the block type). there is
+* only a single compression algorithm setting for all blocks. offset and size
+* information from the block index are required to read a block.
+* <li>in version 2 a block is structured as follows:
+* <ul>
+* <li>magic record identifying the block type (8 bytes)
+* <li>compressed block size, header not included (4 bytes)
+* <li>uncompressed block size, header not included (4 bytes)
+* <li>the offset of the previous block of the same type (8 bytes). this is
+* used to be able to navigate to the previous block without going to the block
+* <li>for minorversions >=1, there is an additional 4 byte field
+* bytesperchecksum that records the number of bytes in a checksum chunk.
+* <li>for minorversions >=1, there is a 4 byte value to store the size of
+* data on disk (excluding the checksums)
+* <li>for minorversions >=1, a series of 4 byte checksums, one each for
+* the number of bytes specified by bytesperchecksum.
+* index.
+* <li>compressed data (or uncompressed data if compression is disabled). the
+* compression algorithm is the same for all the blocks in the {@link hfile},
+* similarly to what was done in version 1.
+* </ul>
+* </ul>
+* the version 2 block representation in the block cache is the same as above,
+* except that the data section is always uncompressed in the cache.
+*/
+public class hfileblock extends schemaconfigured implements cacheable
+/** minor versions starting with this number have hbase checksums */
+static final int minor_version_with_checksum   1
+/** minor version that does not support checksums */
+static final int minor_version_no_checksum   0
+/**
+* on a checksum failure on a reader, these many suceeding read
+* requests switch back to using hdfs checksums before auto-reenabling
+* hbase checksum verification.
+*/
+static final int checksum_verification_num_io_threshold   3
+/** the size data structures with minor version is 0 */
+static final int header_size_no_checksum   magic_length   2   bytes sizeof_int
+bytes sizeof_long
+public static final boolean fill_header   true
+public static final boolean dont_fill_header   false
+/** the size of a version 2 {@link hfile} block header, minor version 1.
+* there is a 1 byte checksum type, followed by a 4 byte bytesperchecksum
+* followed by another 4 byte value to store sizeofdataondisk.
+*/
+static final int header_size   header_size_no_checksum   bytes sizeof_byte
+2   bytes sizeof_int
+/**
+* the size of block header when blocktype is {@link blocktype#encoded_data}.
+* this extends normal header by adding the id of encoder.
+*/
+public static final int encoded_header_size   header_size
+datablockencoding id_size
+/** just an array of bytes of the right size. */
+static final byte dummy_header   new byte
+static final byte dummy_header_no_checksum
+new byte
+public static final int byte_buffer_heap_size    int  classsize estimatebase
+bytebuffer wrap new byte  0  0  getclass    false
+static final int extra_serialization_space   bytes sizeof_long
+bytes sizeof_int
+/**
+* each checksum value is an integer that can be stored in 4 bytes.
+*/
+static final int checksum_size   bytes sizeof_int
+private static final cacheabledeserializer<cacheable> blockdeserializer
+new cacheabledeserializer<cacheable>
+public hfileblock deserialize bytebuffer buf  throws ioexception
+bytebuffer newbytebuffer   bytebuffer allocate buf limit
+hfileblock extra_serialization_space
+buf limit buf limit
+hfileblock extra_serialization_space  rewind
+newbytebuffer put buf
+hfileblock ourbuffer   new hfileblock newbytebuffer
+minor_version_no_checksum
+buf position buf limit
+buf limit buf limit     hfileblock extra_serialization_space
+ourbuffer offset   buf getlong
+ourbuffer nextblockondisksizewithheader   buf getint
+return ourbuffer
+private blocktype blocktype
+/** size on disk without the header. it includes checksum data too. */
+private int ondisksizewithoutheader
+/** size of pure data. does not include header or checksums */
+private final int uncompressedsizewithoutheader
+/** the offset of the previous block on disk */
+private final long prevblockoffset
+/** the type of checksum, better to store the byte than an object */
+private final byte checksumtype
+/** the number of bytes for which a checksum is computed */
+private final int bytesperchecksum
+/** size on disk of header and data. does not include checksum data */
+private final int ondiskdatasizewithheader
+/** the minor version of the hfile. */
+private final int minorversion
+/** the in-memory representation of the hfile block */
+private bytebuffer buf
+/** whether there is a memstore timestamp after every key/value */
+private boolean includesmemstorets
+/**
+* the offset of this block in the file. populated by the reader for
+* convenience of access. this offset is not part of the block header.
+*/
+private long offset    1
+/**
+* the on-disk size of the next block, including the header, obtained by
+* peeking into the first {@link header_size} bytes of the next block's
+* header, or -1 if unknown.
+*/
+private int nextblockondisksizewithheader    1
+/**
+* creates a new {@link hfile} block from the given fields. this constructor
+* is mostly used when the block data has already been read and uncompressed,
+* and is sitting in a byte buffer.
+*
+* @param blocktype the type of this block, see {@link blocktype}
+* @param ondisksizewithoutheader compressed size of the block if compression
+*          is used, otherwise uncompressed size, header size not included
+* @param uncompressedsizewithoutheader uncompressed size of the block,
+*          header size not included. equals ondisksizewithoutheader if
+*          compression is disabled.
+* @param prevblockoffset the offset of the previous block in the
+*          {@link hfile}
+* @param buf block header ({@link #header_size} bytes) followed by
+*          uncompressed data. this
+* @param fillheader true to fill in the first {@link #header_size} bytes of
+*          the buffer based on the header fields provided
+* @param offset the file offset the block was read from
+* @param minorversion the minor version of this block
+* @param bytesperchecksum the number of bytes per checksum chunk
+* @param checksumtype the checksum algorithm to use
+* @param ondiskdatasizewithheader size of header and data on disk not
+*        including checksum data
+*/
+hfileblock blocktype blocktype  int ondisksizewithoutheader
+int uncompressedsizewithoutheader  long prevblockoffset  bytebuffer buf
+boolean fillheader  long offset  boolean includesmemstorets
+int minorversion  int bytesperchecksum  byte checksumtype
+int ondiskdatasizewithheader
+this blocktype   blocktype
+this ondisksizewithoutheader   ondisksizewithoutheader
+this uncompressedsizewithoutheader   uncompressedsizewithoutheader
+this prevblockoffset   prevblockoffset
+this buf   buf
+if  fillheader
+overwriteheader
+this offset   offset
+this includesmemstorets   includesmemstorets
+this minorversion   minorversion
+this bytesperchecksum   bytesperchecksum
+this checksumtype   checksumtype
+this ondiskdatasizewithheader   ondiskdatasizewithheader
+/**
+* creates a block from an existing buffer starting with a header. rewinds
+* and takes ownership of the buffer. by definition of rewind, ignores the
+* buffer position, but if you slice the buffer beforehand, it will rewind
+* to that point. the reason this has a minornumber and not a majornumber is
+* because majornumbers indicate the format of a hfile whereas minornumbers
+* indicate the format inside a hfileblock.
+*/
+hfileblock bytebuffer b  int minorversion  throws ioexception
+b rewind
+blocktype   blocktype read b
+ondisksizewithoutheader   b getint
+uncompressedsizewithoutheader   b getint
+prevblockoffset   b getlong
+this minorversion   minorversion
+if  minorversion >  minor_version_with_checksum
+this checksumtype   b get
+this bytesperchecksum   b getint
+this ondiskdatasizewithheader   b getint
+else
+this checksumtype   checksumtype null getcode
+this bytesperchecksum   0
+this ondiskdatasizewithheader   ondisksizewithoutheader
+header_size_no_checksum
+buf   b
+buf rewind
+public blocktype getblocktype
+return blocktype
+/** @return get data block encoding id that was used to encode this block */
+public short getdatablockencodingid
+if  blocktype    blocktype encoded_data
+throw new illegalargumentexception
+blocktype encoded_data       blocktype
+return buf getshort headersize
+/**
+* @return the on-disk size of the block with header size included. this
+* includes the header, the data and the checksum data.
+*/
+int getondisksizewithheader
+return ondisksizewithoutheader   headersize
+/**
+* returns the size of the compressed part of the block in case compression
+* is used, or the uncompressed size of the data part otherwise. header size
+* and checksum data size is not included.
+*
+* @return the on-disk size of the data part of the block, header and
+*         checksum not included.
+*/
+int getondisksizewithoutheader
+return ondisksizewithoutheader
+/**
+* @return the uncompressed size of the data part of the block, header not
+*         included
+*/
+public int getuncompressedsizewithoutheader
+return uncompressedsizewithoutheader
+/**
+* @return the offset of the previous block of the same type in the file, or
+*         -1 if unknown
+*/
+public long getprevblockoffset
+return prevblockoffset
+/**
+* writes header fields into the first {@link header_size} bytes of the
+* buffer. resets the buffer position to the end of header as side effect.
+*/
+private void overwriteheader
+buf rewind
+blocktype write buf
+buf putint ondisksizewithoutheader
+buf putint uncompressedsizewithoutheader
+buf putlong prevblockoffset
+/**
+* returns a buffer that does not include the header. the array offset points
+* to the start of the block data right after the header. the underlying data
+* array is not copied. checksum data is not included in the returned buffer.
+*
+* @return the buffer with header skipped
+*/
+bytebuffer getbufferwithoutheader
+return bytebuffer wrap buf array    buf arrayoffset     headersize
+buf limit     headersize     totalchecksumbytes    slice
+/**
+* returns the buffer this block stores internally. the clients must not
+* modify the buffer object. this method has to be public because it is
+* used in {@link compoundbloomfilter} to avoid object creation on every
+* bloom filter lookup, but has to be used with caution. checksum data
+* is not included in the returned buffer.
+*
+* @return the buffer of this block for read-only operations
+*/
+public bytebuffer getbufferreadonly
+return bytebuffer wrap buf array    buf arrayoffset
+buf limit     totalchecksumbytes    slice
+/**
+* returns a byte buffer of this block, including header data, positioned at
+* the beginning of header. the underlying data array is not copied.
+*
+* @return the byte buffer with header included
+*/
+bytebuffer getbufferwithheader
+bytebuffer dupbuf   buf duplicate
+dupbuf rewind
+return dupbuf
+/**
+* deserializes fields of the given writable using the data portion of this
+* block. does not check that all the block data has been read.
+*/
+void readinto writable w  throws ioexception
+preconditions checknotnull w
+if  writables getwritable buf array    buf arrayoffset     headersize
+buf limit     headersize    w     null
+throw new ioexception     this
+w getclass   getsimplename
+private void sanitycheckassertion long valuefrombuf  long valuefromfield
+string fieldname  throws ioexception
+if  valuefrombuf    valuefromfield
+throw new assertionerror fieldname       valuefrombuf
+valuefromfield
+/**
+* checks if the block is internally consistent, i.e. the first
+* {@link #header_size} bytes of the buffer contain a valid header consistent
+* with the fields. this function is primary for testing and debugging, and
+* is not thread-safe, because it alters the internal buffer pointer.
+*/
+void sanitycheck   throws ioexception
+buf rewind
+blocktype blocktypefrombuf   blocktype read buf
+if  blocktypefrombuf    blocktype
+throw new ioexception
+blocktypefrombuf       blocktype
+sanitycheckassertion buf getint    ondisksizewithoutheader
+sanitycheckassertion buf getint    uncompressedsizewithoutheader
+sanitycheckassertion buf getlong    prevblockoffset
+if  minorversion >  minor_version_with_checksum
+sanitycheckassertion buf get    checksumtype
+sanitycheckassertion buf getint    bytesperchecksum
+sanitycheckassertion buf getint    ondiskdatasizewithheader
+int cksumbytes   totalchecksumbytes
+int hdrsize   headersize
+int expectedbuflimit   uncompressedsizewithoutheader   headersize
+cksumbytes
+if  buf limit      expectedbuflimit
+throw new assertionerror     expectedbuflimit
+buf limit
+// we might optionally allocate header_size more bytes to read the next
+// block's, header, so there are two sensible values for buffer capacity.
+int size   uncompressedsizewithoutheader   hdrsize   cksumbytes
+if  buf capacity      size
+buf capacity      size   hdrsize
+throw new assertionerror     buf capacity
+size        size   hdrsize
+@override
+public string tostring
+return
+blocktype
+ondisksizewithoutheader
+uncompressedsizewithoutheader
+prevblockoffset
+bytes tostringbinary buf array    buf arrayoffset     headersize
+math min 32  buf limit     buf arrayoffset     headersize
+offset
+private void validateondisksizewithoutheader
+int expectedondisksizewithoutheader  throws ioexception
+if  ondisksizewithoutheader    expectedondisksizewithoutheader
+string blockinfomsg
+offset
+bytes tostringbinary buf array    buf arrayoffset
+buf arrayoffset     math min 32  buf limit
+throw new ioexception
+expectedondisksizewithoutheader
+ondisksizewithoutheader
+blockinfomsg
+/**
+* always allocates a new buffer of the correct size. copies header bytes
+* from the existing buffer. does not change header fields.
+* reserve room to keep checksum bytes too.
+*
+* @param extrabytes whether to reserve room in the buffer to read the next
+*          block's header
+*/
+private void allocatebuffer boolean extrabytes
+int cksumbytes   totalchecksumbytes
+int capacityneeded   headersize     uncompressedsizewithoutheader
+cksumbytes
+extrabytes ? headersize     0
+bytebuffer newbuf   bytebuffer allocate capacityneeded
+// copy header bytes.
+system arraycopy buf array    buf arrayoffset    newbuf array
+newbuf arrayoffset    headersize
+buf   newbuf
+buf limit headersize     uncompressedsizewithoutheader   cksumbytes
+/** an additional sanity-check in case no compression is being used. */
+public void assumeuncompressed   throws ioexception
+if  ondisksizewithoutheader    uncompressedsizewithoutheader
+totalchecksumbytes
+throw new ioexception
+ondisksizewithoutheader
+uncompressedsizewithoutheader
+totalchecksumbytes
+/**
+* @param expectedtype the expected type of this block
+* @throws ioexception if this block's type is different than expected
+*/
+public void expecttype blocktype expectedtype  throws ioexception
+if  blocktype    expectedtype
+throw new ioexception     expectedtype
+blocktype
+/** @return the offset of this block in the file it was read from */
+public long getoffset
+if  offset < 0
+throw new illegalstateexception
+return offset
+/**
+* @return a byte stream reading the data section of this block
+*/
+public datainputstream getbytestream
+return new datainputstream new bytearrayinputstream buf array
+buf arrayoffset     headersize    buf limit     headersize
+@override
+public long heapsize
+long size   classsize align
+// base class size, including object overhead.
+schema_configured_unaligned_heap_size
+// block type and byte buffer references
+2   classsize reference
+// on-disk size, uncompressed size, and next block's on-disk size
+// byteperchecksum,  ondiskdatasize and minorversion
+6   bytes sizeof_int
+// checksum type
+1   bytes sizeof_byte
+// this and previous block offset
+2   bytes sizeof_long
+// "include memstore timestamp" flag
+bytes sizeof_boolean
+if  buf    null
+// deep overhead of the byte buffer. needs to be aligned separately.
+size    classsize align buf capacity     byte_buffer_heap_size
+return classsize align size
+/**
+* read from an input stream. analogous to
+* {@link ioutils#readfully(inputstream, byte[], int, int)}, but specifies a
+* number of "extra" bytes that would be desirable but not absolutely
+* necessary to read.
+*
+* @param in the input stream to read from
+* @param buf the buffer to read into
+* @param bufoffset the destination offset in the buffer
+* @param necessarylen the number of bytes that are absolutely necessary to
+*          read
+* @param extralen the number of extra bytes that would be nice to read
+* @return true if succeeded reading the extra bytes
+* @throws ioexception if failed to read the necessary bytes
+*/
+public static boolean readwithextra inputstream in  byte buf
+int bufoffset  int necessarylen  int extralen  throws ioexception
+int bytesremaining   necessarylen   extralen
+while  bytesremaining > 0
+int ret   in read buf  bufoffset  bytesremaining
+if  ret     1    bytesremaining <  extralen
+// we could not read the "extra data", but that is ok.
+break
+if  ret < 0
+throw new ioexception
+ret       necessarylen
+extralen
+necessarylen   extralen   bytesremaining
+bufoffset    ret
+bytesremaining    ret
+return bytesremaining <  0
+/**
+* @return the on-disk size of the next block (including the header size)
+*         that was read by peeking into the next block's header
+*/
+public int getnextblockondisksizewithheader
+return nextblockondisksizewithheader
+/**
+* unified version 2 {@link hfile} block writer. the intended usage pattern
+* is as follows:
+* <ul>
+* <li>construct an {@link hfileblock.writer}, providing a compression
+* algorithm
+* <li>call {@link writer#startwriting(blocktype, boolean)} and get a data stream to
+* write to
+* <li>write your data into the stream
+* <li>call {@link writer#writeheaderanddata(fsdataoutputstream)} as many times as you need to
+* store the serialized block into an external stream, or call
+* {@link writer#getheaderanddata()} to get it as a byte array.
+* <li>repeat to write more blocks
+* </ul>
+* <p>
+*/
+public static class writer
+private enum state
+init
+writing
+block_ready
+/** writer state. used to ensure the correct usage protocol. */
+private state state   state init
+/** compression algorithm for all blocks this instance writes. */
+private final compression algorithm compressalgo
+/** data block encoder used for data blocks */
+private final hfiledatablockencoder datablockencoder
+/**
+* the stream we use to accumulate data in uncompressed format for each
+* block. we reset this stream at the end of each block and reuse it. the
+* header is written as the first {@link #header_size} bytes into this
+* stream.
+*/
+private bytearrayoutputstream baosinmemory
+/** compressor, which is also reused between consecutive blocks. */
+private compressor compressor
+/** compression output stream */
+private compressionoutputstream compressionstream
+/** underlying stream to write compressed bytes to */
+private bytearrayoutputstream compressedbytestream
+/**
+* current block type. set in {@link #startwriting(blocktype)}. could be
+* changed in {@link #encodedatablockfordisk()} from {@link blocktype#data}
+* to {@link blocktype#encoded_data}.
+*/
+private blocktype blocktype
+/**
+* a stream that we write uncompressed bytes to, which compresses them and
+* writes them to {@link #baosinmemory}.
+*/
+private dataoutputstream userdatastream
+/**
+* bytes to be written to the file system, including the header. compressed
+* if compression is turned on. it also includes the checksum data that
+* immediately follows the block data. (header + data + checksums)
+*/
+private byte ondiskbyteswithheader
+/**
+* the size of the data on disk that does not include the checksums.
+* (header + data)
+*/
+private int ondiskdatasizewithheader
+/**
+* the size of the checksum data on disk. it is used only if data is
+* not compressed. if data is compressed, then the checksums are already
+* part of ondiskbyteswithheader. if data is uncompressed, then this
+* variable stores the checksum data for this block.
+*/
+private byte ondiskchecksum
+/**
+* valid in the ready state. contains the header and the uncompressed (but
+* potentially encoded, if this is a data block) bytes, so the length is
+* {@link #uncompressedsizewithoutheader} + {@link hfileblock#header_size}.
+* does not store checksums.
+*/
+private byte uncompressedbyteswithheader
+/**
+* current block's start offset in the {@link hfile}. set in
+* {@link #writeheaderanddata(fsdataoutputstream)}.
+*/
+private long startoffset
+/**
+* offset of previous block by block type. updated when the next block is
+* started.
+*/
+private long prevoffsetbytype
+/** the offset of the previous block of the same type */
+private long prevoffset
+/** whether we are including memstore timestamp after every key/value */
+private boolean includesmemstorets
+/** checksum settings */
+private checksumtype checksumtype
+private int bytesperchecksum
+/**
+* @param compressionalgorithm compression algorithm to use
+* @param datablockencoderalgo data block encoding algorithm to use
+* @param checksumtype type of checksum
+* @param bytesperchecksum bytes per checksum
+*/
+public writer compression algorithm compressionalgorithm
+hfiledatablockencoder datablockencoder  boolean includesmemstorets
+checksumtype checksumtype  int bytesperchecksum
+compressalgo   compressionalgorithm    null ? none   compressionalgorithm
+this datablockencoder   datablockencoder    null
+? datablockencoder   noopdatablockencoder instance
+baosinmemory   new bytearrayoutputstream
+if  compressalgo    none
+compressor   compressionalgorithm getcompressor
+compressedbytestream   new bytearrayoutputstream
+try
+compressionstream
+compressionalgorithm createplaincompressionstream
+compressedbytestream  compressor
+catch  ioexception e
+throw new runtimeexception
+compressionalgorithm  e
+if  bytesperchecksum < header_size
+throw new runtimeexception
+header_size
+bytesperchecksum
+prevoffsetbytype   new long
+for  int i   0  i < prevoffsetbytype length    i
+prevoffsetbytype    1
+this includesmemstorets   includesmemstorets
+this checksumtype   checksumtype
+this bytesperchecksum   bytesperchecksum
+/**
+* starts writing into the block. the previous block's data is discarded.
+*
+* @return the stream the user can write their data into
+* @throws ioexception
+*/
+public dataoutputstream startwriting blocktype newblocktype
+throws ioexception
+if  state    state block_ready    startoffset     1
+// we had a previous block that was written to a stream at a specific
+// offset. save that offset as the last offset of a block of that type.
+prevoffsetbytype   startoffset
+startoffset    1
+blocktype   newblocktype
+baosinmemory reset
+baosinmemory write dummy_header
+state   state writing
+// we will compress it later in finishblock()
+userdatastream   new dataoutputstream baosinmemory
+return userdatastream
+/**
+* returns the stream for the user to write to. the block writer takes care
+* of handling compression and buffering for caching on write. can only be
+* called in the "writing" state.
+*
+* @return the data output stream for the user to write to
+*/
+dataoutputstream getuserdatastream
+expectstate state writing
+return userdatastream
+/**
+* transitions the block writer from the "writing" state to the "block
+* ready" state.  does nothing if a block is already finished.
+*/
+private void ensureblockready   throws ioexception
+preconditions checkstate state    state init
+state
+if  state    state block_ready
+return
+// this will set state to block_ready.
+finishblock
+/**
+* an internal method that flushes the compressing stream (if using
+* compression), serializes the header, and takes care of the separate
+* uncompressed stream for caching on write, if applicable. sets block
+* write state to "block ready".
+*/
+private void finishblock   throws ioexception
+userdatastream flush
+// this does an array copy, so it is safe to cache this byte array.
+uncompressedbyteswithheader   baosinmemory tobytearray
+prevoffset   prevoffsetbytype
+// we need to set state before we can package the block up for
+// cache-on-write. in a way, the block is ready, but not yet encoded or
+// compressed.
+state   state block_ready
+encodedatablockfordisk
+docompressionandchecksumming
+/**
+* do compression if it is enabled, or re-use the uncompressed buffer if
+* it is not. fills in the compressed block's header if doing compression.
+* also, compute the checksums. in the case of no-compression, write the
+* checksums to its own seperate data structure called ondiskchecksum. in
+* the case when compression is enabled, the checksums are written to the
+* outputbyte stream 'baos'.
+*/
+private void docompressionandchecksumming   throws ioexception
+// do the compression
+if  compressalgo    none
+compressedbytestream reset
+compressedbytestream write dummy_header
+compressionstream resetstate
+compressionstream write uncompressedbyteswithheader  header_size
+uncompressedbyteswithheader length   header_size
+compressionstream flush
+compressionstream finish
+// generate checksums
+ondiskdatasizewithheader   compressedbytestream size       data size
+// reserve space for checksums in the output byte stream
+checksumutil reservespaceforchecksums compressedbytestream
+ondiskdatasizewithheader  bytesperchecksum
+ondiskbyteswithheader   compressedbytestream tobytearray
+putheader ondiskbyteswithheader  0  ondiskbyteswithheader length
+uncompressedbyteswithheader length  ondiskdatasizewithheader
+// generate checksums for header and data. the checksums are
+// part of ondiskbyteswithheader itself.
+checksumutil generatechecksums
+ondiskbyteswithheader  0  ondiskdatasizewithheader
+ondiskbyteswithheader  ondiskdatasizewithheader
+checksumtype  bytesperchecksum
+// checksums are already part of ondiskbyteswithheader
+ondiskchecksum   hconstants empty_byte_array
+//set the header for the uncompressed bytes (for cache-on-write)
+putheader uncompressedbyteswithheader  0
+ondiskbyteswithheader length   ondiskchecksum length
+uncompressedbyteswithheader length  ondiskdatasizewithheader
+else
+// if we are not using any compression, then the
+// checksums are written to its own array ondiskchecksum.
+ondiskbyteswithheader   uncompressedbyteswithheader
+ondiskdatasizewithheader   ondiskbyteswithheader length
+int numbytes    int checksumutil numbytes
+uncompressedbyteswithheader length
+bytesperchecksum
+ondiskchecksum   new byte
+//set the header for the uncompressed bytes
+putheader uncompressedbyteswithheader  0
+ondiskbyteswithheader length   ondiskchecksum length
+uncompressedbyteswithheader length  ondiskdatasizewithheader
+checksumutil generatechecksums
+uncompressedbyteswithheader  0  uncompressedbyteswithheader length
+ondiskchecksum  0
+checksumtype  bytesperchecksum
+/**
+* encodes this block if it is a data block and encoding is turned on in
+* {@link #datablockencoder}.
+*/
+private void encodedatablockfordisk   throws ioexception
+if  blocktype    blocktype data
+return     skip any non data block
+// do data block encoding, if data block encoder is set
+bytebuffer rawkeyvalues   bytebuffer wrap uncompressedbyteswithheader
+header_size  uncompressedbyteswithheader length
+header_size  slice
+pair<bytebuffer  blocktype> encodingresult
+datablockencoder beforewritetodisk rawkeyvalues
+includesmemstorets  dummy_header
+blocktype encodedblocktype   encodingresult getsecond
+if  encodedblocktype    blocktype encoded_data
+uncompressedbyteswithheader   encodingresult getfirst   array
+blocktype   blocktype encoded_data
+else
+// there is no encoding configured. do some extra sanity-checking.
+if  encodedblocktype    blocktype data
+throw new ioexception
+encodedblocktype
+if  userdatastream size
+uncompressedbyteswithheader length   header_size
+throw new ioexception
+userdatastream size
+uncompressedbyteswithheader length   header_size
+/**
+* put the header into the given byte array at the given offset.
+* @param ondisksize size of the block on disk header + data + checksum
+* @param uncompressedsize size of the block after decompression (but
+*          before optional data block decoding) including header
+* @param ondiskdatasize size of the block on disk with header
+*        and data but not including the checksums
+*/
+private void putheader byte dest  int offset  int ondisksize
+int uncompressedsize  int ondiskdatasize
+offset   blocktype put dest  offset
+offset   bytes putint dest  offset  ondisksize   header_size
+offset   bytes putint dest  offset  uncompressedsize   header_size
+offset   bytes putlong dest  offset  prevoffset
+offset   bytes putbyte dest  offset  checksumtype getcode
+offset   bytes putint dest  offset  bytesperchecksum
+offset   bytes putint dest  offset  ondiskdatasizewithheader
+/**
+* similar to {@link #writeheaderanddata(fsdataoutputstream)}, but records
+* the offset of this block so that it can be referenced in the next block
+* of the same type.
+*
+* @param out
+* @throws ioexception
+*/
+public void writeheaderanddata fsdataoutputstream out  throws ioexception
+long offset   out getpos
+if  startoffset     1    offset    startoffset
+throw new ioexception     blocktype
+startoffset
+offset
+startoffset   offset
+writeheaderanddata  dataoutputstream  out
+/**
+* writes the header and the compressed data of this block (or uncompressed
+* data when not using compression) into the given stream. can be called in
+* the "writing" state or in the "block ready" state. if called in the
+* "writing" state, transitions the writer to the "block ready" state.
+*
+* @param out the output stream to write the
+* @throws ioexception
+*/
+private void writeheaderanddata dataoutputstream out  throws ioexception
+ensureblockready
+out write ondiskbyteswithheader
+if  compressalgo    none
+if  ondiskchecksum    hconstants empty_byte_array
+throw new ioexception     blocktype
+out write ondiskchecksum
+/**
+* returns the header or the compressed data (or uncompressed data when not
+* using compression) as a byte array. can be called in the "writing" state
+* or in the "block ready" state. if called in the "writing" state,
+* transitions the writer to the "block ready" state. this returns
+* the header + data + checksums stored on disk.
+*
+* @return header and data as they would be stored on disk in a byte array
+* @throws ioexception
+*/
+byte getheaderanddatafortest   throws ioexception
+ensureblockready
+if  compressalgo    none
+if  ondiskchecksum    hconstants empty_byte_array
+throw new ioexception     blocktype
+// this is not very optimal, because we are doing an extra copy.
+// but this method is used only by unit tests.
+byte output   new byte[ondiskbyteswithheader length
+ondiskchecksum length]
+system arraycopy ondiskbyteswithheader  0
+output  0  ondiskbyteswithheader length
+system arraycopy ondiskchecksum  0
+output  ondiskbyteswithheader length
+ondiskchecksum length
+return output
+return ondiskbyteswithheader
+/**
+* releases the compressor this writer uses to compress blocks into the
+* compressor pool. needs to be called before the writer is discarded.
+*/
+public void releasecompressor
+if  compressor    null
+compressalgo returncompressor compressor
+compressor   null
+/**
+* returns the on-disk size of the data portion of the block. this is the
+* compressed size if compression is enabled. can only be called in the
+* "block ready" state. header is not compressed, and its size is not
+* included in the return value.
+*
+* @return the on-disk size of the block, not including the header.
+*/
+int getondisksizewithoutheader
+expectstate state block_ready
+return ondiskbyteswithheader length   ondiskchecksum length   header_size
+/**
+* returns the on-disk size of the block. can only be called in the
+* "block ready" state.
+*
+* @return the on-disk size of the block ready to be written, including the
+*         header size, the data and the checksum data.
+*/
+int getondisksizewithheader
+expectstate state block_ready
+return ondiskbyteswithheader length   ondiskchecksum length
+/**
+* the uncompressed size of the block data. does not include header size.
+*/
+int getuncompressedsizewithoutheader
+expectstate state block_ready
+return uncompressedbyteswithheader length   header_size
+/**
+* the uncompressed size of the block data, including header size.
+*/
+int getuncompressedsizewithheader
+expectstate state block_ready
+return uncompressedbyteswithheader length
+/** @return true if a block is being written  */
+public boolean iswriting
+return state    state writing
+/**
+* returns the number of bytes written into the current block so far, or
+* zero if not writing the block at the moment. note that this will return
+* zero in the "block ready" state as well.
+*
+* @return the number of bytes written
+*/
+public int blocksizewritten
+if  state    state writing
+return 0
+return userdatastream size
+/**
+* returns the header followed by the uncompressed data, even if using
+* compression. this is needed for storing uncompressed blocks in the block
+* cache. can be called in the "writing" state or the "block ready" state.
+* returns only the header and data, does not include checksum data.
+*
+* @return uncompressed block bytes for caching on write
+*/
+bytebuffer getuncompressedbufferwithheader
+expectstate state block_ready
+return bytebuffer wrap uncompressedbyteswithheader
+private void expectstate state expectedstate
+if  state    expectedstate
+throw new illegalstateexception     expectedstate
+state
+/**
+* takes the given {@link blockwritable} instance, creates a new block of
+* its appropriate type, writes the writable into this block, and flushes
+* the block into the output stream. the writer is instructed not to buffer
+* uncompressed bytes for cache-on-write.
+*
+* @param bw the block-writable object to write as a block
+* @param out the file system output stream
+* @throws ioexception
+*/
+public void writeblock blockwritable bw  fsdataoutputstream out
+throws ioexception
+bw writetoblock startwriting bw getblocktype
+writeheaderanddata out
+/**
+* creates a new hfileblock. checksums have already been validated, so
+* the byte buffer passed into the constructor of this newly created
+* block does not have checksum data even though the header minor
+* version is minor_version_with_checksum. this is indicated by setting a
+* 0 value in bytesperchecksum.
+*/
+public hfileblock getblockforcaching
+return new hfileblock blocktype  getondisksizewithoutheader
+getuncompressedsizewithoutheader    prevoffset
+getuncompressedbufferwithheader    dont_fill_header  startoffset
+includesmemstorets  minor_version_with_checksum
+0  checksumtype null getcode        no checksums in cached data
+ondiskbyteswithheader length   ondiskchecksum length
+/** something that can be written into a block. */
+public interface blockwritable
+/** the type of block this data should use. */
+blocktype getblocktype
+/**
+* writes the block to the provided stream. must not write any magic
+* records.
+*
+* @param out a stream to write uncompressed data into
+*/
+void writetoblock dataoutput out  throws ioexception
+// block readers and writers
+/** an interface allowing to iterate {@link hfileblock}s. */
+public interface blockiterator
+/**
+* get the next block, or null if there are no more blocks to iterate.
+*/
+hfileblock nextblock   throws ioexception
+/**
+* similar to {@link #nextblock()} but checks block type, throws an
+* exception if incorrect, and returns the hfile block
+*/
+hfileblock nextblockwithblocktype blocktype blocktype  throws ioexception
+/** a full-fledged reader with iteration ability. */
+public interface fsreader
+/**
+* reads the block at the given offset in the file with the given on-disk
+* size and uncompressed size.
+*
+* @param offset
+* @param ondisksize the on-disk size of the entire block, including all
+*          applicable headers, or -1 if unknown
+* @param uncompressedsize the uncompressed size of the compressed part of
+*          the block, or -1 if unknown
+* @return the newly read block
+*/
+hfileblock readblockdata long offset  long ondisksize
+int uncompressedsize  boolean pread  throws ioexception
+/**
+* creates a block iterator over the given portion of the {@link hfile}.
+* the iterator returns blocks starting with offset such that offset <=
+* startoffset < endoffset.
+*
+* @param startoffset the offset of the block to start iteration with
+* @param endoffset the offset to end iteration at (exclusive)
+* @return an iterator of blocks between the two given offsets
+*/
+blockiterator blockrange long startoffset  long endoffset
+/**
+* a common implementation of some methods of {@link fsreader} and some
+* tools for implementing hfile format version-specific block readers.
+*/
+private abstract static class abstractfsreader implements fsreader
+/** the file system stream of the underlying {@link hfile} that
+* does checksum validations in the filesystem */
+protected final fsdatainputstream istream
+/** the file system stream of the underlying {@link hfile} that
+* does not do checksum verification in the file system */
+protected final fsdatainputstream istreamnofschecksum
+/** compression algorithm used by the {@link hfile} */
+protected compression algorithm compressalgo
+/** the size of the file we are reading from, or -1 if unknown. */
+protected long filesize
+/** the minor version of this reader */
+private int minorversion
+/** the size of the header */
+protected int hdrsize
+/** the filesystem used to access data */
+protected hfilesystem hfs
+/** the path (if any) where this data is coming from */
+protected path path
+/** the default buffer size for our buffered streams */
+public static final int default_buffer_size   1 << 20
+public abstractfsreader fsdatainputstream istream
+fsdatainputstream istreamnofschecksum
+algorithm compressalgo
+long filesize  int minorversion  hfilesystem hfs  path path
+throws ioexception
+this istream   istream
+this compressalgo   compressalgo
+this filesize   filesize
+this minorversion   minorversion
+this hfs   hfs
+this path   path
+this hdrsize   headersize minorversion
+this istreamnofschecksum   istreamnofschecksum
+@override
+public blockiterator blockrange final long startoffset
+final long endoffset
+return new blockiterator
+private long offset   startoffset
+@override
+public hfileblock nextblock   throws ioexception
+if  offset >  endoffset
+return null
+hfileblock b   readblockdata offset   1   1  false
+offset    b getondisksizewithheader
+return b
+@override
+public hfileblock nextblockwithblocktype blocktype blocktype
+throws ioexception
+hfileblock blk   nextblock
+if  blk getblocktype      blocktype
+throw new ioexception     blocktype
+blk getblocktype
+return blk
+/**
+* does a positional read or a seek and read into the given buffer. returns
+* the on-disk size of the next block, or -1 if it could not be determined.
+*
+* @param dest destination buffer
+* @param destoffset offset in the destination buffer
+* @param size size of the block to be read
+* @param peekintonextblock whether to read the next block's on-disk size
+* @param fileoffset position in the stream to read at
+* @param pread whether we should do a positional read
+* @param istream the input source of data
+* @return the on-disk size of the next block with header size included, or
+*         -1 if it could not be determined
+* @throws ioexception
+*/
+protected int readatoffset fsdatainputstream istream
+byte dest  int destoffset  int size
+boolean peekintonextblock  long fileoffset  boolean pread
+throws ioexception
+if  peekintonextblock
+destoffset   size   hdrsize > dest length
+// we are asked to read the next block's header as well, but there is
+// not enough room in the array.
+throw new ioexception     size
+hdrsize       dest length
+destoffset
+if  pread
+// positional read. better for random reads.
+int extrasize   peekintonextblock ? hdrsize   0
+int ret   istream read fileoffset  dest  destoffset  size   extrasize
+if  ret < size
+throw new ioexception     size
+fileoffset       ret
+if  ret    size    ret < size   extrasize
+// could not read the next block's header, or did not try.
+return  1
+else
+// seek + read. better for scanning.
+synchronized  istream
+istream seek fileoffset
+long realoffset   istream getpos
+if  realoffset    fileoffset
+throw new ioexception     fileoffset
+size       realoffset
+if   peekintonextblock
+ioutils readfully istream  dest  destoffset  size
+return  1
+// try to read the next block header.
+if   readwithextra istream  dest  destoffset  size  hdrsize
+return  1
+assert peekintonextblock
+return bytes toint dest  destoffset   size   blocktype magic_length
+hdrsize
+/**
+* decompresses data from the given stream using the configured compression
+* algorithm.
+* @param dest
+* @param destoffset
+* @param bufferedboundedstream
+*          a stream to read compressed data from, bounded to the exact
+*          amount of compressed data
+* @param uncompressedsize
+*          uncompressed data size, header not included
+* @throws ioexception
+*/
+protected void decompress byte dest  int destoffset
+inputstream bufferedboundedstream
+int uncompressedsize  throws ioexception
+decompressor decompressor   null
+try
+decompressor   compressalgo getdecompressor
+inputstream is   compressalgo createdecompressionstream
+bufferedboundedstream  decompressor  0
+ioutils readfully is  dest  destoffset  uncompressedsize
+is close
+finally
+if  decompressor    null
+compressalgo returndecompressor decompressor
+/**
+* creates a buffered stream reading a certain slice of the file system
+* input stream. we need this because the decompression we use seems to
+* expect the input stream to be bounded.
+*
+* @param offset the starting file offset the bounded stream reads from
+* @param size the size of the segment of the file the stream should read
+* @param pread whether to use position reads
+* @return a stream restricted to the given portion of the file
+*/
+protected inputstream createbufferedboundedstream long offset
+int size  boolean pread
+return new bufferedinputstream new boundedrangefileinputstream istream
+offset  size  pread   math min default_buffer_size  size
+/**
+* @return the minorversion of this hfile
+*/
+protected int getminorversion
+return minorversion
+/**
+* reads version 1 blocks from the file system. in version 1 blocks,
+* everything is compressed, including the magic record, if compression is
+* enabled. everything might be uncompressed if no compression is used. this
+* reader returns blocks represented in the uniform version 2 format in
+* memory.
+*/
+static class fsreaderv1 extends abstractfsreader
+/** header size difference between version 1 and 2 */
+private static final int header_delta   header_size_no_checksum
+magic_length
+public fsreaderv1 fsdatainputstream istream  algorithm compressalgo
+long filesize  throws ioexception
+super istream  istream  compressalgo  filesize  0  null  null
+/**
+* read a version 1 block. there is no uncompressed header, and the block
+* type (the magic record) is part of the compressed data. this
+* implementation assumes that the bounded range file input stream is
+* needed to stop the decompressor reading into next block, because the
+* decompressor just grabs a bunch of data without regard to whether it is
+* coming to end of the compressed section.
+*
+* the block returned is still a version 2 block, and in particular, its
+* first {@link #header_size} bytes contain a valid version 2 header.
+*
+* @param offset the offset of the block to read in the file
+* @param ondisksizewithmagic the on-disk size of the version 1 block,
+*          including the magic record, which is the part of compressed
+*          data if using compression
+* @param uncompressedsizewithmagic uncompressed size of the version 1
+*          block, including the magic record
+*/
+@override
+public hfileblock readblockdata long offset  long ondisksizewithmagic
+int uncompressedsizewithmagic  boolean pread  throws ioexception
+if  uncompressedsizewithmagic <  0
+throw new ioexception
+uncompressedsizewithmagic
+if  ondisksizewithmagic <  0    ondisksizewithmagic >  integer max_value
+throw new ioexception     ondisksizewithmagic
+integer max_value
+int ondisksize    int  ondisksizewithmagic
+if  uncompressedsizewithmagic < magic_length
+throw new ioexception
+uncompressedsizewithmagic
+magic_length
+// the existing size already includes magic size, and we are inserting
+// a version 2 header.
+bytebuffer buf   bytebuffer allocate uncompressedsizewithmagic
+header_delta
+int ondisksizewithoutheader
+if  compressalgo    compression algorithm none
+// a special case when there is no compression.
+if  ondisksize    uncompressedsizewithmagic
+throw new ioexception     ondisksize
+uncompressedsizewithmagic
+// the first magic_length bytes of what this will read will be
+// overwritten.
+readatoffset istream  buf array    buf arrayoffset     header_delta
+ondisksize  false  offset  pread
+ondisksizewithoutheader   uncompressedsizewithmagic   magic_length
+else
+inputstream bufferedboundedstream   createbufferedboundedstream
+offset  ondisksize  pread
+decompress buf array    buf arrayoffset     header_delta
+bufferedboundedstream  uncompressedsizewithmagic
+// we don't really have a good way to exclude the "magic record" size
+// from the compressed block's size, since it is compressed as well.
+ondisksizewithoutheader   ondisksize
+blocktype newblocktype   blocktype parse buf array    buf arrayoffset
+header_delta  magic_length
+// we set the uncompressed size of the new hfile block we are creating
+// to the size of the data portion of the block without the magic record,
+// since the magic record gets moved to the header.
+hfileblock b   new hfileblock newblocktype  ondisksizewithoutheader
+uncompressedsizewithmagic   magic_length   1l  buf  fill_header
+offset  memstore no_persistent_ts  0  0  checksumtype null getcode
+ondisksizewithoutheader   header_size_no_checksum
+return b
+/**
+* we always prefetch the header of the next block, so that we know its
+* on-disk size in advance and can read it in one operation.
+*/
+private static class prefetchedheader
+long offset    1
+byte header   new byte
+bytebuffer buf   bytebuffer wrap header  0  header_size
+/** reads version 2 blocks from the filesystem. */
+static class fsreaderv2 extends abstractfsreader
+// the configuration states that we should validate hbase checksums
+private final boolean usehbasechecksumconfigured
+// record the current state of this reader with respect to
+// validating checkums in hbase. this is originally set the same
+// value as usehbasechecksumconfigured, but can change state as and when
+// we encounter checksum verification failures.
+private volatile boolean usehbasechecksum
+// in the case of a checksum failure, do these many succeeding
+// reads without hbase checksum verification.
+private volatile int checksumoffcount    1
+/** whether we include memstore timestamp in data blocks */
+protected boolean includesmemstorets
+/** data block encoding used to read from file */
+protected hfiledatablockencoder datablockencoder
+noopdatablockencoder instance
+private threadlocal<prefetchedheader> prefetchedheaderforthread
+new threadlocal<prefetchedheader>
+@override
+public prefetchedheader initialvalue
+return new prefetchedheader
+public fsreaderv2 fsdatainputstream istream
+fsdatainputstream istreamnofschecksum  algorithm compressalgo
+long filesize  int minorversion  hfilesystem hfs  path path
+throws ioexception
+super istream  istreamnofschecksum  compressalgo  filesize
+minorversion  hfs  path
+if  hfs    null
+// check the configuration to determine whether hbase-level
+// checksum verification is needed or not.
+usehbasechecksum   hfs usehbasechecksum
+else
+// the configuration does not specify anything about hbase checksum
+// validations. set it to true here assuming that we will verify
+// hbase checksums for all reads. for older files that do not have
+// stored checksums, this flag will be reset later.
+usehbasechecksum   true
+// for older versions, hbase did not store checksums.
+if  getminorversion   < minor_version_with_checksum
+usehbasechecksum   false
+this usehbasechecksumconfigured   usehbasechecksum
+/**
+* a constructor that reads files with the latest minor version.
+* this is used by unit tests only.
+*/
+fsreaderv2 fsdatainputstream istream  algorithm compressalgo
+long filesize  throws ioexception
+this istream  istream  compressalgo  filesize
+hfilereaderv2 max_minor_version  null  null
+/**
+* reads a version 2 block. tries to do as little memory allocation as
+* possible, using the provided on-disk size.
+*
+* @param offset the offset in the stream to read at
+* @param ondisksizewithheaderl the on-disk size of the block, including
+*          the header, or -1 if unknown
+* @param uncompressedsize the uncompressed size of the the block. always
+*          expected to be -1. this parameter is only used in version 1.
+* @param pread whether to use a positional read
+*/
+@override
+public hfileblock readblockdata long offset  long ondisksizewithheaderl
+int uncompressedsize  boolean pread  throws ioexception
+// it is ok to get a reference to the stream here without any
+// locks because it is marked final.
+fsdatainputstream is   this istreamnofschecksum
+// get a copy of the current state of whether to validate
+// hbase checksums or not for this read call. this is not
+// thread-safe but the one constaint is that if we decide
+// to skip hbase checksum verification then we are
+// guaranteed to use hdfs checksum verification.
+boolean doverificationthruhbasechecksum   this usehbasechecksum
+if   doverificationthruhbasechecksum
+is   this istream
+hfileblock blk   readblockdatainternal is  offset
+ondisksizewithheaderl
+uncompressedsize  pread
+doverificationthruhbasechecksum
+if  blk    null
+hfile log warn
+path
+offset       filesize
+if   doverificationthruhbasechecksum
+string msg
+path
+offset       filesize
+doverificationthruhbasechecksum
+hfile log warn msg
+throw new ioexception msg      cannot happen case here
+hfile checksumfailures incrementandget       update metrics
+// if we have a checksum failure, we fall back into a mode where
+// the next few reads use hdfs level checksums. we aim to make the
+// next checksum_verification_num_io_threshold reads avoid
+// hbase checksum verification, but since this value is set without
+// holding any locks, it can so happen that we might actually do
+// a few more than precisely this number.
+this checksumoffcount   checksum_verification_num_io_threshold
+this usehbasechecksum   false
+doverificationthruhbasechecksum   false
+is   this istream
+blk   readblockdatainternal is  offset  ondisksizewithheaderl
+uncompressedsize  pread
+doverificationthruhbasechecksum
+if  blk    null
+hfile log warn
+path
+offset       filesize
+if  blk    null     doverificationthruhbasechecksum
+string msg
+path
+offset       filesize
+hfile log warn msg
+throw new ioexception msg
+// if there is a checksum mismatch earlier, then retry with
+// hbase checksums switched off and use hdfs checksum verification.
+// this triggers hdfs to detect and fix corrupt replicas. the
+// next checksumoffcount read requests will use hdfs checksums.
+// the decrementing of this.checksumoffcount is not thread-safe,
+// but it is harmless because eventually checksumoffcount will be
+// a negative number.
+if   this usehbasechecksum    this usehbasechecksumconfigured
+if  this checksumoffcount   < 0
+this usehbasechecksum   true     auto re enable hbase checksums
+return blk
+/**
+* reads a version 2 block.
+*
+* @param offset the offset in the stream to read at
+* @param ondisksizewithheaderl the on-disk size of the block, including
+*          the header, or -1 if unknown
+* @param uncompressedsize the uncompressed size of the the block. always
+*          expected to be -1. this parameter is only used in version 1.
+* @param pread whether to use a positional read
+* @param verifychecksum whether to use hbase checksums.
+*        if hbase checksum is switched off, then use hdfs checksum.
+* @return the hfileblock or null if there is a hbase checksum mismatch
+*/
+private hfileblock readblockdatainternal fsdatainputstream is  long offset
+long ondisksizewithheaderl
+int uncompressedsize  boolean pread  boolean verifychecksum
+throws ioexception
+if  offset < 0
+throw new ioexception     offset
+ondisksizewithheaderl
+uncompressedsize
+if  uncompressedsize     1
+throw new ioexception
+if   ondisksizewithheaderl < hdrsize    ondisksizewithheaderl     1
+ondisksizewithheaderl >  integer max_value
+throw new ioexception     ondisksizewithheaderl
+hdrsize
+integer max_value
+offset       uncompressedsize
+int ondisksizewithheader    int  ondisksizewithheaderl
+hfileblock b
+if  ondisksizewithheader > 0
+// we know the total on-disk size but not the uncompressed size. read
+// the entire block into memory, then parse the header and decompress
+// from memory if using compression. this code path is used when
+// doing a random read operation relying on the block index, as well as
+// when the client knows the on-disk size from peeking into the next
+// block's header (e.g. this block's header) when reading the previous
+// block. this is the faster and more preferable case.
+int ondisksizewithoutheader   ondisksizewithheader   hdrsize
+assert ondisksizewithoutheader >  0
+// see if we can avoid reading the header. this is desirable, because
+// we will not incur a seek operation to seek back if we have already
+// read this block's header as part of the previous read's look-ahead.
+prefetchedheader prefetchedheader   prefetchedheaderforthread get
+byte header   prefetchedheader offset    offset
+? prefetchedheader header   null
+// size that we have to skip in case we have already read the header.
+int prereadheadersize   header    null ? 0   hdrsize
+if  compressalgo    compression algorithm none
+// just read the whole thing. allocate enough space to read the
+// next block's header too.
+bytebuffer headeranddata   bytebuffer allocate ondisksizewithheader
+hdrsize
+headeranddata limit ondisksizewithheader
+if  header    null
+system arraycopy header  0  headeranddata array    0
+hdrsize
+int nextblockondisksizewithheader   readatoffset is
+headeranddata array    headeranddata arrayoffset
+prereadheadersize  ondisksizewithheader
+prereadheadersize  true  offset   prereadheadersize
+pread
+b   new hfileblock headeranddata  getminorversion
+b assumeuncompressed
+b validateondisksizewithoutheader ondisksizewithoutheader
+b nextblockondisksizewithheader   nextblockondisksizewithheader
+if  verifychecksum
+validateblockchecksum b  headeranddata array    hdrsize
+return null                 checksum mismatch
+if  b nextblockondisksizewithheader > 0
+setnextblockheader offset  b
+else
+// allocate enough space to fit the next block's header too.
+byte ondiskblock   new byte
+int nextblockondisksize   readatoffset is  ondiskblock
+prereadheadersize  ondisksizewithheader   prereadheadersize
+true  offset   prereadheadersize  pread
+if  header    null
+header   ondiskblock
+try
+b   new hfileblock bytebuffer wrap header  0  hdrsize
+getminorversion
+catch  ioexception ex
+// seen in load testing. provide comprehensive debug info.
+throw new ioexception
+offset       ondisksizewithheader
+prereadheadersize
+header length
+bytes tostringbinary header  0  hdrsize   ex
+b validateondisksizewithoutheader ondisksizewithoutheader
+b nextblockondisksizewithheader   nextblockondisksize
+if  verifychecksum
+validateblockchecksum b  ondiskblock  hdrsize
+return null                 checksum mismatch
+datainputstream dis   new datainputstream new bytearrayinputstream
+ondiskblock  hdrsize  ondisksizewithoutheader
+// this will allocate a new buffer but keep header bytes.
+b allocatebuffer b nextblockondisksizewithheader > 0
+decompress b buf array    b buf arrayoffset     hdrsize  dis
+b uncompressedsizewithoutheader
+// copy next block's header bytes into the new block if we have them.
+if  nextblockondisksize > 0
+system arraycopy ondiskblock  ondisksizewithheader  b buf array
+b buf arrayoffset     hdrsize
+b uncompressedsizewithoutheader   b totalchecksumbytes
+hdrsize
+setnextblockheader offset  b
+else
+// we don't know the on-disk size. read the header first, determine the
+// on-disk size from it, and read the remaining data, thereby incurring
+// two read operations. this might happen when we are doing the first
+// read in a series of reads or a random read, and we don't have access
+// to the block index. this is costly and should happen very rarely.
+// check if we have read this block's header as part of reading the
+// previous block. if so, don't read the header again.
+prefetchedheader prefetchedheader   prefetchedheaderforthread get
+bytebuffer headerbuf   prefetchedheader offset    offset ?
+prefetchedheader buf   null
+if  headerbuf    null
+// unfortunately, we still have to do a separate read operation to
+// read the header.
+headerbuf   bytebuffer allocate hdrsize
+readatoffset is  headerbuf array    headerbuf arrayoffset    hdrsize
+false  offset  pread
+b   new hfileblock headerbuf  getminorversion
+// this will also allocate enough room for the next block's header.
+b allocatebuffer true
+if  compressalgo    compression algorithm none
+// avoid creating bounded streams and using a "codec" that does
+// nothing.
+b assumeuncompressed
+b nextblockondisksizewithheader   readatoffset is  b buf array
+b buf arrayoffset     hdrsize
+b uncompressedsizewithoutheader   b totalchecksumbytes
+true  offset   hdrsize
+pread
+if  verifychecksum
+validateblockchecksum b  b buf array    hdrsize
+return null                 checksum mismatch
+if  b nextblockondisksizewithheader > 0
+setnextblockheader offset  b
+else
+// allocate enough space for the block's header and compressed data.
+byte compressedbytes   new byte[b getondisksizewithheader
+hdrsize]
+b nextblockondisksizewithheader   readatoffset is  compressedbytes
+hdrsize  b ondisksizewithoutheader  true  offset
+hdrsize  pread
+if  verifychecksum
+validateblockchecksum b  compressedbytes  hdrsize
+return null                 checksum mismatch
+datainputstream dis   new datainputstream new bytearrayinputstream
+compressedbytes  hdrsize  b ondisksizewithoutheader
+decompress b buf array    b buf arrayoffset     hdrsize  dis
+b uncompressedsizewithoutheader
+if  b nextblockondisksizewithheader > 0
+// copy the next block's header into the new block.
+int nextheaderoffset   b buf arrayoffset     hdrsize
+b uncompressedsizewithoutheader   b totalchecksumbytes
+system arraycopy compressedbytes
+compressedbytes length   hdrsize
+b buf array
+nextheaderoffset
+hdrsize
+setnextblockheader offset  b
+b includesmemstorets   includesmemstorets
+b offset   offset
+return b
+private void setnextblockheader long offset  hfileblock b
+prefetchedheader prefetchedheader   prefetchedheaderforthread get
+prefetchedheader offset   offset   b getondisksizewithheader
+int nextheaderoffset   b buf arrayoffset     hdrsize
+b uncompressedsizewithoutheader   b totalchecksumbytes
+system arraycopy b buf array    nextheaderoffset
+prefetchedheader header  0  hdrsize
+void setincludesmemstorets boolean enabled
+includesmemstorets   enabled
+void setdatablockencoder hfiledatablockencoder encoder
+this datablockencoder   encoder
+/**
+* generates the checksum for the header as well as the data and
+* then validates that it matches the value stored in the header.
+* if there is a checksum mismatch, then return false. otherwise
+* return true.
+*/
+protected boolean validateblockchecksum hfileblock block
+byte data  int hdrsize  throws ioexception
+return checksumutil validateblockchecksum path  block
+data  hdrsize
+@override
+public int getserializedlength
+if  buf    null
+return this buf limit     hfileblock extra_serialization_space
+return 0
+@override
+public void serialize bytebuffer destination
+destination put this buf duplicate
+destination putlong this offset
+destination putint this nextblockondisksizewithheader
+destination rewind
+@override
+public cacheabledeserializer<cacheable> getdeserializer
+return hfileblock blockdeserializer
+@override
+public boolean equals object comparison
+if  this    comparison
+return true
+if  comparison    null
+return false
+if  comparison getclass      this getclass
+return false
+hfileblock castedcomparison    hfileblock  comparison
+if  castedcomparison blocktype    this blocktype
+return false
+if  castedcomparison nextblockondisksizewithheader    this nextblockondisksizewithheader
+return false
+if  castedcomparison offset    this offset
+return false
+if  castedcomparison ondisksizewithoutheader    this ondisksizewithoutheader
+return false
+if  castedcomparison prevblockoffset    this prevblockoffset
+return false
+if  castedcomparison uncompressedsizewithoutheader    this uncompressedsizewithoutheader
+return false
+if  this buf compareto castedcomparison buf     0
+return false
+if  this buf position      castedcomparison buf position
+return false
+if  this buf limit      castedcomparison buf limit
+return false
+return true
+public boolean doesincludememstorets
+return includesmemstorets
+public datablockencoding getdatablockencoding
+if  blocktype    blocktype encoded_data
+return datablockencoding getencodingbyid getdatablockencodingid
+return datablockencoding none
+byte getchecksumtype
+return this checksumtype
+int getbytesperchecksum
+return this bytesperchecksum
+int getondiskdatasizewithheader
+return this ondiskdatasizewithheader
+int getminorversion
+return this minorversion
+/**
+* calcuate the number of bytes required to store all the checksums
+* for this block. each checksum value is a 4 byte integer.
+*/
+int totalchecksumbytes
+// if the hfile block has minorversion 0, then there are no checksum
+// data to validate. similarly, a zero value in this.bytesperchecksum
+// indicates that cached blocks do not have checksum data because
+// checksums were already validated when the block was read from disk.
+if  minorversion < minor_version_with_checksum    this bytesperchecksum    0
+return 0
+return  int checksumutil numbytes ondiskdatasizewithheader  bytesperchecksum
+/**
+* returns the size of this block header.
+*/
+public int headersize
+return headersize this minorversion
+/**
+* maps a minor version to the size of the header.
+*/
+static private int headersize int minorversion
+if  minorversion < minor_version_with_checksum
+return header_size_no_checksum
+return header_size
+/**
+* return the appropriate dummy_header for the minor version
+*/
+public byte getdummyheaderforversion
+return getdummyheaderforversion minorversion
+/**
+* return the appropriate dummy_header for the minor version
+*/
+static private byte getdummyheaderforversion int minorversion
+if  minorversion < minor_version_with_checksum
+return dummy_header_no_checksum
+return dummy_header
+/**
+* convert the contents of the block header into a human readable string.
+* this is mostly helpful for debugging. this assumes that the block
+* has minor version > 0.
+*/
+static string tostringheader bytebuffer buf  throws ioexception
+int offset   buf arrayoffset
+byte b   buf array
+long magic   bytes tolong b  offset
+blocktype bt   blocktype read buf
+offset    bytes sizeof_long
+int compressedblocksizenoheader   bytes toint b  offset
+offset    bytes sizeof_int
+int uncompressedblocksizenoheader   bytes toint b  offset
+offset    bytes sizeof_int
+long prevblockoffset   bytes tolong b  offset
+offset    bytes sizeof_long
+byte cksumtype   b
+offset    bytes sizeof_byte
+long bytesperchecksum   bytes toint b  offset
+offset    bytes sizeof_int
+long ondiskdatasizewithheader   bytes toint b  offset
+offset    bytes sizeof_int
+return     magic
+bt
+compressedblocksizenoheader
+uncompressedblocksizenoheader
+prevblockoffset
+checksumtype codetotype cksumtype
+bytesperchecksum
+ondiskdatasizewithheader

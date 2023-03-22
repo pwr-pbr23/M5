@@ -1,0 +1,202 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql optimizer physical index
+import java io ioexception
+import java util arraylist
+import java util hashmap
+import java util linkedhashset
+import java util list
+import java util map
+import java util set
+import java util stack
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop fs contentsummary
+import org apache hadoop hive metastore api index
+import org apache hadoop hive ql exec mapredtask
+import org apache hadoop hive ql exec tablescanoperator
+import org apache hadoop hive ql exec task
+import org apache hadoop hive ql exec utilities
+import org apache hadoop hive ql hooks readentity
+import org apache hadoop hive ql index hiveindexhandler
+import org apache hadoop hive ql index hiveindexquerycontext
+import org apache hadoop hive ql lib node
+import org apache hadoop hive ql lib nodeprocessor
+import org apache hadoop hive ql lib nodeprocessorctx
+import org apache hadoop hive ql metadata hiveexception
+import org apache hadoop hive ql metadata hiveutils
+import org apache hadoop hive ql metadata partition
+import org apache hadoop hive ql metadata table
+import org apache hadoop hive ql optimizer indexutils
+import org apache hadoop hive ql parse parsecontext
+import org apache hadoop hive ql parse semanticexception
+import org apache hadoop hive ql plan exprnodedesc
+import org apache hadoop hive ql plan mapredwork
+import org apache hadoop hive ql plan tabledesc
+import org apache hadoop hive ql plan tablescandesc
+/**
+*
+* indexwhereprocessor.
+* processes operator nodes to look for where queries with a predicate column
+* on which we have an index.  creates an index subquery task for these
+* where queries to use the index automatically.
+*/
+public class indexwhereprocessor implements nodeprocessor
+private static final log log   logfactory getlog indexwhereprocessor class getname
+private final map<table  list<index>> indexes
+public indexwhereprocessor map<table  list<index>> indexes
+super
+this indexes   indexes
+@override
+/**
+* process a node of the operator tree. this matches on the rule in indexwheretaskdispatcher
+*/
+public object process node nd  stack<node> stack  nodeprocessorctx procctx
+object    nodeoutputs  throws semanticexception
+tablescanoperator operator    tablescanoperator  nd
+list<node> opchildren   operator getchildren
+tablescandesc operatordesc   operator getconf
+if  operatordesc    null
+return null
+exprnodedesc predicate   operatordesc getfilterexpr
+indexwhereprocctx context    indexwhereprocctx  procctx
+parsecontext pctx   context getparsecontext
+log info
+if  predicate    null
+log info
+return null
+log info predicate getexprstring
+// check if we have indexes on all partitions in this table scan
+set<partition> querypartitions
+try
+querypartitions   indexutils checkpartitionscoveredbyindex operator  pctx  indexes
+if  querypartitions    null       partitions not covered
+return null
+catch  hiveexception e
+log error    e
+throw new semanticexception e
+// we can only process mapreduce tasks to check input size
+if   context getcurrenttask   ismapredtask
+return null
+mapredtask currenttask    mapredtask  context getcurrenttask
+// get potential reentrant index queries from each index
+map<index  hiveindexquerycontext> querycontexts   new hashmap<index  hiveindexquerycontext>
+// make sure we have an index on the table being scanned
+tabledesc tbldesc   operator gettabledesc
+table srctable   pctx gettoptotable   get operator
+if  indexes    null    indexes get srctable     null
+return null
+list<index> tableindexes   indexes get srctable
+map<string  list<index>> indexesbytype   new hashmap<string  list<index>>
+for  index indexontable   tableindexes
+if  indexesbytype get indexontable getindexhandlerclass       null
+list<index> newtype   new arraylist<index>
+newtype add indexontable
+indexesbytype put indexontable getindexhandlerclass    newtype
+else
+indexesbytype get indexontable getindexhandlerclass    add indexontable
+// choose index type with most indexes of the same type on the table
+// todo hive-2130 this would be a good place for some sort of cost based choice?
+list<index> bestindexes   indexesbytype values   iterator   next
+for  list<index> indextypes   indexesbytype values
+if  bestindexes size   < indextypes size
+bestindexes   indextypes
+// rewrite index queries for the chosen index type
+hiveindexquerycontext tmpquerycontext   new hiveindexquerycontext
+tmpquerycontext setquerypartitions querypartitions
+rewriteforindexes predicate  bestindexes  pctx  currenttask  tmpquerycontext
+list<task<?>> indextasks   tmpquerycontext getquerytasks
+if  indextasks    null    indextasks size   > 0
+querycontexts put bestindexes get 0   tmpquerycontext
+// choose an index rewrite to use
+if  querycontexts size   > 0
+// todo hive-2130 this would be a good place for some sort of cost based choice?
+index chosenindex   querycontexts keyset   iterator   next
+// modify the parse context to use indexing
+// we need to delay this until we choose one index so that we don't attempt to modify pctx multiple times
+hiveindexquerycontext querycontext   querycontexts get chosenindex
+// prepare the map reduce job to use indexing
+mapredwork work   currenttask getwork
+work setinputformat querycontext getindexinputformat
+work addindexintermediatefile querycontext getindexintermediatefile
+// modify inputs based on index query
+set<readentity> inputs   pctx getsemanticinputs
+inputs addall querycontext getadditionalsemanticinputs
+list<task<?>> chosenrewrite   querycontext getquerytasks
+// add dependencies so index query runs first
+insertindexquery pctx  context  chosenrewrite
+return null
+/**
+* get a list of tasks to activate use of indexes.
+* generate the tasks for the index query (where we store results of
+* querying the index in a tmp file) inside the indexhandler
+* @param predicate predicate of query to rewrite
+* @param index index to use for rewrite
+* @param pctx
+* @param task original task before rewrite
+* @param querycontext stores return values
+*/
+private void rewriteforindexes exprnodedesc predicate  list<index> indexes
+parsecontext pctx  task<mapredwork> task
+hiveindexquerycontext querycontext
+throws semanticexception
+hiveindexhandler indexhandler
+// all indexes in the list are of the same type, and therefore can use the
+// same handler to generate the index query tasks
+index index   indexes get 0
+try
+indexhandler   hiveutils getindexhandler pctx getconf    index getindexhandlerclass
+catch  hiveexception e
+log error     index getindexhandlerclass    e
+throw new semanticexception     index getindexhandlerclass    e
+// check the size
+try
+contentsummary inputsummary   utilities getinputsummary pctx getcontext    task getwork    null
+long inputsize   inputsummary getlength
+if   indexhandler checkquerysize inputsize  pctx getconf
+querycontext setquerytasks null
+return
+catch  ioexception e
+throw new semanticexception    e
+// use the indexhandler to generate the index query
+indexhandler generateindexquery indexes  predicate  pctx  querycontext
+// todo hive-2115 use querycontext.residualpredicate to process residual predicate
+return
+/**
+* insert the rewrite tasks at the head of the pctx task tree
+* @param pctx
+* @param context
+* @param chosenrewrite
+*/
+private void insertindexquery parsecontext pctx  indexwhereprocctx context  list<task<?>> chosenrewrite
+task<?> wholetablescan   context getcurrenttask
+linkedhashset<task<?>> rewriteleaves   new linkedhashset<task<?>>
+findleaves chosenrewrite  rewriteleaves
+for  task<?> leaf   rewriteleaves
+leaf adddependenttask wholetablescan      add full scan task as child for every index query task
+// replace the original with the index sub-query as a root task
+pctx replaceroottask wholetablescan  chosenrewrite
+/**
+* find the leaves of the task tree
+*/
+private void findleaves list<task<?>> tasks  set<task<?>> leaves
+for  task<?> t   tasks
+if  t getdependenttasks      null
+leaves add t
+else
+findleaves t getdependenttasks    leaves

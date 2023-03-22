@@ -1,0 +1,426 @@
+/*
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements. see the notice file distributed with this
+* work for additional information regarding copyright ownership. the asf
+* licenses this file to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance with the license.
+* you may obtain a copy of the license at
+*
+* http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis, without
+* warranties or conditions of any kind, either express or implied. see the
+* license for the specific language governing permissions and limitations
+* under the license.
+*/
+package org apache hadoop hbase io encoding
+import java io datainputstream
+import java io dataoutputstream
+import java io ioexception
+import java nio bytebuffer
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase util bytebufferutils
+import org apache hadoop hbase util bytes
+import org apache hadoop io rawcomparator
+/**
+* compress using:
+* - store size of common prefix
+* - save column family once, it is same within hfile
+* - use integer compression for key, value and prefix (7-bit encoding)
+* - use bits to avoid duplication key length, value length
+*   and type if it same as previous
+* - store in 3 bits length of timestamp field
+* - allow diff in timestamp instead of actual value
+*
+* format:
+* - 1 byte:    flag
+* - 1-5 bytes: key length (only if flag_same_key_length is not set in flag)
+* - 1-5 bytes: value length (only if flag_same_value_length is not set in flag)
+* - 1-5 bytes: prefix length
+* - ... bytes: rest of the row (if prefix length is small enough)
+* - ... bytes: qualifier (or suffix depending on prefix length)
+* - 1-8 bytes: timestamp or diff
+* - 1 byte:    type (only if flag_same_type is not set in the flag)
+* - ... bytes: value
+*/
+public class diffkeydeltaencoder extends buffereddatablockencoder
+static final int flag_same_key_length   1
+static final int flag_same_value_length   1 << 1
+static final int flag_same_type   1 << 2
+static final int flag_timestamp_is_diff   1 << 3
+static final int mask_timestamp_length    1 << 4     1 << 5     1 << 6
+static final int shift_timestamp_length   4
+static final int flag_timestamp_sign   1 << 7
+protected static class diffcompressionstate extends compressionstate
+long timestamp
+byte familynamewithsize
+@override
+protected void readtimestamp bytebuffer in
+timestamp   in getlong
+@override
+void copyfrom compressionstate state
+super copyfrom state
+diffcompressionstate state2    diffcompressionstate  state
+timestamp   state2 timestamp
+private void compresssinglekeyvalue diffcompressionstate previousstate
+diffcompressionstate currentstate  dataoutputstream out
+bytebuffer in  throws ioexception
+byte flag   0
+int kvpos   in position
+int keylength   in getint
+int valuelength   in getint
+long timestamp
+long difftimestamp   0
+int difftimestampfitsinbytes   0
+int commonprefix
+int timestampfitsinbytes
+if  previousstate isfirst
+currentstate readkey in  keylength  valuelength
+currentstate prevoffset   kvpos
+timestamp   currentstate timestamp
+if  timestamp < 0
+flag    flag_timestamp_sign
+timestamp    timestamp
+timestampfitsinbytes   bytebufferutils longfitsin timestamp
+flag     timestampfitsinbytes   1  << shift_timestamp_length
+commonprefix   0
+// put column family
+in mark
+bytebufferutils skip in  currentstate rowlength
+keyvalue row_length_size
+bytebufferutils movebuffertostream out  in  currentstate familylength
+keyvalue family_length_size
+in reset
+else
+// find a common prefix and skip it
+commonprefix
+bytebufferutils findcommonprefix in  in position
+previousstate prevoffset   keyvalue row_offset  keylength
+keyvalue timestamp_type_size
+// don't compress timestamp and type using prefix
+currentstate readkey in  keylength  valuelength
+commonprefix  previousstate
+currentstate prevoffset   kvpos
+timestamp   currentstate timestamp
+boolean negativetimestamp   timestamp < 0
+if  negativetimestamp
+timestamp    timestamp
+timestampfitsinbytes   bytebufferutils longfitsin timestamp
+if  keylength    previousstate keylength
+flag    flag_same_key_length
+if  valuelength    previousstate valuelength
+flag    flag_same_value_length
+if  currentstate type    previousstate type
+flag    flag_same_type
+// encode timestamp
+difftimestamp   previousstate timestamp   currentstate timestamp
+boolean minusdifftimestamp   difftimestamp < 0
+if  minusdifftimestamp
+difftimestamp    difftimestamp
+difftimestampfitsinbytes   bytebufferutils longfitsin difftimestamp
+if  difftimestampfitsinbytes < timestampfitsinbytes
+flag     difftimestampfitsinbytes   1  << shift_timestamp_length
+flag    flag_timestamp_is_diff
+if  minusdifftimestamp
+flag    flag_timestamp_sign
+else
+flag     timestampfitsinbytes   1  << shift_timestamp_length
+if  negativetimestamp
+flag    flag_timestamp_sign
+out write flag
+if   flag   flag_same_key_length     0
+bytebufferutils putcompressedint out  keylength
+if   flag   flag_same_value_length     0
+bytebufferutils putcompressedint out  valuelength
+bytebufferutils putcompressedint out  commonprefix
+bytebufferutils skip in  commonprefix
+if  previousstate isfirst
+commonprefix < currentstate rowlength   keyvalue row_length_size
+int restrowlength
+currentstate rowlength   keyvalue row_length_size   commonprefix
+bytebufferutils movebuffertostream out  in  restrowlength
+bytebufferutils skip in  currentstate familylength
+keyvalue family_length_size
+bytebufferutils movebuffertostream out  in  currentstate qualifierlength
+else
+bytebufferutils movebuffertostream out  in
+keylength   commonprefix   keyvalue timestamp_type_size
+if   flag   flag_timestamp_is_diff     0
+bytebufferutils putlong out  timestamp  timestampfitsinbytes
+else
+bytebufferutils putlong out  difftimestamp  difftimestampfitsinbytes
+if   flag   flag_same_type     0
+out write currentstate type
+bytebufferutils skip in  keyvalue timestamp_type_size
+bytebufferutils movebuffertostream out  in  valuelength
+private void uncompresssinglekeyvalue datainputstream source
+bytebuffer buffer
+diffcompressionstate state
+throws ioexception  encoderbuffertoosmallexception
+// read the column family at the beginning
+if  state isfirst
+state familylength   source readbyte
+state familynamewithsize
+new byte
+state familynamewithsize   state familylength
+source read state familynamewithsize  keyvalue family_length_size
+state familylength
+// read flag
+byte flag   source readbyte
+// read key/value/common lengths
+int keylength
+int valuelength
+if   flag   flag_same_key_length     0
+keylength   state keylength
+else
+keylength   bytebufferutils readcompressedint source
+if   flag   flag_same_value_length     0
+valuelength   state valuelength
+else
+valuelength   bytebufferutils readcompressedint source
+int commonprefix   bytebufferutils readcompressedint source
+// create keyvalue buffer and fill it prefix
+int keyoffset   buffer position
+bytebufferutils ensurespace buffer  keylength   valuelength
+keyvalue row_offset
+buffer putint keylength
+buffer putint valuelength
+// copy common from previous key
+if  commonprefix > 0
+bytebufferutils copyfrombuffertobuffer buffer  buffer  state prevoffset
+keyvalue row_offset  commonprefix
+// copy the rest of the key from the buffer
+int keyrestlength
+if  state isfirst      commonprefix <
+state rowlength   keyvalue row_length_size
+// omit the family part of the key, it is always the same
+short rowlength
+int rowrestlength
+// check length of row
+if  commonprefix < keyvalue row_length_size
+// not yet copied, do it now
+bytebufferutils copyfromstreamtobuffer buffer  source
+keyvalue row_length_size   commonprefix
+bytebufferutils skip buffer   keyvalue row_length_size
+rowlength   buffer getshort
+rowrestlength   rowlength
+else
+// already in buffer, just read it
+rowlength   buffer getshort keyoffset   keyvalue row_offset
+rowrestlength   rowlength   keyvalue row_length_size   commonprefix
+// copy the rest of row
+bytebufferutils copyfromstreamtobuffer buffer  source  rowrestlength
+state rowlength   rowlength
+// copy the column family
+buffer put state familynamewithsize
+keyrestlength   keylength   rowlength
+state familynamewithsize length
+keyvalue row_length_size   keyvalue timestamp_type_size
+else
+// prevrowwithsizelength is the same as on previous row
+keyrestlength   keylength   commonprefix   keyvalue timestamp_type_size
+// copy the rest of the key, after column family -> column qualifier
+bytebufferutils copyfromstreamtobuffer buffer  source  keyrestlength
+// handle timestamp
+int timestampfitsinbytes
+flag   mask_timestamp_length  >>> shift_timestamp_length    1
+long timestamp   bytebufferutils readlong source  timestampfitsinbytes
+if   flag   flag_timestamp_sign     0
+timestamp    timestamp
+if   flag   flag_timestamp_is_diff     0
+timestamp   state timestamp   timestamp
+buffer putlong timestamp
+// copy the type field
+byte type
+if   flag   flag_same_type     0
+type   state type
+else
+type   source readbyte
+buffer put type
+// copy value part
+bytebufferutils copyfromstreamtobuffer buffer  source  valuelength
+state keylength   keylength
+state valuelength   valuelength
+state prevoffset   keyoffset
+state timestamp   timestamp
+state type   type
+// state.qualifier is unused
+@override
+public void compresskeyvalues dataoutputstream out
+bytebuffer in  boolean includesmemstorets  throws ioexception
+in rewind
+bytebufferutils putint out  in limit
+diffcompressionstate previousstate   new diffcompressionstate
+diffcompressionstate currentstate   new diffcompressionstate
+while  in hasremaining
+compresssinglekeyvalue previousstate  currentstate
+out  in
+afterencodingkeyvalue in  out  includesmemstorets
+// swap previousstate <-> currentstate
+diffcompressionstate tmp   previousstate
+previousstate   currentstate
+currentstate   tmp
+@override
+public bytebuffer uncompresskeyvalues datainputstream source
+int allocheaderlength  int skiplastbytes  boolean includesmemstorets
+throws ioexception
+int decompressedsize   source readint
+bytebuffer buffer   bytebuffer allocate decompressedsize
+allocheaderlength
+buffer position allocheaderlength
+diffcompressionstate state   new diffcompressionstate
+while  source available   > skiplastbytes
+uncompresssinglekeyvalue source  buffer  state
+afterdecodingkeyvalue source  buffer  includesmemstorets
+if  source available      skiplastbytes
+throw new illegalstateexception
+return buffer
+@override
+public bytebuffer getfirstkeyinblock bytebuffer block
+block mark
+block position bytes sizeof_int
+byte familylength   block get
+bytebufferutils skip block  familylength
+byte flag   block get
+int keylength   bytebufferutils readcompressedint block
+bytebufferutils readcompressedint block      valuelength
+bytebufferutils readcompressedint block      commonlength
+bytebuffer result   bytebuffer allocate keylength
+// copy row
+int pos   result arrayoffset
+block get result array    pos  bytes sizeof_short
+pos    bytes sizeof_short
+short rowlength   result getshort
+block get result array    pos  rowlength
+pos    rowlength
+// copy family
+int saveposition   block position
+block position bytes sizeof_int
+block get result array    pos  familylength   bytes sizeof_byte
+pos    familylength   bytes sizeof_byte
+// copy qualifier
+block position saveposition
+int qualifierlength
+keylength   pos   result arrayoffset     keyvalue timestamp_type_size
+block get result array    pos  qualifierlength
+pos    qualifierlength
+// copy the timestamp and type
+int timestampfitinbytes
+flag   mask_timestamp_length  >>> shift_timestamp_length    1
+long timestamp   bytebufferutils readlong block  timestampfitinbytes
+if   flag   flag_timestamp_sign     0
+timestamp    timestamp
+result putlong pos  timestamp
+pos    bytes sizeof_long
+block get result array    pos  bytes sizeof_byte
+block reset
+return result
+@override
+public string tostring
+return diffkeydeltaencoder class getsimplename
+protected static class diffseekerstate extends seekerstate
+private int rowlengthwithsize
+private long timestamp
+@override
+protected void copyfromnext seekerstate that
+super copyfromnext that
+diffseekerstate other    diffseekerstate  that
+rowlengthwithsize   other rowlengthwithsize
+timestamp   other timestamp
+@override
+public encodedseeker createseeker rawcomparator<byte> comparator
+final boolean includesmemstorets
+return new bufferedencodedseeker<diffseekerstate> comparator
+private byte familynamewithsize
+private static final int timestamp_with_type_length
+bytes sizeof_long   bytes sizeof_byte
+private void decode boolean isfirst
+byte flag   currentbuffer get
+byte type   0
+if   flag   flag_same_key_length     0
+if   isfirst
+type   current keybuffer
+current keylength   bytebufferutils readcompressedint currentbuffer
+if   flag   flag_same_value_length     0
+current valuelength
+bytebufferutils readcompressedint currentbuffer
+current lastcommonprefix
+bytebufferutils readcompressedint currentbuffer
+current ensurespaceforkey
+if  current lastcommonprefix < bytes sizeof_short
+// length of row is different, copy everything except family
+// copy the row size
+currentbuffer get current keybuffer  current lastcommonprefix
+bytes sizeof_short   current lastcommonprefix
+current rowlengthwithsize   bytes toshort current keybuffer  0
+bytes sizeof_short
+// copy the rest of row
+currentbuffer get current keybuffer  bytes sizeof_short
+current rowlengthwithsize   bytes sizeof_short
+// copy the column family
+system arraycopy familynamewithsize  0  current keybuffer
+current rowlengthwithsize  familynamewithsize length
+// copy the qualifier
+currentbuffer get current keybuffer
+current rowlengthwithsize   familynamewithsize length
+current keylength   current rowlengthwithsize
+familynamewithsize length   timestamp_with_type_length
+else if  current lastcommonprefix < current rowlengthwithsize
+// we have to copy part of row and qualifier,
+// but column family is in right place
+// before column family (rest of row)
+currentbuffer get current keybuffer  current lastcommonprefix
+current rowlengthwithsize   current lastcommonprefix
+// after column family (qualifier)
+currentbuffer get current keybuffer
+current rowlengthwithsize   familynamewithsize length
+current keylength   current rowlengthwithsize
+familynamewithsize length   timestamp_with_type_length
+else
+// copy just the ending
+currentbuffer get current keybuffer  current lastcommonprefix
+current keylength   timestamp_with_type_length
+current lastcommonprefix
+// timestamp
+int pos   current keylength   timestamp_with_type_length
+int timestampfitinbytes   1
+flag   mask_timestamp_length  >>> shift_timestamp_length
+long timestampordiff
+bytebufferutils readlong currentbuffer  timestampfitinbytes
+if   flag   flag_timestamp_sign     0
+timestampordiff    timestampordiff
+if   flag   flag_timestamp_is_diff     0       it is timestamp
+current timestamp   timestampordiff
+else      it is diff
+current timestamp   current timestamp   timestampordiff
+bytes putlong current keybuffer  pos  current timestamp
+pos    bytes sizeof_long
+// type
+if   flag   flag_same_type     0
+currentbuffer get current keybuffer  pos  bytes sizeof_byte
+else if   flag   flag_same_key_length     0
+current keybuffer   type
+current valueoffset   currentbuffer position
+bytebufferutils skip currentbuffer  current valuelength
+if  includesmemstorets
+current memstorets   bytebufferutils readvlong currentbuffer
+else
+current memstorets   0
+current nextkvoffset   currentbuffer position
+@override
+protected void decodefirst
+bytebufferutils skip currentbuffer  bytes sizeof_int
+// read column family
+byte familynamelength   currentbuffer get
+familynamewithsize   new byte
+familynamewithsize   familynamelength
+currentbuffer get familynamewithsize  bytes sizeof_byte
+familynamelength
+decode true
+@override
+protected void decodenext
+decode false
+@override
+protected diffseekerstate createseekerstate
+return new diffseekerstate

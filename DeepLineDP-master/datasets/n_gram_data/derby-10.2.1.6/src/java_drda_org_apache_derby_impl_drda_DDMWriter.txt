@@ -1,0 +1,1464 @@
+/*
+derby - class org.apache.derby.impl.drda.ddmwriter
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl drda
+import java io outputstream
+import java io inputstream
+import java io bufferedinputstream
+import java io bufferedoutputstream
+import org apache derby iapi services sanity sanitymanager
+import java sql sqlexception
+import java sql datatruncation
+import java math bigdecimal
+import org apache derby iapi error exceptionseverity
+import java util arrays
+import org apache derby iapi reference property
+import org apache derby iapi services property propertyutil
+import java io ioexception
+/**
+the ddmwriter is used to write drda protocol.   the drda protocol is
+described in the ddmreader class.
+for more details, see drda volume 3 (distributed data management(ddm)
+architecture (dds definition)
+*/
+class ddmwriter
+// number of nesting levels for collections.  we need to mark the length
+// location of the collection so that we can update it as we add more stuff
+// to the collection
+private final static int max_marks_nesting   10
+// default buffer size
+private final static int default_buffer_size   32767
+static final bigdecimal zero   bigdecimal valueof 0l
+// output buffer
+private byte bytes
+// offset into output buffer
+private int offset
+// a saved mark in the stream is saved temporarily to revisit the location.
+private int markstack   new int
+// top of the stack
+private int top
+// ccsid manager for translation of strings in the protocol to ebcdic
+private ccsidmanager ccsidmanager
+// drda connection thread for this writer
+private drdaconnthread agent
+//	this object tracks the location of the current
+//	dss header length bytes.	this is done so
+//	the length bytes can be automatically
+//	updated as information is added to this stream.
+private int dsslengthlocation
+// current correlation id
+private	int correlationid
+// next correlation id
+private int nextcorrelationid
+// is this drda protocol or cmd protocol
+private boolean isdrdaprotocol
+// trace object of the associated session
+private dsstrace dsstrace
+// location within the "bytes" array of the start of the header
+// of the dss most recently written to the buffer.
+private int prevhdrlocation
+// correlation id of the last dss that was written to buffer.
+private int previouscorrid
+// chaining bit of the last dss that was written to buffer.
+private byte previouschainbyte
+// whether or not the current dss is a continuation dss.
+private boolean iscontinuationdss
+// in situations where we want to "mark" a buffer location so that
+// we can "back-out" of a write to handle errors, this holds the
+// location within the "bytes" array of the start of the header
+// that immediately precedes the mark.
+private int lastdssbeforemark
+// constructors
+ddmwriter  int minsize  ccsidmanager ccsidmanager  drdaconnthread agent  dsstrace dsstrace
+this bytes   new byte
+this ccsidmanager   ccsidmanager
+this agent   agent
+this prevhdrlocation    1
+this previouscorrid   dssconstants correlation_id_unknown
+this previouschainbyte   dssconstants dss_nochain
+this iscontinuationdss   false
+this lastdssbeforemark    1
+reset dsstrace
+ddmwriter  ccsidmanager ccsidmanager  drdaconnthread agent  dsstrace dsstrace
+this bytes   new byte
+this ccsidmanager   ccsidmanager
+this agent   agent
+this prevhdrlocation    1
+this previouscorrid   dssconstants correlation_id_unknown
+this previouschainbyte   dssconstants dss_nochain
+this iscontinuationdss   false
+this lastdssbeforemark    1
+reset dsstrace
+/**
+* reset values for sending next message
+*
+*/
+protected void reset dsstrace dsstrace
+offset   0
+top   0
+dsslengthlocation   0
+nextcorrelationid   1
+correlationid   dssconstants correlation_id_unknown
+isdrdaprotocol   true
+this dsstrace   dsstrace
+/**
+* set protocol to cmd protocol
+*/
+protected void setcmdprotocol
+isdrdaprotocol   false
+/**
+* create dss reply object
+*/
+protected void createdssreply
+begindss dssconstants dssfmt_rpydss  true
+/**
+* create dss request object
+* note: this is _only_ used for testing the protocol
+* (via the testproto.java file in this package)!
+* we should never create a dss request in normal
+* drda processing (we should only create dss replies
+* and dss objects).
+*/
+protected void createdssrequest
+begindss dssconstants dssfmt_rqsdss  true
+/**
+* create dss data object
+*/
+protected void createdssobject
+begindss dssconstants dssfmt_objdss  true
+/**
+* mark the dss that we're currently writing as
+* a continued dss, which is done by setting
+* the high-order bit to "1", per ddm spec.
+* this means:
+*
+*	1. one or more continuation dsses will immediately
+* 		follow the current (continued) dss.
+*	2. all continuation dsses will have a 2-byte
+* 		continuation header, followed by data; in
+* 		other words, chaining state, correlation
+*		id, dss format info, and code point will
+* 		not be included.  all of that info is
+* 		present only in the first dss in the
+*		list of continued dsses.
+*
+*	note: a dss can be a "continuation" dss _and_
+* 	a "continued" dss at the same time.  however,
+* 	the first dss to be continued cannot be
+*	a continuation dss.
+*/
+private void markdssascontinued boolean forlob
+if   forlob
+// continuation bit defaults to '1' for lobs, so
+// we only have to switch it if we're not writing
+// lobs.
+bytes    0x80
+// we need to set the chaining state, but only
+// if this is the first dss in the continuation
+// list (only the first one has chaining state
+// in it's header; the others do not).
+if   iscontinuationdss
+enddss  forlob
+/**
+* end dss header by writing the length in the length location
+* and setting the chain bit.  unlike the other two enddss
+* methods, this one overrides the default chaining byte
+* (which is set in begindss) with the chaining byte that
+* is passed in.  note: this method is only used in
+* association with createdssrequest, and thus is for
+* testing purposes only (via testproto.java).  no calls
+* should be made to this method in normal drda processing
+* (because for normal processing, chaining must be
+* determined automatically based on dss requests).
+*/
+protected void enddss byte chainbyte
+// do regular enddss processing.
+enddss true
+// now override default chain state.
+bytes    0x0f 	   zero out default
+bytes    chainbyte
+previouschainbyte   chainbyte
+/**
+* end dss header by writing the length in the length location
+* and setting the chain bit.
+*/
+protected void enddss
+enddss true
+/**
+* end dss header by writing the length in the length location
+* and setting the chain bit.
+*/
+private void enddss  boolean finalizelength
+if  finalizelength
+finalizedsslength
+if  iscontinuationdss
+// no chaining information for this dss; so we're done.
+iscontinuationdss   false
+return
+previouscorrid   correlationid
+prevhdrlocation   dsslengthlocation
+previouschainbyte   dssconstants dsschain_same_id
+/**
+* end final ddm and dss header by writing the length in the length location
+*
+*/
+protected void endddmanddss
+endddm   	   updates last ddm object
+enddss
+/**
+* copy data to end
+* create a buffer and copy from the position given to the end of data
+*
+* note that the position given is treated as relative to the
+* current dss, for there may be other dss blocks (chained, presumably)
+* which are sitting unwritten in the buffer. the caller doesn't
+* know this, though, and works only with the current dss.
+*
+* getdsslength, copydssdatatoend, and truncatedss work together to
+* provide a sub-protocol for drdaconnthread to use in its
+* implementation of the lmtblkprc protocol. they enable the caller
+* to determine when it has written too much data into the current
+* dss, to reclaim the extra data that won't fit, and to truncate
+* that extra data once it has been reclaimed and stored elsewhere.
+* note that this support only works for the current dss. earlier,
+* chained dss blocks cannot be accessed using these methods. for
+* additional background information, the interested reader should
+* investigate bugs derby-491 and 492 at:
+* http://issues.apache.org/jira/browse/derby-491 and
+* http://issues.apache.org/jira/browse/derby-492
+*
+* @param start
+*/
+protected byte  copydssdatatoend int start
+start   start   dsslengthlocation
+int length   offset   start
+byte  temp   new byte
+system arraycopy bytes start temp 0 length
+return temp
+// collection methods
+/**
+* mark the location of the length bytes for the collection so they
+* can be updated later
+*
+*/
+protected void startddm  int codepoint
+// save the location of the beginning of the collection so
+// that we can come back and fill in the length bytes
+markstack   offset
+ensurelength  4      verify space for length bytes and code point
+offset    2     move past the length bytes before writing the code point
+bytes    byte    codepoint >>> 8    0xff
+bytes    byte   codepoint   0xff
+offset    2
+/**
+* erase all writes for the current ddm and reset the
+* top
+*/
+protected void clearddm
+offset   markstack
+/**
+* clear the entire send buffer
+*
+*/
+protected void clearbuffer
+offset   0
+top   0
+dsslengthlocation   0
+correlationid   dssconstants correlation_id_unknown
+nextcorrelationid   1
+isdrdaprotocol   true
+/**
+* end the current ddm
+*
+*/
+protected void endddm
+// remove the top length location offset from the mark stack
+// calculate the length based on the marked location and end of data.
+int lengthlocation   markstack
+int length   offset   lengthlocation
+// determine if any extended length bytes are needed.	the value returned
+// from calculateextendedlengthbytecount is the number of extended length
+// bytes required. 0 indicates no exteneded length.
+int extendedlengthbytecount   calculateextendedlengthbytecount  length
+if  extendedlengthbytecount    0
+// ensure there is enough room in the buffer for the extended length bytes.
+ensurelength  extendedlengthbytecount
+// calculate the length to be placed in the extended length bytes.
+// this length does not include the 4 byte llcp.
+int extendedlength   length   4
+// shift the data to the right by the number of extended
+// length bytes needed.
+int extendedlengthlocation   lengthlocation   4
+system arraycopy  bytes
+extendedlengthlocation
+bytes
+extendedlengthlocation   extendedlengthbytecount
+extendedlength
+// write the extended length
+int shiftsize    extendedlengthbytecount  1    8
+for  int i   0  i < extendedlengthbytecount  i
+bytes
+byte    extendedlength >>> shiftsize     0xff
+shiftsize    8
+// adjust the offset to account for the shift and insert
+offset    extendedlengthbytecount
+// the two byte length field before the codepoint contains the length
+// of itself, the length of the codepoint, and the number of bytes used
+// to hold the extended length.	the 2 byte length field also has the first
+// bit on to indicate extended length bytes were used.
+length   extendedlengthbytecount   4
+length    dssconstants continuation_bit
+// write the 2 byte length field (2 bytes before codepoint).
+bytes    byte    length >>> 8    0xff
+bytes    byte   length   0xff
+/**
+* get the length of the current dss block we're working on. this is
+* used by the lmtblkprc protocol, which does its own conversational
+* blocking protocol above the layer of the drda blocking. the lmtblkprc
+* implementation (in drdaconnthread) needs to be able to truncate a
+* dss block when splitting a qrydta response.
+*
+* @return current dss block length
+*/
+protected int getdsslength
+return offset   dsslengthlocation
+/**
+* truncate the current dss. before making this call, you should ensure
+* that you have copied the data to be truncated somewhere else, by
+* calling copydssdatatoend
+*
+* @param value dss length
+*/
+protected void truncatedss int value
+offset   dsslengthlocation   value
+// write routines
+/**
+* write byte
+*
+* @param 	value	byte to be written
+*/
+protected void writebyte  int value
+if  sanitymanager debug
+if  value > 255
+sanitymanager throwassert
+value
+ensurelength  1
+bytes    byte   value   0xff
+/**
+* write network short
+*
+* @param 	value	value to be written
+*/
+protected void writenetworkshort  int value
+ensurelength  2
+bytes    byte    value >>> 8    0xff
+bytes    byte   value   0xff
+offset    2
+/**
+* write network int
+*
+* @param 	value	value to be written
+*/
+protected void writenetworkint  int value
+ensurelength  4
+bytes    byte    value >>> 24    0xff
+bytes    byte    value >>> 16    0xff
+bytes    byte    value >>> 8    0xff
+bytes    byte   value   0xff
+offset    4
+/**
+* write byte array
+*
+* @param 	buf	byte array to be written
+* @param	length  - length to write
+*/
+protected void writebytes  byte buf  int length
+writebytes buf  0 length
+/**
+* write byte array
+*
+* @param 	buf	byte array to be written
+* @param	start  - starting position
+* @param	length  - length to write
+*/
+protected void writebytes  byte buf  int start  int length
+if  sanitymanager debug
+if  buf    null    length > 0
+sanitymanager throwassert
+if  length   start   1 > buf length
+sanitymanager throwassert
+ensurelength  length
+system arraycopy buf start bytes offset length
+offset    length
+/**
+* write byte array
+*
+* @param 	buf	byte array to be written
+**/
+protected void writebytes  byte buf
+writebytes buf buf length
+protected void writeldbytes byte buf
+writeldbytes buf  0
+protected void writeldbytes byte buf  int index
+int length   buf length
+int writelen    buf length
+writeshort writelen
+writebytes buf 0 writelen
+/**
+* write code point and 4 bytes
+*
+* @param 	codepoint - code point to write
+* @param	value  - value to write after code point
+*/
+void writecodepoint4bytes  int codepoint  int value
+ensurelength  4
+bytes    byte    codepoint >>> 8    0xff
+bytes    byte   codepoint   0xff
+bytes    byte    value >>> 8    0xff
+bytes    byte   value   0xff
+offset    4
+/**
+* write scalar 1 byte object includes length, codepoint and value
+*
+* @param 	codepoint - code point to write
+* @param	value  - value to write after code point
+*/
+void writescalar1byte  int codepoint  int value
+ensurelength  5
+bytes   0x00
+bytes   0x05
+bytes    byte    codepoint >>> 8    0xff
+bytes    byte   codepoint   0xff
+bytes    byte   value   0xff
+offset    5
+/**
+* write scalar 2 byte object includes length, codepoint and value
+*
+* @param 	codepoint - code point to write
+* @param	value  - value to write after code point
+*/
+protected void writescalar2bytes  int codepoint  int value
+ensurelength  6
+bytes   0x00
+bytes   0x06
+bytes    byte    codepoint >>> 8    0xff
+bytes    byte   codepoint   0xff
+bytes    byte    value >>> 8    0xff
+bytes    byte   value   0xff
+offset    6
+protected void writescalar2bytes   int value
+ensurelength  2
+bytes    byte    value >>> 8    0xff
+bytes    byte   value   0xff
+offset    2
+/**
+* write length and codepoint
+*
+* @param 	length - length of object
+* @param 	codepoint - code point to write
+*/
+protected void startddm  int length  int codepoint
+ensurelength  4
+bytes    byte    length >>> 8    0xff
+bytes    byte   length   0xff
+bytes    byte    codepoint >>> 8    0xff
+bytes    byte   codepoint   0xff
+offset    4
+/**
+* write scalar byte array object includes length, codepoint and value
+*
+* @param 	codepoint - code point to write
+* @param	buf  - value to write after code point
+* @param	length - number of bytes to write
+*/
+protected void writescalarbytes  int codepoint  byte buf  int length
+if  sanitymanager debug
+if  buf    null    length > 0
+sanitymanager throwassert
+if  length > buf length
+sanitymanager throwassert
+ensurelength  length   4
+bytes    byte     length 4  >>> 8    0xff
+bytes    byte    length 4    0xff
+bytes    byte    codepoint >>> 8    0xff
+bytes    byte   codepoint   0xff
+system arraycopy buf 0 bytes offset   4  length
+offset    length   4
+protected void writescalarstream  boolean chainedwithsamecorrelator
+int codepoint
+extdtainputstream in
+boolean writenullbyte
+throws drdaprotocolexception
+// stream equivalent of "begindss"...
+int sparedsslength   prepscalarstream  chainedwithsamecorrelator
+codepoint
+writenullbyte
+// write the data
+int bytesread   0
+int totalbytesread   0
+try
+outputstream out
+placelayerbstreamingbuffer  agent getoutputstream
+boolean islastsegment   false
+while   islastsegment
+int sparebufferlength   bytes length   offset
+if  sanitymanager debug
+if  propertyutil getsystemproperty       null
+throw new ioexception
+bytesread   in read bytes
+offset
+math min sparedsslength
+sparebufferlength
+totalbytesread    bytesread
+offset    bytesread
+sparedsslength    bytesread
+sparebufferlength    bytesread
+islastsegment   peekstream in  < 0
+if islastsegment
+sparedsslength    0
+flushscalarstreamsegment  islastsegment
+out
+if    islastsegment
+sparedsslength   dssconstants max_dss_length   2
+out flush
+catch ioexception e
+agent markcommunicationsfailure
+e getmessage
+/**
+* begins a dss stream (for writing lob data).
+*/
+private void begindss  boolean chainedtonextstructure
+int dsstype
+begindss dsstype  false  	   false  > don't ensure length
+// always turn on continuation flags... this is helpful for lobs...
+// these bytes will get rest if dss lengths are finalized.
+bytes    byte  0xff
+bytes    byte  0xff
+// set whether or not this dss should be chained to
+// the next one.  if it's chained, it has to be chained
+// with same id (that's the nature of extdta chaining).
+if  chainedtonextstructure
+dsstype    dssconstants gdschain_same_id
+bytes    byte   dsstype   0xff
+/**
+* prepscalarstream does the following prep for writing stream data:
+* 1.  flushes an existing dss segment, if necessary
+* 2.  determines if extended length bytes are needed
+* 3.  creates a new dss/ddm header and a null byte indicator, if applicable
+*
+* if value of length was less than 0, this method processes streaming as layer b streaming.
+* cf. page 315 of specification of drda, version 3, volume 3
+*
+*/
+private int prepscalarstream  boolean chainedwithsamecorrelator
+int codepoint
+boolean writenullbyte  throws drdaprotocolexception
+ensurelength  default_buffer_size   offset
+final int nullindicatorsize   writenullbyte ? 1 0
+// flush the existing dss segment ,
+// if this stream will not fit in the send buffer or
+// length of this stream is unknown.
+// here, 10 stands for sum of headers of layer a and b.
+try
+// the existing dss segment was finalized by enddss; all
+// we have to do is send it across the wire.
+sendbytes agent getoutputstream
+catch  java io ioexception e
+agent markcommunicationsfailure
+e getmessage
+// buildstreamdss should not call ensure length.
+begindss chainedwithsamecorrelator  dssconstants gdsfmt_objdss
+writelengthcodepoint 0x8004 codepoint
+// write the null byte, if necessary
+if  writenullbyte
+writebyte 0x0
+//here, 6 stands for header of layer a and
+//4 stands for header of layer b.
+return dssconstants max_dss_length   6   4   nullindicatorsize
+// method to determine if any data is in the request.
+// this indicates there is a dss object already in the buffer.
+protected boolean doesrequestcontaindata
+return offset    0
+// writes out a scalar stream dss segment, along with dss continuation
+// headers if necessary.
+private void flushscalarstreamsegment   boolean lastsegment
+outputstream out
+throws drdaprotocolexception
+// either at end of data, end of dss segment, or both.
+if    lastsegment
+// 32k segment filled and not at end of data.
+try
+// mark current dss as continued, set its chaining state,
+// then send the data across.
+markdssascontinued true   	   true  > for lobs
+sendbytes  out
+false
+catch  java io ioexception ioe
+agent markcommunicationsfailure
+ioe getmessage
+// prepare a dss continuation header for next dss.
+dsslengthlocation   offset
+bytes    byte   0xff
+bytes    byte   0xff
+iscontinuationdss   true
+else
+// we're done writing the data, so end the dss.
+enddss
+private void writeextendedlengthbytes  int extendedlengthbytecount  long length
+int shiftsize    extendedlengthbytecount  1    8
+for  int i   0  i < extendedlengthbytecount  i
+bytes    byte    length >>> shiftsize    0xff
+shiftsize    8
+offset    extendedlengthbytecount
+// insert a 4 byte length/codepoint pair into the buffer.
+// total of 4 bytes inserted in buffer.
+// note: the length value inserted in the buffer is the same as the value
+// passed in as an argument (this value is not incremented by 4 before being
+// inserted).
+void writelengthcodepoint  int length  int codepoint
+ensurelength  4
+bytes    byte    length >>> 8    0xff
+bytes    byte   length   0xff
+bytes    byte    codepoint >>> 8    0xff
+bytes    byte   codepoint   0xff
+offset   4
+/**
+* write scalar object header includes length and codepoint
+*
+* @param 	codepoint - code point to write
+* @param	datalength - length of object data
+*/
+protected void writescalarheader  int codepoint  int datalength
+ensurelength  datalength   4
+bytes    byte     datalength 4  >>> 8    0xff
+bytes    byte    datalength 4    0xff
+bytes    byte    codepoint >>> 8    0xff
+bytes    byte   codepoint   0xff
+offset    4
+/**
+* write scalar string object includes length, codepoint and value
+* the string is converted into the appropriate codeset (ebcdic)
+*
+* @param 	codepoint - code point to write
+* @param	string - string to be written
+*/
+void writescalarstring  int codepoint  string string
+int stringlength   string length
+ensurelength   stringlength   2     4
+bytes    byte     stringlength 4  >>> 8    0xff
+bytes    byte    stringlength 4    0xff
+bytes    byte    codepoint >>> 8    0xff
+bytes    byte   codepoint   0xff
+offset   ccsidmanager convertfromucs2  string  bytes  offset   4
+/**
+* write padded scalar string object includes length, codepoint and value
+* the string is converted into the appropriate codeset (ebcdic)
+*
+* @param 	codepoint - code point to write
+* @param	string - string to be written
+* @param 	paddedlength - length to pad string to
+*/
+void writescalarpaddedstring  int codepoint  string string  int paddedlength
+int stringlength   string length
+int filllength   paddedlength   stringlength
+ensurelength  paddedlength   4
+bytes    byte     paddedlength 4  >>> 8    0xff
+bytes    byte    paddedlength 4    0xff
+bytes    byte    codepoint >>> 8    0xff
+bytes    byte   codepoint   0xff
+offset   ccsidmanager convertfromucs2  string  bytes  offset   4
+arrays fill bytes offset  offset   filllength ccsidmanager space
+offset    filllength
+/**
+* write padded scalar string object value
+* the string is converted into the appropriate codeset (ebcdic)
+*
+* @param	string - string to be written
+* @param 	paddedlength - length to pad string to
+*/
+protected void writescalarpaddedstring  string string  int paddedlength
+int stringlength   string length
+int filllength   paddedlength  stringlength
+ensurelength  paddedlength
+offset   ccsidmanager convertfromucs2  string  bytes  offset
+arrays fill bytes offset  offset   filllength ccsidmanager space
+offset    filllength
+/**
+* write padded scalar <code>drdastring</code> object value. the
+* string is converted into the appropriate codeset.
+*
+* @param drdastring string to be written
+* @param paddedlength length to pad string to
+*/
+protected void writescalarpaddedstring  drdastring drdastring  int paddedlength
+int stringlength   drdastring length
+int filllength   paddedlength   stringlength
+ensurelength paddedlength
+system arraycopy drdastring getbytes    0  bytes  offset  stringlength
+offset    stringlength
+arrays fill bytes  offset  offset   filllength  ccsidmanager space
+offset    filllength
+/**
+* write padded scalar byte array object includes length, codepoint and value
+*
+* @param 	codepoint - code point to write
+* @param	buf - byte array to be written
+* @param 	paddedlength - length to pad string to
+* @param	padbyte - byte to be used for padding
+*/
+protected void writescalarpaddedbytes  int codepoint  byte buf  int paddedlength  byte padbyte
+int buflength   buf length
+ensurelength  paddedlength   4
+bytes    byte     paddedlength 4  >>> 8    0xff
+bytes    byte    paddedlength 4    0xff
+bytes    byte    codepoint >>> 8    0xff
+bytes    byte   codepoint   0xff
+offset    4
+system arraycopy buf 0 bytes offset buflength
+offset    buflength
+int filllength   paddedlength   buflength
+arrays fill bytes offset offset   filllength padbyte
+offset    filllength
+/**
+* write padded scalar byte array object  value
+*
+* @param	buf - byte array to be written
+* @param 	paddedlength - length to pad string to
+* @param	padbyte - byte to be used for padding
+*/
+protected void writescalarpaddedbytes  byte buf  int paddedlength  byte padbyte
+int buflength   buf length
+int filllength   paddedlength   buflength
+ensurelength  paddedlength
+system arraycopy buf 0 bytes offset buflength
+offset   buflength
+arrays fill bytes offset offset   filllength padbyte
+offset    filllength
+/**
+* write scalar byte array object includes length, codepoint and value
+*
+* @param 	codepoint - code point to write
+* @param	buf - byte array to be written
+*/
+protected void writescalarbytes  int codepoint  byte buf
+int buflength   buf length
+ensurelength  buflength   4
+bytes    byte     buflength 4  >>> 8    0xff
+bytes    byte    buflength 4    0xff
+bytes    byte    codepoint >>> 8    0xff
+bytes    byte   codepoint   0xff
+system arraycopy buf 0 bytes offset   4 buflength
+offset    buflength   4
+/**
+* write scalar byte array object includes length, codepoint and value
+*
+* @param 	codepoint - code point to write
+* @param	buf - byte array to be written
+* @param	start - starting point
+* @param 	length - length to write
+*/
+protected void writescalarbytes  int codepoint  byte buf  int start  int length
+if  sanitymanager debug
+if  buf    null    length > start
+sanitymanager throwassert
+if  length   start > buf length
+sanitymanager throwassert
+int numbytes   length   start
+ensurelength  numbytes   4
+bytes    byte     numbytes 4  >>> 8    0xff
+bytes    byte    numbytes 4    0xff
+bytes    byte    codepoint >>> 8    0xff
+bytes    byte   codepoint   0xff
+offset    4
+system arraycopy buf start bytes offset numbytes
+offset    numbytes
+// the following methods write data in the platform format
+// the platform format was indicated during connection time as asc since
+// jcc doesn't read jvm platform (yet)
+/**
+* write platform short
+*
+* @param 	v	value to be written
+*/
+protected void writeshort  int v
+writenetworkshort v
+/**
+* write boolean as short
+* @param b boolean value true = 1 false = 0
+*
+*/
+protected void writeshort boolean b
+writenetworkshort b ? 1   0
+/**
+* write platform int
+*
+* @param 	v	value to be written
+*/
+protected void writeint  int v
+writenetworkint v
+/**
+* write platform long
+*
+* @param 	v	value to be written
+*/
+protected void writelong  long v
+ensurelength  8
+bytes  	 byte    v >>> 56    0xff
+bytes  	 byte    v >>> 48    0xff
+bytes  	 byte    v >>> 40    0xff
+bytes  	 byte    v >>> 32    0xff
+bytes  	 byte    v >>> 24    0xff
+bytes  	 byte    v >>> 16    0xff
+bytes  	 byte    v >>>  8    0xff
+bytes  	 byte    v >>>  0    0xff
+offset    8
+/**
+* write platform float
+*
+* @param 	v	value to be written
+*/
+protected void writefloat  float v
+writeint  float floattointbits  v
+/**
+* write platform double
+*
+* @param 	v	value to be written
+*/
+protected void writedouble  double v
+writelong  double doubletolongbits  v
+/**
+* write big decimal to buffer
+*
+* @param v value to write
+* @param precision precison of decimal or numeric type
+* @param scale declared scale
+* @exception sqlexception thrown if number of digits > 31
+*/
+protected void writebigdecimal  java math bigdecimal v  int precision  int scale
+throws sqlexception
+int length   precision   2   1
+ensurelength  offset   length
+bigdecimaltopackeddecimalbytes  v precision  scale
+offset    length
+/**
+* write platform boolean
+*
+* @param 	v	value to be written
+*/
+protected void writeboolean  boolean v
+ensurelength  1
+bytes    byte    v ? 1   0    0xff
+/**
+* write length delimited string
+*
+* @param s value to be written with integer
+*
+* @exception drdaprotocolexception
+*/
+protected void writeldstring string s  throws drdaprotocolexception
+writeldstring s 0
+/**
+* write length delimited string
+*
+* @param s              value to be written with integer
+* @param index          column index to put in warning
+* @exception drdaprotocolexception
+*/
+protected void writeldstring string s  int index  throws drdaprotocolexception
+try
+byte  byteval   s getbytes networkservercontrolimpl default_encoding
+int origlen   byteval length
+boolean multibytetrunc   false
+int writelen
+java lang math min fdocaconstants longvarchar_max_len
+origlen
+/*
+need to make sure we truncate on character boundaries.
+we are assuming
+http://www.sun.com/developers/gadc/technicalpublications/articles/utf8.html
+to find the beginning of a multibyte character:
+1) does the current byte start with the bit pattern 10xxxxxx?
+2) if yes, move left and go to step #1.
+3) finished
+we assume that networkservercontrolimpl.default_encoding remains utf-8
+*/
+if  sanitymanager debug
+if    networkservercontrolimpl default_encoding equals
+sanitymanager throwassert     networkservercontrolimpl default_encoding
+if  writelen    origlen
+// first position on the first byte of the multibyte char
+while   byteval   0xc0     0x80
+multibytetrunc   true
+writelen
+// then subtract one more to get to the end of the
+// previous character
+if  multibytetrunc    true
+writelen   writelen  1
+writeshort writelen
+writebytes byteval writelen
+catch  exception e
+//this should never happen
+agent agenterror     networkservercontrolimpl default_encoding
+/**
+* write string with default encoding
+*
+* @param s value to be written
+*
+* @exception drdaprotocolexception
+*/
+protected void writestring string s  throws drdaprotocolexception
+try
+writebytes s getbytes networkservercontrolimpl default_encoding
+catch  exception e
+//this should never happen
+agent agenterror     networkservercontrolimpl default_encoding
+/**
+* write string with default encoding and specified length
+*
+* @param s value to be written
+* @param length number of bytes to be written
+*
+* @exception drdaprotocolexception
+*/
+protected void writestring string s  int length  throws drdaprotocolexception
+byte bs   null
+try
+bs   s getbytes networkservercontrolimpl default_encoding
+catch  exception e
+//this should never happen
+agent agenterror     networkservercontrolimpl default_encoding
+int len   bs length
+if  len >  length
+writebytes bs  length
+else
+writebytes bs
+padbytes networkservercontrolimpl space_char  length len
+/**
+* write pad bytes using spacechar
+*
+* @param   val	value to be written
+* @param	length		length to be written
+*/
+protected void padbytes  byte val  int length
+arrays fill bytes offset  offset   length val
+offset    length
+/**
+* flush buffer to outputstream
+*
+*
+* @exception ioexception
+*/
+protected void flush    throws java io ioexception
+flush agent getoutputstream
+/**
+* flush buffer to specified stream
+*
+* @param socketoutputstream
+*
+* @exception ioexception
+*/
+protected void flush outputstream socketoutputstream
+throws java io ioexception
+try
+socketoutputstream write  bytes  0  offset
+socketoutputstream flush
+finally
+if   dsstrace    null     dsstrace iscombuffertraceon
+dsstrace writecombufferdata  bytes
+0
+offset
+dsstrace type_trace_send
+5
+reset dsstrace
+// private methods
+/**
+* write dss header
+* dss header format is
+* 	2 bytes	- length
+*	1 byte	- 'd0'	- indicates ddm data
+* 	1 byte	- dss format
+*		|---|---------|----------|
+*		| 0	|	flags |	type     |
+*		|---|---------|----------|
+*		| 0 | 1	2	3 | 4 5 6 7	 |
+*		|---|---------|----------|
+*		bit 0 - '0'
+*		bit 1 - '0' - unchained, '1' - chained
+*		bit 2 - '0'	- do not continue on error, '1' - continue on error
+*		bit 3 - '0' - next dss has different correlator, '1' - next dss has
+*						same correlator
+*		type - 1 - request dss
+*			 - 2 - reply dss
+*			 - 3 - object dss
+*			 - 4 - communications dss
+*			 - 5 - request dss where no reply is expected
+*/
+private void begindss  int dsstype  boolean ensurelen
+// save length position, the length will be written at the end
+dsslengthlocation   offset
+// should this really only be for non-stream dsses?
+if  ensurelen
+ensurelength 6
+// skip past length; we'll come back and set it later.
+offset    2
+// write gds info
+bytes    byte  0xd0
+// write dss type, and default chain bit to be
+// dssconstants.dsschain_same_id.  this default
+// will be overridden by calls to "finalizechain()"
+// and/or calls to "begindss(boolean, int)" for
+// writing lob data.
+bytes    byte  dsstype
+bytes    dssconstants dsschain_same_id
+// save correlationid for use in error messages while processing
+// this dss
+correlationid   getcorrelationid
+// write the reply correlation id
+bytes    byte    correlationid >>> 8    0xff
+bytes    byte   correlationid   0xff
+offset    4
+/**
+* finish a dss layer a object.
+* the length of dss object will be calculated based on the difference between the
+* start of the dss, saved on the begindss call, and the current
+* offset into the buffer which marks the end of the data.	in the event
+* the length requires the use of continuation dss headers, one for each 32k
+* chunk of data, the data will be shifted and the continuation headers
+* will be inserted with the correct values as needed.
+*/
+private void finalizedsslength
+// calculate the total size of the dss and the number of bytes which would
+// require continuation dss headers.	the total length already includes the
+// the 6 byte dss header located at the beginning of the dss.	it does not
+// include the length of any continuation headers.
+int totalsize   offset   dsslengthlocation
+int bytesrequiringcontdssheader   totalsize   dssconstants max_dss_length
+// determine if continuation headers are needed
+if  bytesrequiringcontdssheader > 0
+// the continuation headers are needed, so calculate how many.
+// after the first 32767 worth of data, a continuation header is
+// needed for every 32765 bytes (32765 bytes of data + 2 bytes of
+// continuation header = 32767 dss max size).
+int contdssheadercount   bytesrequiringcontdssheader   32765
+if  bytesrequiringcontdssheader % 32765    0
+contdssheadercount
+// right now the code will shift to the right.	in the future we may want
+// to try something fancier to help reduce the copying (maybe keep
+// space in the beginning of the buffer??).
+// the offset points to the next available offset in the buffer to place
+// a piece of data, so the last databyte is at offset -1.
+// various bytes will need to be shifted by different amounts
+// depending on how many dss headers to insert so the amount to shift
+// will be calculated and adjusted as needed.	ensure there is enough room
+// for all the conutinuation headers and adjust the offset to point to the
+// new end of the data.
+int databyte   offset   1
+int shiftsize   contdssheadercount   2
+ensurelength  shiftsize
+offset    shiftsize
+// notes on the behavior of the layer b segmenting loop below:
+//
+// we start with the right most chunk. for a 3-segment object we'd
+// shift 2 segments: shift the first (rightmost) one 4 bytes and
+// the second one 2. note that by 'first' we mean 'first time
+// through the loop', but that is actually the last segment
+// of data since we are moving right-to-left. for an object
+// of k segments we will pass through this loop k-1 times.
+// the 0th (leftmost) segment is not shifted, as it is
+// already in the right place. when we are done, we will
+// have made room in each segment for an additional
+// 2 bytes for the continuation header. thus, each
+// segment k is shifted k*2 bytes to the right.
+//
+// each time through the loop, "databyte" points to the
+// last byte in the segment; "datatoshift" is the amount of
+// data that we need to shift, and "shiftsize" is the
+// distance that we need to shift it. since databyte points
+// at the last byte, not one byte beyond it (as with the
+// "offset" variable used elsewhere in ddmwriter), the start
+// of the segement is actually at (databyte-datatoshift+1).
+//
+// after we have shifted the segment, we move back to the
+// start of the segment and set the value of the 2-byte dss
+// continuation header, which needs to hold the length of
+// this segment's data, together with the continuation flag
+// if this is not the rightmost (passone) segment.
+//
+// in general, each segment except the rightmost will contain
+// 32765 bytes of data, plus the 2-byte header, and its
+// continuation flag will be set, so the header value will
+// be 0xffff. the rightmost segment will not have the
+// continuation flag set, so its value may be anything from
+// 0x0001 to 0x7fff, depending on the amount of data in that
+// segment.
+//
+// note that the 0th (leftmost) segment also has a 2-byte
+// dss header, which needs to have its continuation flag set.
+// this is done by resetting the "totalsize" variable below,
+// at which point that variable no longer holds the total size
+// of the object, but rather just the length of segment 0. the
+// total size of the object was written using extended length
+// bytes by the endddm() method earlier.
+//
+// additional information about this routine is available in the
+// bug notes for derby-125:
+// http://issues.apache.org/jira/browse/derby-125
+// mark passone to help with calculating the length of the final (first or
+// rightmost) continuation header.
+boolean passone   true
+do
+// calculate chunk of data to shift
+int datatoshift   bytesrequiringcontdssheader % 32765
+if  datatoshift    0
+datatoshift   32765
+int startofcopydata   databyte   datatoshift   1
+system arraycopy bytes startofcopydata  bytes
+startofcopydata   shiftsize  datatoshift
+databyte    datatoshift
+// calculate the value the value of the 2 byte continuation dss
+// header which includes the length of itself.  on the first pass,
+// if the length is 32767
+// we do not want to set the continuation dss header flag.
+int twobytecontdssheader   datatoshift   2
+if  passone
+passone   false
+else
+if  twobytecontdssheader    dssconstants max_dss_length
+twobytecontdssheader    twobytecontdssheader
+dssconstants continuation_bit
+// insert the header's length bytes
+bytes    byte
+twobytecontdssheader >>> 8    0xff
+bytes    byte
+twobytecontdssheader   0xff
+// adjust the bytesrequiringcontdssheader and the amount to shift for
+// data in upstream headers.
+bytesrequiringcontdssheader    datatoshift
+shiftsize    2
+// shift and insert another header for more data.
+while  bytesrequiringcontdssheader > 0
+// set the continuation dss header flag on for the first header
+totalsize    dssconstants max_dss_length
+dssconstants continuation_bit
+// insert the length bytes in the 6 byte dss header.
+bytes    byte    totalsize >>> 8    0xff
+bytes    byte   totalsize   0xff
+protected void writeextendedlength long size
+int numbytes   calculateextendedlengthbytecount size
+if  size > 0
+writeint 0x8000   numbytes
+else
+writeint numbytes
+/**
+* calculate extended length byte count which follows the dss header
+* for extended ddm.
+*
+* @param ddmsize - size of ddm command
+* @return minimum number of extended length bytes needed. 0 indicates no
+* 	extended length needed.
+*/
+private int calculateextendedlengthbytecount  long ddmsize
+if  ddmsize <  0x7fff
+return 0
+// jcc does not support 2 at this time, so we always send
+// at least 4
+//		else if (ddmsize <= 0xffff)
+//	return 2;
+else if  ddmsize <  0xffffffffl
+return 4
+else if  ddmsize <  0xffffffffffffl
+return 6
+else if  ddmsize <  0x7fffffffffffffffl
+return 8
+else
+// shouldn't happen
+// xxx - add sanity debug stuff here
+return 0
+/**
+* ensure that there is space in the buffer
+*
+* @param length space required
+*/
+private void ensurelength  int length
+length    offset
+if  length > bytes length
+if  sanitymanager debug
+agent trace
+byte newbytes   new byte
+system arraycopy  bytes  0  newbytes  0  offset
+bytes   newbytes
+/**
+* write a java <code>java.math.bigdecimal</code> to packed decimal bytes.
+*
+* @param b bigdecimal to write
+* @param precision precision of decimal or numeric type
+* @return length written.
+*
+* @exception sqlexception thrown if # digits > 31
+*/
+private int bigdecimaltopackeddecimalbytes  java math bigdecimal b
+int precision  int scale
+throws sqlexception
+int declaredprecision   precision
+int declaredscale   scale
+// packed decimal may only be up to 31 digits.
+if  declaredprecision > 31     this is a bugcheck only
+clearddm
+throw new java sql sqlexception
+// get absolute unscaled value of the bigdecimal as a string.
+string unscaledstr   b unscaledvalue   abs   tostring
+// get precision of the bigdecimal.
+int bigprecision   unscaledstr length
+if  bigprecision > 31
+clearddm
+throw new sqlexception   "
+b tostring
+is not valid because its value is out of range "
+405
+int bigscale   b scale
+int bigwholeintegerlength   bigprecision   bigscale
+if    bigwholeintegerlength > 0       unscaledstr equals
+// if whole integer part exists, check if overflow.
+int declaredwholeintegerlength   declaredprecision   declaredscale
+if  bigwholeintegerlength > declaredwholeintegerlength
+clearddm
+throw new sqlexception   "
+b tostring
+"
+413
+// convert the unscaled value to a packed decimal bytes.
+// get unicode '0' value.
+int zerobase
+// start index in target packed decimal.
+int packedindex   declaredprecision 1
+// start index in source big decimal.
+int bigindex
+if  bigscale >  declaredscale
+// if target scale is less than source scale,
+// discard excessive fraction.
+// set start index in source big decimal to ignore excessive fraction.
+bigindex   bigprecision 1  bigscale declaredscale
+if  bigindex < 0
+// all digits are discarded, so only process the sign nybble.
+bytes
+byte     b signum  > 0 ?12 13       sign nybble
+else
+// process the last nybble together with the sign nybble.
+bytes
+byte       unscaledstr charat bigindex  zerobase  << 4        last nybble
+b signum  > 0 ?12 13         sign nybble
+packedindex  2
+bigindex  2
+else
+// if target scale is greater than source scale,
+// pad the fraction with zero.
+// set start index in source big decimal to pad fraction with zero.
+bigindex   declaredscale bigscale 1
+// process the sign nybble.
+bytes
+byte     b signum  > 0 ?12 13       sign nybble
+for  packedindex  2  bigindex  2  bigindex> 0  packedindex  2  bigindex  2
+bytes    byte  0
+if  bigindex     1
+bytes
+byte     unscaledstr charat bigprecision 1  zerobase  << 4       high nybble
+packedindex  2
+bigindex   bigprecision 3
+else
+bigindex   bigprecision 2
+// process the rest.
+for    bigindex> 0  packedindex  2  bigindex  2
+bytes
+byte       unscaledstr charat bigindex  zerobase  << 4        high nybble
+unscaledstr charat bigindex 1  zerobase         low nybble
+// process the first nybble when there is one left.
+if  bigindex     1
+bytes
+byte   unscaledstr charat 0    zerobase
+packedindex  2
+// pad zero in front of the big decimal if necessary.
+for    packedindex>  1  packedindex  2
+bytes    byte  0
+return declaredprecision 2   1
+/***
+* prepend zeros to numeric string
+*
+* @param s string
+* @param precision - length of padded string
+*
+* @return zero padded string
+*/
+public static string zeropadstring string s  int precision
+if  s    null
+return s
+int slen   s length
+if  precision    slen
+return s
+else if  precision > slen
+char ca    new char
+arrays fill ca 0 precision   slen
+return new string ca    s
+else
+// shouldn't happen but just in case
+// truncate
+return s substring 0 precision
+private void sendbytes  java io outputstream socketoutputstream
+throws java io ioexception
+sendbytes socketoutputstream
+true
+private void sendbytes  java io outputstream socketoutputstream
+boolean flashstream
+throws java io ioexception
+resetchainstate
+try
+socketoutputstream write  bytes  0  offset
+if flashstream
+socketoutputstream flush
+finally
+if   dsstrace    null     dsstrace iscombuffertraceon
+dsstrace writecombufferdata  bytes
+0
+offset
+dsstrace type_trace_send
+5
+clearbuffer
+protected string todebugstring string indent
+string s   indent
+int byteslen   0
+if   bytes    null
+byteslen   bytes length
+s    indent       bytes length
+return s
+/**
+* reset any chaining state that needs to be reset
+* at time of the send
+*/
+protected void resetchainstate
+prevhdrlocation    1
+/**
+* looks at chaining info for previous dss written, and use
+* that to figure out what the correlation id for the current
+* dss should be.  return that correlation id.
+*/
+private int getcorrelationid
+int cid
+if  previouscorrid    dssconstants correlation_id_unknown
+if  previouschainbyte    dssconstants dsschain_same_id
+// then we have to use the last correlation id we sent.
+cid   previouscorrid
+else
+// get correlation id as normal.
+cid   nextcorrelationid
+else
+// must be the case that this is the first dss we're
+// writing for this connection (because we haven't
+// called "enddss" yet).  so, get the corr id as
+// normal.
+cid   nextcorrelationid
+return cid
+/**
+* finalize the current dss chain and send it if
+* needed.
+*
+* updates the chaining state of the most recently-written-
+* to-buffer dss to correspond to the most recently-read-
+* from-client request.  if that chaining state indicates
+* we've reached the end of a chain, then we go ahead
+* and send the buffer across the wire.
+* @param socketoutputstream output stream to which we're flushing.
+*/
+protected void finalizechain byte currchainbyte
+outputstream socketoutputstream  throws drdaprotocolexception
+// go back to previous dss and override the default
+// chain state (with_same_id) with whatever the last
+// request dictates.
+if  prevhdrlocation     1
+// note: == -1 => the previous dss was already sent; this
+// should only happen in cases where the buffer filled up
+// and we had to send it (which means we were probably
+// writing extdta).  in such cases, proper chaining
+// should already have been handled @ time of send.
+bytes    0x0f 	   zero out old chain value
+bytes    currchainbyte
+// previouschainbyte needs to match what we just did.
+previouschainbyte   currchainbyte
+if  currchainbyte    dssconstants dss_nochain
+// then we're still inside a chain, so don't send.
+return
+// else, we just ended the chain, so send it across.
+if   sanitymanager debug      agent    null
+agent trace
+resetchainstate
+if  doesrequestcontaindata
+try
+flush socketoutputstream
+catch  java io ioexception e
+agent markcommunicationsfailure
+e getmessage
+/**
+* takes note of the location of the most recently completed
+* dss in the buffer, and then returns the current offset.
+* this method is used in conjunction with "cleardssesbacktomark"
+* to allow for drdaconnthread to "back-out" dsses in the
+* event of errors.
+*/
+protected int markdssclearpoint
+lastdssbeforemark   prevhdrlocation
+return offset
+/**
+* does a logical "clear" of everything written to the buffer after
+* the received mark.  it's assumed that this method will be used
+* in error cases when we've started writing one or more dsses,
+* but then hit an error and need to back out.  after backing out,
+* we'll always need to write _something_ back to the client to
+* indicate an error (typically, we just write an sqlcard) but what
+* exactly gets written is handled in drdaconnthread.  here, we
+* just do the necessary prep so that whatever comes next will
+* succeed.
+*/
+protected void cleardssesbacktomark int mark
+// logical clear.
+offset   mark
+// because we've just cleared out the most recently-
+// written dsses, we have to make sure the next thing
+// we write will have the correct correlation id.  we
+// do this by setting the value of 'nextcorrelationid'
+// based on the chaining byte from the last remaining
+// dss (where "remaining" means that it still exists
+// in the buffer after the clear).
+if  lastdssbeforemark     1
+// we cleared out the entire buffer; reset corr id.
+nextcorrelationid   1
+else
+// last remaining dss had chaining, so we set "nextcorrelationid"
+// to be 1 greater than whatever the last remaining dss had as
+// its correlation id.
+nextcorrelationid   1    int
+bytes   0xff  << 8
+bytes   0xff
+private static int peekstream inputstream in  throws ioexception
+in mark 1
+try
+return in read
+finally
+in reset
+private static int getlayerbstreamingbuffersize
+return propertyutil getsystemint  property drda_prop_streamoutbuffersize   0
+private static outputstream placelayerbstreamingbuffer outputstream original
+int size   getlayerbstreamingbuffersize
+if size < 1
+return original
+else
+return new bufferedoutputstream  original  size

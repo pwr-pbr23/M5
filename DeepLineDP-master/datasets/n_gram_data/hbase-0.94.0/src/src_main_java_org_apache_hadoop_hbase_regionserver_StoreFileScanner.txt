@@ -1,0 +1,285 @@
+/**
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver
+import java io ioexception
+import java util arraylist
+import java util collection
+import java util list
+import java util sortedset
+import java util concurrent atomic atomiclong
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase client scan
+import org apache hadoop hbase io hfile hfilescanner
+import org apache hadoop hbase regionserver storefile reader
+/**
+* keyvaluescanner adaptor over the reader.  it also provides hooks into
+* bloom filter things.
+*/
+class storefilescanner implements keyvaluescanner
+static final log log   logfactory getlog store class
+// the reader it comes from:
+private final storefile reader reader
+private final hfilescanner hfs
+private keyvalue cur   null
+private boolean realseekdone
+private boolean delayedreseek
+private keyvalue delayedseekkv
+private boolean enforcemvcc   false
+//the variable, realseekdone, may cheat on store file scanner for the
+// multi-column bloom-filter optimization.
+// so this flag shows whether this storefilescanner could do a reseek.
+private boolean isreseekable   false
+private static final atomiclong seekcount   new atomiclong
+private scanquerymatcher matcher
+/**
+* implements a {@link keyvaluescanner} on top of the specified {@link hfilescanner}
+* @param hfs hfile scanner
+*/
+public storefilescanner storefile reader reader  hfilescanner hfs  boolean usemvcc
+this reader   reader
+this hfs   hfs
+this enforcemvcc   usemvcc
+/**
+* return an array of scanners corresponding to the given
+* set of store files.
+*/
+public static list<storefilescanner> getscannersforstorefiles
+collection<storefile> files
+boolean cacheblocks
+boolean usepread  throws ioexception
+return getscannersforstorefiles files  cacheblocks
+usepread  false
+/**
+* return an array of scanners corresponding to the given set of store files.
+*/
+public static list<storefilescanner> getscannersforstorefiles
+collection<storefile> files  boolean cacheblocks  boolean usepread
+boolean iscompaction  throws ioexception
+return getscannersforstorefiles files  cacheblocks  usepread  iscompaction
+
+/**
+* return an array of scanners corresponding to the given set of store files,
+* and set the scanquerymatcher for each store file scanner for further
+* optimization
+*/
+public static list<storefilescanner> getscannersforstorefiles
+collection<storefile> files  boolean cacheblocks  boolean usepread
+boolean iscompaction  scanquerymatcher matcher  throws ioexception
+list<storefilescanner> scanners   new arraylist<storefilescanner>
+files size
+for  storefile file   files
+storefile reader r   file createreader
+storefilescanner scanner   r getstorefilescanner cacheblocks  usepread
+iscompaction
+scanner setscanquerymatcher matcher
+scanners add scanner
+return scanners
+public string tostring
+return     hfs tostring         cur
+public keyvalue peek
+return cur
+public keyvalue next   throws ioexception
+keyvalue retkey   cur
+try
+// only seek if we aren't at the end. cur == null implies 'end'.
+if  cur    null
+hfs next
+cur   hfs getkeyvalue
+skipkvsnewerthanreadpoint
+catch ioexception e
+throw new ioexception     this  e
+return retkey
+public boolean seek keyvalue key  throws ioexception
+seekcount incrementandget
+try
+try
+if  seekatorafter hfs  key
+close
+return false
+this isreseekable   true
+cur   hfs getkeyvalue
+return skipkvsnewerthanreadpoint
+finally
+realseekdone   true
+catch  ioexception ioe
+throw new ioexception     this       key  ioe
+public boolean reseek keyvalue key  throws ioexception
+seekcount incrementandget
+try
+try
+if   reseekatorafter hfs  key
+close
+return false
+cur   hfs getkeyvalue
+return skipkvsnewerthanreadpoint
+finally
+realseekdone   true
+catch  ioexception ioe
+throw new ioexception     this       key
+ioe
+protected boolean skipkvsnewerthanreadpoint   throws ioexception
+long readpoint   multiversionconsistencycontrol getthreadreadpoint
+// we want to ignore all key-values that are newer than our current
+// readpoint
+while enforcemvcc
+cur    null
+cur getmemstorets   > readpoint
+hfs next
+cur   hfs getkeyvalue
+if  cur    null
+close
+return false
+// for the optimisation in hbase-4346, we set the kv's memstorets to
+// 0, if it is older than all the scanners' read points. it is possible
+// that a newer kv's memstorets was reset to 0. but, there is an
+// older kv which was not reset to 0 (because it was
+// not old enough during flush). make sure that we set it correctly now,
+// so that the comparision order does not change.
+if  cur getmemstorets   <  readpoint
+cur setmemstorets 0
+return true
+public void close
+// nothing to close on hfilescanner?
+cur   null
+/**
+*
+* @param s
+* @param k
+* @return
+* @throws ioexception
+*/
+public static boolean seekatorafter hfilescanner s  keyvalue k
+throws ioexception
+int result   s seekto k getbuffer    k getkeyoffset    k getkeylength
+if result < 0
+// passed kv is smaller than first kv in file, work from start of file
+return s seekto
+else if result > 0
+// passed kv is larger than current kv in file, if there is a next
+// it is the "after", if not then this scanner is done.
+return s next
+// seeked to the exact key
+return true
+static boolean reseekatorafter hfilescanner s  keyvalue k
+throws ioexception
+//this function is similar to seekatorafter function
+int result   s reseekto k getbuffer    k getkeyoffset    k getkeylength
+if  result <  0
+return true
+else
+// passed kv is larger than current kv in file, if there is a next
+// it is after, if not then this scanner is done.
+return s next
+@override
+public long getsequenceid
+return reader getsequenceid
+/**
+* pretend we have done a seek but don't do it yet, if possible. the hope is
+* that we find requested columns in more recent files and won't have to seek
+* in older files. creates a fake key/value with the given row/column and the
+* highest (most recent) possible timestamp we might get from this file. when
+* users of such "lazy scanner" need to know the next kv precisely (e.g. when
+* this scanner is at the top of the heap), they run {@link #enforceseek()}.
+* <p>
+* note that this function does guarantee that the current kv of this scanner
+* will be advanced to at least the given kv. because of this, it does have
+* to do a real seek in cases when the seek timestamp is older than the
+* highest timestamp of the file, e.g. when we are trying to seek to the next
+* row/column and use oldest_timestamp in the seek key.
+*/
+@override
+public boolean requestseek keyvalue kv  boolean forward  boolean usebloom
+throws ioexception
+if  kv getfamilylength      0
+usebloom   false
+boolean havetoseek   true
+if  usebloom
+// check rowcol bloom filter first.
+if  reader getbloomfiltertype      storefile bloomtype rowcol
+havetoseek   reader passesgeneralbloomfilter kv getbuffer
+kv getrowoffset    kv getrowlength    kv getbuffer
+kv getqualifieroffset    kv getqualifierlength
+else if  this matcher    null     matcher hasnullcolumninquery
+kv isdeletefamily
+// if there is no such delete family kv in the store file,
+// then no need to seek.
+havetoseek   reader passesdeletefamilybloomfilter kv getbuffer
+kv getrowoffset    kv getrowlength
+delayedreseek   forward
+delayedseekkv   kv
+if  havetoseek
+// this row/column might be in this store file (or we did not use the
+// bloom filter), so we still need to seek.
+realseekdone   false
+long maxtimestampinfile   reader getmaxtimestamp
+long seektimestamp   kv gettimestamp
+if  seektimestamp > maxtimestampinfile
+// create a fake key that is not greater than the real next key.
+// (lower timestamps correspond to higher kvs.)
+// to understand this better, consider that we are asked to seek to
+// a higher timestamp than the max timestamp in this file. we know that
+// the next point when we have to consider this file again is when we
+// pass the max timestamp of this file (with the same row/column).
+cur   kv createfirstonrowcolts maxtimestampinfile
+else
+// this will be the case e.g. when we need to seek to the next
+// row/column, and we don't know exactly what they are, so we set the
+// seek key's timestamp to oldest_timestamp to skip the rest of this
+// row/column.
+enforceseek
+return cur    null
+// multi-column bloom filter optimization.
+// create a fake key/value, so that this scanner only bubbles up to the top
+// of the keyvalueheap in storescanner after we scanned this row/column in
+// all other store files. the query matcher will then just skip this fake
+// key/value and the store scanner will progress to the next column. this
+// is obviously not a "real real" seek, but unlike the fake kv earlier in
+// this method, we want this to be propagated to scanquerymatcher.
+cur   kv createlastonrowcol
+realseekdone   true
+return true
+reader getreaderfortesting
+return reader
+@override
+public boolean realseekdone
+return realseekdone
+@override
+public void enforceseek   throws ioexception
+if  realseekdone
+return
+if  delayedreseek    this isreseekable
+reseek delayedseekkv
+else
+seek delayedseekkv
+public void setscanquerymatcher scanquerymatcher matcher
+this matcher   matcher
+@override
+public boolean isfilescanner
+return true
+// test methods
+static final long getseekcount
+return seekcount get
+@override
+public boolean shouldusescanner scan scan  sortedset<byte> columns
+long oldestunexpiredts
+return reader passestimerangefilter scan  oldestunexpiredts
+reader passesbloomfilter scan  columns

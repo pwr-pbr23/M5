@@ -1,0 +1,211 @@
+/**
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase master
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop hbase chore
+import org apache hadoop hbase clusterstatus
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase servername
+import org apache hadoop hbase protobuf generated clusterstatusprotos
+import org apache hadoop hbase util environmentedgemanager
+import org apache hadoop hbase util pair
+import org apache hadoop hbase util threads
+import org apache hadoop hbase util versioninfo
+import org jboss netty bootstrap connectionlessbootstrap
+import org jboss netty channel channels
+import org jboss netty channel socket datagramchannel
+import org jboss netty channel socket datagramchannelfactory
+import org jboss netty channel socket oio oiodatagramchannelfactory
+import org jboss netty handler codec protobuf protobufencoder
+import java io closeable
+import java io ioexception
+import java net inetaddress
+import java net inetsocketaddress
+import java net unknownhostexception
+import java util arraylist
+import java util collections
+import java util comparator
+import java util list
+import java util map
+import java util concurrent concurrenthashmap
+import java util concurrent concurrentmap
+import java util concurrent executorservice
+import java util concurrent executors
+/**
+* class to publish the cluster status to the client. this allows them to know immediately
+*  the dead region servers, hence to cut the connection they have with them, eventually stop
+*  waiting on the socket. this improves the mean time to recover, and as well allows to increase
+*  on the client the different timeouts, as the dead servers will be detected separately.
+*/
+@interfaceaudience private
+public class clusterstatuspublisher extends chore
+/**
+* the implementation class used to publish the status. default is null (no publish).
+* use org.apache.hadoop.hbase.master.clusterstatuspublisher.multicastpublisher to multicast the
+* status.
+*/
+public static final string status_publisher_class
+public static final class<? extends clusterstatuspublisher publisher>
+default_status_publisher_class   null
+/**
+* the minimum time between two status messages, in milliseconds.
+*/
+public static final string status_publish_period
+public static final int default_status_publish_period   10000
+private long lastmessagetime   0
+private final hmaster master
+private final int messageperiod     time between two message
+private final concurrentmap<servername  integer> lastsent
+new concurrenthashmap<servername  integer>
+private publisher publisher
+private boolean connected   false
+/**
+* we want to limit the size of the protobuf message sent, do fit into a single packet.
+* a reasonable size for ip / ethernet is less than 1kb.
+*/
+public static int max_server_per_message   10
+/**
+* if a server dies, we're sending the information multiple times in case a receiver misses the
+* message.
+*/
+public static int nb_send   5
+public clusterstatuspublisher hmaster master  configuration conf
+class<? extends publisher> publisherclass
+throws ioexception
+super     master getname
+conf getint status_publish_period  default_status_publish_period   master
+this master   master
+this messageperiod   conf getint status_publish_period  default_status_publish_period
+try
+this publisher   publisherclass newinstance
+catch  instantiationexception e
+throw new ioexception     publisherclass getname    e
+catch  illegalaccessexception e
+throw new ioexception     publisherclass getname    e
+this publisher connect conf
+connected   true
+// for tests only
+protected clusterstatuspublisher
+master   null
+messageperiod   0
+@override
+protected void chore
+if   connected
+return
+list<servername> sns   generatedeadserverslisttosend
+if  sns isempty
+// nothing to send. done.
+return
+final long curtime   environmentedgemanager currenttimemillis
+if  lastmessagetime > curtime   messageperiod
+// we already sent something less than 10 second ago. done.
+return
+// ok, we're going to send something then.
+lastmessagetime   curtime
+// we're reusing an existing protobuf message, but we don't send everything.
+// this could be extended in the future, for example if we want to send stuff like the
+//  meta server name.
+clusterstatus cs   new clusterstatus versioninfo getversion
+master getmasterfilesystem   getclusterid   tostring
+
+sns
+master getservername
+
+
+
+
+publisher publish cs
+protected void cleanup
+connected   false
+publisher close
+/**
+* create the dead server to send. a dead server is sent nb_send times. we send at max
+* max_server_per_message at a time. if there are too many dead servers, we send the newly
+* dead first.
+*/
+protected list<servername> generatedeadserverslisttosend
+// we're getting the message sent since last time, and add them to the list
+long since   environmentedgemanager currenttimemillis     messageperiod   2
+for  pair<servername  long> dead   getdeadservers since
+lastsent putifabsent dead getfirst    0
+// we're sending the new deads first.
+list<map entry<servername  integer>> entries   new arraylist<map entry<servername  integer>>
+entries addall lastsent entryset
+collections sort entries  new comparator<map entry<servername  integer>>
+@override
+public int compare map entry<servername  integer> o1  map entry<servername  integer> o2
+return o1 getvalue   compareto o2 getvalue
+// with a limit of max_server_per_message
+int max   entries size   > max_server_per_message ? max_server_per_message   entries size
+list<servername> res   new arraylist<servername> max
+for  int i   0  i < max  i
+map entry<servername  integer> tosend   entries get i
+if  tosend getvalue   >   nb_send   1
+lastsent remove tosend getkey
+else
+lastsent replace tosend getkey    tosend getvalue    tosend getvalue     1
+res add tosend getkey
+return res
+/**
+* get the servers which died since a given timestamp.
+* protected because it can be subclassed by the tests.
+*/
+protected list<pair<servername  long>> getdeadservers long since
+if  master getservermanager      null
+return collections emptylist
+return master getservermanager   getdeadservers   copydeadserverssince since
+public static interface publisher extends closeable
+public void connect configuration conf  throws ioexception
+public void publish clusterstatus cs
+@override
+public void close
+public static class multicastpublisher implements publisher
+private datagramchannel channel
+private final executorservice service   executors newsinglethreadexecutor
+threads newdaemonthreadfactory
+public multicastpublisher
+@override
+public void connect configuration conf  throws ioexception
+string mcaddress   conf get hconstants status_multicast_address
+hconstants default_status_multicast_address
+int port   conf getint hconstants status_multicast_port
+hconstants default_status_multicast_port
+// can't be nio with netty today => not implemented in netty.
+datagramchannelfactory f   new oiodatagramchannelfactory service
+connectionlessbootstrap b   new connectionlessbootstrap f
+b setpipeline channels pipeline new protobufencoder
+channel    datagramchannel  b bind new inetsocketaddress 0
+channel getconfig   setreuseaddress true
+inetaddress ina
+try
+ina   inetaddress getbyname mcaddress
+catch  unknownhostexception e
+throw new ioexception     mcaddress  e
+channel joingroup ina
+channel connect new inetsocketaddress mcaddress  port
+@override
+public void publish clusterstatus cs
+clusterstatusprotos clusterstatus csp   cs convert
+channel write csp
+@override
+public void close
+if  channel    null
+channel close
+service shutdown

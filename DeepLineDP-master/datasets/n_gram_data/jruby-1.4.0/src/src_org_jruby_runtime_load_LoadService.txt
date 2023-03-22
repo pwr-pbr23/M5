@@ -1,0 +1,795 @@
+/***** begin license block *****
+* version: cpl 1.0/gpl 2.0/lgpl 2.1
+*
+* the contents of this file are subject to the common public
+* license version 1.0 (the "license"); you may not use this file
+* except in compliance with the license. you may obtain a copy of
+* the license at http://www.eclipse.org/legal/cpl-v10.html
+*
+* software distributed under the license is distributed on an "as
+* is" basis, without warranty of any kind, either express or
+* implied. see the license for the specific language governing
+* rights and limitations under the license.
+*
+* copyright (c) 2002-2004 anders bengtsson <ndrsbngtssn@yahoo.se>
+* copyright (c) 2002-2004 jan arne petersen <jpetersen@uni-bonn.de>
+* copyright (c) 2004 thomas e enebo <enebo@acm.org>
+* copyright (c) 2004-2005 charles o nutter <headius@headius.com>
+* copyright (c) 2004 stefan matthias aust <sma@3plus4.de>
+* copyright (c) 2006 ola bini <ola@ologix.com>
+*
+* alternatively, the contents of this file may be used under the terms of
+* either of the gnu general public license version 2 or later (the "gpl"),
+* or the gnu lesser general public license version 2.1 or later (the "lgpl"),
+* in which case the provisions of the gpl or the lgpl are applicable instead
+* of those above. if you wish to allow use of your version of this file only
+* under the terms of either the gpl or the lgpl, and not to allow others to
+* use your version of this file under the terms of the cpl, indicate your
+* decision by deleting the provisions above and replace them with the notice
+* and other provisions required by the gpl or the lgpl. if you do not delete
+* the provisions above, a recipient may use your version of this file under
+* the terms of any one of the cpl, the gpl or the lgpl.
+***** end license block *****/
+package org jruby runtime load
+import java io file
+import java io filenotfoundexception
+import java io ioexception
+import java net malformedurlexception
+import java net url
+import java util arraylist
+import java util collections
+import java util hashmap
+import java util hashtable
+import java util iterator
+import java util list
+import java util map
+import java util jar jarfile
+import java util regex matcher
+import java util regex pattern
+import java util zip zipexception
+import org jruby compatversion
+import org jruby ruby
+import org jruby rubyarray
+import org jruby rubyfile
+import org jruby rubyhash
+import org jruby rubyinstanceconfig
+import org jruby rubystring
+import org jruby ast executable script
+import org jruby exceptions mainexitexception
+import org jruby exceptions raiseexception
+import org jruby platform platform
+import org jruby runtime constants
+import org jruby runtime builtin irubyobject
+import org jruby util jrubyfile
+/**
+* <b>how require works in jruby</b>
+* when requiring a name from ruby, jruby will first remove any file extension it knows about,
+* thereby making it possible to use this string to see if jruby has already loaded
+* the name in question. if a .rb extension is specified, jruby will only try
+* those extensions when searching. if a .so, .o, .dll, or .jar extension is specified, jruby
+* will only try .so or .jar when searching. otherwise, jruby goes through the known suffixes
+* (.rb, .rb.ast.ser, .so, and .jar) and tries to find a library with this name. the process for finding a library follows this order
+* for all searchable extensions:
+* <ol>
+* <li>first, check if the name starts with 'jar:', then the path points to a jar-file resource which is returned.</li>
+* <li>second, try searching for the file in the current dir</li>
+* <li>then jruby looks through the load path trying these variants:
+*   <ol>
+*     <li>see if the current load path entry starts with 'jar:', if so check if this jar-file contains the name</li>
+*     <li>otherwise jruby tries to construct a path by combining the entry and the current working directy, and then see if
+*         a file with the correct name can be reached from this point.</li>
+*   </ol>
+* </li>
+* <li>if all these fail, try to load the name as a resource from classloader resources, using the bare name as
+*     well as the load path entries</li>
+* <li>when we get to this state, the normal jruby loading has failed. at this stage jruby tries to load
+*     java native extensions, by following this process:
+*   <ol>
+*     <li>first it checks that we haven't already found a library. if we found a library of type jarredscript, the method continues.</li>
+*     <li>the first step is translating the name given into a valid java extension class name. first it splits the string into
+*     each path segment, and then makes all but the last downcased. after this it takes the last entry, removes all underscores
+*     and capitalizes each part separated by underscores. it then joins everything together and tacks on a 'service' at the end.
+*     lastly, it removes all leading dots, to make it a valid java fwcn.</li>
+*     <li>if the previous library was of type jarredscript, we try to add the jar-file to the classpath</li>
+*     <li>now jruby tries to instantiate the class with the name constructed. if this works, we return a classextensionlibrary. otherwise,
+*     the old library is put back in place, if there was one.
+*   </ol>
+* </li>
+* <li>when all separate methods have been tried and there was no result, a loaderror will be raised.</li>
+* <li>otherwise, the name will be added to the loaded features, and the library loaded</li>
+* </ol>
+*
+* <b>how to make a class that can get required by jruby</b>
+* <p>first, decide on what name should be used to require the extension.
+* in this purely hypothetical example, this name will be 'active_record/connection_adapters/jdbc_adapter'.
+* then create the class name for this require-name, by looking at the guidelines above. our class should
+* be named active_record.connection_adapters.jdbcadapterservice, and implement one of the library-interfaces.
+* the easiest one is basiclibraryservice, where you define the basicload-method, which will get called
+* when your library should be loaded.</p>
+* <p>the next step is to either put your compiled class on jruby's classpath, or package the class/es inside a
+* jar-file. to package into a jar-file, we first create the file, then rename it to jdbc_adapter.jar. then
+* we put this jar-file in the directory active_record/connection_adapters somewhere in jruby's load path. for
+* example, copying jdbc_adapter.jar into jruby_home/lib/ruby/site_ruby/1.8/active_record/connection_adapters
+* will make everything work. if you've packaged your extension inside a rubygem, write a setub.rb-script that
+* copies the jar-file to this place.</p>
+* <p>if you don't want to have the name of your extension-class to be prescribed, you can also put a file called
+* jruby-ext.properties in your jar-files meta-inf directory, where you can use the key <full-extension-name>.impl
+* to make the extension library load the correct class. an example for the above would have a jruby-ext.properties
+* that contained a ruby like: "active_record/connection_adapters/jdbc_adapter=org.jruby.ar.jdbcadapter". (note: this
+* feature is not implemented yet.)</p>
+*
+* @author jpetersen
+*/
+public class loadservice
+public enum suffixtype
+source  extension  both  neither
+public static final string sourcesuffixes
+public static final string extensionsuffixes
+private static final string allsuffixes
+private static final string emptysuffixes
+public string getsuffixes
+switch  this
+case source
+return sourcesuffixes
+case extension
+return extensionsuffixes
+case both
+return allsuffixes
+case neither
+return emptysuffixes
+throw new runtimeexception     this
+protected static final pattern sourcepattern   pattern compile
+protected static final pattern extensionpattern   pattern compile
+protected rubyarray loadpath
+protected rubyarray loadedfeatures
+protected list loadedfeaturesinternal
+protected final map<string  library> builtinlibraries   new hashmap<string  library>
+protected final map<string  jarfile> jarfiles   new hashmap<string  jarfile>
+protected final map<string  iautoloadmethod> autoloadmap   new hashmap<string  iautoloadmethod>
+protected final ruby runtime
+public loadservice ruby runtime
+this runtime   runtime
+public void init list additionaldirectories
+loadpath   rubyarray newarray runtime
+loadedfeatures   rubyarray newarray runtime
+loadedfeaturesinternal   collections synchronizedlist loadedfeatures
+// add all startup load paths to the list first
+for  iterator iter   additionaldirectories iterator    iter hasnext
+addpath  string  iter next
+// add $rubylib paths
+rubyhash env    rubyhash  runtime getobject   fastgetconstant
+rubystring env_rubylib   runtime newstring
+if  env has_key_p env_rubylib  istrue
+string rubylib   env op_aref runtime getcurrentcontext    env_rubylib  tostring
+string paths   rubylib split file pathseparator
+for  int i   0  i < paths length  i
+addpath paths
+// wrap in try/catch for security exceptions in an applet
+if   ruby issecurityrestricted
+try
+string jrubyhome   runtime getjrubyhome
+if  jrubyhome    null
+char sep
+string rubydir   jrubyhome   sep       sep       sep
+// if we're running in 1.9 compat mode, add ruby 1.9 libs to path before 1.8 libs
+if  runtime is1_9
+addpath rubydir       sep   constants ruby1_9_major_version
+addpath rubydir       sep
+addpath rubydir       sep   constants ruby_major_version
+addpath rubydir   constants ruby1_9_major_version
+else
+// add 1.8 libs
+addpath rubydir       sep   constants ruby_major_version
+addpath rubydir       sep
+addpath rubydir   constants ruby_major_version
+catch securityexception e
+// "." dir is used for relative path loads from a given file, as in require '../foo/bar'
+if  runtime getsafelevel      0
+addpath
+protected void addloadedfeature rubystring loadnamerubystring
+loadedfeaturesinternal add loadnamerubystring
+protected void addpath string path
+// empty paths do not need to be added
+if  path    null    path length      0  return
+synchronized loadpath
+loadpath append runtime newstring path replace
+public void load string file  boolean wrap
+if  runtime getprofile   allowload file
+throw runtime newloaderror     file
+searchstate state   new searchstate file
+state prepareloadsearch file
+library library   findbuiltinlibrary state  state searchfile  state suffixtype
+if  library    null  library   findlibrarywithoutcwd state  state searchfile  state suffixtype
+if  library    null
+library   findlibrarywithclassloaders state  state searchfile  state suffixtype
+if  library    null
+throw runtime newloaderror     file
+try
+library load runtime  wrap
+catch  ioexception e
+if  runtime getdebug   istrue    e printstacktrace runtime geterr
+throw runtime newloaderror     file
+public searchstate findfileforload string file  throws alreadyloaded
+searchstate state   new searchstate file
+state preparerequiresearch file
+for  loadsearcher searcher   searchers
+if  searcher shouldtrysearch state
+searcher trysearch state
+else
+continue
+return state
+public boolean lockandrequire string requirename
+object requirelock
+try
+synchronized  requirelocks
+requirelock   requirelocks get requirename
+if  requirelock    null
+requirelock   new object
+requirelocks put requirename  requirelock
+synchronized  requirelock
+return require requirename
+finally
+synchronized  requirelocks
+requirelocks remove requirename
+protected map requirelocks   new hashtable
+public boolean smartload string file
+checkemptyload file
+// we don't support .so, but some stdlib require .so directly
+// replace it with .jar to look for an extension type we do support
+if  file endswith
+file   file replaceall
+if  platform is_windows
+file   file replace
+try
+searchstate state   findfileforload file
+return tryloadinglibraryorscript runtime  state
+catch  alreadyloaded al
+// library has already been loaded in some form, bail out
+return false
+public boolean require string file
+if  runtime getprofile   allowrequire file
+throw runtime newloaderror     file
+return smartload file
+/**
+* load the org.jruby.runtime.load.library implementation specified by
+* classname. the purpose of using this method is to avoid having static
+* references to the given library class, thereby avoiding the additional
+* classloading when the library is not in use.
+*
+* @param runtime the runtime in which to load
+* @param libraryname the name of the library, to use for error messages
+* @param classname the class of the library
+* @param classloader the classloader to use to load it
+* @param wrap whether to wrap top-level in an anonymous module
+*/
+public static void reflectedload ruby runtime  string libraryname  string classname  classloader classloader  boolean wrap
+try
+if  classloader    null    ruby issecurityrestricted
+classloader   runtime getinstanceconfig   getloader
+library library    library  classloader loadclass classname  newinstance
+library load runtime  false
+catch  raiseexception re
+throw re
+catch  throwable e
+if  runtime getdebug   istrue    e printstacktrace
+throw runtime newloaderror     libraryname       e
+public irubyobject getloadpath
+return loadpath
+public irubyobject getloadedfeatures
+return loadedfeatures
+public iautoloadmethod autoloadfor string name
+return autoloadmap get name
+public void removeautoloadfor string name
+autoloadmap remove name
+public irubyobject autoload string name
+iautoloadmethod loadmethod   autoloadmap remove name
+if  loadmethod    null
+return loadmethod load runtime  name
+return null
+public void addautoload string name  iautoloadmethod loadmethod
+autoloadmap put name  loadmethod
+public void addbuiltinlibrary string name  library library
+builtinlibraries put name  library
+public void removebuiltinlibrary string name
+builtinlibraries remove name
+public void removeinternalloadedfeature string name
+loadedfeaturesinternal remove name
+protected boolean featurealreadyloaded rubystring loadnamerubystring
+return loadedfeaturesinternal contains loadnamerubystring
+protected boolean isjarfilelibrary searchstate state  final string file
+return state library instanceof jarredscript    file endswith
+protected void removeloadedfeature rubystring loadnamerubystring
+loadedfeaturesinternal remove loadnamerubystring
+protected void reraiseraiseexceptions throwable e  throws raiseexception
+if  e instanceof raiseexception
+throw  raiseexception  e
+public interface loadsearcher
+public boolean shouldtrysearch searchstate state
+public void trysearch searchstate state  throws alreadyloaded
+public class alreadyloaded extends exception
+private rubystring searchnamestring
+public alreadyloaded rubystring searchnamestring
+this searchnamestring   searchnamestring
+public rubystring getsearchnamestring
+return searchnamestring
+public class bailoutsearcher implements loadsearcher
+public boolean shouldtrysearch searchstate state
+return true
+public void trysearch searchstate state  throws alreadyloaded
+for  string suffix   state suffixtype getsuffixes
+string searchname   state searchfile   suffix
+rubystring searchnamestring   rubystring newstring runtime  searchname
+if  featurealreadyloaded searchnamestring
+throw new alreadyloaded searchnamestring
+public class normalsearcher implements loadsearcher
+public boolean shouldtrysearch searchstate state
+return state library    null
+public void trysearch searchstate state
+state library   findlibrarywithoutcwd state  state searchfile  state suffixtype
+public class classloadersearcher implements loadsearcher
+public boolean shouldtrysearch searchstate state
+return state library    null
+public void trysearch searchstate state
+state library   findlibrarywithclassloaders state  state searchfile  state suffixtype
+public class extensionsearcher implements loadsearcher
+public boolean shouldtrysearch searchstate state
+return  state library    null    state library instanceof jarredscript      state searchfile equalsignorecase
+public void trysearch searchstate state
+// this code exploits the fact that all .jar files will be found for the jarredscript feature.
+// this is where the basic extension mechanism gets fixed
+library oldlibrary   state library
+// create package name, by splitting on / and joining all but the last elements with a ".", and downcasing them.
+string all   state searchfile split
+stringbuilder finname   new stringbuilder
+for int i 0  j  all length 1   i<j  i
+finname append all tolowercase    append
+try
+// make the class name look nice, by splitting on _ and capitalize each segment, then joining
+// the, together without anything separating them, and last put on "service" at the end.
+string last   all split
+for int i 0  j last length  i<j  i
+finname append character touppercase last charat 0    append last substring 1
+finname append
+// we don't want a package name beginning with dots, so we remove them
+string classname   finname tostring   replaceall
+// if there is a jar-file with the required name, we add this to the class path.
+if state library instanceof jarredscript
+// it's _really_ expensive to check that the class actually exists in the jar, so
+// we don't do that now.
+runtime getjrubyclassloader   addurl   jarredscript state library  getresource   geturl
+// quietly try to load the class
+class theclass   runtime getjavasupport   loadjavaclassquiet classname
+state library   new classextensionlibrary theclass
+catch  exception ee
+state library   null
+runtime getglobalvariables   set    runtime getnil
+// if there was a good library before, we go back to that
+if state library    null    oldlibrary    null
+state library   oldlibrary
+public class scriptclasssearcher implements loadsearcher
+public class scriptclasslibrary implements library
+private script script
+public scriptclasslibrary script script
+this script   script
+public void load ruby runtime  boolean wrap
+runtime loadscript script
+public boolean shouldtrysearch searchstate state
+return state library    null
+public void trysearch searchstate state  throws raiseexception
+// no library or extension found, try to load directly as a class
+script script
+string classname   buildclassname state searchfile
+int lastslashindex   classname lastindexof
+if  lastslashindex >  1    lastslashindex < classname length     1     character isjavaidentifierstart classname charat lastslashindex   1
+if  lastslashindex     1
+classname       classname
+else
+classname   classname substring 0  lastslashindex   1        classname substring lastslashindex   1
+classname   classname replace
+try
+class scriptclass   class forname classname
+script    script  scriptclass newinstance
+catch  exception cnfe
+throw runtime newloaderror     state searchfile
+state library   new scriptclasslibrary script
+public class searchstate
+public library library
+public string loadname
+public suffixtype suffixtype
+public string searchfile
+public searchstate string file
+loadname   file
+public void preparerequiresearch final string file
+// if an extension is specified, try more targetted searches
+if  file lastindexof    > file lastindexof
+matcher matcher   null
+if   matcher   sourcepattern matcher file   find
+// source extensions
+suffixtype   suffixtype source
+// trim extension to try other options
+searchfile   file substring 0  matcher start
+else if   matcher   extensionpattern matcher file   find
+// extension extensions
+suffixtype   suffixtype extension
+// trim extension to try other options
+searchfile   file substring 0  matcher start
+else
+// unknown extension, fall back to search with extensions
+suffixtype   suffixtype both
+searchfile   file
+else
+// try all extensions
+suffixtype   suffixtype both
+searchfile   file
+public void prepareloadsearch final string file
+// if a source extension is specified, try all source extensions
+if  file lastindexof    > file lastindexof
+matcher matcher   null
+if   matcher   sourcepattern matcher file   find
+// source extensions
+suffixtype   suffixtype source
+// trim extension to try other options
+searchfile   file substring 0  matcher start
+else
+// unknown extension, fall back to exact search
+suffixtype   suffixtype neither
+searchfile   file
+else
+// try only literal search
+suffixtype   suffixtype neither
+searchfile   file
+protected boolean tryloadinglibraryorscript ruby runtime  searchstate state
+// attempt to load the found library
+rubystring loadnamerubystring   rubystring newstring runtime  state loadname
+try
+synchronized  loadedfeaturesinternal
+if  loadedfeaturesinternal contains loadnamerubystring
+return false
+else
+addloadedfeature loadnamerubystring
+// otherwise load the library we've found
+state library load runtime  false
+return true
+catch  mainexitexception mee
+// allow mainexitexception to propagate out for exec and friends
+throw mee
+catch  throwable e
+if isjarfilelibrary state  state searchfile
+return true
+removeloadedfeature loadnamerubystring
+reraiseraiseexceptions e
+if runtime getdebug   istrue    e printstacktrace runtime geterr
+raiseexception re   runtime newloaderror     state searchfile
+re initcause e
+throw re
+protected final list<loadsearcher> searchers   new arraylist<loadsearcher>
+searchers add new bailoutsearcher
+searchers add new normalsearcher
+searchers add new classloadersearcher
+searchers add new extensionsearcher
+searchers add new scriptclasssearcher
+protected string buildclassname string classname
+// remove any relative prefix, e.g. "./foo/bar" becomes "foo/bar".
+classname   classname replacefirst
+if  classname lastindexof        1
+classname   classname substring 0  classname lastindexof
+classname   classname replace       replace
+return classname
+protected void checkemptyload string file  throws raiseexception
+if  file equals
+throw runtime newloaderror     file
+protected void debuglogtry string what  string msg
+if  rubyinstanceconfig debug_load_service
+runtime geterr   println      what       msg
+protected void debuglogfound string what  string msg
+if  rubyinstanceconfig debug_load_service
+runtime geterr   println      what       msg
+protected void debuglogfound  loadserviceresource resource
+string resourceurl
+try
+resourceurl   resource geturl   tostring
+catch  ioexception e
+resourceurl   e getmessage
+if  rubyinstanceconfig debug_load_service
+runtime geterr   println      resourceurl
+protected library findbuiltinlibrary searchstate state  string basename  suffixtype suffixtype
+for  string suffix   suffixtype getsuffixes
+string nameplussuffix   basename   suffix
+debuglogtry      nameplussuffix
+if  builtinlibraries containskey nameplussuffix
+state loadname   nameplussuffix
+library lib   builtinlibraries get nameplussuffix
+debuglogfound     nameplussuffix
+return lib
+return null
+protected library findlibrarywithoutcwd searchstate state  string basename  suffixtype suffixtype
+library library   null
+switch  suffixtype
+case both
+library   findbuiltinlibrary state  basename  suffixtype source
+if  library    null  library   createlibrary state  tryresourcefromjarurl state  basename  suffixtype source
+if  library    null  library   createlibrary state  tryresourcefromloadpathorurl state  basename  suffixtype source
+// if we fail to find as a normal ruby script, we try to find as an extension,
+// checking for a builtin first.
+if  library    null  library   findbuiltinlibrary state  basename  suffixtype extension
+if  library    null  library   createlibrary state  tryresourcefromjarurl state  basename  suffixtype extension
+if  library    null  library   createlibrary state  tryresourcefromloadpathorurl state  basename  suffixtype extension
+break
+case source
+case extension
+// check for a builtin first.
+library   findbuiltinlibrary state  basename  suffixtype
+if  library    null  library   createlibrary state  tryresourcefromjarurl state  basename  suffixtype
+if  library    null  library   createlibrary state  tryresourcefromloadpathorurl state  basename  suffixtype
+break
+case neither
+library   createlibrary state  tryresourcefromjarurl state  basename  suffixtype neither
+if  library    null  library   createlibrary state  tryresourcefromloadpathorurl state  basename  suffixtype neither
+break
+return library
+protected library findlibrarywithclassloaders searchstate state  string basename  suffixtype suffixtype
+for  string suffix   suffixtype getsuffixes
+string file   basename   suffix
+loadserviceresource resource   findfileinclasspath file
+if  resource    null
+state loadname   file
+return createlibrary state  resource
+return null
+protected library createlibrary searchstate state  loadserviceresource resource
+if  resource    null
+return null
+string file   state loadname
+if  file endswith
+throw runtime newloaderror
+else if  file endswith
+return new jarredscript resource
+else if  file endswith
+return new javacompiledscript resource
+else
+return new externalscript resource  file
+protected loadserviceresource tryresourcefromcwd searchstate state  string basename suffixtype suffixtype  throws raiseexception
+loadserviceresource foundresource   null
+for  string suffix   suffixtype getsuffixes
+string nameplussuffix   basename   suffix
+// check current directory; if file exists, retrieve url and return resource
+try
+jrubyfile file   jrubyfile create runtime getcurrentdirectory    rubyfile expanduserpath runtime getcurrentcontext    nameplussuffix
+debuglogtry    file tostring
+if  file isfile      file isabsolute      file canread
+boolean absolute   true
+string s   nameplussuffix
+if  nameplussuffix startswith
+s       s
+foundresource   new loadserviceresource file  s  absolute
+debuglogfound foundresource
+state loadname   nameplussuffix
+break
+catch  illegalargumentexception illargex
+catch  securityexception secex
+return foundresource
+protected loadserviceresource tryresourcefromjarurl searchstate state  string basename  suffixtype suffixtype
+// if a jar or file url, return load service resource directly without further searching
+loadserviceresource foundresource   null
+if  basename startswith
+for  string suffix   suffixtype getsuffixes
+string nameplussuffix   basename   suffix
+try
+url url   new url nameplussuffix
+debuglogtry    url tostring
+if  url openstream      null
+foundresource   new loadserviceresource url  nameplussuffix
+debuglogfound foundresource
+catch  filenotfoundexception e
+catch  malformedurlexception e
+throw runtime newioerrorfromexception e
+catch  ioexception e
+throw runtime newioerrorfromexception e
+if  foundresource    null
+state loadname   nameplussuffix
+break     end suffix iteration
+else if basename startswith       basename indexof        1
+for  string suffix   suffixtype getsuffixes
+string nameplussuffix   basename   suffix
+try
+string jarfile   nameplussuffix substring 5  nameplussuffix indexof
+jarfile file   new jarfile jarfile
+string filename   nameplussuffix substring nameplussuffix indexof      2
+string canonicalfilename   canonicalizepath filename
+debuglogtry    canonicalfilename tostring
+if file getjarentry canonicalfilename     null
+foundresource   new loadserviceresource new url     jarfile       canonicalfilename   nameplussuffix
+debuglogfound foundresource
+catch exception e
+if  foundresource    null
+state loadname   nameplussuffix
+break     end suffix iteration
+return foundresource
+protected loadserviceresource tryresourcefromloadpathorurl searchstate state  string basename  suffixtype suffixtype
+loadserviceresource foundresource   null
+// if it's a ./ basename, use cwd logic
+if  basename startswith
+foundresource   tryresourcefromcwd state  basename  suffixtype
+if  foundresource    null
+state loadname   foundresource getname
+return foundresource
+// if given path is absolute, just try it as-is (with extensions) and no load path
+if  new file basename  isabsolute      basename startswith
+for  string suffix   suffixtype getsuffixes
+string nameplussuffix   basename   suffix
+foundresource   tryresourceasis nameplussuffix
+if  foundresource    null
+state loadname   nameplussuffix
+return foundresource
+return null
+outer  for  iterator pathiter   loadpath getlist   iterator    pathiter hasnext
+// todo this is really ineffient, and potentially a problem everytime anyone require's something.
+// we should try to make loadpath a special array object.
+string loadpathentry     irubyobject pathiter next    tostring
+if  loadpathentry equals
+foundresource   tryresourcefromcwd state  basename  suffixtype
+if  foundresource    null
+string ss   foundresource getname
+if ss startswith
+ss   ss substring 2
+state loadname   ss
+break outer
+else
+for  string suffix   suffixtype getsuffixes
+string nameplussuffix   basename   suffix
+if  loadpathlookslikejarurl loadpathentry
+foundresource   tryresourcefromjarurlwithloadpath nameplussuffix  loadpathentry
+else
+foundresource   tryresourcefromloadpath nameplussuffix  loadpathentry
+if  foundresource    null
+string ss   nameplussuffix
+if ss startswith
+ss   ss substring 2
+state loadname   ss
+break outer     end suffix iteration
+return foundresource
+protected loadserviceresource tryresourcefromjarurlwithloadpath string nameplussuffix  string loadpathentry
+loadserviceresource foundresource   null
+jarfile current   jarfiles get loadpathentry
+boolean isfilejarurl   loadpathentry startswith       loadpathentry indexof        1
+string after   isfilejarurl ? loadpathentry substring loadpathentry indexof      2
+string before   isfilejarurl ? loadpathentry substring 0  loadpathentry indexof       loadpathentry
+if null    current
+try
+if loadpathentry startswith
+current   new jarfile loadpathentry substring 4
+else if  loadpathentry endswith
+current   new jarfile loadpathentry
+else
+current   new jarfile loadpathentry substring 5 loadpathentry indexof
+jarfiles put loadpathentry current
+catch  zipexception ignored
+if  runtime getinstanceconfig   isverbose
+runtime geterr   println     loadpathentry
+ignored printstacktrace runtime geterr
+catch  filenotfoundexception ignored
+catch  ioexception e
+throw runtime newioerrorfromexception e
+string canonicalentry   after nameplussuffix
+if  current    null
+debuglogtry    current getname         canonicalentry
+if  current getjarentry canonicalentry     null
+try
+if  loadpathentry endswith
+foundresource   new loadserviceresource new url     loadpathentry       canonicalentry       nameplussuffix
+else if  loadpathentry startswith
+foundresource   new loadserviceresource new url     before       canonicalentry   loadpathentry       nameplussuffix
+else
+foundresource    new loadserviceresource new url     loadpathentry substring 4        nameplussuffix   loadpathentry   nameplussuffix
+debuglogfound foundresource
+catch  malformedurlexception e
+throw runtime newioerrorfromexception e
+return foundresource
+protected boolean loadpathlookslikejarurl string loadpathentry
+return loadpathentry startswith       loadpathentry endswith        loadpathentry startswith       loadpathentry indexof        1
+protected loadserviceresource tryresourcefromloadpath  string nameplussuffix string loadpathentry  throws raiseexception
+loadserviceresource foundresource   null
+try
+if   ruby issecurityrestricted
+string reportedpath   loadpathentry       nameplussuffix
+jrubyfile actualpath
+boolean absolute   false
+// we check length == 0 for 'load', which does not use load path
+if  new file reportedpath  isabsolute
+absolute   true
+// it's an absolute path, use it as-is
+actualpath   jrubyfile create loadpathentry  rubyfile expanduserpath runtime getcurrentcontext    nameplussuffix
+else
+absolute   false
+// prepend ./ if . is not already there, since we're loading based on cwd
+if  reportedpath charat 0
+reportedpath       reportedpath
+actualpath   jrubyfile create jrubyfile create runtime getcurrentdirectory    loadpathentry  getabsolutepath    rubyfile expanduserpath runtime getcurrentcontext    nameplussuffix
+debuglogtry    actualpath tostring
+if  actualpath isfile      actualpath canread
+foundresource   new loadserviceresource actualpath  reportedpath  absolute
+debuglogfound foundresource
+catch  securityexception secex
+return foundresource
+protected loadserviceresource tryresourceasis string nameplussuffix  throws raiseexception
+loadserviceresource foundresource   null
+try
+if   ruby issecurityrestricted
+string reportedpath   nameplussuffix
+file actualpath
+// we check length == 0 for 'load', which does not use load path
+if  new file reportedpath  isabsolute
+// it's an absolute path, use it as-is
+actualpath   new file rubyfile expanduserpath runtime getcurrentcontext    nameplussuffix
+else
+// prepend ./ if . is not already there, since we're loading based on cwd
+if  reportedpath charat 0          reportedpath charat 1
+reportedpath   reportedpath replacefirst    runtime getcurrentdirectory
+//                     if (reportedpath.charat(0) != '.') {
+//                         reportedpath = "./" + reportedpath;
+//                     }
+actualpath   jrubyfile create runtime getcurrentdirectory    rubyfile expanduserpath runtime getcurrentcontext    nameplussuffix
+//                    actualpath = new file(rubyfile.expanduserpath(runtime.getcurrentcontext(), reportedpath));
+debuglogtry    actualpath tostring
+if  actualpath isfile      actualpath canread
+foundresource   new loadserviceresource actualpath  reportedpath
+debuglogfound foundresource
+catch  securityexception secex
+return foundresource
+/**
+* this method uses the appropriate lookup strategy to find a file.
+* it is used by kernel#require.
+*
+* @mri rb_find_file
+* @param name the file to find, this is a path name
+* @return the correct file
+*/
+protected loadserviceresource findfileinclasspath string name
+// look in classpath next (we do not use file as a test since unc names will match)
+// note: jar resources must never begin with an '/'. (previous code said "always begin with a /")
+classloader classloader   runtime getjrubyclassloader
+// handle security-sensitive case
+if  ruby issecurityrestricted      classloader    null
+classloader   runtime getinstanceconfig   getloader
+for  iterator pathiter   loadpath getlist   iterator    pathiter hasnext
+string entry   pathiter next   tostring
+// if entry is an empty string, skip it
+if  entry length      0  continue
+// if entry starts with a slash, skip it since classloader resources never start with a /
+if  entry charat 0           entry length   > 1    entry charat 1         continue
+// otherwise, try to load from classpath (note: jar resources always uses '/')
+debuglogtry    entry       name
+url loc   classloader getresource entry       name
+// make sure this is not a directory or unavailable in some way
+if  isrequireable loc
+loadserviceresource foundresource   new loadserviceresource loc  loc getpath
+debuglogfound foundresource
+return foundresource
+// if name starts with a / we're done (classloader resources won't load with an initial /)
+if  name charat 0           name length   > 1    name charat 1         return null
+// try to load from classpath without prefix. "a/b.rb" will not load as
+// "./a/b.rb" in a jar file.
+debuglogtry    name
+url loc   classloader getresource name
+if  isrequireable loc
+loadserviceresource foundresource   new loadserviceresource loc  loc getpath
+debuglogfound foundresource
+return foundresource
+return null
+/* directories and unavailable resources are not able to open a stream. */
+protected boolean isrequireable url loc
+if  loc    null
+if  loc getprotocol   equals       new java io file loc getfile    isdirectory
+return false
+try
+loc openconnection
+return true
+catch  exception e
+return false
+protected string canonicalizepath string path
+try
+string cwd   new file runtime getcurrentdirectory    getcanonicalpath
+return new file path  getcanonicalpath
+substring cwd length     1
+replaceall
+catch exception e
+return path

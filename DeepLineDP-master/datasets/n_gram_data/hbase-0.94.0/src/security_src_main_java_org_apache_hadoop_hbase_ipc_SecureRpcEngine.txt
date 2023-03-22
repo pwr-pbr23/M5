@@ -1,0 +1,332 @@
+/*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase ipc
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configurable
+import org apache hadoop conf configuration
+import org apache hadoop hbase server
+import org apache hadoop hbase client retriesexhaustedexception
+import org apache hadoop hbase io hbaseobjectwritable
+import org apache hadoop hbase monitoring monitoredrpchandler
+import org apache hadoop hbase security hbasepolicyprovider
+import org apache hadoop hbase security hbasesaslrpcserver
+import org apache hadoop hbase security user
+import org apache hadoop hbase security token authenticationtokensecretmanager
+import org apache hadoop hbase util objects
+import org apache hadoop io writable
+import org apache hadoop metrics util metricstimevaryingrate
+import org apache hadoop net netutils
+import org apache hadoop security authorize serviceauthorizationmanager
+import javax net socketfactory
+import java io datainput
+import java io dataoutput
+import java io ioexception
+import java lang reflect
+import java net connectexception
+import java net inetsocketaddress
+import java net sockettimeoutexception
+import java util hashmap
+import java util map
+/**
+* a loadable rpc engine supporting sasl authentication of connections, using
+* gssapi for kerberos authentication or digest-md5 for authentication via
+* signed tokens.
+*
+* <p>
+* this is a fork of the {@code org.apache.hadoop.ipc.writeablerpcengine} from
+* secure hadoop, reworked to eliminate code duplication with the existing
+* hbase {@link writablerpcengine}.
+* </p>
+*
+* @see secureclient
+* @see secureserver
+*/
+public class securerpcengine implements rpcengine
+// leave this out in the hadoop ipc package but keep class name.  do this
+// so that we dont' get the logging of this class's invocations by doing our
+// blanket enabling debug on the o.a.h.h. package.
+protected static final log log
+logfactory getlog
+private securerpcengine
+super
+no public ctor
+/* cache a client using its socket factory as the hash key */
+static private class clientcache
+private map<socketfactory  secureclient> clients
+new hashmap<socketfactory  secureclient>
+protected clientcache
+/**
+* construct & cache an ipc client with the user-provided socketfactory
+* if no cached client exists.
+*
+* @param conf configuration
+* @param factory socket factory
+* @return an ipc client
+*/
+protected synchronized secureclient getclient configuration conf
+socketfactory factory
+// construct & cache client.  the configuration is only used for timeout,
+// and clients have connection pools.  so we can either (a) lose some
+// connection pooling and leak sockets, or (b) use the same timeout for all
+// configurations.  since the ipc is usually intended globally, not
+// per-job, we choose (a).
+secureclient client   clients get factory
+if  client    null
+// make an hbase client instead of hadoop client.
+client   new secureclient hbaseobjectwritable class  conf  factory
+clients put factory  client
+else
+client inccount
+return client
+/**
+* construct & cache an ipc client with the default socketfactory
+* if no cached client exists.
+*
+* @param conf configuration
+* @return an ipc client
+*/
+protected synchronized secureclient getclient configuration conf
+return getclient conf  socketfactory getdefault
+/**
+* stop a rpc client connection
+* a rpc client is closed only when its reference count becomes zero.
+* @param client client to stop
+*/
+protected void stopclient secureclient client
+synchronized  this
+client deccount
+if  client iszeroreference
+clients remove client getsocketfactory
+if  client iszeroreference
+client stop
+protected final static clientcache clients   new clientcache
+private static class invoker implements invocationhandler
+private class<? extends versionedprotocol> protocol
+private inetsocketaddress address
+private user ticket
+private secureclient client
+private boolean isclosed   false
+final private int rpctimeout
+public invoker class<? extends versionedprotocol> protocol
+inetsocketaddress address  user ticket
+configuration conf  socketfactory factory  int rpctimeout
+this protocol   protocol
+this address   address
+this ticket   ticket
+this client   clients getclient conf  factory
+this rpctimeout   rpctimeout
+public object invoke object proxy  method method  object args
+throws throwable
+final boolean logdebug   log isdebugenabled
+long starttime   0
+if  logdebug
+starttime   system currenttimemillis
+hbaseobjectwritable value    hbaseobjectwritable
+client call new invocation method  args   address
+protocol  ticket  rpctimeout
+if  logdebug
+long calltime   system currenttimemillis     starttime
+log debug     method getname         calltime
+return value get
+/* close the ipc client that's responsible for this invoker's rpcs */
+synchronized protected void close
+if   isclosed
+isclosed   true
+clients stopclient client
+/**
+* construct a client-side proxy object that implements the named protocol,
+* talking to a server at the named address.
+*
+* @param protocol interface
+* @param clientversion version we are expecting
+* @param addr remote address
+* @param ticket ticket
+* @param conf configuration
+* @param factory socket factory
+* @return proxy
+* @throws java.io.ioexception e
+*/
+public versionedprotocol getproxy
+class<? extends versionedprotocol> protocol  long clientversion
+inetsocketaddress addr  user ticket
+configuration conf  socketfactory factory  int rpctimeout
+throws ioexception
+if  user issecurityenabled
+hbasesaslrpcserver init conf
+versionedprotocol proxy
+versionedprotocol  proxy newproxyinstance
+protocol getclassloader    new class   protocol
+new invoker protocol  addr  ticket  conf  factory  rpctimeout
+long serverversion   proxy getprotocolversion protocol getname
+clientversion
+if  serverversion    clientversion
+throw new hbaserpc versionmismatch protocol getname    clientversion
+serverversion
+return proxy
+/**
+* stop this proxy and release its invoker's resource
+* @param proxy the proxy to be stopped
+*/
+public void stopproxy versionedprotocol proxy
+if  proxy  null
+invoker proxy getinvocationhandler proxy   close
+/** expert: make multiple, parallel calls to a set of servers. */
+public object call method method  object params
+inetsocketaddress addrs
+class<? extends versionedprotocol> protocol
+user ticket  configuration conf
+throws ioexception  interruptedexception
+invocation invocations   new invocation
+for  int i   0  i < params length  i
+invocations   new invocation method  params
+secureclient client   clients getclient conf
+try
+writable wrappedvalues
+client call invocations  addrs  protocol  ticket
+if  method getreturntype      void type
+return null
+object values
+object array newinstance method getreturntype    wrappedvalues length
+for  int i   0  i < values length  i
+if  wrappedvalues    null
+values     hbaseobjectwritable wrappedvalues  get
+return values
+finally
+clients stopclient client
+/** construct a server for a protocol implementation instance listening on a
+* port and address, with a secret manager. */
+public server getserver class<? extends versionedprotocol> protocol
+final object instance
+class<?> ifaces
+final string bindaddress  final int port
+final int numhandlers
+int metahandlercount  final boolean verbose  configuration conf
+int highprioritylevel
+throws ioexception
+server server   new server instance  ifaces  conf  bindaddress  port
+numhandlers  metahandlercount  verbose
+highprioritylevel
+return server
+/** an rpc server. */
+public static class server extends secureserver
+private object instance
+private class<?> implementation
+private class<?> ifaces
+private boolean verbose
+private static string classnamebase string classname
+string names   classname split     1
+if  names    null    names length    0
+return classname
+return names
+/** construct an rpc server.
+* @param instance the instance whose methods will be called
+* @param conf the configuration to use
+* @param bindaddress the address to bind on to listen for connection
+* @param port the port to listen for connections on
+* @param numhandlers the number of method handler threads to run
+* @param verbose whether each call should be logged
+* @throws java.io.ioexception e
+*/
+public server object instance  final class<?> ifaces
+configuration conf  string bindaddress   int port
+int numhandlers  int metahandlercount  boolean verbose
+int highprioritylevel
+throws ioexception
+super bindaddress  port  invocation class  numhandlers  metahandlercount  conf
+classnamebase instance getclass   getname     highprioritylevel
+this instance   instance
+this implementation   instance getclass
+this verbose   verbose
+this ifaces   ifaces
+// create metrics for the advertised interfaces this server implements.
+this rpcmetrics createmetrics this ifaces
+public authenticationtokensecretmanager createsecretmanager
+if  instance instanceof org apache hadoop hbase server
+org apache hadoop hbase server server
+org apache hadoop hbase server instance
+configuration conf   server getconfiguration
+long keyupdateinterval
+conf getlong    24 60 60 1000
+long maxage
+conf getlong    7 24 60 60 1000
+return new authenticationtokensecretmanager conf  server getzookeeper
+server getservername   tostring    keyupdateinterval  maxage
+return null
+@override
+public void startthreads
+authenticationtokensecretmanager mgr   createsecretmanager
+if  mgr    null
+setsecretmanager mgr
+mgr start
+this authmanager   new serviceauthorizationmanager
+hbasepolicyprovider init conf  authmanager
+// continue with base startup
+super startthreads
+@override
+public writable call class<? extends versionedprotocol> protocol
+writable param  long receivedtime  monitoredrpchandler status
+throws ioexception
+try
+invocation call    invocation param
+if call getmethodname      null
+throw new ioexception
+if  verbose  log     call
+method method
+protocol getmethod call getmethodname
+call getparameterclasses
+method setaccessible true
+object impl   null
+if  protocol isassignablefrom this implementation
+impl   this instance
+else
+throw new hbaserpc unknownprotocolexception protocol
+long starttime   system currenttimemillis
+object params   call getparameters
+object value   method invoke impl  params
+int processingtime    int   system currenttimemillis     starttime
+int qtime    int   starttime receivedtime
+if  tracelog isdebugenabled
+tracelog debug     curcall get   id
+protocol getsimplename     call getmethodname
+qtime
+processingtime
+objects describequantity params
+rpcmetrics rpcqueuetime inc qtime
+rpcmetrics rpcprocessingtime inc processingtime
+rpcmetrics inc call getmethodname    processingtime
+if  verbose  log   value
+return new hbaseobjectwritable method getreturntype    value
+catch  invocationtargetexception e
+throwable target   e gettargetexception
+if  target instanceof ioexception
+throw  ioexception target
+ioexception ioe   new ioexception target tostring
+ioe setstacktrace target getstacktrace
+throw ioe
+catch  throwable e
+if    e instanceof ioexception
+log error    e
+ioexception ioe   new ioexception e tostring
+ioe setstacktrace e getstacktrace
+throw ioe
+protected static void log string value
+string v   value
+if  v    null    v length   > 55
+v   v substring 0  55
+log info v

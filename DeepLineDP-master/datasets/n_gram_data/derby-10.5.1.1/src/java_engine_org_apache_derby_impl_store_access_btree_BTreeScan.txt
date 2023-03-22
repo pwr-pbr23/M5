@@ -1,0 +1,1698 @@
+/*
+derby - class org.apache.derby.impl.store.access.btree.btreescan
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store access btree
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby iapi store access conglomerate logicalundo
+import org apache derby iapi store access conglomerate scanmanager
+import org apache derby iapi store access conglomerate transactionmanager
+import org apache derby iapi store access conglomeratecontroller
+import org apache derby iapi store access dynamiccompiledopenconglominfo
+import org apache derby iapi store access qualifier
+import org apache derby iapi store access rowutil
+import org apache derby iapi store access scancontroller
+import org apache derby iapi store access scaninfo
+import org apache derby iapi store access staticcompiledopenconglominfo
+import org apache derby iapi store raw containerhandle
+import org apache derby iapi store raw fetchdescriptor
+import org apache derby iapi store raw lockingpolicy
+import org apache derby iapi store raw page
+import org apache derby iapi store raw recordhandle
+import org apache derby iapi store raw transaction
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi types rowlocation
+import org apache derby impl store access conglomerate templaterow
+import org apache derby iapi services io formatablebitset
+import org apache derby iapi store access backingstorehashtable
+/**
+a b-tree scan controller corresponds to an instance of an open b-tree scan.
+<p>
+<b>concurrency notes</b>
+<p>
+the concurrency rules are derived from openbtree.
+<p>
+@see openbtree
+**/
+public abstract class btreescan extends openbtree implements scanmanager
+/*
+** fields of btreescan
+*/
+/**
+* init_startkeyvalue, init_qualifier, and init_stopkeyvalue all are used
+* to store * references to the values passed in when scancontroller.init()
+* is called.  it is assumed that these are not altered by the client
+* while the scan is active.
+*/
+protected transaction           init_rawtran               null
+protected boolean               init_forupdate
+protected formatablebitset      init_scancolumnlist
+protected datavaluedescriptor init_template
+protected datavaluedescriptor init_startkeyvalue
+protected int                   init_startsearchoperator   0
+protected qualifier             init_qualifier         null
+protected datavaluedescriptor init_stopkeyvalue
+protected int                   init_stopsearchoperator    0
+protected boolean               init_hold
+/**
+* the fetch descriptor which describes the row to be returned by the scan.
+**/
+protected fetchdescriptor       init_fetchdesc
+/**
+* a constant fetchdescriptor which describes the position of the
+* rowlocation field within the btree, currently always the last column).
+* used by lock/unlock to fetch the rowlocation.
+* only needs to be allocated once per scan.
+**/
+protected fetchdescriptor       init_lock_fetch_desc
+btreerowposition                scan_position
+/**
+* whether the scan should requests update locks which then will be
+* converted to x locks when the actual operation is performed.
+**/
+protected boolean init_useupdatelocks   false
+/*
+* there are 5 states a scan can be in.
+*     scan_init - a scan has started but no positioning has been done.
+*                 the scan will be positioned when the first next() call
+*                 has been made.  none of the positioning state variables
+*                 are valid in this state.
+*     scan_inprogress -
+*                 a scan is in this state after the first next() call.
+*                 on exit from any btreescan method, while in this state,
+*                 the scan "points" at a row which qualifies for the
+*                 scan.  while not maintaining latches on a page the
+*                 current position of the scan is either kept by record
+*                 handle or key.  to tell which use the following:
+*                 if (record key == null)
+*                    record handle has current position
+*                 else
+*                    record key has current position
+*
+*     scan_done - once the end of the table or the stop condition is met
+*                 then the scan is placed in this state.  only valid
+*                 scancontroller method at this point is close().
+*
+*     scan_hold_init -
+*                 the scan has been opened and held open across a commit,
+*                 at the last commit the state was scan_init.
+*                 the scan has never progressed from the scan_init state
+*                 during a transaction.  when a next is done the state
+*                 will either progress to scan_inprogress or scan_done.
+*
+*     scan_hold_inprogress -
+*                 the scan has been opened and held open across a commit,
+*                 at the last commit the state was in scan_inprogress.
+*                 the transaction which opened the scan has committed,
+*                 but the scan was opened with the "hold" option true.
+*                 at commit the locks were released and the "current"
+*                 position is remembered.  in this state only two calls
+*                 are valid, either next() or close().  when next() is
+*                 called the scan is reopened, the underlying container
+*                 is opened thus associating all new locks with the current
+*                 transaction, and the scan continues at the "next" row.
+*/
+protected static final int    scan_init               1
+protected static final int    scan_inprogress         2
+protected static final int    scan_done               3
+protected static final int    scan_hold_init          4
+protected static final int    scan_hold_inprogress    5
+/**
+* delay positioning the  table at the start position until the first
+* next() call.  the initial position is done in positionatstartposition().
+*/
+protected int         scan_state        scan_init
+/**
+* performance counters ...
+*/
+protected int stat_numpages_visited           0
+protected int stat_numrows_visited            0
+protected int stat_numrows_qualified          0
+protected int stat_numdeleted_rows_visited    0
+/**
+* what kind of row locks to get during the scan.
+**/
+protected int lock_operation
+/**
+* a 1 element array to turn fetchnext and fetch calls into
+* fetchnextgroup calls.
+**/
+protected datavaluedescriptor fetchnext_one_slot_array
+new datavaluedescriptor
+/* constructors for this class: */
+public btreescan
+/*
+** private/protected methods of this class, sorted alphabetically
+*/
+/**
+* fetch the next n rows from the table.
+* <p>
+* utility routine used by both fetchset() and fetchnextgroup().
+*
+* @exception  standardexception  standard exception policy.
+**/
+abstract protected int fetchrows
+btreerowposition        pos
+datavaluedescriptor row_array
+rowlocation           rowloc_array
+backingstorehashtable   hash_table
+long                    max_rowcnt
+int                   key_column_numbers
+throws standardexception
+/**
+* shared initialization code between init() and reopenscan().
+* <p>
+* basically save away input parameters describing qualifications for
+* the scan, and do some error checking.
+*
+* @exception  standardexception  standard exception policy.
+**/
+private void initscanparams
+datavaluedescriptor   startkeyvalue
+int                     startsearchoperator
+qualifier               qualifier
+datavaluedescriptor   stopkeyvalue
+int                     stopsearchoperator
+throws standardexception
+// startkeyvalue init.
+this init_startkeyvalue           startkeyvalue
+if  rowutil isrowempty this init_startkeyvalue
+this init_startkeyvalue   null
+// startsearchoperator init.
+this init_startsearchoperator     startsearchoperator
+// qualifier init.
+if   qualifier    null      qualifier  length    0
+qualifier   null
+this init_qualifier               qualifier
+// stopkeyvalue init.
+this init_stopkeyvalue            stopkeyvalue
+if  rowutil isrowempty this init_stopkeyvalue
+this init_stopkeyvalue   null
+// stopsearchoperator init.
+this init_stopsearchoperator      stopsearchoperator
+// reset the "current" position to starting condition.
+// resolve (mmm) - "compile" this.
+scan_position   new btreerowposition this
+scan_position init
+scan_position current_lock_template
+new datavaluedescriptor
+scan_position current_lock_template
+scan_position current_lock_row_loc
+rowlocation    rowlocation
+init_template  cloneobject
+// verify that all columns in start key value, stop key value, and
+// qualifiers are present in the list of columns described by the
+// scancolumnlist.
+if (sanitymanager.debug)
+if  init_scancolumnlist    null
+// verify that all columns specified in qualifiers, start
+// and stop positions are specified in the scancolumnlist.
+formatablebitset required_cols
+if  qualifier    null
+required_cols   rowutil getqualifierbitset qualifier
+else
+required_cols   new formatablebitset 0
+// add in start columns
+if  this init_startkeyvalue    null
+required_cols grow this init_startkeyvalue length
+for  int i   0  i < this init_startkeyvalue length  i
+required_cols set i
+if  this init_stopkeyvalue    null
+required_cols grow this init_stopkeyvalue length
+for  int i   0  i < this init_stopkeyvalue length  i
+required_cols set i
+formatablebitset required_cols_and_scan_list
+formatablebitset  required_cols clone
+required_cols_and_scan_list and init_scancolumnlist
+// formatablebitset equals requires the two formatablebitsets to be of same
+// length.
+required_cols grow init_scancolumnlist size
+if   required_cols_and_scan_list equals required_cols
+sanitymanager.throwassert(
+required_cols_and_scan_list
+required_cols
+init_scancolumnlist
+/**
+* position scan at "start" position for a forward scan.
+* <p>
+* positions the scan to the slot just before the first record to be
+* returned from the scan.  returns the start page latched, and
+* sets "current_slot" to the slot number.
+* <p>
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected void positionatstartforforwardscan
+btreerowposition    pos
+throws standardexception
+boolean         exact
+// this routine should only be called from first next() call //
+if (sanitymanager.debug)
+sanitymanager assert
+scan_state    scan_init      scan_state    scan_hold_init
+sanitymanager assert pos current_rh             null
+sanitymanager assert pos current_positionkey    null
+// loop until you can lock the row previous to the first row to be
+// returned by the scan, while holding the page latched, without
+// waiting.  if you have to wait, drop the latch, wait for the lock -
+// which makes it likely if you wait for the lock you will loop just
+// once, find the same lock satisfies the search and since you already
+// have the lock it will be granted.
+while  true
+// find the starting page and row slot, must start at root and
+// search either for leftmost leaf, or search for specific key.
+controlrow root   controlrow get this  btree rootpageid
+// include search of tree in page visited stats.
+stat_numpages_visited    root getlevel     1
+boolean need_previous_lock   true
+if  init_startkeyvalue    null
+// no start given, so position at 0 slot of leftmost leaf page
+pos current_leaf    leafcontrolrow  root searchleft this
+pos current_slot   controlrow cr_slot
+exact       false
+else
+// search for the starting row.
+if (sanitymanager.debug)
+sanitymanager assert
+init_startsearchoperator    scancontroller ge
+init_startsearchoperator    scancontroller gt
+searchparameters sp   new searchparameters
+init_startkeyvalue
+init_startsearchoperator    scancontroller ge  ?
+searchparameters position_left_of_partial_key_match
+searchparameters position_right_of_partial_key_match
+init_template  this  false
+pos current_leaf    leafcontrolrow  root search sp
+pos current_slot   sp resultslot
+exact       sp resultexact
+// the way that scans are used, the caller calls next()
+// to position on the first row.  if the result of the
+// search that found the starting page and slot was not
+// exact, then the page/slot will refer to the row before
+// the first qualifying row.  the first call to next()
+// will therefore move to the first (potentially) qualifying
+// row.  however, if the search was exact, then we don't
+// want to move the position on the first call to next.
+// in that case, by decrementing the slot, the first call
+// to next will put us back	on the starting row.
+if  exact    init_startsearchoperator    scancontroller ge
+pos current_slot
+// a scan on a unique index, with a start position of
+// ge, need not get a previous key lock to protect the
+// range.  since it is unique no other key can go before
+// the first row returned from the scan.
+//
+// resolve - currently btree's only support allowduplicates
+// of "false", so no need to do the extra check, current
+// btree implementation depends on rowlocation field
+// making every key unique (duplicate indexes are supported
+// by the nuniquecolumns and nkeyfields).
+if  getconglomerate   nuniquecolumns < getconglomerate   nkeyfields
+// this implies unique index, thus no prev key.
+need_previous_lock   false
+boolean latch_released   false
+if  need_previous_lock
+latch_released
+this getlockingpolicy   lockscanrow
+this  this getconglomerate    pos
+init_lock_fetch_desc
+pos current_lock_template
+pos current_lock_row_loc
+true  init_forupdate
+lock_operation
+// special test to see if latch release code works
+if (sanitymanager.debug)
+latch_released
+test_errors
+this
+null     no need to save the position  since we'll
+// retry the operation if the latch is released
+this getlockingpolicy
+pos current_leaf  latch_released
+if  latch_released
+// lost latch on pos.current_leaf, search the tree again.
+pos current_leaf   null
+continue
+else
+// success! got all the locks, while holding the latch.
+break
+this scan_state           scan_inprogress
+if (sanitymanager.debug)
+sanitymanager assert pos current_leaf    null
+/**
+* position scan at "start" position for a backward scan.
+* <p>
+* positions the scan to the slot just after the first record to be
+* returned from the backward scan.  returns the start page latched, and
+* sets "current_slot" to the slot number just right of the first slot
+* to return.
+* <p>
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected void positionatstartforbackwardscan
+btreerowposition    pos
+throws standardexception
+boolean         exact
+// this routine should only be called from first next() call //
+if (sanitymanager.debug)
+sanitymanager assert
+this scan_state    scan_init
+this scan_state    scan_hold_init
+sanitymanager assert pos current_rh             null
+sanitymanager assert pos current_positionkey            null
+// loop until you can lock the row previous to the first row to be
+// returned by the scan, while holding the page latched, without
+// waiting.  if you have to wait, drop the latch, wait for the lock -
+// which makes it likely if you wait for the lock you will loop just
+// once, find the same lock satisfies the search and since you already
+// have the lock it will be granted.
+while  true
+// find the starting page and row slot, must start at root and
+// search either for leftmost leaf, or search for specific key.
+controlrow root   controlrow get this  btree rootpageid
+// include search of tree in page visited stats.
+stat_numpages_visited    root getlevel     1
+if  init_startkeyvalue    null
+// no start given, position at last slot + 1 of rightmost leaf
+pos current_leaf    leafcontrolrow  root searchright this
+pos current_slot   pos current_leaf page recordcount
+exact       false
+else
+/*
+if (sanitymanager.debug)
+sanitymanager.throwassert(
+"code not ready yet for positioned backward scans.");
+*/
+if (sanitymanager.debug)
+sanitymanager assert
+init_startsearchoperator    scancontroller ge
+init_startsearchoperator    scancontroller gt
+// search for the starting row.
+searchparameters sp   new searchparameters
+init_startkeyvalue
+init_startsearchoperator    scancontroller ge  ?
+searchparameters position_right_of_partial_key_match
+searchparameters position_left_of_partial_key_match
+init_template  this  false
+pos current_leaf    leafcontrolrow  root search sp
+pos current_slot   sp resultslot
+exact       sp resultexact
+// the way that backward scans are used, the caller calls next()
+// to position on the first row.  if the result of the
+// search that found the starting page and slot was not
+// exact, then the page/slot will refer to the row before
+// the first qualifying row.  the first call to next()
+// will therefore move to the first (potentially) qualifying
+// row.  however, if the search was exact, then we don't
+// want to move the position on the first call to next.
+// in that case, by decrementing the slot, the first call
+// to next will put us back	on the starting row.
+if  exact
+// the search has found exactly the start position key
+if  init_startsearchoperator    scancontroller ge
+// insure backward scan returns this row by moving
+// slot to one after this row.
+pos current_slot
+else
+// no work necessary leave startslot positioned on the
+// row, we will skip this record
+if (sanitymanager.debug)
+sanitymanager assert
+init_startsearchoperator    scancontroller gt
+else
+// the search positioned one before the start position key,
+// move it to one "after"
+pos current_slot
+boolean latch_released
+this getlockingpolicy   lockscanrow
+this  this getconglomerate    pos
+init_lock_fetch_desc
+pos current_lock_template
+pos current_lock_row_loc
+true  init_forupdate  lock_operation
+// special test to see if latch release code works
+if (sanitymanager.debug)
+latch_released
+test_errors
+this
+pos
+this getlockingpolicy    pos current_leaf  latch_released
+if  latch_released
+// lost latch on pos.current_leaf, search the tree again.
+pos current_leaf   null
+continue
+else
+// success! got all the locks, while holding the latch.
+break
+this scan_state            scan_inprogress
+if (sanitymanager.debug)
+sanitymanager assert pos current_leaf    null
+// system.out.println("backward scan end start position: " +
+//       " current_slot = " + this.current_slot );
+/**
+* position scan to 0 slot on next page.
+* <p>
+* position to next page, keeping latch on previous page until we have
+* latch on next page.  this routine releases the latch on current_page
+* once it has successfully gotten the latch on the next page.
+*
+* @param pos           current row position of the scan.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected void positionatnextpage
+btreerowposition    pos
+throws standardexception
+pos next_leaf    leafcontrolrow  pos current_leaf getrightsibling this
+// now that we either have the latch on next leaf, or there is no next
+// leaf, we can release the latch on the current page.
+// unlock the previous row if doing read.
+if  pos current_rh    null
+this getlockingpolicy   unlockscanrecordafterread
+pos  init_forupdate
+pos current_leaf release
+pos current_leaf          pos next_leaf
+// set up for scan to continue at beginning of next page.
+pos current_slot          page first_slot_number
+pos current_rh            null
+/**
+position scan at "start" position.
+<p>
+positions the scan to the slot just before the first record to be returned
+from the scan.  returns the start page latched, and sets "current_slot" to
+the slot number.
+@exception  standardexception  standard exception policy.
+**/
+abstract void positionatstartposition
+btreerowposition    pos
+throws standardexception
+/**
+* do any necessary work to complete the scan.
+*
+* @param pos           current row position of the scan.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected void positionatdonescanfromclose
+btreerowposition    pos
+throws standardexception
+// call unlockscanrecordafterread() before closing, currently
+// this is only important for releasing rr locks on non-qualified
+// rows.
+//
+// otherwise the correct behavior happens as part of the close, ie.:
+//
+//     for read_uncommitted there is no lock to release,
+//     for read_committed   all read locks will be released,
+//     for repeatable_read or serializable no locks are released.
+if   pos current_rh    null      pos current_rh_qualified
+if  pos current_leaf    null    pos current_leaf page    null
+// if we are being called from a "normal" close then there
+// will be no latch on current_leaf, get it and do the the
+// unlock.  we may be called sometimes, after an error where
+// we may have the latch, in this case the transaction is about
+// to be backed out anyway so don't worry about doing this
+// unlock (thus why we only do the following code if we
+// "don't" have lock, ie. pos.current_leaf== null).
+this getlockingpolicy   unlockscanrecordafterread
+pos  init_forupdate
+pos current_slot   page invalid_slot_number
+pos current_rh     null
+pos current_positionkey    null
+this scan_state     scan_done
+return
+/**
+* do work necessary to close a scan.
+* <p>
+* this routine can only be called "inline" from other btree routines,
+* as it counts on the state of the pos to be correct.
+* <p>
+* closing a scan from close() must handle long jumps from exceptions
+* where the state of pos may not be correct.  the easiest case is
+* a lock timeout which has caused us not to have a latch on a page,
+* but pos still thinks there is a latch.  this is the easiest but
+* other exceptions can also caused the same state at close() time.
+**/
+protected void positionatdonescan
+btreerowposition    pos
+throws standardexception
+pos current_slot          page invalid_slot_number
+pos current_rh            null
+pos current_positionkey   null
+this scan_state           scan_done
+return
+/**
+* process_qualifier - determine if a row meets all qualifier conditions.
+* <p>
+* check all qualifiers in the qualifier array against row.  return true
+* if all compares specified by the qualifier array return true, else
+* return false.
+* <p>
+* it is up to caller to make sure qualifier list is non-null.
+*
+* @param row      the row with the same partial column list as the
+*                 row returned by the current scan.
+*
+* @exception  standardexception  standard exception policy.
+*/
+protected boolean process_qualifier
+datavaluedescriptor     row
+throws standardexception
+boolean     row_qualifies   true
+qualifier   q
+// process the 2-d qualifier which is structured as follows:
+//
+// a two dimensional array is to be used to pass around a and's and or's
+// in conjunctive normal form (cnf).  the top slot of the 2 dimensional
+// array is optimized for the more frequent where no or's are present.
+// the first array slot is always a list of and's to be treated as
+// described above for single dimensional and qualifier arrays.  the
+// subsequent slots are to be treated as and'd arrays or or's.  thus
+// the 2 dimensional array qual[][] argument is to be treated as the
+// following, note if qual.length = 1 then only the first array is
+// valid and // it is and an array of and clauses:
+//
+// (qual[0][0] and qual[0][0] ... and qual[0][qual[0].length - 1])
+// and
+// (qual[1][0] or  qual[1][1] ... or  qual[1][qual[1].length - 1])
+// and
+// (qual[2][0] or  qual[2][1] ... or  qual[2][qual[2].length - 1])
+// ...
+// and
+// (qual[qual.length - 1][0] or  qual[1][1] ... or  qual[1][2])
+// first do the qual[0] which is an array of qualifer terms.
+if (sanitymanager.debug)
+// routine should not be called if there is no qualifier
+sanitymanager assert this init_qualifier    null
+sanitymanager assert this init_qualifier length > 0
+for  int i   0  i < this init_qualifier length  i
+// process each and clause
+row_qualifies   false
+// process each or clause.
+q   this init_qualifier
+// get the column from the possibly partial row, of the
+// q.getcolumnid()'th column in the full row.
+datavaluedescriptor columnvalue   row
+row_qualifies
+columnvalue compare
+q getoperator
+q getorderable
+q getorderednulls
+q getunknownrv
+if  q negatecompareresult
+row_qualifies    row_qualifies
+// once an and fails the whole qualification fails - do a return!
+if   row_qualifies
+return false
+// all the qual[0] and terms passed, now process the or clauses
+for  int and_idx   1  and_idx < this init_qualifier length  and_idx
+// process each and clause
+row_qualifies   false
+if (sanitymanager.debug)
+// each or clause must be non-empty.
+sanitymanager assert this init_qualifier length > 0
+for  int or_idx   0
+or_idx < this init_qualifier length  or_idx
+// process each or clause.
+q   this init_qualifier
+// get the column from the possibly partial row, of the
+// q.getcolumnid()'th column in the full row.
+datavaluedescriptor columnvalue   row
+row_qualifies
+columnvalue compare
+q getoperator
+q getorderable
+q getorderednulls
+q getunknownrv
+if  q negatecompareresult
+row_qualifies    row_qualifies
+// once one or qualifies the entire clause is true
+if  row_qualifies
+break
+if   row_qualifies
+break
+return row_qualifies
+/**
+* reposition the scan leaving and reentering the access layer.
+* <p>
+* when a scan leaves access it saves the recordhandle of the record
+* on the page.  there are 2 cases to consider when trying to reposition
+* the scan when re-entering access:
+*     o row has not moved off the page.
+*       if the row has not moved then the recordhandle we have saved
+*       away is valid, and we just call rawstore to reposition on that
+*       recordhandle (rawstore takes care of the row moving within
+*       the page).
+*     o row has moved off the page.
+*       this can only happen in the case of a btree split.  in that
+*       case the splitter will have caused all scans positioned on
+*       this page within the same transaction to save a copy of the
+*       row that the scan was positioned on.  then to reposition the
+*       scan it is necessary to research the tree from the top using
+*       the copy of the row.
+*
+* there are a few cases where it is possible that
+* the key no longer exists in the table.  in the case of a scan held
+* open across commit it is easy to imagine that the row the scan was
+* positioned on could be deleted and subsequently purged from the table
+* all before the scan resumes.  also in the case of read uncommitted
+* the scan holds no lock on the current row, so it could be purged -
+* in the following scenario for instance:  read uncommitted transaction 1
+* opens scan and positions on row (1,2), transaction 2 deletes (1,2) and
+* commits, transaction 1 inserts (1,3) which goes to same page as (1,2)
+* and is going to cause a split, transaction 1 saves scan position as
+* key, and then purges row (1, 2), when transaction
+* 1 resumes scan (1, 2) no longer exists.  missing_row_for_key_ok
+* parameter is added as a sanity check to make sure it ok that
+* repositioning does not go to same row that we were repositioned on.
+*
+*
+*
+* @param   pos                     position to set the scan to.
+*
+* @param   missing_row_for_key_ok  if true and exact key is not found then
+*                                  scan is just set to key just left of
+*                                  the key (thus a next will move to the
+*                                  key just after "pos")
+*
+* @return  returns true if scan has been repositioned successfully, else
+*          returns false if the position key could not be found and
+*          missing_row_for_key_ok was false indicating that scan could
+*          only be positioned on the exact key match.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected boolean reposition
+btreerowposition pos
+boolean          missing_row_for_key_ok
+throws standardexception
+// resolve (mikem) - performance - we need to do a buffer manager
+// get for every row returned from the scan.  it may be better to
+// allow a reference to the page with no latch (ie. a fixed bit).
+if  this scan_state    scan_inprogress
+throw standardexception newexception
+sqlstate btree_scan_not_positioned
+new integer this scan_state
+// positionkey is always valid
+if (sanitymanager.debug)
+if  pos current_positionkey    null
+sanitymanager.throwassert(
+pos current_rh
+pos current_positionkey
+if  pos current_positionkey    null
+throw standardexception newexception
+sqlstate btree_scan_internal_error
+new boolean pos current_rh    null
+new boolean pos current_positionkey    null
+// if current_rh is non-null, we know the exact physical position of
+// the scan before the latch on the leaf was released. check if the
+// row is still on that position so that we don't need to renavigate
+// from the root of the b-tree in the common case.
+if  pos current_rh    null
+// reposition to remembered spot on page.
+// get the page object. if getpage() returns null, the page is
+// not valid (could for instance have been removed by compress
+// table) so we need to reposition by key instead.
+page page   container getpage pos current_rh getpagenumber
+if  page    null
+controlrow row
+controlrow getcontrolrowforpage container  page
+if  row instanceof leafcontrolrow
+row page isrepositionneeded pos versionwhensaved
+// no rows have been moved off the page after we released
+// the latch, and the page is still a leaf page. no need
+// to reposition by key.
+pos current_leaf    leafcontrolrow  row
+pos current_slot   row page getslotnumber pos current_rh
+pos current_positionkey   null
+return true
+// we couldn't use the position specified by current_rh, so we
+// need to reposition by key and may find the row on another
+// page. therefore, give up the latch on this page.
+row release
+searchparameters sp
+new searchparameters
+pos current_positionkey
+// this is a full key search, so this arg is not used.
+searchparameters position_left_of_partial_key_match
+init_template  this  false
+pos current_leaf    leafcontrolrow
+controlrow get this  btree rootpageid  search sp
+if   sp resultexact     missing_row_for_key_ok
+// did not find key to exactly position on.
+pos current_leaf release
+pos current_leaf   null
+return  false
+pos current_slot   sp resultslot
+// need to update current_rh to the new position. current_rh should
+// only be non-null if the row was locked when the position was saved,
+// so we don't set it here if its old value is null.
+if  pos current_rh    null
+pos current_rh   pos current_leaf page
+getrecordhandleatslot pos current_slot
+pos current_positionkey   null
+return true
+/*
+** public methods of btreescan
+*/
+/**
+initialize the scan for use.
+<p>
+any changes to this method may have to be reflected in close as well.
+<p>
+the btree init opens the container (super.init), and stores away the
+state of the qualifiers.  the actual searching for the first position
+is delayed until the first next() call.
+@exception  standardexception  standard exception policy.
+**/
+public void init
+transactionmanager              xact_manager
+transaction                     rawtran
+boolean                         hold
+int                             open_mode
+int                             lock_level
+btreelockingpolicy              btree_locking_policy
+formatablebitset                scancolumnlist
+datavaluedescriptor		    startkeyvalue
+int                             startsearchoperator
+qualifier                       qualifier
+datavaluedescriptor		    stopkeyvalue
+int                             stopsearchoperator
+btree                           conglomerate
+logicalundo                     undo
+staticcompiledopenconglominfo   static_info
+dynamiccompiledopenconglominfo  dynamic_info
+throws standardexception
+super init
+xact_manager  xact_manager   containerhandle  null  rawtran
+hold
+open_mode  lock_level  btree_locking_policy
+conglomerate  undo  dynamic_info
+this init_rawtran                 rawtran
+this init_forupdate
+open_mode   containerhandle mode_forupdate
+containerhandle mode_forupdate
+// keep track of whether this scan should use update locks.
+this init_useupdatelocks
+open_mode
+containerhandle mode_use_update_locks     0
+this init_hold                    hold
+this init_template
+runtime_mem get_template getrawtran
+this init_scancolumnlist          scancolumnlist
+this init_lock_fetch_desc
+rowutil getfetchdescriptorconstant init_template length   1
+if (sanitymanager.debug)
+sanitymanager assert
+init_lock_fetch_desc getmaxfetchcolumnid
+init_template length   1
+sanitymanager assert
+init_lock_fetch_desc getvalidcolumnsarray       1
+// note that we don't process qualifiers in btree fetch's
+this init_fetchdesc
+new fetchdescriptor
+init_template length  init_scancolumnlist  qualifier  null
+initscanparams
+startkeyvalue  startsearchoperator
+qualifier  stopkeyvalue  stopsearchoperator
+if (sanitymanager.debug)
+sanitymanager assert
+templaterow checkcolumntypes
+getrawtran   getdatavaluefactory
+this getconglomerate   format_ids
+this getconglomerate   collation_ids
+init_template
+// system.out.println("initializing scan:" + this);
+// initialize default locking operation for the scan.
+this lock_operation
+init_forupdate ?
+conglomeratecontroller lock_upd
+conglomeratecontroller lock_read
+if  init_useupdatelocks
+this lock_operation    conglomeratecontroller lock_update_locks
+// system.out.println("btree scan: " + this);
+/*
+** methods of scancontroller
+*/
+/**
+close the scan.
+**/
+public void close
+throws standardexception
+// scan is closed, make sure no access to any state variables
+positionatdonescanfromclose scan_position
+super close
+// null out so that these object's can get gc'd earlier.
+this init_rawtran         null
+this init_template        null
+this init_startkeyvalue   null
+this init_qualifier       null
+this init_stopkeyvalue    null
+this getxactmgr   closeme this
+/**
+delete the row at the current position of the scan.
+@see scancontroller#delete
+@exception  standardexception  standard exception policy.
+**/
+public boolean delete
+throws standardexception
+boolean     ret_val        false
+if  scan_state    scan_inprogress
+throw standardexception newexception
+sqlstate am_scan_not_positioned
+if (sanitymanager.debug)
+sanitymanager assert this container    null
+sanitymanager assert init_forupdate
+try
+// get current page of scan, with latch.
+if   reposition scan_position  false
+throw standardexception newexception
+sqlstate am_record_not_found
+new long err_containerid
+new long scan_position current_rh getid
+if  init_useupdatelocks
+// resolve (mikem) - i don't think lockscanrow() is the right
+// thing to call.
+// if we are doing update locking, then we got an u lock on
+// this row when the scan positioned on it, but now that we
+// are doing a delete on the current position we need to upgrade
+// the lock to x.
+boolean latch_released
+this getlockingpolicy   lockscanrow
+this  this getconglomerate    scan_position
+init_lock_fetch_desc
+scan_position current_lock_template
+scan_position current_lock_row_loc
+false  init_forupdate  lock_operation
+if  latch_released
+// lost latch on page in order to wait for row lock.
+// reposition() will take care of the complexity of
+// positioning on the correct page if the row has been
+// moved to another page.
+if  reposition scan_position  false
+throw standardexception newexception
+sqlstate am_record_not_found
+new long err_containerid
+new long scan_position current_rh getid
+if (sanitymanager.debug)
+// derby-2197: assume no row locking here. if locking policy
+// requires row locking, we would need to obtain a row lock at
+// this point.
+sanitymanager assert
+container getlockingpolicy   getmode
+lockingpolicy mode_record
+if  scan_position current_leaf page isdeletedatslot
+scan_position current_slot
+ret_val   false
+else
+scan_position current_leaf page deleteatslot
+scan_position current_slot  true  this btree_undo
+ret_val   true
+// see if we just deleted the last row on the page, in a btree a
+// page with all rows still has 1 left - the control row.
+// do not reclaim the root page of the btree if there are no
+// children since we were doing too many post commit actions in a
+// benchmark which does an insert/commit/delete/commit operations
+// in a single user system.  now with this change the work will
+// move to the user thread which does the insert and finds no space
+// on the root page.  in that case it will try a split, which
+// automatically first checks if there is committed deleted space
+// that can be reclaimed.
+if  scan_position current_leaf page nondeletedrecordcount      1
+scan_position current_leaf getisroot
+scan_position current_leaf getlevel      0
+this getxactmgr   addpostcommitwork new btreepostcommit
+this getxactmgr   getaccessmanager
+this getconglomerate
+scan_position current_leaf page getpagenumber
+finally
+if  scan_position current_leaf    null
+// release latch on page
+savepositionandreleasepage
+return ret_val
+/**
+* a call to allow client to indicate that current row does not qualify.
+* <p>
+* indicates to the scancontroller that the current row does not
+* qualify for the scan.  if the isolation level of the scan allows,
+* this may result in the scan releasing the lock on this row.
+* <p>
+* note that some scan implimentations may not support releasing locks on
+* non-qualifying rows, or may delay releasing the lock until sometime
+* later in the scan (ie. it may be necessary to keep the lock until
+* either the scan is repositioned on the next row or page).
+* <p>
+* this call should only be made while the scan is positioned on a current
+* valid row.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void didnotqualify
+throws standardexception
+/**
+* returns true if the current position of the scan still qualifies
+* under the set of qualifiers passed to the openscan().  when called
+* this routine will reapply all qualifiers against the row currently
+* positioned and return true if the row still qualifies.  if the row
+* has been deleted or no longer passes the qualifiers then this routine
+* will return false.
+* <p>
+* this case can come about if the current scan
+* or another scan on the same table in the same transaction
+* deleted the row or changed columns referenced by the qualifier after
+* the next() call which positioned the scan at this row.
+* <p>
+* note that for comglomerates which don't support update, like btree's,
+* there is no need to recheck the qualifiers.
+* <p>
+* the results of a fetch() performed on a scan positioned on
+* a deleted row are undefined.
+* <p>
+* @exception standardexception standard exception policy.
+**/
+public boolean doescurrentpositionqualify
+throws standardexception
+if  scan_state    scan_inprogress
+throw standardexception newexception
+sqlstate am_scan_not_positioned
+if (sanitymanager.debug)
+sanitymanager assert this container    null
+try
+// get current page of scan, with latch
+if   reposition scan_position  false
+// todo - write unit test to get here, language always calls
+// iscurrentpositiondeleted() right before calling this, so
+// hard to write .sql test to exercise this.
+// if reposition fails it means the position of the scan
+// has been purged from the table - for example if this is
+// a uncommitted read scan and somehow the row was purged
+// since the last positioning.
+return false
+if (sanitymanager.debug)
+sanitymanager assert
+scan_position current_leaf page fetchnumfieldsatslot
+scan_position current_slot  > 1
+// since btree row don't get updated, the only way a current
+// position may not qualify is if it got deleted.
+return
+scan_position current_leaf page isdeletedatslot
+scan_position current_slot
+finally
+if  scan_position current_leaf    null
+// release latch on page.
+savepositionandreleasepage
+/**
+* fetch the row at the current position of the scan.
+*
+* @param row the row into which the value of the current
+* position in the scan is to be stored.
+* @param qualify indicates whether the qualifiers should be applied.
+*
+* @exception  standardexception  standard exception policy.
+*/
+private void fetch datavaluedescriptor row  boolean qualify
+throws standardexception
+if  scan_state    scan_inprogress
+throw standardexception newexception
+sqlstate am_scan_not_positioned
+if (sanitymanager.debug)
+sanitymanager assert this container    null
+try
+// get current page of scan, with latch
+if   reposition scan_position  false
+// todo - write unit test to get here, language always calls
+// iscurrentpositiondeleted() right before calling this, so
+// hard to write .sql test to exercise this.
+throw standardexception newexception
+sqlstate am_record_not_found
+new long err_containerid
+new long scan_position current_rh getid
+if (sanitymanager.debug)
+sanitymanager assert
+scan_position current_leaf page fetchnumfieldsatslot
+scan_position current_slot  > 1
+scan_position current_rh
+scan_position current_leaf page fetchfromslot
+recordhandle  null
+scan_position current_slot  row
+qualify ? init_fetchdesc   null
+true
+// the possibility is that the row at the current position
+// has been marked as deleted (it cannot have been purged
+// since the scan maintains a lock on the row, and purges
+// are always done from system transactions).  i'm not sure
+// what the desired behavior is in this case.  for now,
+// just return null.
+// resolve (mikem) - what should be done here?
+if  scan_position current_leaf page isdeletedatslot
+scan_position current_slot
+if (sanitymanager.debug)
+sanitymanager assert false
+finally
+if  scan_position current_leaf    null
+// release latch on page.
+savepositionandreleasepage
+return
+/**
+* @see org.apache.derby.iapi.store.access.scancontroller#isheldaftercommit
+*/
+public boolean isheldaftercommit   throws standardexception
+return  scan_state    scan_hold_init
+scan_state    scan_hold_inprogress
+/**
+fetch the row at the current position of the scan.
+@see scancontroller#fetch
+@exception  standardexception  standard exception policy.
+**/
+public void fetch datavaluedescriptor row
+throws standardexception
+fetch row  true
+/**
+* fetch the row at the current position of the scan without applying the
+* qualifiers.
+* @see scancontroller#fetchwithoutqualify
+*
+* @exception  standardexception  standard exception policy.
+*/
+public void fetchwithoutqualify datavaluedescriptor row
+throws standardexception
+fetch row  false
+/**
+* return scaninfo object which describes performance of scan.
+* <p>
+* return scaninfo object which contains information about the current
+* scan.
+* <p>
+*
+* @see scaninfo
+*
+* @return the scaninfo object which contains info about current scan.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public scaninfo getscaninfo
+throws standardexception
+return new btreescaninfo this
+/**
+returns true if the current position of the scan is at a
+deleted row.  this case can come about if the current scan
+or another scan on the same table in the same transaction
+deleted the row after the next() call which positioned the
+scan at this row.
+the results of a fetch() performed on a scan positioned on
+a deleted row are undefined.
+@exception standardexception standard exception policy.
+**/
+public boolean iscurrentpositiondeleted
+throws standardexception
+boolean     ret_val
+if  scan_state    scan_inprogress
+throw standardexception newexception
+sqlstate am_scan_not_positioned
+if (sanitymanager.debug)
+sanitymanager assert this container    null
+try
+// get current page of scan, with latch
+if  reposition scan_position  false
+if (sanitymanager.debug)
+sanitymanager assert
+scan_position current_leaf page fetchnumfieldsatslot
+scan_position current_slot  > 1
+ret_val
+scan_position current_leaf page isdeletedatslot
+scan_position current_slot
+else
+ret_val   false
+finally
+if  scan_position current_leaf    null
+// release latch on page.
+savepositionandreleasepage
+return ret_val
+/**
+* return whether this is a keyed conglomerate.
+* <p>
+*
+* @return whether this is a keyed conglomerate.
+**/
+public boolean iskeyed
+return true
+/**
+* @see scancontroller#positionatrowlocation
+*
+* not implemented for this class
+*/
+public boolean positionatrowlocation  rowlocation rloc
+throws standardexception
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+/**
+move to the next position in the scan.
+@see scancontroller#next
+@exception  standardexception  standard exception policy.
+**/
+public boolean next
+throws standardexception
+// turn this call into a group fetch of a 1 element group.
+fetchnext_one_slot_array   runtime_mem get_scratch_row getrawtran
+boolean ret_val
+fetchrows
+scan_position
+fetchnext_one_slot_array
+rowlocation  null
+backingstorehashtable  null
+1
+int  null     1
+return ret_val
+/**
+fetch the row at the next position of the scan.
+if there is a valid next position in the scan then
+the value in the template storable row is replaced
+with the value of the row at the current scan
+position.  the columns of the template row must
+be of the same type as the actual columns in the
+underlying conglomerate.
+the resulting contents of templaterow after a fetchnext()
+which returns false is undefined.
+the result of calling fetchnext(row) is exactly logically
+equivalent to making a next() call followed by a fetch(row)
+call.  this interface allows implementations to optimize
+the 2 calls if possible.
+@param row the template row into which the value
+of the next position in the scan is to be stored.
+@return true if there is a next position in the scan,
+false if there isn't.
+@exception standardexception standard exception policy.
+**/
+public boolean fetchnext datavaluedescriptor row
+throws standardexception
+boolean ret_val
+// turn this call into a group fetch of a 1 element group.
+fetchnext_one_slot_array   row
+ret_val
+fetchrows
+scan_position
+fetchnext_one_slot_array
+rowlocation  null
+backingstorehashtable  null
+1
+int  null     1
+return ret_val
+/**
+* fetch the next n rows from the table.
+* <p>
+* the client allocates an array of n rows and passes it into the
+* fetchnextset() call.  this routine does the equivalent of n
+* fetchnext() calls, filling in each of the rows in the array.
+* locking is performed exactly as if the n fetchnext() calls had
+* been made.
+* <p>
+* it is up to access how many rows to return.  fetchnextset() will
+* return how many rows were filled in.  if fetchnextset() returns 0
+* then the scan is complete, (ie. the scan is in the same state as if
+* fetchnext() had returned false).  if the scan is not complete then
+* fetchnext() will return (1 <= row_count <= n).
+* <p>
+* the current position of the scan is undefined if fetchnextset()
+* is used (ie. mixing fetch()/fetchnext() and fetchnextset() calls
+* in a single scan does not work).  this is because a fetchnextset()
+* request for 5 rows from a heap where the first 2 rows qualify, but
+* no other rows qualify will result in the scan being positioned at
+* the end of the table, while if 5 rows did qualify the scan will be
+* positioned on the 5th row.
+* <p>
+* qualifiers, start and stop positioning of the openscan are applied
+* just as in a normal scan.
+* <p>
+* the columns of the row will be the standard columns returned as
+* part of a scan, as described by the validcolumns - see openscan for
+* description.
+* <p>
+* expected usage:
+*
+* // allocate an array of 5 empty row templates
+* datavaluedescriptor[][] row_array = allocate_row_array(5);
+* int row_cnt = 0;
+*
+* scan = openscan();
+*
+* while ((row_cnt = scan.fetchnextset(row_array) != 0)
+* {
+*     // i got "row_cnt" rows from the scan.  these rows will be
+*     // found in row_array[0] through row_array[row_cnt - 1]
+* }
+*
+* <p>
+*
+* resolve - this interface is being provided so that we can prototype
+*           the performance results it can achieve.  if it looks like
+*           this interface is useful, it is very likely we will look
+*           into a better way to tie together the now 4 different
+*           fetch interfaces: fetch, fetchnext(), fetchnextgroup(),
+*           and fetchset().
+*
+* @return the number of qualifying rows found and copied into the
+*         provided array of rows.  if 0 then the scan is complete,
+*         otherwise the return value will be:
+*         1 <= row_count <= row_array.length
+*
+* @param row_array         the array of rows to copy rows into.
+*                          row_array[].length must >= 1.  this routine
+*                          assumes that all entries in the array
+*                          contain complete template rows.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public int fetchnextgroup
+datavaluedescriptor row_array
+rowlocation           rowloc_array
+throws standardexception
+return
+fetchrows
+scan_position
+row_array
+rowloc_array
+backingstorehashtable  null
+row_array length
+int  null
+public int fetchnextgroup
+datavaluedescriptor row_array
+rowlocation           old_rowloc_array
+rowlocation           new_rowloc_array
+throws standardexception
+// this interface is currently only used to move rows around in
+// a heap table, unused in btree's -- so not implemented.
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+/**
+* insert all rows that qualify for the current scan into the input
+* hash table.
+* <p>
+* this routine scans executes the entire scan as described in the
+* openscan call.  for every qualifying unique row value an entry is
+* placed into the hashtable. for unique row values the entry in the
+* backingstorehashtable has a key value of the object stored in
+* row[key_column_number], and the value of the data is row.  for row
+* values with duplicates, the key value is also row[key_column_number],
+* but the value of the data is a vector of
+* rows.  the caller will have to call "instanceof" on the data value
+* object if duplicates are expected, to determine if the data value
+* of the hashtable entry is a row or is a vector of rows.
+* <p>
+* note, that for this routine to work efficiently the caller must
+* ensure that the object in row[key_column_number] implements
+* the hashcode and equals method as appropriate for it's datatype.
+* <p>
+* it is expected that this call will be the first and only call made in
+* an openscan.  qualifiers and stop position of the openscan are applied
+* just as in a normal scan.  this call is logically equivalent to the
+* caller performing the following:
+*
+* import java.util.hashtable;
+*
+* hash_table = new hashtable();
+*
+* while (next())
+* {
+*     row = create_new_row();
+*     fetch(row);
+*     if ((duplicate_value =
+*         hash_table.put(row[key_column_number], row)) != null)
+*     {
+*         vector row_vec;
+*
+*         // inserted a duplicate
+*         if ((duplicate_value instanceof vector))
+*         {
+*             row_vec = (vector) duplicate_value;
+*         }
+*         else
+*         {
+*             // allocate vector to hold duplicates
+*             row_vec = new vector(2);
+*
+*             // insert original row into vector
+*             row_vec.addelement(duplicate_value);
+*
+*             // put the vector as the data rather than the row
+*             hash_table.put(row[key_column_number], row_vec);
+*         }
+*
+*         // insert new row into vector
+*         row_vec.addelement(row);
+*     }
+* }
+* <p>
+* the columns of the row will be the standard columns returned as
+* part of a scan, as described by the validcolumns - see openscan for
+* description.
+* resolve - is this ok?  or should i hard code somehow the row to
+*           be the first column and the row location?
+* <p>
+* currently it is only possible to hash on the first column in the
+* conglomerate, in the future we may change the interface to allow
+* hashing either on a different column or maybe on a combination of
+* columns.
+* <p>
+* no overflow to external storage is provided, so calling this routine
+* on a 1 gigabyte conglomerate will incur at least 1 gigabyte of memory
+* (probably failing with a java out of memory condition).  if this
+* routine gets an out of memory condition, or if "max_rowcnt" is
+* exceeded then then the routine will give up, empty the hashtable,
+* and return "false."
+* <p>
+* on exit from this routine, whether the fetchset() succeeded or not
+* the scan is complete, it is positioned just the same as if the scan
+* had been drained by calling "next()" until it returns false (ie.
+* fetchnext() and next() calls will return false).
+* reopenscan() can be called to restart the scan.
+* <p>
+*
+* resolve - until we get row counts what should we do for sizing the
+*           the size, capasity, and load factor of the hash table.
+*           for now it is up to the caller to create the hashtable,
+*           access does not reset any parameters.
+* <p>
+* resolve - i am not sure if access should be in charge of allocating
+*           the new row objects.  i know that i can do this in the
+*           case of btree's, but i don't think i can do this in heaps.
+*           maybe this is solved by work to be done on the sort
+*           interface.
+*
+*
+* @param max_rowcnt        the maximum number of rows to insert into the
+*                          hash table.  pass in -1 if there is no maximum.
+* @param key_column_numbers the column numbers of the columns in the
+*                          scan result row to be the key to the hashtable.
+*                          "0" is the first column in the scan result
+*                          row (which may be different than the first
+*                          column in the row in the table of the scan).
+* @param hash_table        the java hashtable to load into.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void fetchset
+long                    max_rowcnt
+int                   key_column_numbers
+backingstorehashtable   hash_table
+throws standardexception
+// system.out.println("fetchset");
+fetchrows
+scan_position
+datavaluedescriptor  null
+rowlocation  null
+backingstorehashtable  hash_table
+max_rowcnt
+key_column_numbers
+return
+/**
+reposition the current scan.  this call is semantically the same as if
+the current scan had been closed and a openscan() had been called instead.
+the scan is reopened with against the same conglomerate, and the scan
+is reopened with the same "hold" and "forupdate" parameters passed in
+the original openscan.  the previous template row continues to be used.
+@param startkeyvalue  an indexable row which holds a
+(partial) key value which, in combination with the
+startsearchoperator, defines the starting position of
+the scan.  if null, the starting position of the scan
+is the first row of the conglomerate.
+@param startsearchoperator an operator which defines
+how the startkeyvalue is to be searched for.  if
+startsearchoperation is scancontroller.ge, the scan starts on
+the first row which is greater than or equal to the
+startkeyvalue.  if startsearchoperation is scancontroller.gt,
+the scan starts on the first row whose key is greater than
+startkeyvalue.  the startsearchoperation parameter is
+ignored if the startkeyvalue parameter is null.
+@param qualifier an array of qualifiers which, applied
+to each key, restrict the rows returned by the scan.  rows
+for which any one of the qualifiers returns false are not
+returned by the scan. if null, all rows are returned.
+@param stopkeyvalue  an indexable row which holds a
+(partial) key value which, in combination with the
+stopsearchoperator, defines the ending position of
+the scan.  if null, the ending position of the scan
+is the last row of the conglomerate.
+@param stopsearchoperator an operator which defines
+how the stopkeyvalue is used to determine the scan stopping
+position. if stopsearchoperation is scancontroller.ge, the scan
+stops just before the first row which is greater than or
+equal to the stopkeyvalue.  if stopsearchoperation is
+scancontroller.gt, the scan stops just before the first row whose
+key is greater than	startkeyvalue.  the stopsearchoperation
+parameter is ignored if the stopkeyvalue parameter is null.
+@exception standardexception standard exception policy.
+**/
+public final void reopenscan
+datavaluedescriptor   startkeyvalue
+int                     startsearchoperator
+qualifier               qualifier
+datavaluedescriptor   stopkeyvalue
+int                     stopsearchoperator
+throws standardexception
+if (sanitymanager.debug)
+if   init_hold
+sanitymanager assert this container    null
+// should only be called by clients outside of store, so should
+// not be possible for a latch to held.
+sanitymanager assert scan_position current_leaf    null
+// call unlockscanrecordafterread() before setting the scan back
+// to init state, so that we release the last lock if necessary (ie.
+// for read committed).
+//
+if  scan_position current_rh    null
+this getlockingpolicy   unlockscanrecordafterread
+scan_position  init_forupdate
+scan_position current_slot   page invalid_slot_number
+scan_position current_rh     null
+scan_position current_positionkey    null
+initscanparams
+startkeyvalue  startsearchoperator
+qualifier  stopkeyvalue  stopsearchoperator
+if   init_hold
+this scan_state   scan_init
+else
+this scan_state
+this container    null ? scan_init   scan_hold_init
+/**
+reposition the current scan.  this call is semantically the same as if
+the current scan had been closed and a openscan() had been called instead.
+the scan is reopened against the same conglomerate, and the scan
+is reopened with the same "scan column list", "hold" and "forupdate"
+parameters passed in the original openscan.
+<p>
+the statistics gathered by the scan are not reset to 0 by a reopenscan(),
+rather they continue to accumulate.
+<p>
+note that this operation is currently only supported on heap conglomerates.
+also note that order of rows within are heap are not guaranteed, so for
+instance positioning at a rowlocation in the "middle" of a heap, then
+inserting more data, then continuing the scan is not guaranteed to see
+the new rows - they may be put in the "beginning" of the heap.
+@param startrowlocation  an existing rowlocation within the conglomerate,
+at which to position the start of the scan.  the scan will begin at this
+location and continue forward until the end of the conglomerate.
+positioning at a non-existent rowlocation (ie. an invalid one or one that
+had been deleted), will result in an exception being thrown when the
+first next operation is attempted.
+@param qualifier an array of qualifiers which, applied
+to each key, restrict the rows returned by the scan.  rows
+for which any one of the qualifiers returns false are not
+returned by the scan. if null, all rows are returned.
+@exception standardexception standard exception policy.
+**/
+public void reopenscanbyrowlocation
+rowlocation startrowlocation
+qualifier   qualifier
+throws standardexception
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+/*
+** methods of scancontroller, which are not supported by btree.
+*/
+/**
+fetch the location of the current position in the scan.
+@see scancontroller#fetchlocation
+@exception  standardexception  standard exception policy.
+**/
+public void fetchlocation rowlocation templatelocation
+throws standardexception
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+/**
+return a row location object of the correct type to be
+used in calls to fetchlocation.
+@see org.apache.derby.iapi.store.access.genericscancontroller#newrowlocationtemplate
+@exception  standardexception  standard exception policy.
+**/
+public rowlocation newrowlocationtemplate
+throws standardexception
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+/**
+replace the entire row at the current position of the scan.
+unimplemented interface by btree, will throw an exception.
+@see scancontroller#replace
+@exception  standardexception  standard exception policy.
+**/
+public boolean replace datavaluedescriptor row  formatablebitset validcolumns
+throws standardexception
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+/*
+** methods of scanmanager
+*/
+/**
+close the scan, a commit or abort is about to happen.
+**/
+public boolean closeforendtransaction boolean closeheldscan
+throws standardexception
+if   init_hold    closeheldscan
+// scan is closed, make sure no access to any state variables
+positionatdonescan scan_position
+super close
+// null out so that these object's can get gc'd earlier.
+this init_rawtran         null
+this init_template        null
+this init_startkeyvalue   null
+this init_qualifier       null
+this init_stopkeyvalue    null
+this getxactmgr   closeme this
+return true
+else
+if  this scan_state    scan_inprogress
+if (sanitymanager.debug)
+sanitymanager assert scan_position    null
+sanitymanager assert
+scan_position current_positionkey    null
+// when the transaction ends, we release all the locks
+// obtained in this scan, so the row we're positioned on is
+// no longer locked.
+scan_position current_rh   null
+this scan_state   scan_hold_inprogress
+else if  this scan_state    scan_init
+this scan_state   scan_hold_init
+super close
+return false
+/**
+* save the current scan position by key and release the latch on the leaf
+* that's being scanned. this method should be called if the latch on a
+* leaf needs to be released in the middle of the scan. the scan can
+* later reposition to the saved position by calling {@code reposition()}.
+*
+* @param partialkey known parts of the key that should be saved, or
+* {@code null} if the entire key is unknown and will have to be fetched
+* from the page
+* @param vcols an array which tells which columns of the partial key are
+* valid (key columns that have 0 in this array are not valid, and their
+* values must be fetched from the page), or {@code null} if all the
+* columns are valid
+* @throws standardexception if an error occurs while saving the position
+* @see #reposition(btreerowposition, boolean)
+*/
+void savepositionandreleasepage datavaluedescriptor partialkey
+int vcols
+throws standardexception
+final page page   scan_position current_leaf getpage
+if  sanitymanager debug
+sanitymanager assert page islatched
+sanitymanager assert scan_position current_positionkey    null
+if  partialkey    null
+sanitymanager assert vcols    null
+if  vcols    null
+sanitymanager assert partialkey    null
+sanitymanager assert vcols length <  partialkey length
+try
+datavaluedescriptor fullkey   scan_position getkeytemplate
+fetchdescriptor fetchdescriptor   null
+boolean haveallcolumns   false
+if  partialkey    null
+int copiedcols   0
+final int partialkeylength
+vcols    null  ? partialkey length   vcols length
+for  int i   0  i < partialkeylength  i
+if  vcols    null    vcols    0
+fullkey setvalue partialkey
+copiedcols
+if  copiedcols < fullkey length
+fetchdescriptor
+scan_position getfetchdescriptorforsavekey
+vcols  fullkey length
+else
+haveallcolumns   true
+if   haveallcolumns
+recordhandle rh   page fetchfromslot
+recordhandle  null
+scan_position current_slot
+fullkey
+fetchdescriptor
+true
+if  sanitymanager debug
+sanitymanager assert rh    null
+scan_position current_positionkey   fullkey
+// don't null out current_rh, we might be able to use it later if
+// no rows are moved off the page.
+//scan_position.current_rh = null;
+scan_position versionwhensaved   page getpageversion
+scan_position current_slot   page invalid_slot_number
+finally
+scan_position current_leaf release
+scan_position current_leaf   null
+/** shortcut for for savepositionandreleasepage(null,null). */
+void savepositionandreleasepage   throws standardexception
+savepositionandreleasepage null  null
+public recordhandle getcurrentrecordhandlefordebugging
+return scan_position current_rh
+/*
+** standard tostring() method.  prints out current position in scan.
+*/
+public string tostring
+if (sanitymanager.debug)
+string string
+this getconglomerate
+this instanceof btreeforwardscan  ?
+this instanceof btreemaxscan ?
+this scan_state    scan_init       ?
+this scan_state    scan_inprogress ?
+this scan_state    scan_done       ?
+this scan_state    scan_hold_init  ?
+this scan_state    scan_hold_inprogress ?
+scan_position current_rh
+scan_position current_positionkey
+init_rawtran
+init_hold
+init_forupdate
+init_useupdatelocks
+init_scancolumnlist
+init_scancolumnlist    null ?
+init_scancolumnlist size     0
+rowutil tostring init_template
+rowutil tostring init_startkeyvalue
+init_startsearchoperator    scancontroller ge ?
+init_startsearchoperator    scancontroller gt ?
+integer tostring init_startsearchoperator
+init_qualifier
+rowutil tostring init_stopkeyvalue
+init_stopsearchoperator    scancontroller ge ?
+init_stopsearchoperator    scancontroller gt ?
+integer tostring init_stopsearchoperator
+stat_numpages_visited
+stat_numrows_visited
+stat_numrows_qualified
+stat_numdeleted_rows_visited
+return string
+else
+return null

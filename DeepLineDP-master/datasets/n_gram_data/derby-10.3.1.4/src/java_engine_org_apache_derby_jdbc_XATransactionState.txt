@@ -1,0 +1,276 @@
+/*
+derby - class org.apache.derby.jdbc.xatransactionstate
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby jdbc
+import java sql sqlexception
+import java util timer
+import java util timertask
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services timer timerfactory
+import org apache derby impl jdbc embedconnection
+import javax transaction xa xaresource
+import org apache derby iapi services context contextimpl
+import org apache derby iapi services context contextmanager
+import org apache derby iapi error exceptionseverity
+import org apache derby iapi error standardexception
+import org apache derby iapi store access xa xaxactid
+import org apache derby iapi reference sqlstate
+import java util hashmap
+import javax transaction xa xaexception
+/**
+*/
+final class xatransactionstate extends contextimpl
+/** rollback-only due to timeout */
+final static int tro_timeout                   3
+/** rollback-only due to deadlock */
+final static int tro_deadlock				   2
+/** rollback-only due to end(tmfail) */
+final static int tro_fail					   1
+final static int t0_not_associated			  0
+final static int t1_associated				  1
+// final static int t2_association_suspended	= 2;
+final static int tc_completed				  3     rollback commit called
+final embedconnection	conn
+final embedxaresource creatingresource
+// owning xaresource
+private embedxaresource  associatedresource
+final xaxactid			xid
+/**
+when an xaresource suspends a transaction (end(tmsuspend)) it must be resumed
+using the same xaconnection. this has been the traditional cloudscape/derby behaviour,
+though there does not seem to be a specific reference to this behaviour in
+the jta spec. note that while the transaction is suspended by this xaresource,
+another xaresource may join the transaction and suspend it after the join.
+*/
+hashmap suspendedlist
+/**
+association state of the transaction.
+*/
+int associationstate
+int rollbackonlycode
+/**
+has this transaction been prepared.
+*/
+boolean isprepared
+/** has this transaction been finished (committed
+* or rolled back)? */
+boolean isfinished
+/** a timer task scheduled for the time when the transaction will timeout. */
+cancelxatransactiontask timeouttask   null
+/** the implementation of timertask to cancel a global transaction. */
+private class cancelxatransactiontask extends timertask
+/** creates the cancelation object to be passed to a timer. */
+public cancelxatransactiontask
+xatransactionstate this timeouttask   this
+/** runs the cancel task of the global transaction */
+public void run
+try
+xatransactionstate this cancel
+catch  xaexception ex
+monitor logthrowable ex
+xatransactionstate contextmanager cm  embedconnection conn
+embedxaresource resource  xaxactid xid
+super cm
+this conn   conn
+this associatedresource   resource
+this creatingresource   resource
+this associationstate   xatransactionstate t1_associated
+this xid   xid
+this isfinished   false
+public void cleanuponerror throwable t
+if  t instanceof standardexception
+standardexception se    standardexception  t
+if  se getseverity   >  exceptionseverity session_severity
+popme
+return
+if  se getseverity      exceptionseverity transaction_severity
+synchronized  this
+// disable use of the connection until it is cleaned up.
+conn setapplicationconnection null
+notifyall
+associationstate   tro_fail
+if  sqlstate deadlock equals se getmessageid
+rollbackonlycode   xaexception xa_rbdeadlock
+else if  sqlstate lock_timeout equals se getmessageid
+rollbackonlycode   xaexception xa_rbtimeout
+else
+rollbackonlycode   xaexception xa_rbother
+void start embedxaresource resource  int flags  throws xaexception
+synchronized  this
+if  associationstate    xatransactionstate tro_fail
+throw new xaexception rollbackonlycode
+boolean issuspendedbyresource    suspendedlist    null      suspendedlist get resource     null
+if  flags    xaresource tmresume
+if   issuspendedbyresource
+throw new xaexception xaexception xaer_proto
+else
+// cannot join a transaction we have suspended.
+if  issuspendedbyresource
+throw new xaexception xaexception xaer_proto
+while  associationstate    xatransactionstate t1_associated
+try
+wait
+catch  interruptedexception ie
+throw new xaexception xaexception xa_retry
+switch  associationstate
+case xatransactionstate t0_not_associated
+break
+case xatransactionstate tro_deadlock
+case xatransactionstate tro_timeout
+case xatransactionstate tro_fail
+throw new xaexception rollbackonlycode
+default
+throw new xaexception xaexception xaer_nota
+if  isprepared
+throw new xaexception xaexception xaer_proto
+if  issuspendedbyresource
+suspendedlist remove resource
+associationstate   xatransactionstate t1_associated
+associatedresource   resource
+boolean end embedxaresource resource  int flags
+boolean endingcurrentxid  throws xaexception
+boolean rollbackonly   false
+synchronized  this
+boolean issuspendedbyresource    suspendedlist    null      suspendedlist get resource     null
+if   endingcurrentxid
+while  associationstate    xatransactionstate t1_associated
+try
+wait
+catch  interruptedexception ie
+throw new xaexception xaexception xa_retry
+switch  associationstate
+case xatransactionstate tc_completed
+throw new xaexception xaexception xaer_nota
+case xatransactionstate tro_fail
+if  endingcurrentxid
+flags   xaresource tmfail
+else
+throw new xaexception rollbackonlycode
+boolean notify   false
+switch  flags
+case xaresource tmsuccess
+if  issuspendedbyresource
+suspendedlist remove resource
+else
+if  resource    associatedresource
+throw new xaexception xaexception xaer_proto
+associationstate   xatransactionstate t0_not_associated
+associatedresource   null
+notify   true
+conn setapplicationconnection null
+break
+case xaresource tmfail
+if  issuspendedbyresource
+suspendedlist remove resource
+else
+if  resource    associatedresource
+throw new xaexception xaexception xaer_proto
+associatedresource   null
+if  associationstate    xatransactionstate tro_fail
+associationstate   xatransactionstate tro_fail
+rollbackonlycode   xaexception xa_rbrollback
+conn setapplicationconnection null
+notify   true
+rollbackonly   true
+break
+case xaresource tmsuspend
+if  issuspendedbyresource
+throw new xaexception xaexception xaer_proto
+if  resource    associatedresource
+throw new xaexception xaexception xaer_proto
+if  suspendedlist    null
+suspendedlist   new hashmap
+suspendedlist put resource  this
+associationstate   xatransactionstate t0_not_associated
+associatedresource   null
+conn setapplicationconnection null
+notify   true
+break
+default
+throw new xaexception xaexception xaer_inval
+if  notify
+notifyall
+return rollbackonly
+/**
+* schedule a timeout task wich will rollback the global transaction
+* after the specified time will elapse.
+*
+* @param timeoutmillis the number of milliseconds to be elapsed before
+*                      the transaction will be rolled back.
+*/
+synchronized void scheduletimeouttask long timeoutmillis
+// schedule a time out task if the timeout was specified
+if  timeoutmillis > 0
+// take care of the transaction timeout
+timertask canceltask   new cancelxatransactiontask
+timerfactory timerfactory   monitor getmonitor   gettimerfactory
+timer timer   timerfactory getcancellationtimer
+timer schedule canceltask  timeoutmillis
+else
+timeouttask   null
+/**
+* rollback the global transaction and cancel the timeout task.
+*/
+synchronized void xa_rollback   throws sqlexception
+conn xa_rollback
+xa_finalize
+/**
+* commit the global transaction and cancel the timeout task.
+* @param onephase indicates whether to use one phase commit protocol.
+*                otherwise two phase commit protocol will be used.
+*/
+synchronized void xa_commit boolean onephase  throws sqlexception
+conn xa_commit onephase
+xa_finalize
+/**
+* prepare the global transaction for commit.
+*/
+synchronized int xa_prepare   throws sqlexception
+int retval   conn xa_prepare
+return retval
+/** this method cancels timeouttask and marks the transaction
+* as finished by assigning 'isfinished = true'.
+*/
+synchronized void xa_finalize
+if  timeouttask    null
+timeouttask cancel
+isfinished   true
+/**
+* this function is called from the timer task when the transaction
+* times out.
+*
+* @see cancelxatransactiontask
+*/
+private synchronized void cancel   throws xaexception
+// check isfinished just to be sure that
+// the cancellation task was not started
+// just before the xa_commit/rollback
+// obtained this object's monitor.
+if   isfinished
+// check whether the transaction is associated
+// with any embedxaresource instance.
+if  associationstate    xatransactionstate t1_associated
+conn cancelrunningstatement
+embedxaresource assocres   associatedresource
+end assocres  xaresource tmfail  true
+// rollback the global transaction
+try
+conn xa_rollback
+catch  sqlexception sqle
+xaexception ex   new xaexception xaexception xaer_rmerr
+ex initcause sqle
+throw ex
+// do the cleanup on the resource
+creatingresource returnconnectiontoresource this  xid

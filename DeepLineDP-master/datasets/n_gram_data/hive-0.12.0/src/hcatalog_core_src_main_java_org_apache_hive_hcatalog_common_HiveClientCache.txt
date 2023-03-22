@@ -1,0 +1,262 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing,
+* software distributed under the license is distributed on an
+* "as is" basis, without warranties or conditions of any
+* kind, either express or implied.  see the license for the
+* specific language governing permissions and limitations
+* under the license.
+*/
+package org apache hive hcatalog common
+import com google common cache cache
+import com google common cache cachebuilder
+import com google common cache removallistener
+import com google common cache removalnotification
+import org apache commons lang builder equalsbuilder
+import org apache commons lang builder hashcodebuilder
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive metastore hivemetastoreclient
+import org apache hadoop hive metastore api metaexception
+import org apache hadoop hive metastore api nosuchobjectexception
+import org apache hadoop hive shims shimloader
+import org apache hadoop security usergroupinformation
+import org apache thrift texception
+import org slf4j logger
+import org slf4j loggerfactory
+import javax security auth login loginexception
+import java io ioexception
+import java util concurrent callable
+import java util concurrent concurrentmap
+import java util concurrent executionexception
+import java util concurrent timeunit
+import java util concurrent atomic atomicinteger
+/**
+* a thread safe time expired cache for hivemetastoreclient
+*/
+class hiveclientcache
+final private cache<hiveclientcachekey  cacheablehivemetastoreclient> hivecache
+private static final logger log   loggerfactory getlogger hiveclientcache class
+private final int timeout
+// this lock is used to make sure removallistener won't close a client that is being contemplated for returning by get()
+private final object cache_teardown_lock   new object
+private static final atomicinteger nextid   new atomicinteger 0
+// since hivemetastoreclient is not threadsafe, hive clients are not  shared across threads.
+// thread local variable containing each thread's unique id, is used as one of the keys for the cache
+// causing each thread to get a different client even if the hiveconf is same.
+private static final threadlocal<integer> threadid
+new threadlocal<integer>
+@override
+protected integer initialvalue
+return nextid getandincrement
+private int getthreadid
+return threadid get
+/**
+* @param timeout the length of time in seconds after a client is created that it should be automatically removed
+*/
+public hiveclientcache final int timeout
+this timeout   timeout
+removallistener<hiveclientcachekey  cacheablehivemetastoreclient> removallistener
+new removallistener<hiveclientcachekey  cacheablehivemetastoreclient>
+public void onremoval removalnotification<hiveclientcachekey  cacheablehivemetastoreclient> notification
+cacheablehivemetastoreclient hivemetastoreclient   notification getvalue
+if  hivemetastoreclient    null
+synchronized  cache_teardown_lock
+hivemetastoreclient setexpiredfromcache
+hivemetastoreclient teardownifunused
+hivecache   cachebuilder newbuilder
+expireafterwrite timeout  timeunit seconds
+removallistener removallistener
+build
+// add a shutdown hook for cleanup, if there are elements remaining in the cache which were not cleaned up.
+// this is the best effort approach. ignore any error while doing so. notice that most of the clients
+// would get cleaned up via either the removallistener or the close() call, only the active clients
+// that are in the cache or expired but being used in other threads wont get cleaned. the following code will only
+// clean the active cache ones. the ones expired from cache but being hold by other threads are in the mercy
+// of finalize() being called.
+thread cleanuphiveclientshutdownthread   new thread
+@override
+public void run
+log debug
+closeallclientsquietly
+runtime getruntime   addshutdownhook cleanuphiveclientshutdownthread
+/**
+* note: this doesn't check if they are being used or not, meant only to be called during shutdown etc.
+*/
+void closeallclientsquietly
+try
+concurrentmap<hiveclientcachekey  cacheablehivemetastoreclient> elements   hivecache asmap
+for  cacheablehivemetastoreclient cacheablehivemetastoreclient   elements values
+cacheablehivemetastoreclient teardown
+catch  exception e
+log warn    e
+public void cleanup
+hivecache cleanup
+/**
+* returns a cached client if exists or else creates one, caches and returns it. it also checks that the client is
+* healthy and can be reused
+* @param hiveconf
+* @return the hive client
+* @throws metaexception
+* @throws ioexception
+* @throws loginexception
+*/
+public hivemetastoreclient get final hiveconf hiveconf  throws metaexception  ioexception  loginexception
+final hiveclientcachekey cachekey   hiveclientcachekey fromhiveconf hiveconf  getthreadid
+cacheablehivemetastoreclient hivemetastoreclient   null
+// the hmsc is not shared across threads. so the only way it could get closed while we are doing healthcheck
+// is if removallistener closes it. the synchronization takes care that removallistener won't do it
+synchronized  cache_teardown_lock
+hivemetastoreclient   getorcreate cachekey
+hivemetastoreclient acquire
+if   hivemetastoreclient isopen
+synchronized  cache_teardown_lock
+hivecache invalidate cachekey
+hivemetastoreclient close
+hivemetastoreclient   getorcreate cachekey
+hivemetastoreclient acquire
+return hivemetastoreclient
+/**
+* return from cache if exists else create/cache and return
+* @param cachekey
+* @return
+* @throws ioexception
+* @throws metaexception
+* @throws loginexception
+*/
+private cacheablehivemetastoreclient getorcreate final hiveclientcachekey cachekey  throws ioexception  metaexception  loginexception
+try
+return hivecache get cachekey  new callable<cacheablehivemetastoreclient>
+@override
+public cacheablehivemetastoreclient call   throws metaexception
+return new cacheablehivemetastoreclient cachekey gethiveconf    timeout
+catch  executionexception e
+throwable t   e getcause
+if  t instanceof ioexception
+throw  ioexception  t
+else if  t instanceof metaexception
+throw  metaexception  t
+else if  t instanceof loginexception
+throw  loginexception  t
+else
+throw new ioexception    t
+/**
+* a class to wrap hiveconf and expose equality based only on usergroupinformation and the metastoreuris.
+* this becomes the key for the cache and this way the same hivemetastoreclient would be returned if
+* usergroupinformation and metastoreuris are same. this function can evolve to express
+* the cases when hiveconf is different but the same hivemetastoreclient can be used
+*/
+public static class hiveclientcachekey
+final private string metastoreuris
+final private usergroupinformation ugi
+final private hiveconf hiveconf
+final private int threadid
+private hiveclientcachekey hiveconf hiveconf  final int threadid  throws ioexception  loginexception
+this metastoreuris   hiveconf getvar hiveconf confvars metastoreuris
+ugi   shimloader gethadoopshims   getugiforconf hiveconf
+this hiveconf   hiveconf
+this threadid   threadid
+public static hiveclientcachekey fromhiveconf hiveconf hiveconf  final int threadid  throws ioexception  loginexception
+return new hiveclientcachekey hiveconf  threadid
+public hiveconf gethiveconf
+return hiveconf
+@override
+public boolean equals object o
+if  this    o  return true
+if  o    null    getclass      o getclass    return false
+hiveclientcachekey that    hiveclientcachekey  o
+return new equalsbuilder
+append this metastoreuris
+that metastoreuris
+append this ugi  that ugi
+append this threadid  that threadid  isequals
+@override
+public int hashcode
+return new hashcodebuilder
+append metastoreuris
+append ugi
+append threadid  tohashcode
+/**
+* add # of current users on hivemetastoreclient, so that the client can be cleaned when no one is using it.
+*/
+public static class cacheablehivemetastoreclient extends hivemetastoreclient
+private atomicinteger users   new atomicinteger 0
+private volatile boolean expiredfromcache   false
+private boolean isclosed   false
+private final long expirytime
+private static final int expiry_time_extension_in_millis   60   1000
+public cacheablehivemetastoreclient final hiveconf conf  final int timeout  throws metaexception
+super conf
+// extend the expiry time with some extra time on top of guava expiry time to make sure
+// that items closed() are for sure expired and would never be returned by guava.
+this expirytime   system currenttimemillis     timeout   1000   expiry_time_extension_in_millis
+private void acquire
+users incrementandget
+private void release
+users decrementandget
+public void setexpiredfromcache
+expiredfromcache   true
+public boolean isclosed
+return isclosed
+/**
+* make a call to hive meta store and see if the client is still usable. some calls where the user provides
+* invalid data renders the client unusable for future use (example: create a table with very long table name)
+* @return
+*/
+protected boolean isopen
+try
+// look for an unlikely database name and see if either metaexception or texception is thrown
+this getdatabase
+catch  nosuchobjectexception e
+return true     it is okay if the database doesn't exist
+catch  metaexception e
+return false
+catch  texception e
+return false
+return true
+/**
+* decrement the user count and piggyback this to set expiry flag as well, then  teardown(), if conditions are met.
+* this *must* be called by anyone who uses this client.
+*/
+@override
+public void close
+release
+if  system currenttimemillis   >  expirytime
+setexpiredfromcache
+teardownifunused
+/**
+* tear down only if
+*  1. there are no active user
+*  2. it has expired from the cache
+*/
+private void teardownifunused
+if  users get      0    expiredfromcache
+this teardown
+/**
+* close if not closed already
+*/
+protected synchronized void teardown
+try
+if   isclosed
+super close
+isclosed   true
+catch  exception e
+log warn    e
+/**
+* last effort to clean up, may not even get called.
+* @throws throwable
+*/
+@override
+protected void finalize   throws throwable
+try
+this teardown
+finally
+super finalize

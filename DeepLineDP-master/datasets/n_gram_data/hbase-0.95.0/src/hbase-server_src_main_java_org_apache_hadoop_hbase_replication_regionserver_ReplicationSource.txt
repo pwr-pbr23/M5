@@ -1,0 +1,742 @@
+/*
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase replication regionserver
+import java io eofexception
+import java io filenotfoundexception
+import java io ioexception
+import java net connectexception
+import java net sockettimeoutexception
+import java util arraylist
+import java util arrays
+import java util collections
+import java util comparator
+import java util hashset
+import java util list
+import java util navigablemap
+import java util random
+import java util set
+import java util uuid
+import java util concurrent countdownlatch
+import java util concurrent priorityblockingqueue
+import java util concurrent timeunit
+import java util concurrent atomic atomicboolean
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase servername
+import org apache hadoop hbase stoppable
+import org apache hadoop hbase client adminprotocol
+import org apache hadoop hbase client hconnection
+import org apache hadoop hbase client hconnectionmanager
+import org apache hadoop hbase protobuf protobufutil
+import org apache hadoop hbase protobuf replicationprotbufutil
+import org apache hadoop hbase regionserver wal hlog
+import org apache hadoop hbase regionserver wal hlogkey
+import org apache hadoop hbase regionserver wal waledit
+import org apache hadoop hbase replication replicationzookeeper
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util threads
+import org apache hadoop ipc remoteexception
+import org apache zookeeper keeperexception
+/**
+* class that handles the source of a replication stream.
+* currently does not handle more than 1 slave
+* for each slave cluster it selects a random number of peers
+* using a replication ratio. for example, if replication ration = 0.1
+* and slave cluster has 100 region servers, 10 will be selected.
+* <p/>
+* a stream is considered down when we cannot contact a region server on the
+* peer cluster for more than 55 seconds by default.
+* <p/>
+*
+*/
+@interfaceaudience private
+public class replicationsource extends thread
+implements replicationsourceinterface
+private static final log log   logfactory getlog replicationsource class
+// queue of logs to process
+private priorityblockingqueue<path> queue
+// container of entries to replicate
+private hlog entry entriesarray
+private hconnection conn
+// helper class for zookeeper
+private replicationzookeeper zkhelper
+private configuration conf
+// ratio of region servers to chose from a slave cluster
+private float ratio
+private random random
+// should we replicate or not?
+private atomicboolean replicating
+// id of the peer cluster this source replicates to
+private string peerid
+// the manager of all sources to which we ping back our progress
+private replicationsourcemanager manager
+// should we stop everything?
+private stoppable stopper
+// list of chosen sinks (region servers)
+private list<servername> currentpeers
+// how long should we sleep for each retry
+private long sleepforretries
+// max size in bytes of entriesarray
+private long replicationqueuesizecapacity
+// max number of entries in entriesarray
+private int replicationqueuenbcapacity
+// our reader for the current log
+private hlog reader reader
+// last position in the log that we sent to zookeeper
+private long lastloggedposition    1
+// path of the current log
+private volatile path currentpath
+private filesystem fs
+// id of this cluster
+private uuid clusterid
+// id of the other cluster
+private uuid peerclusterid
+// total number of edits we replicated
+private long totalreplicatededits   0
+// the znode we currently play with
+private string peerclusterznode
+// indicates if this queue is recovered (and will be deleted when depleted)
+private boolean queuerecovered
+// list of all the dead region servers that had this queue (if recovered)
+private list<string> deadregionservers   new arraylist<string>
+// maximum number of retries before taking bold actions
+private int maxretriesmultiplier
+// socket timeouts require even bolder actions since we don't want to ddos
+private int sockettimeoutmultiplier
+// current number of entries that we need to replicate
+private int currentnbentries   0
+// current number of operations (put/delete) that we need to replicate
+private int currentnboperations   0
+// current size of data we need to replicate
+private int currentsize   0
+// indicates if this particular source is running
+private volatile boolean running   true
+// metrics for this source
+private metricssource metrics
+// handle on the log reader helper
+private replicationhlogreadermanager replogreader
+/**
+* instantiation method used by region servers
+*
+* @param conf configuration to use
+* @param fs file system to use
+* @param manager replication manager to ping to
+* @param stopper     the atomic boolean to use to stop the regionserver
+* @param replicating the atomic boolean that starts/stops replication
+* @param peerclusterznode the name of our znode
+* @throws ioexception
+*/
+public void init final configuration conf
+final filesystem fs
+final replicationsourcemanager manager
+final stoppable stopper
+final atomicboolean replicating
+final string peerclusterznode
+throws ioexception
+this stopper   stopper
+this conf   conf
+this replicationqueuesizecapacity
+this conf getlong    1024 1024 64
+this replicationqueuenbcapacity
+this conf getint    25000
+this entriesarray   new hlog entry
+for  int i   0  i < this replicationqueuenbcapacity  i
+this entriesarray   new hlog entry
+this maxretriesmultiplier
+this conf getint    10
+this sockettimeoutmultiplier   maxretriesmultiplier   maxretriesmultiplier
+this queue
+new priorityblockingqueue<path>
+conf getint    32
+new logscomparator
+this conn   hconnectionmanager getconnection conf
+this zkhelper   manager getrepzkwrapper
+this ratio   this conf getfloat    0 1f
+this currentpeers   new arraylist<servername>
+this random   new random
+this replicating   replicating
+this manager   manager
+this sleepforretries
+this conf getlong    1000
+this fs   fs
+this metrics   new metricssource peerclusterznode
+this replogreader   new replicationhlogreadermanager this fs  this conf
+try
+this clusterid   zkhelper getuuidforcluster zkhelper getzookeeperwatcher
+catch  keeperexception ke
+throw new ioexception    ke
+// finally look if this is a recovered queue
+this checkifqueuerecovered peerclusterznode
+// the passed znode will be either the id of the peer cluster or
+// the handling story of that queue in the form of id-servername-*
+//
+// package access for testing
+void checkifqueuerecovered string peerclusterznode
+string parts   peerclusterznode split    2
+this queuerecovered   parts length    1
+this peerid   this queuerecovered ?
+parts   peerclusterznode
+this peerclusterznode   peerclusterznode
+if  parts length < 2
+// not queue recovered situation
+return
+// extract dead servers
+extractdeadserversfromznodestring parts  this deadregionservers
+/**
+* for tests only
+*/
+list<string> getdeadregionservers
+return collections unmodifiablelist this deadregionservers
+/**
+* parse dead server names from znode string servername can contain "-" such as
+* "ip-10-46-221-101.ec2.internal", so we need skip some "-" during parsing for the following
+* cases: 2-ip-10-46-221-101.ec2.internal,52170,1364333181125-<server name>-...
+*/
+private static void
+extractdeadserversfromznodestring string deadserverliststr  list<string> result
+if deadserverliststr    null    result    null    deadserverliststr isempty    return
+// valid server name delimiter "-" has to be after "," in a server name
+int seencommacnt   0
+int startindex   0
+int len   deadserverliststr length
+for  int i   0  i < len  i
+switch  deadserverliststr charat i
+case
+seencommacnt    1
+break
+case
+if seencommacnt> 2
+if  i > startindex
+string servername   deadserverliststr substring startindex  i
+if servername isfullservername servername
+result add servername
+else
+log error     servername
+startindex   i   1
+seencommacnt   0
+break
+default
+break
+// add tail
+if startindex < len   1
+string servername   deadserverliststr substring startindex  len
+if servername isfullservername servername
+result add servername
+else
+log error     servername
+log debug     result
+/**
+* select a number of peers at random using the ratio. mininum 1.
+*/
+private void choosesinks
+this currentpeers clear
+list<servername> addresses   this zkhelper getslavesaddresses peerid
+set<servername> setofaddr   new hashset<servername>
+int nbpeers    int   math ceil addresses size     ratio
+log info     nbpeers
+peerid
+for  int i   0  i < nbpeers  i
+servername sn
+// make sure we get one address that we don't already have
+do
+sn   addresses get this random nextint addresses size
+while  setofaddr contains sn
+log info     sn
+setofaddr add sn
+this currentpeers addall setofaddr
+@override
+public void enqueuelog path log
+this queue put log
+this metrics setsizeoflogqueue queue size
+@override
+public void run
+connecttopeers
+// we were stopped while looping to connect to sinks, just abort
+if   this isactive
+metrics clear
+return
+int sleepmultiplier   1
+// delay this until we are in an asynchronous thread
+while  this peerclusterid    null
+this peerclusterid   zkhelper getpeeruuid this peerid
+if  this peerclusterid    null
+if  sleepforretries    sleepmultiplier
+sleepmultiplier
+// resetting to 1 to reuse later
+sleepmultiplier   1
+log info   clusterid       peerclusterid
+// if this is recovered, the queue is already full and the first log
+// normally has a position (unless the rs failed between 2 logs)
+if  this queuerecovered
+try
+this replogreader setposition this zkhelper gethlogrepposition
+this peerclusterznode  this queue peek   getname
+catch  keeperexception e
+this terminate
+peerclusterznode  e
+// loop until we close down
+while  isactive
+// sleep until replication is enabled again
+if   ispeerenabled
+if  sleepforretries    sleepmultiplier
+sleepmultiplier
+continue
+path oldpath   getcurrentpath      note that in the current scenario
+//oldpath will be null when a log roll
+//happens.
+// get a new path
+boolean hascurrentpath   getnextpath
+if  getcurrentpath      null    oldpath    null
+sleepmultiplier   1    reset the sleepmultiplier on a path change
+if   hascurrentpath
+if  sleepforretries    sleepmultiplier
+sleepmultiplier
+continue
+boolean currentwalisbeingwrittento   false
+//for wal files we own (rather than recovered), take a snapshot of whether the
+//current wal file (this.currentpath) is in use (for writing) now!
+//since the new wal paths are enqueued only after the prev wal file
+//is 'closed', presence of an element in the queue means that
+//the previous wal file was closed, else the file is in use (currentpath)
+//we take the snapshot now so that we are protected against races
+//where a new file gets enqueued while the current file is being processed
+//(and where we just finished reading the current file).
+if   this queuerecovered    queue size      0
+currentwalisbeingwrittento   true
+// open a reader on it
+if   openreader sleepmultiplier
+// reset the sleep multiplier, else it'd be reused for the next file
+sleepmultiplier   1
+continue
+// if we got a null reader but didn't continue, then sleep and continue
+if  this reader    null
+if  sleepforretries    sleepmultiplier
+sleepmultiplier
+continue
+boolean gotioe   false
+currentnboperations   0
+currentnbentries   0
+currentsize   0
+try
+if  readallentriestoreplicateornextfile currentwalisbeingwrittento
+continue
+catch  ioexception ioe
+log warn peerclusterznode      ioe
+gotioe   true
+if  ioe getcause   instanceof eofexception
+boolean considerdumping   false
+if  this queuerecovered
+try
+filestatus stat   this fs getfilestatus this currentpath
+if  stat getlen      0
+log warn peerclusterznode
+considerdumping   true
+catch  ioexception e
+log warn peerclusterznode      e
+else if  currentnbentries    0
+log warn peerclusterznode
+currentpath
+considerdumping   true
+currentnbentries   0
+if  considerdumping
+sleepmultiplier    this maxretriesmultiplier
+processendoffile
+continue
+finally
+try
+this reader   null
+this replogreader closereader
+catch  ioexception e
+gotioe   true
+log warn    e
+// if we didn't get anything to replicate, or if we hit a ioe,
+// wait a bit and retry.
+// but if we need to stop, don't bother sleeping
+if  this isactive       gotioe    currentnbentries    0
+if  this lastloggedposition    this replogreader getposition
+this manager logpositionandcleanoldlogs this currentpath
+this peerclusterznode  this replogreader getposition
+queuerecovered  currentwalisbeingwrittento
+this lastloggedposition   this replogreader getposition
+if  sleepforretries    sleepmultiplier
+sleepmultiplier
+continue
+sleepmultiplier   1
+shipedits currentwalisbeingwrittento
+if  this conn    null
+try
+this conn close
+catch  ioexception e
+log debug    e
+log debug     peerid
+metrics clear
+/**
+* read all the entries from the current log files and retain those
+* that need to be replicated. else, process the end of the current file.
+* @param currentwalisbeingwrittento is the current wal being written to
+* @return true if we got nothing and went to the next file, false if we got
+* entries
+* @throws ioexception
+*/
+protected boolean readallentriestoreplicateornextfile boolean currentwalisbeingwrittento
+throws ioexception
+long seenentries   0
+this replogreader seek
+hlog entry entry
+this replogreader readnextandsetposition this entriesarray  this currentnbentries
+while  entry    null
+waledit edit   entry getedit
+this metrics incrlogeditsread
+seenentries
+// remove all kvs that should not be replicated
+hlogkey logkey   entry getkey
+// don't replicate if the log entries originated in the peer
+if   logkey getclusterid   equals peerclusterid
+removenonreplicableedits edit
+// don't replicate catalog entries, if the waledit wasn't
+// containing anything to replicate and if we're currently not set to replicate
+if    bytes equals logkey gettablename    hconstants root_table_name
+bytes equals logkey gettablename    hconstants meta_table_name
+edit size      0    replicating get
+// only set the clusterid if is a local key.
+// this ensures that the originator sets the cluster id
+// and all replicas retain the initial cluster id.
+// this is *only* place where a cluster id other than the default is set.
+if  hconstants default_cluster_id    logkey getclusterid
+logkey setclusterid this clusterid
+currentnboperations    countdistinctrowkeys edit
+currentnbentries
+currentsize    entry getedit   size
+else
+this metrics incrlogeditsfiltered
+// stop if too many entries or too big
+if  currentsize >  this replicationqueuesizecapacity
+currentnbentries >  this replicationqueuenbcapacity
+break
+try
+entry   this replogreader readnextandsetposition this entriesarray  this currentnbentries
+catch  ioexception ie
+log debug     ie getmessage
+break
+if  currentwalisbeingwrittento
+return false
+// if we didn't get anything and the queue has an object, it means we
+// hit the end of the file for sure
+return seenentries    0    processendoffile
+private void connecttopeers
+// connect to peer cluster first, unless we have to stop
+while  this isactive      this currentpeers size      0
+try
+choosesinks
+thread sleep this sleepforretries
+catch  interruptedexception e
+log error    e
+/**
+* poll for the next path
+* @return true if a path was obtained, false if not
+*/
+protected boolean getnextpath
+try
+if  this currentpath    null
+this currentpath   queue poll this sleepforretries  timeunit milliseconds
+this metrics setsizeoflogqueue queue size
+catch  interruptedexception e
+log warn    e
+return this currentpath    null
+/**
+* open a reader on the current path
+*
+* @param sleepmultiplier by how many times the default sleeping time is augmented
+* @return true if we should continue with that file, false if we are over with it
+*/
+protected boolean openreader int sleepmultiplier
+try
+try
+this reader   replogreader openreader this currentpath
+catch  filenotfoundexception fnfe
+if  this queuerecovered
+// we didn't find the log in the archive directory, look if it still
+// exists in the dead rs folder (there could be a chain of failures
+// to look at)
+log info     deadregionservers size
+for  string curdeadservername   deadregionservers
+path deadrsdirectory
+new path manager getlogdir   getparent    curdeadservername
+path locs   new path
+new path deadrsdirectory  currentpath getname
+new path deadrsdirectory suffix hlog splitting_ext
+currentpath getname
+for  path possibleloglocation   locs
+log info     possibleloglocation touri   tostring
+if  this manager getfs   exists possibleloglocation
+// we found the right new location
+log info     this currentpath
+possibleloglocation
+// breaking here will make us sleep since reader is null
+return true
+// todo what happens if the log was missing from every single location?
+// although we need to check a couple of times as the log could have
+// been moved by the master between the checks
+// it can also happen if a recovered queue wasn't properly cleaned,
+// such that the znode pointing to a log exists but the log was
+// deleted a long time ago.
+// for the moment, we'll throw the io and processendoffile
+throw new ioexception
+fnfe
+else
+// if the log was archived, continue reading from there
+path archivedloglocation
+new path manager getoldlogdir    currentpath getname
+if  this manager getfs   exists archivedloglocation
+currentpath   archivedloglocation
+log info     this currentpath
+archivedloglocation
+// open the log at the new location
+this openreader sleepmultiplier
+// todo what happens the log is missing in both places?
+catch  ioexception ioe
+log warn peerclusterznode      ioe
+this reader   null
+// todo need a better way to determinate if a file is really gone but
+// todo without scanning all logs dir
+if  sleepmultiplier    this maxretriesmultiplier
+log warn
+return  processendoffile
+return true
+/**
+* do the sleeping logic
+* @param msg why we sleep
+* @param sleepmultiplier by how many times the default sleeping time is augmented
+* @return true if <code>sleepmultiplier</code> is &lt; <code>maxretriesmultiplier</code>
+*/
+protected boolean sleepforretries string msg  int sleepmultiplier
+try
+log debug msg       sleepforretries       sleepmultiplier
+thread sleep this sleepforretries   sleepmultiplier
+catch  interruptedexception e
+log debug
+return sleepmultiplier < maxretriesmultiplier
+/**
+* we only want kvs that are scoped other than local
+* @param edit the kv to check for replication
+*/
+protected void removenonreplicableedits waledit edit
+navigablemap<byte  integer> scopes   edit getscopes
+list<keyvalue> kvs   edit getkeyvalues
+for  int i   edit size   1  i >  0  i
+keyvalue kv   kvs get i
+// the scope will be null or empty if
+// there's nothing to replicate in that waledit
+if  scopes    null     scopes containskey kv getfamily
+kvs remove i
+/**
+* count the number of different row keys in the given edit because of
+* mini-batching. we assume that there's at least one kv in the waledit.
+* @param edit edit to count row keys from
+* @return number of different row keys
+*/
+private int countdistinctrowkeys waledit edit
+list<keyvalue> kvs   edit getkeyvalues
+int distinctrowkeys   1
+keyvalue lastkv   kvs get 0
+for  int i   0  i < edit size    i
+if   kvs get i  matchingrow lastkv
+distinctrowkeys
+return distinctrowkeys
+/**
+* do the shipping logic
+* @param currentwalisbeingwrittento was the current wal being (seemingly)
+* written to when this method was called
+*/
+protected void shipedits boolean currentwalisbeingwrittento
+int sleepmultiplier   1
+if  this currentnbentries    0
+log warn
+return
+while  this isactive
+if   ispeerenabled
+if  sleepforretries    sleepmultiplier
+sleepmultiplier
+continue
+try
+adminprotocol rrs   getrs
+replicationprotbufutil replicatewalentry rrs
+arrays copyof this entriesarray  currentnbentries
+if  this lastloggedposition    this replogreader getposition
+this manager logpositionandcleanoldlogs this currentpath
+this peerclusterznode  this replogreader getposition
+queuerecovered  currentwalisbeingwrittento
+this lastloggedposition   this replogreader getposition
+this totalreplicatededits    currentnbentries
+this metrics shipbatch this currentnboperations
+this metrics setageoflastshippedop
+this entriesarray getkey   getwritetime
+break
+catch  ioexception ioe
+// didn't ship anything, but must still age the last time we did
+this metrics refreshageoflastshippedop
+if  ioe instanceof remoteexception
+ioe     remoteexception  ioe  unwrapremoteexception
+log warn    ioe
+else
+if  ioe instanceof sockettimeoutexception
+// this exception means we waited for more than 60s and nothing
+// happened, the cluster is alive and calling it right away
+// even for a test just makes things worse.
+sleepforretries
+this sockettimeoutmultiplier
+else if  ioe instanceof connectexception
+log warn    ioe
+choosesinks
+else
+log warn    ioe
+try
+boolean down
+// spin while the slave is down and we're not asked to shutdown/close
+do
+down   isslavedown
+if  down
+if  sleepforretries    sleepmultiplier
+sleepmultiplier
+else
+choosesinks
+while  this isactive      down
+catch  interruptedexception e
+log debug
+/**
+* check whether the peer is enabled or not
+*
+* @return true if the peer is enabled, otherwise false
+*/
+protected boolean ispeerenabled
+return this replicating get      this zkhelper getpeerenabled peerid
+/**
+* if the queue isn't empty, switch to the next one
+* else if this is a recovered queue, it means we're done!
+* else we'll just continue to try reading the log file
+* @return true if we're done with the current file, false if we should
+* continue trying to read from it
+*/
+protected boolean processendoffile
+if  this queue size      0
+this currentpath   null
+this replogreader finishcurrentfile
+this reader   null
+return true
+else if  this queuerecovered
+this manager closerecoveredqueue this
+log info
+this running   false
+return true
+return false
+public void startup
+string n   thread currentthread   getname
+thread uncaughtexceptionhandler handler
+new thread uncaughtexceptionhandler
+public void uncaughtexception final thread t  final throwable e
+log error
+currentpath  e
+threads setdaemonthreadrunning
+this  n       peerclusterznode  handler
+public void terminate string reason
+terminate reason  null
+public void terminate string reason  exception cause
+if  cause    null
+log info
+this peerclusterznode       reason
+else
+log error     this peerclusterznode
+reason  cause
+this running   false
+threads shutdown this  this sleepforretries
+/**
+* get a new region server at random from this peer
+* @return
+* @throws ioexception
+*/
+private adminprotocol getrs   throws ioexception
+if  this currentpeers size      0
+throw new ioexception this peerclusterznode
+servername address
+currentpeers get random nextint this currentpeers size
+return this conn getadmin address
+/**
+* check if the slave is down by trying to establish a connection
+* @return true if down, false if up
+* @throws interruptedexception
+*/
+public boolean isslavedown   throws interruptedexception
+final countdownlatch latch   new countdownlatch 1
+thread pingthread   new thread
+public void run
+try
+adminprotocol rrs   getrs
+// dummy call which should fail
+protobufutil getserverinfo rrs
+latch countdown
+catch  ioexception ex
+if  ex instanceof remoteexception
+ex     remoteexception  ex  unwrapremoteexception
+log info     ex getmessage
+pingthread start
+// awaits returns true if countdown happened
+boolean down     latch await this sleepforretries  timeunit milliseconds
+pingthread interrupt
+return down
+public string getpeerclusterznode
+return this peerclusterznode
+public string getpeerclusterid
+return this peerid
+public path getcurrentpath
+return this currentpath
+private boolean isactive
+return  this stopper isstopped      this running
+/**
+* comparator used to compare logs together based on their start time
+*/
+public static class logscomparator implements comparator<path>
+@override
+public int compare path o1  path o2
+return long valueof getts o1   compareto getts o2
+/**
+* split a path to get the start time
+* for example: 10.20.20.171%3a60020.1277499063250
+* @param p path to split
+* @return start time
+*/
+private long getts path p
+string parts   p getname   split
+return long parselong parts
+@override
+public string getstats
+string position
+try
+if  this reader    null
+position   this reader getposition
+catch  ioexception ioe
+return     totalreplicatededits
+this currentpath
+position

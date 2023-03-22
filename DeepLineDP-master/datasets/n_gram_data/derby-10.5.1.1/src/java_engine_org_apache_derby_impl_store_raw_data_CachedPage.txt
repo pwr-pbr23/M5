@@ -1,0 +1,634 @@
+/*
+derby - class org.apache.derby.impl.store.raw.data.cachedpage
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store raw data
+import org apache derby iapi reference sqlstate
+import org apache derby iapi store raw log loginstant
+import org apache derby iapi store raw pagekey
+import org apache derby iapi services cache cacheable
+import org apache derby iapi services cache cachemanager
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services io formatidutil
+import org apache derby iapi error standardexception
+import org apache derby iapi error exceptionseverity
+import java io ioexception
+/**
+a base page that is cached.
+since there are multiple page formats, use this abstract class to implement
+cacheable interface.
+*/
+public abstract class cachedpage extends basepage implements cacheable
+protected boolean   alreadyreadpage        true when page read by another
+// class
+protected byte    pagedata 		       the actual page data   this is
+// the 'buffer' in the buffer cache
+// the isdirty flag indicates if the pagedata or pageheader has been
+// modified.  the predirty flag indicates that the pagedata or the
+// pageheader is about to be modified.  the reason for these 2 flags
+// instead of just one is to accomodate checkpoint.  after a clean
+// (latched) page sends a log record to the log stream but before that page
+// is dirtied by the log operation, a checkpoint could be taken.  if so,
+// then the redolwm will be after the log record but, without predirty, the
+// cache cleaning will not have waited for the change.  so the predirty bit
+// is to stop the cache cleaning from skipping over this (latched) page
+// even though it has not really been modified yet.
+protected boolean		isdirty 		   must be set to true whenever the
+// pagedata array is touched
+// directly or indirectly.
+protected boolean		predirty 		   set to true if the page is clean
+// and the pagedata array is about
+// to be touched directly or
+// indirectly.
+protected int		initialrowcount        keep a running count of rows for
+// estimated row count.
+private long 		containerrowcount 	   the number of rows in the
+// container when this page is read
+// from disk
+/*
+** these fields are immutable and can be used by the subclasses directly.
+*/
+/**
+the page cache i live in.
+<br> mt - immutable
+*/
+protected cachemanager		pagecache
+/**
+the container cache my container lives in.
+<br> mt - immutable
+*/
+protected cachemanager		containercache
+/**
+my factory class.
+<br> mt - immutable -
+*/
+protected basedatafilefactory		datafactory      my factory class
+protected static final int page_format_id_size   4
+/*
+* the page need to be written and synced to disk
+*/
+public static final int write_sync   1
+/*
+* the page need to be write to disk but not synced
+*/
+public static final int write_no_sync   2
+public cachedpage
+super
+public final void setfactory basedatafilefactory factory
+datafactory       factory
+pagecache         factory getpagecache
+containercache    factory getcontainercache
+/**
+initialize a cachedpage.
+<p>
+initialize the object, ie. perform work normally perfomed in
+constructor.  called by setidentity() and createidentity().
+*/
+protected void initialize
+super initialize
+isdirty               false
+predirty              false
+initialrowcount       0
+containerrowcount     0
+/*
+** methods of cacheable
+*/
+/**
+* find the container and then read the page from that container.
+* <p>
+* this is the way new pages enter the page cache.
+* <p>
+*
+* @return always true, higher levels have already checked the page number
+*         is valid for an open.
+*
+* @exception standardexception standard derby policy.
+*
+* @see cacheable#setidentity
+**/
+public cacheable setidentity object key
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert key instanceof pagekey
+initialize
+pagekey newidentity    pagekey  key
+filecontainer mycontainer
+filecontainer  containercache find newidentity getcontainerid
+setcontainerrowcount mycontainer getestimatedrowcount 0
+try
+if   alreadyreadpage
+// fill in the pagedata array by reading bytes from disk.
+readpage mycontainer  newidentity
+else
+// pagedata array already filled
+alreadyreadpage   false
+// if the formatid on disk is not the same as this page instance's
+// format id, instantiate the real page object
+int fmtid   gettypeformatid
+int onpageformatid   formatidutil readformatidinteger pagedata
+if  fmtid    onpageformatid
+return changeinstanceto
+onpageformatid  newidentity  setidentity key
+// this is the correct page instance
+initfromdata mycontainer  newidentity
+finally
+containercache release mycontainer
+mycontainer   null
+fillinidentity newidentity
+initialrowcount   0
+return this
+/**
+* find the container and then create the page in that container.
+* <p>
+* this is the process of creating a new page in a container, in that
+* case no need to read the page from disk - just need to initialize it
+* in the cache.
+* <p>
+*
+* @return new page, higher levels have already checked the page number is
+*         valid for an open.
+*
+* @param key               which page is this?
+* @param createparameter   details needed to create page like size,
+*                          format id, ...
+*
+* @exception  standardexception  standard exception policy.
+*
+* @see cacheable#createidentity
+**/
+public cacheable createidentity
+object  key
+object  createparameter
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert key instanceof pagekey
+initialize
+pagekey newidentity    pagekey  key
+pagecreationargs createargs    pagecreationargs  createparameter
+int formatid   createargs formatid
+if  formatid     1
+throw standardexception newexception
+sqlstate data_unknown_page_format_2
+newidentity
+org apache derby iapi util stringutil hexdump pagedata
+// createargs[0] contains the integer form of the formatid
+// if it is not the same as this instance's formatid, instantiate the
+// real page object
+if  formatid    gettypeformatid
+return
+changeinstanceto formatid  newidentity  createidentity
+key  createparameter
+// this is the correct page instance
+initializeheaders 5
+createpage newidentity  createargs
+fillinidentity newidentity
+initialrowcount   0
+/*
+* if we need to grow the container and the page has not been
+* preallocated, writing page before the log is written so that we
+* know if there is an io error - like running out of disk space - then
+* we don't write out the log record, because if we do, it may fail
+* after the log goes to disk and then the database may not be
+* recoverable.
+*
+* write_sync is used when we create the page without first
+*	preallocating it
+* write_no_sync is used when we are preallocating the page - there
+*	will be a sync call after all the pages are preallocated
+* 0 means creating a page that has already been preallocated.
+*/
+int syncflag   createargs syncflag
+if   syncflag   write_sync     0
+syncflag   write_no_sync     0
+writepage newidentity   syncflag   write_sync     0
+if  sanitymanager debug
+if  sanitymanager debug_on filecontainer space_trace
+string sync
+syncflag   write_sync     0      ?
+syncflag   write_no_sync     0  ?
+sanitymanager debug
+filecontainer space_trace
+newidentity       sync
+return this
+/**
+* convert this page to requested type, as defined by input format id.
+* <p>
+* the current cache entry is a different format id than the requested
+* type, change it.  this object is instantiated to the wrong subtype of
+* cachedpage, this routine will create an object with the correct subtype,
+* and transfer all pertinent information from this to the new correct
+* object.
+* <p>
+*
+* @return the new object created with the input fid and transfered info.
+*
+* @param fid          the format id of the new page.
+* @param newidentity  the key of the new page.
+*
+* @exception  standardexception  standard exception policy.
+**/
+private cachedpage changeinstanceto int fid  pagekey newidentity
+throws standardexception
+cachedpage realpage
+try
+realpage
+cachedpage  monitor newinstancefromidentifier fid
+catch  standardexception se
+if  se getseverity   > exceptionseverity statement_severity
+throw se
+else
+throw standardexception newexception
+sqlstate data_unknown_page_format_2
+newidentity
+org apache derby iapi util stringutil hexdump pagedata
+realpage setfactory datafactory
+// avoid creating the data buffer if possible, transfer it to the new
+// page if this is the first time the page buffer is used, then
+// createpage will create the page array with the correct page size
+if  this pagedata    null
+realpage alreadyreadpage   true
+realpage usepagebuffer this pagedata
+// resolve (12/15/06) - the following code is commented out, but
+// not sure why.
+// this page should not be used any more, null out all its content and
+// wait for gc to clean it up
+//destroypage();// let this subtype have a chance to get rid of stuff
+//this.pagedata = null;	// this instance no longer own the data array
+//this.pagecache = null;
+//this.datafactory = null;
+//this.containercache = null;
+return realpage
+/**
+* is the page dirty?
+* <p>
+* the isdirty flag indicates if the pagedata or pageheader has been
+* modified.  the predirty flag indicates that the pagedata or the
+* pageheader is about to be modified.  the reason for these 2 flags
+* instead of just one is to accomodate checkpoint.  after a clean
+* (latched) page sends a log record to the log stream but before that page
+* is dirtied by the log operation, a checkpoint could be taken.  if so,
+* then the redolwm will be after the log record but, without predirty, the
+* cache cleaning will not have waited for the change.  so the predirty bit
+* is to stop the cache cleaning from skipping over this (latched) page
+* even though it has not really been modified yet.
+*
+* @return true if the page is dirty.
+*
+* @see cacheable#isdirty
+**/
+public boolean isdirty
+synchronized  this
+return isdirty    predirty
+/**
+* has the page or its header been modified.
+* <p>
+* see comment on class header on meaning of isdirty and predirty bits.
+* <p>
+*
+* @return true if changes have actually been made to the page in memory.
+**/
+public boolean isactuallydirty
+synchronized  this
+return isdirty
+/**
+* set state to indicate the page or its header is about to be modified.
+* <p>
+* see comment on class header on meaning of isdirty and predirty bits.
+**/
+public void predirty
+synchronized  this
+if   isdirty
+predirty   true
+/**
+* set state to indicate the page or its header has been modified.
+* <p>
+* see comment on class header on meaning of isdirty and predirty bits.
+* <p>
+**/
+protected void setdirty
+synchronized  this
+isdirty    true
+predirty   false
+/**
+* exclusive latch on page is being released.
+* <p>
+* the only work done in cachedpage is to update the row count on the
+* container if it is too out of sync.
+**/
+protected void releaseexclusive
+// look at dirty bit without latching, the updating of the row
+// count is just an optimization so does not need the latch.
+//
+// if this page actually has > 1/8 rows of the entire container, then
+// consider updating the row count if it is different.
+//
+// no need to special case allocation pages because it has recordcount
+// of zero, thus the if clause will never be true for an allocation
+// page.
+if  isdirty     isoverflowpage
+containerrowcount   8  < recordcount
+int currentrowcount   internalnondeletedrecordcount
+int delta             currentrowcount initialrowcount
+int posdelta          delta > 0 ? delta     delta
+if   containerrowcount 8  < posdelta
+// this pages delta row count represents a significant change
+// with respect to current container row count so update
+// container row count
+filecontainer mycontainer   null
+try
+mycontainer    filecontainer
+containercache find identity getcontainerid
+if  mycontainer    null
+mycontainer updateestimatedrowcount delta
+setcontainerrowcount
+mycontainer getestimatedrowcount 0
+initialrowcount   currentrowcount
+// since i have the container, might as well update the
+// unfilled information
+mycontainer trackunfilledpage
+identity getpagenumber    unfilled
+catch  standardexception se
+// do nothing, not sure what could fail but this update
+// is just an optimization so no need to throw error.
+finally
+if  mycontainer    null
+containercache release mycontainer
+super releaseexclusive
+/**
+* write the page to disk.
+* <p>
+* mp - in a simple world we would just not allow clean until it held the
+*      latch on the page.  but in order to fit into the cache system, we
+*      don't have enough state around to just make clean() latch the page
+*      while doing the i/o - but we still need someway to insure that no
+*      changes happen to the page while the i/o is taking place.
+*      also someday it would be fine to allow reads of this page
+*      while the i/o was taking place.
+*
+*
+* @exception  standardexception  error writing the page.
+*
+* @see cacheable#clean
+**/
+public void clean boolean remove  throws standardexception
+// must wait for the page to be unlatched
+synchronized  this
+if   isdirty
+return
+// is someone else cleaning it
+while  inclean
+try
+wait
+catch  interruptedexception ie
+throw standardexception interrupt ie
+// page is not "inclean" by other thread at this point.
+if   isdirty
+return
+inclean   true
+// if page is in latched state (as opposed to unlatch or prelatch)
+// wait for the page to move to unlatched state.  see comments in
+// generic/basepage.java describing the interaction of inclean,
+// (owner != null), and prelatch.
+while   owner    null      prelatch
+try
+wait
+catch  interruptedexception ie
+inclean   false
+throw standardexception interrupt ie
+// the page is now effectively latched by the cleaner.
+// we only want to clean the page if the page is actually dirtied,
+// not when it is just pre-dirtied.
+if   isactuallydirty
+// the person who latched it gives up the
+// latch without really dirtying the page
+predirty   false
+inclean    false
+notifyall
+return
+try
+writepage getpageid    false
+catch standardexception se
+// if we get an error while trying to write a page, current
+// recovery system requires that entire db is shutdown.  then
+// when system is rebooted we will run redo recovery which
+// if it does not encounter disk errors will guarantee to recover
+// to a transaction consistent state.  if this write is a
+// persistent device problem, redo recovery will likely fail
+// attempting to the same i/o.  mark corrupt will stop all further
+// writes of data and log by the system.
+throw datafactory markcorrupt se
+finally
+// if there is something wrong in writing out the page,
+// do not leave it inclean state or it will block the next cleaner
+// forever
+synchronized  this
+inclean   false
+notifyall
+public void clearidentity
+alreadyreadpage   false
+super clearidentity
+/**
+* read the page from disk into this cachedpage object.
+* <p>
+* a page is read in from disk into the pagedata array of this object,
+* and then put in the cache.
+* <p>
+*
+* @param mycontainer the container to read the page from.
+* @param newidentity indentity (ie. page number) of the page to read
+*
+* @exception  standardexception  standard exception policy.
+**/
+private void readpage
+filecontainer   mycontainer
+pagekey         newidentity
+throws standardexception
+int pagesize   mycontainer getpagesize
+// we will reuse the existing page array if it is same size, the
+// cache does support caching various sized pages.
+setpagearray pagesize
+for  int io_retry_count   0
+try
+mycontainer readpage newidentity getpagenumber    pagedata
+break
+catch  ioexception ioe
+io_retry_count
+// retrying read i/o's has been found to be successful sometimes
+// in completing the read without having to fail the calling
+// query, and in some cases avoiding complete db shutdown.
+// some situations are:
+//     spurious interrupts being sent to thread by clients.
+//     unreliable hardware like a network mounted file system.
+//
+// the only option other than retrying is to fail the i/o
+// immediately and throwing an error, thus performance cost
+// not really a consideration.
+//
+// the retry max of 4 is arbitrary, but has been enough that
+// not many read i/o errors have been reported.
+if  io_retry_count > 4
+// page cannot be physically read
+standardexception se
+standardexception newexception
+sqlstate file_read_page_exception
+ioe  newidentity  new integer pagesize
+if  datafactory getlogfactory   inrfr
+//if in rollforward recovery, it is possible that this
+//page actually does not exist on the disk yet because
+//the log record we are proccessing now is actually
+//creating the page, we will recreate the page if we
+//are in rollforward recovery, so just throw the
+//exception.
+throw se
+else
+if  sanitymanager debug
+// by shutting down system in debug mode, maybe
+// we can catch root cause of the interrupt.
+throw datafactory markcorrupt se
+else
+// no need to shut down runtime database on read
+// error in delivered system, throwing exception
+// should be enough.  thrown exception has nested
+// io exception which is root cause of error.
+throw se
+/**
+* write the page from this cachedpage object to disk.
+* <p>
+*
+* @param identity indentity (ie. page number) of the page to read
+* @param syncme      does the write of this single page have to be sync'd?
+*
+* @exception  standardexception  standard exception policy.
+**/
+private void writepage
+pagekey identity
+boolean syncme
+throws standardexception
+// make subclass write the page format
+writeformatid identity
+// let subclass have a chance to write any cached data to page data
+// array
+writepage identity
+// force wal - and check to see if database is corrupt or is frozen.
+// last log instant may be null if the page is being forced
+// to disk on a createpage (which violates the wal protocol actually).
+// see filecontainer.newpage
+loginstant flushlogto   getlastloginstant
+datafactory flush flushlogto
+if  flushlogto    null
+clearlastloginstant
+// find the container and file access object
+filecontainer mycontainer
+filecontainer  containercache find identity getcontainerid
+if  mycontainer    null
+standardexception nested
+standardexception newexception
+sqlstate data_container_vanished
+identity getcontainerid
+throw datafactory markcorrupt
+standardexception newexception
+sqlstate file_write_page_exception  nested
+identity
+try
+mycontainer writepage
+identity getpagenumber    pagedata  syncme
+//
+// do some in memory unlogged bookkeeping tasks while we have
+// the container.
+//
+if   isoverflowpage      isdirty
+// let the container knows whether this page is a not
+// filled, non-overflow page
+mycontainer trackunfilledpage
+identity getpagenumber    unfilled
+// if this is not an overflow page, see if the page's row
+// count has changed since it come into the cache.
+//
+// if the page is not invalid, row count is 0.	otherwise,
+// count non-deleted records on page.
+//
+// cannot call nondeletedrecordcount because the page is
+// unlatched now even though nobody is changing it
+int currentrowcount   internalnondeletedrecordcount
+if  currentrowcount    initialrowcount
+mycontainer updateestimatedrowcount
+currentrowcount   initialrowcount
+setcontainerrowcount
+mycontainer getestimatedrowcount 0
+initialrowcount   currentrowcount
+catch  ioexception ioe
+// page cannot be written
+throw standardexception newexception
+sqlstate file_write_page_exception
+ioe  identity
+finally
+containercache release mycontainer
+mycontainer   null
+synchronized  this
+// change page state to not dirty after the successful write
+isdirty       false
+predirty      false
+public void setcontainerrowcount long rowcount
+containerrowcount   rowcount
+/**
+** if the page size is different from the page buffer, then make a
+** new page buffer and make subclass use the new page buffer
+*/
+protected void setpagearray int pagesize
+if   pagedata    null      pagedata length    pagesize
+// give a chance for garbage collection to free
+// the old array before the new array is allocated.
+// just in case memory is low.
+pagedata   null
+pagedata   new byte
+// always call usepagebuffer(), even when we reuse the buffer, so that
+// totalspace and friends are recalculated (derby-3116).
+usepagebuffer pagedata
+/**
+* returns the page data array used to write on disk version.
+*
+* <p>
+* returns the page data array, that is actually written to the disk,
+* when the page is cleaned from the page cache.  takes care of flushing
+* in-memory information to the array (like page header and format id info).
+* <p>
+*
+* @return the array of bytes that is the on disk version of page.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected byte getpagearray   throws standardexception
+// make subclass write the page format
+writeformatid identity
+// let subclass have a chance to write any cached
+// data to page data array
+writepage identity
+return pagedata
+/* methods for subclass of cached page */
+// use a new pagedata buffer, initialize in memory structure that depend on
+// the pagedata's size.  the actual disk data may not have not been read in
+// yet so don't look at the content of the buffer
+protected abstract void usepagebuffer byte buffer
+// initialize in memory structure using the read in buffer in pagedata
+protected abstract void initfromdata filecontainer container  pagekey id
+throws standardexception
+// create the page
+protected abstract void createpage pagekey id  pagecreationargs args
+throws standardexception
+// page is about to be written, write everything to pagedata array
+protected abstract void writepage pagekey id  throws standardexception
+// write out the formatid to the pagedata
+protected abstract void writeformatid pagekey identity
+throws standardexception

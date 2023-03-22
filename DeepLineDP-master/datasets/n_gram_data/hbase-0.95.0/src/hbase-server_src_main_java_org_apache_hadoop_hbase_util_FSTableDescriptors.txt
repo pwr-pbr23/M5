@@ -1,0 +1,520 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase util
+import java io filenotfoundexception
+import java io ioexception
+import java util arrays
+import java util comparator
+import java util list
+import java util map
+import java util treemap
+import java util concurrent concurrenthashmap
+import java util regex matcher
+import java util regex pattern
+import org apache commons lang notimplementedexception
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop fs fsdatainputstream
+import org apache hadoop fs fsdataoutputstream
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop fs pathfilter
+import org apache hadoop hbase exceptions deserializationexception
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase tabledescriptors
+import org apache hadoop hbase exceptions tableinfomissingexception
+import org apache hadoop hbase protobuf protobufutil
+import com google common primitives ints
+/**
+* implementation of {@link tabledescriptors} that reads descriptors from the
+* passed filesystem.  it expects descriptors to be in a file under the
+* table's directory in fs.  can be read-only -- i.e. does not modify
+* the filesystem or can be read and write.
+*
+* <p>also has utility for keeping up the table descriptors tableinfo file.
+* the table schema file is kept under the table directory in the filesystem.
+* it has a {@link #tableinfo_name} prefix and then a suffix that is the
+* edit sequenceid: e.g. <code>.tableinfo.0000000003</code>.  this sequenceid
+* is always increasing.  it starts at zero.  the table schema file with the
+* highest sequenceid has the most recent schema edit. usually there is one file
+* only, the most recent but there may be short periods where there are more
+* than one file. old files are eventually cleaned.  presumption is that there
+* will not be lots of concurrent clients making table schema edits.  if so,
+* the below needs a bit of a reworking and perhaps some supporting api in hdfs.
+*/
+@interfaceaudience private
+public class fstabledescriptors implements tabledescriptors
+private static final log log   logfactory getlog fstabledescriptors class
+private final filesystem fs
+private final path rootdir
+private final boolean fsreadonly
+long cachehits   0
+long invocations   0
+/** the file name used to store htd in hdfs  */
+public static final string tableinfo_name
+// this cache does not age out the old stuff.  thinking is that the amount
+// of data we keep up in here is so small, no need to do occasional purge.
+// todo.
+private final map<string  tabledescriptormodtime> cache
+new concurrenthashmap<string  tabledescriptormodtime>
+/**
+* data structure to hold modification time and table descriptor.
+*/
+static class tabledescriptormodtime
+private final htabledescriptor descriptor
+private final long modtime
+tabledescriptormodtime final long modtime  final htabledescriptor htd
+this descriptor   htd
+this modtime   modtime
+long getmodtime
+return this modtime
+htabledescriptor gettabledescriptor
+return this descriptor
+public fstabledescriptors final filesystem fs  final path rootdir
+this fs  rootdir  false
+/**
+* @param fs
+* @param rootdir
+* @param fsreadonly true if we are read-only when it comes to filesystem
+* operations; i.e. on remove, we do not do delete in fs.
+*/
+public fstabledescriptors final filesystem fs  final path rootdir
+final boolean fsreadonly
+super
+this fs   fs
+this rootdir   rootdir
+this fsreadonly   fsreadonly
+/* (non-javadoc)
+* @see org.apache.hadoop.hbase.tabledescriptors#gethtabledescriptor(java.lang.string)
+*/
+@override
+public htabledescriptor get final byte  tablename
+throws ioexception
+return get bytes tostring tablename
+/* (non-javadoc)
+* @see org.apache.hadoop.hbase.tabledescriptors#gettabledescriptor(byte[])
+*/
+@override
+public htabledescriptor get final string tablename
+throws ioexception
+invocations
+if  htabledescriptor root_tabledesc getnameasstring   equals tablename
+cachehits
+return htabledescriptor root_tabledesc
+if  htabledescriptor meta_tabledesc getnameasstring   equals tablename
+cachehits
+return htabledescriptor meta_tabledesc
+// .meta. and -root- is already handled. if some one tries to get the descriptor for
+// .logs, .oldlogs or .corrupt throw an exception.
+if  hconstants hbase_non_user_table_dirs contains tablename
+throw new ioexception     tablename
+// look in cache of descriptors.
+tabledescriptormodtime cachedtdm   this cache get tablename
+if  cachedtdm    null
+// check mod time has not changed (this is trip to nn).
+if  gettableinfomodtime this fs  this rootdir  tablename  <  cachedtdm getmodtime
+cachehits
+return cachedtdm gettabledescriptor
+tabledescriptormodtime tdmt   null
+try
+tdmt   gettabledescriptormodtime this fs  this rootdir  tablename
+catch  nullpointerexception e
+log debug
+tablename  e
+catch  ioexception ioe
+log debug
+tablename  ioe
+if  tdmt    null
+log warn
+tablename
+else
+this cache put tablename  tdmt
+return tdmt    null ? null   tdmt gettabledescriptor
+/* (non-javadoc)
+* @see org.apache.hadoop.hbase.tabledescriptors#gettabledescriptors(org.apache.hadoop.fs.filesystem, org.apache.hadoop.fs.path)
+*/
+@override
+public map<string  htabledescriptor> getall
+throws ioexception
+map<string  htabledescriptor> htds   new treemap<string  htabledescriptor>
+list<path> tabledirs   fsutils gettabledirs fs  rootdir
+for  path d  tabledirs
+htabledescriptor htd   null
+try
+htd   get d getname
+catch  filenotfoundexception fnfe
+// inability of retrieving one htd shouldn't stop getting the remaining
+log warn    fnfe
+if  htd    null  continue
+htds put d getname    htd
+return htds
+@override
+public void add htabledescriptor htd  throws ioexception
+if  bytes equals hconstants root_table_name  htd getname
+throw new notimplementedexception
+if  bytes equals hconstants meta_table_name  htd getname
+throw new notimplementedexception
+if  hconstants hbase_non_user_table_dirs contains htd getnameasstring
+throw new notimplementedexception
+if   this fsreadonly  updatehtabledescriptor this fs  this rootdir  htd
+long modtime   gettableinfomodtime this fs  this rootdir  htd getnameasstring
+this cache put htd getnameasstring    new tabledescriptormodtime modtime  htd
+@override
+public htabledescriptor remove final string tablename
+throws ioexception
+if   this fsreadonly
+path tabledir   fsutils gettablepath this rootdir  tablename
+if  this fs exists tabledir
+if   this fs delete tabledir  true
+throw new ioexception     tabledir tostring
+tabledescriptormodtime tdm   this cache remove tablename
+return tdm    null ? null   tdm gettabledescriptor
+/**
+* checks if <code>.tableinfo<code> exists for given table
+*
+* @param fs file system
+* @param rootdir root directory of hbase installation
+* @param tablename name of table
+* @return true if exists
+* @throws ioexception
+*/
+public static boolean istableinfoexists filesystem fs  path rootdir
+string tablename  throws ioexception
+filestatus status   gettableinfopath fs  rootdir  tablename
+return status    null? false  fs exists status getpath
+private static filestatus gettableinfopath final filesystem fs
+final path rootdir  final string tablename
+throws ioexception
+path tabledir   fsutils gettablepath rootdir  tablename
+return gettableinfopath fs  tabledir
+/**
+* looks under the table directory in the filesystem for files with a
+* {@link #tableinfo_name} prefix.  returns reference to the 'latest' instance.
+* @param fs
+* @param tabledir
+* @return the 'current' tableinfo file.
+* @throws ioexception
+*/
+public static filestatus gettableinfopath final filesystem fs
+final path tabledir
+throws ioexception
+filestatus  status   fsutils liststatus fs  tabledir  new pathfilter
+@override
+public boolean accept path p
+// accept any file that starts with tableinfo_name
+return p getname   startswith tableinfo_name
+if  status    null    status length < 1  return null
+arrays sort status  new filestatusfilenamecomparator
+if  status length > 1
+// clean away old versions of .tableinfo
+for  int i   1  i < status length  i
+path p   status getpath
+// clean up old versions
+if   fs delete p  false
+log warn     p
+else
+log debug     p
+return status
+/**
+* compare {@link filestatus} instances by {@link path#getname()}.
+* returns in reverse order.
+*/
+static class filestatusfilenamecomparator
+implements comparator<filestatus>
+@override
+public int compare filestatus left  filestatus right
+return  left compareto right
+/**
+* width of the sequenceid that is a suffix on a tableinfo file.
+*/
+static final int width_of_sequence_id   10
+/*
+* @param number number to use as suffix.
+* @return returns zero-prefixed 5-byte wide decimal version of passed
+* number (does absolute in case number is negative).
+*/
+static string formattableinfosequenceid final int number
+byte  b   new byte
+int d   math abs number
+for  int i   b length   1  i >  0  i
+b    byte   d % 10
+d    10
+return bytes tostring b
+/**
+* regex to eat up sequenceid suffix on a .tableinfo file.
+* use regex because may encounter oldstyle .tableinfos where there is no
+* sequenceid on the end.
+*/
+private static final pattern suffix
+pattern compile tableinfo_name       width_of_sequence_id
+/**
+* @param p path to a <code>.tableinfo</code> file.
+* @return the current editid or 0 if none found.
+*/
+static int gettableinfosequenceid final path p
+if  p    null  return 0
+matcher m   suffix matcher p getname
+if   m matches    throw new illegalargumentexception p tostring
+string suffix   m group 2
+if  suffix    null    suffix length   <  0  return 0
+return integer parseint m group 2
+/**
+* @param tabledir
+* @param sequenceid
+* @return name of tableinfo file.
+*/
+static path gettableinfofilename final path tabledir  final int sequenceid
+return new path tabledir
+tableinfo_name       formattableinfosequenceid sequenceid
+/**
+* @param fs
+* @param rootdir
+* @param tablename
+* @return modification time for the table {@link #tableinfo_name} file
+* or <code>0</code> if no tableinfo file found.
+* @throws ioexception
+*/
+static long gettableinfomodtime final filesystem fs  final path rootdir
+final string tablename
+throws ioexception
+filestatus status   gettableinfopath fs  rootdir  tablename
+return status    null? 0  status getmodificationtime
+/**
+* get htd from hdfs.
+* @param fs
+* @param hbaserootdir
+* @param tablename
+* @return descriptor or null if none found.
+* @throws ioexception
+*/
+public static htabledescriptor gettabledescriptor filesystem fs
+path hbaserootdir  byte tablename
+throws ioexception
+htabledescriptor htd   null
+try
+tabledescriptormodtime tdmt
+gettabledescriptormodtime fs  hbaserootdir  bytes tostring tablename
+htd   tdmt    null ? null   tdmt gettabledescriptor
+catch  nullpointerexception e
+log debug
+bytes tostring tablename   e
+return htd
+static htabledescriptor gettabledescriptor filesystem fs
+path hbaserootdir  string tablename  throws nullpointerexception  ioexception
+tabledescriptormodtime tdmt   gettabledescriptormodtime fs  hbaserootdir  tablename
+return tdmt    null ? null   tdmt gettabledescriptor
+static tabledescriptormodtime gettabledescriptormodtime filesystem fs
+path hbaserootdir  string tablename  throws nullpointerexception  ioexception
+// ignore both -root- and .meta. tables
+if  bytes compareto bytes tobytes tablename   hconstants root_table_name     0
+bytes compareto bytes tobytes tablename   hconstants meta_table_name     0
+return null
+return gettabledescriptormodtime fs  fsutils gettablepath hbaserootdir  tablename
+static tabledescriptormodtime gettabledescriptormodtime filesystem fs  path tabledir
+throws nullpointerexception  ioexception
+if  tabledir    null  throw new nullpointerexception
+filestatus status   gettableinfopath fs  tabledir
+if  status    null
+throw new tableinfomissingexception
+tabledir touri
+int len   ints checkedcast status getlen
+byte  content   new byte
+fsdatainputstream fsdatainputstream   fs open status getpath
+try
+fsdatainputstream readfully content
+finally
+fsdatainputstream close
+htabledescriptor htd   null
+try
+htd   htabledescriptor parsefrom content
+catch  deserializationexception e
+throw new ioexception     bytes toshort content   e
+if   protobufutil ispbmagicprefix content
+// convert the file over to be pb before leaving here.
+createtabledescriptor fs  tabledir getparent    htd  true
+return new tabledescriptormodtime status getmodificationtime    htd
+public static htabledescriptor gettabledescriptor filesystem fs  path tabledir
+throws ioexception  nullpointerexception
+tabledescriptormodtime tdmt   gettabledescriptormodtime fs  tabledir
+return tdmt    null ? null   tdmt gettabledescriptor
+/**
+* update table descriptor
+* @param fs
+* @param conf
+* @param htabledescriptor
+* @return new tableinfo or null if we failed update.
+* @throws ioexception thrown if failed update.
+*/
+static path updatehtabledescriptor filesystem fs  path rootdir
+htabledescriptor htabledescriptor
+throws ioexception
+path tabledir   fsutils gettablepath rootdir  htabledescriptor getname
+path p   writetabledescriptor fs  htabledescriptor  tabledir
+gettableinfopath fs  tabledir
+if  p    null  throw new ioexception
+log info     p
+return p
+/**
+* deletes a table's directory from the file system if exists. used in unit
+* tests.
+*/
+public static void deletetabledescriptorifexists string tablename
+configuration conf  throws ioexception
+filesystem fs   fsutils getcurrentfilesystem conf
+filestatus status   gettableinfopath fs  fsutils getrootdir conf   tablename
+// the below deletedirectory works for either file or directory.
+if  status    null    fs exists status getpath
+fsutils deletedirectory fs  status getpath
+/**
+* @param fs
+* @param htabledescriptor
+* @param tabledir
+* @param status
+* @return descriptor file or null if we failed write.
+* @throws ioexception
+*/
+private static path writetabledescriptor final filesystem fs
+final htabledescriptor htabledescriptor  final path tabledir
+final filestatus status
+throws ioexception
+// get temporary dir into which we'll first write a file to avoid half-written file phenomenon.
+path tmptabledir   new path tabledir
+// what is current sequenceid?  we read the current sequenceid from
+// the current file.  after we read it, another thread could come in and
+// compete with us writing out next version of file.  the below retries
+// should help in this case some but its hard to do guarantees in face of
+// concurrent schema edits.
+int currentsequenceid   status    null? 0  gettableinfosequenceid status getpath
+int sequenceid   currentsequenceid
+// put arbitrary upperbound on how often we retry
+int retries   10
+int retrymax   currentsequenceid   retries
+path tableinfopath   null
+do
+sequenceid    1
+path p   gettableinfofilename tmptabledir  sequenceid
+if  fs exists p
+log debug p       retries
+continue
+try
+writehtd fs  p  htabledescriptor
+tableinfopath   gettableinfofilename tabledir  sequenceid
+if   fs rename p  tableinfopath
+throw new ioexception     p       tableinfopath
+catch  ioexception ioe
+// presume clash of names or something; go around again.
+log debug    ioe
+if   fsutils deletedirectory fs  p
+log warn     p
+tableinfopath   null
+continue
+// cleanup old schema file.
+if  status    null
+if   fsutils deletedirectory fs  status getpath
+log warn     status getpath
+break
+while  sequenceid < retrymax
+return tableinfopath
+private static void writehtd final filesystem fs  final path p  final htabledescriptor htd
+throws ioexception
+fsdataoutputstream out   fs create p  false
+try
+// we used to write this file out as a serialized htd writable followed by two '\n's and then
+// the tostring version of htd.  now we just write out the pb serialization.
+out write htd tobytearray
+finally
+out close
+/**
+* create new htabledescriptor in hdfs. happens when we are creating table.
+*
+* @param htabledescriptor
+* @param conf
+*/
+public static boolean createtabledescriptor final htabledescriptor htabledescriptor
+configuration conf
+throws ioexception
+return createtabledescriptor htabledescriptor  conf  false
+/**
+* create new htabledescriptor in hdfs. happens when we are creating table. if
+* forcecreation is true then even if previous table descriptor is present it
+* will be overwritten
+*
+* @param htabledescriptor
+* @param conf
+* @param forcecreation true if we are to overwrite existing file.
+*/
+static boolean createtabledescriptor final htabledescriptor htabledescriptor
+final configuration conf  boolean forcecreation
+throws ioexception
+filesystem fs   fsutils getcurrentfilesystem conf
+return createtabledescriptor fs  fsutils getrootdir conf   htabledescriptor  forcecreation
+/**
+* create new htabledescriptor in hdfs. happens when we are creating table.
+* used by tests.
+* @param fs
+* @param htabledescriptor
+* @param rootdir
+*/
+public static boolean createtabledescriptor filesystem fs  path rootdir
+htabledescriptor htabledescriptor
+throws ioexception
+return createtabledescriptor fs  rootdir  htabledescriptor  false
+/**
+* create new htabledescriptor in hdfs. happens when we are creating table. if
+* forcecreation is true then even if previous table descriptor is present it
+* will be overwritten
+*
+* @param fs
+* @param htabledescriptor
+* @param rootdir
+* @param forcecreation
+* @return true if we successfully created file.
+*/
+public static boolean createtabledescriptor filesystem fs  path rootdir
+htabledescriptor htabledescriptor  boolean forcecreation
+throws ioexception
+path tabledir   fsutils gettablepath rootdir  htabledescriptor getnameasstring
+return createtabledescriptorfortabledirectory fs  tabledir  htabledescriptor  forcecreation
+/**
+* create a new htabledescriptor in hdfs in the specified table directory. happens when we create
+* a new table or snapshot a table.
+* @param fs filesystem where the descriptor should be written
+* @param tabledir directory under which we should write the file
+* @param htabledescriptor description of the table to write
+* @param forcecreation if <tt>true</tt>,then even if previous table descriptor is present it will
+*          be overwritten
+* @return <tt>true</tt> if the we successfully created the file, <tt>false</tt> if the file
+*         already exists and we weren't forcing the descriptor creation.
+* @throws ioexception if a filesystem error occurs
+*/
+public static boolean createtabledescriptorfortabledirectory filesystem fs  path tabledir
+htabledescriptor htabledescriptor  boolean forcecreation  throws ioexception
+filestatus status   gettableinfopath fs  tabledir
+if  status    null
+log info     status getpath
+if   forcecreation
+if  fs exists status getpath       status getlen   > 0
+if  gettabledescriptor fs  status getpath   getparent    equals htabledescriptor
+log info
+return false
+path p   writetabledescriptor fs  htabledescriptor  tabledir  status
+return p    null

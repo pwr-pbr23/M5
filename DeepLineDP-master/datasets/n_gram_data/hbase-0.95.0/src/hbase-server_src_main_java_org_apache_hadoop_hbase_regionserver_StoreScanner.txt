@@ -1,0 +1,521 @@
+/**
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver
+import java io ioexception
+import java io interruptedioexception
+import java util arraylist
+import java util list
+import java util navigableset
+import java util concurrent countdownlatch
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop hbase exceptions donotretryioexception
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase client scan
+import org apache hadoop hbase executor executorservice
+import org apache hadoop hbase filter filter
+import org apache hadoop hbase regionserver scaninfo
+import org apache hadoop hbase regionserver handler parallelseekhandler
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util environmentedgemanager
+/**
+* scanner scans both the memstore and the store. coalesce keyvalue stream
+* into list<keyvalue> for a single row.
+*/
+@interfaceaudience private
+public class storescanner extends nonlazykeyvaluescanner
+implements keyvaluescanner  internalscanner  changedreadersobserver
+static final log log   logfactory getlog storescanner class
+protected store store
+protected scanquerymatcher matcher
+protected keyvalueheap heap
+protected boolean cacheblocks
+protected int countperrow   0
+protected int storelimit    1
+protected int storeoffset   0
+// used to indicate that the scanner has closed (see hbase-1107)
+// doesnt need to be volatile because it's always accessed via synchronized methods
+protected boolean closing   false
+protected final boolean isget
+protected final boolean explicitcolumnquery
+protected final boolean userowcolbloom
+/**
+* a flag that enables storefilescanner parallel-seeking
+*/
+protected boolean isparallelseekenabled   false
+protected executorservice executor
+protected final scan scan
+protected final navigableset<byte> columns
+protected final long oldestunexpiredts
+protected final int minversions
+/** we don't ever expect to change this, the constant is just for clarity. */
+static final boolean lazy_seek_enabled_by_default   true
+public static final string storescanner_parallel_seek_enable
+/** used during unit testing to ensure that lazy seek does save seek ops */
+protected static boolean lazyseekenabledglobally
+lazy_seek_enabled_by_default
+// if heap == null and lasttop != null, you need to reseek given the key below
+protected keyvalue lasttop   null
+/** an internal constructor. */
+protected storescanner store store  boolean cacheblocks  scan scan
+final navigableset<byte> columns  long ttl  int minversions
+this store   store
+this cacheblocks   cacheblocks
+isget   scan isgetscan
+int numcol   columns    null ? 0   columns size
+explicitcolumnquery   numcol > 0
+this scan   scan
+this columns   columns
+oldestunexpiredts   environmentedgemanager currenttimemillis     ttl
+this minversions   minversions
+// we look up row-column bloom filters for multi-column queries as part of
+// the seek operation. however, we also look the row-column bloom filter
+// for multi-row (non-"get") scans because this is not done in
+// storefile.passesbloomfilter(scan, sortedset<byte[]>).
+userowcolbloom   numcol > 1      isget    numcol    1
+// the parallel-seeking is on :
+// 1) the config value is *true*
+// 2) store has more than one store file
+if  store    null      hstore store  gethregion      null
+store getstorefilescount   > 1
+regionserverservices rsservice     hstore store  gethregion   getregionserverservices
+if  rsservice    null     rsservice getconfiguration   getboolean
+storescanner_parallel_seek_enable  false   return
+isparallelseekenabled   true
+executor   rsservice getexecutorservice
+/**
+* opens a scanner across memstore, snapshot, and all storefiles. assumes we
+* are not in a compaction.
+*
+* @param store who we scan
+* @param scan the spec
+* @param columns which columns we are scanning
+* @throws ioexception
+*/
+public storescanner store store  scaninfo scaninfo  scan scan  final navigableset<byte> columns
+throws ioexception
+this store  scan getcacheblocks    scan  columns  scaninfo getttl
+scaninfo getminversions
+if  columns    null    scan israw
+throw new donotretryioexception
+matcher   new scanquerymatcher scan  scaninfo  columns
+scantype user_scan  long max_value  hconstants latest_timestamp
+oldestunexpiredts
+// pass columns to try to filter out unnecessary storefiles.
+list<keyvaluescanner> scanners   getscannersnocompaction
+// seek all scanners to the start of the row (or if the exact matching row
+// key does not exist, then to the start of the next matching row).
+// always check bloom filter to optimize the top row seek for delete
+// family marker.
+if  explicitcolumnquery    lazyseekenabledglobally
+for  keyvaluescanner scanner   scanners
+scanner requestseek matcher getstartkey    false  true
+else
+if   isparallelseekenabled
+for  keyvaluescanner scanner   scanners
+scanner seek matcher getstartkey
+else
+parallelseek scanners  matcher getstartkey
+// set storelimit
+this storelimit   scan getmaxresultspercolumnfamily
+// set rowoffset
+this storeoffset   scan getrowoffsetpercolumnfamily
+// combine all seeked scanners with a heap
+heap   new keyvalueheap scanners  store getcomparator
+this store addchangedreaderobserver this
+/**
+* used for compactions.<p>
+*
+* opens a scanner across specified storefiles.
+* @param store who we scan
+* @param scan the spec
+* @param scanners ancillary scanners
+* @param smallestreadpoint the readpoint that we should use for tracking
+*          versions
+*/
+public storescanner store store  scaninfo scaninfo  scan scan
+list<? extends keyvaluescanner> scanners  scantype scantype
+long smallestreadpoint  long earliestputts  throws ioexception
+this store  scaninfo  scan  scanners  scantype  smallestreadpoint  earliestputts  null  null
+/**
+* used for compactions that drop deletes from a limited range of rows.<p>
+*
+* opens a scanner across specified storefiles.
+* @param store who we scan
+* @param scan the spec
+* @param scanners ancillary scanners
+* @param smallestreadpoint the readpoint that we should use for tracking versions
+* @param dropdeletesfromrow the inclusive left bound of the range; can be empty_start_row.
+* @param dropdeletestorow the exclusive right bound of the range; can be empty_end_row.
+*/
+public storescanner store store  scaninfo scaninfo  scan scan
+list<? extends keyvaluescanner> scanners  long smallestreadpoint  long earliestputts
+byte dropdeletesfromrow  byte dropdeletestorow  throws ioexception
+this store  scaninfo  scan  scanners  scantype compact_retain_deletes  smallestreadpoint
+earliestputts  dropdeletesfromrow  dropdeletestorow
+private storescanner store store  scaninfo scaninfo  scan scan
+list<? extends keyvaluescanner> scanners  scantype scantype  long smallestreadpoint
+long earliestputts  byte dropdeletesfromrow  byte dropdeletestorow  throws ioexception
+this store  false  scan  null  scaninfo getttl
+scaninfo getminversions
+if  dropdeletesfromrow    null
+matcher   new scanquerymatcher scan  scaninfo  null  scantype
+smallestreadpoint  earliestputts  oldestunexpiredts
+else
+matcher   new scanquerymatcher scan  scaninfo  null  smallestreadpoint
+earliestputts  oldestunexpiredts  dropdeletesfromrow  dropdeletestorow
+// filter the list of scanners using bloom filters, time range, ttl, etc.
+scanners   selectscannersfrom scanners
+// seek all scanners to the initial key
+if   isparallelseekenabled
+for  keyvaluescanner scanner   scanners
+scanner seek matcher getstartkey
+else
+parallelseek scanners  matcher getstartkey
+// combine all seeked scanners with a heap
+heap   new keyvalueheap scanners  store getcomparator
+/** constructor for testing. */
+storescanner final scan scan  scaninfo scaninfo
+scantype scantype  final navigableset<byte> columns
+final list<keyvaluescanner> scanners  throws ioexception
+this scan  scaninfo  scantype  columns  scanners
+hconstants latest_timestamp
+// constructor for testing.
+storescanner final scan scan  scaninfo scaninfo
+scantype scantype  final navigableset<byte> columns
+final list<keyvaluescanner> scanners  long earliestputts
+throws ioexception
+this null  scan getcacheblocks    scan  columns  scaninfo getttl
+scaninfo getminversions
+this matcher   new scanquerymatcher scan  scaninfo  columns  scantype
+long max_value  earliestputts  oldestunexpiredts
+// seek all scanners to the initial key
+if   isparallelseekenabled
+for  keyvaluescanner scanner   scanners
+scanner seek matcher getstartkey
+else
+parallelseek scanners  matcher getstartkey
+heap   new keyvalueheap scanners  scaninfo getcomparator
+/**
+* get a filtered list of scanners. assumes we are not in a compaction.
+* @return list of scanners to seek
+*/
+protected list<keyvaluescanner> getscannersnocompaction   throws ioexception
+final boolean iscompaction   false
+return selectscannersfrom store getscanners cacheblocks  isget
+iscompaction  matcher  scan getstartrow    scan getstoprow
+/**
+* filters the given list of scanners using bloom filter, time range, and
+* ttl.
+*/
+protected list<keyvaluescanner> selectscannersfrom
+final list<? extends keyvaluescanner> allscanners
+boolean memonly
+boolean filesonly
+if  scan instanceof internalscan
+internalscan iscan    internalscan scan
+memonly   iscan ischeckonlymemstore
+filesonly   iscan ischeckonlystorefiles
+else
+memonly   false
+filesonly   false
+list<keyvaluescanner> scanners
+new arraylist<keyvaluescanner> allscanners size
+// we can only exclude store files based on ttl if minversions is set to 0.
+// otherwise, we might have to return kvs that have technically expired.
+long expiredtimestampcutoff   minversions    0 ? oldestunexpiredts
+long min_value
+// include only those scan files which pass all filters
+for  keyvaluescanner kvs   allscanners
+boolean isfile   kvs isfilescanner
+if    isfile    filesonly      isfile    memonly
+continue
+if  kvs shouldusescanner scan  columns  expiredtimestampcutoff
+scanners add kvs
+return scanners
+@override
+public synchronized keyvalue peek
+if  this heap    null
+return this lasttop
+return this heap peek
+@override
+public keyvalue next
+// throw runtime exception perhaps?
+throw new runtimeexception
+@override
+public synchronized void close
+if  this closing  return
+this closing   true
+// under test, we dont have a this.store
+if  this store    null
+this store deletechangedreaderobserver this
+if  this heap    null
+this heap close
+this heap   null     closed
+this lasttop   null     if both are null  we are closed
+@override
+public synchronized boolean seek keyvalue key  throws ioexception
+// reset matcher state, in case that underlying store changed
+checkreseek
+return this heap seek key
+/**
+* get the next row of values from this store.
+* @param outresult
+* @param limit
+* @return true if there are more rows, false if scanner is done
+*/
+@override
+public synchronized boolean next list<keyvalue> outresult  int limit  throws ioexception
+return next outresult  limit  null
+/**
+* get the next row of values from this store.
+* @param outresult
+* @param limit
+* @return true if there are more rows, false if scanner is done
+*/
+@override
+public synchronized boolean next list<keyvalue> outresult  int limit
+string metric  throws ioexception
+if  checkreseek
+return true
+// if the heap was left null, then the scanners had previously run out anyways, close and
+// return.
+if  this heap    null
+close
+return false
+keyvalue peeked   this heap peek
+if  peeked    null
+close
+return false
+// only call setrow if the row changes; avoids confusing the query matcher
+// if scanning intra-row
+byte row   peeked getbuffer
+int offset   peeked getrowoffset
+short length   peeked getrowlength
+if   matcher row    null      bytes equals row  offset  length  matcher row
+matcher rowoffset  matcher rowlength
+this countperrow   0
+matcher setrow row  offset  length
+keyvalue kv
+keyvalue prevkv   null
+// only do a sanity-check if store and comparator are available.
+keyvalue kvcomparator comparator
+store    null ? store getcomparator     null
+long cumulativemetric   0
+int count   0
+try
+loop  while  kv   this heap peek       null
+// check that the heap gives us kvs in an increasing order.
+assert prevkv    null    comparator    null    comparator compare prevkv  kv  <  0
+prevkv           kv       store
+prevkv   kv
+scanquerymatcher matchcode qcode   matcher match kv
+switch qcode
+case include
+case include_and_seek_next_row
+case include_and_seek_next_col
+filter f   matcher getfilter
+if  f    null
+kv   f transform kv
+this countperrow
+if  storelimit >  1
+this countperrow >  storelimit   storeoffset
+// do what seek_next_row does.
+if   matcher morerowsmayexistafter kv
+return false
+reseek matcher getkeyfornextrow kv
+break loop
+// add to results only if we have skipped #storeoffset kvs
+// also update metric accordingly
+if  this countperrow > storeoffset
+if  metric    null
+cumulativemetric    kv getlength
+outresult add kv
+count
+if  qcode    scanquerymatcher matchcode include_and_seek_next_row
+if   matcher morerowsmayexistafter kv
+return false
+reseek matcher getkeyfornextrow kv
+else if  qcode    scanquerymatcher matchcode include_and_seek_next_col
+reseek matcher getkeyfornextcolumn kv
+else
+this heap next
+if  limit > 0     count    limit
+break loop
+continue
+case done
+return true
+case done_scan
+close
+return false
+case seek_next_row
+// this is just a relatively simple end of scan fix, to short-cut end
+// us if there is an endkey in the scan.
+if   matcher morerowsmayexistafter kv
+return false
+reseek matcher getkeyfornextrow kv
+break
+case seek_next_col
+reseek matcher getkeyfornextcolumn kv
+break
+case skip
+this heap next
+break
+case seek_next_using_hint
+keyvalue nextkv   matcher getnextkeyhint kv
+if  nextkv    null
+reseek nextkv
+else
+heap next
+break
+default
+throw new runtimeexception
+finally
+if  cumulativemetric > 0    metric    null
+if  count > 0
+return true
+// no more keys
+close
+return false
+@override
+public synchronized boolean next list<keyvalue> outresult  throws ioexception
+return next outresult   1  null
+@override
+public synchronized boolean next list<keyvalue> outresult  string metric
+throws ioexception
+return next outresult   1  metric
+// implementation of changedreadersobserver
+@override
+public synchronized void updatereaders   throws ioexception
+if  this closing  return
+// all public synchronized api calls will call 'checkreseek' which will cause
+// the scanner stack to reseek if this.heap==null && this.lasttop != null.
+// but if two calls to updatereaders() happen without a 'next' or 'peek' then we
+// will end up calling this.peek() which would cause a reseek in the middle of a updatereaders
+// which is not what we want, not to mention could cause an npe. so we early out here.
+if  this heap    null  return
+// this could be null.
+this lasttop   this peek
+//debugprint.println("ss updatereaders, topkey = " + lasttop);
+// close scanners to old obsolete store files
+this heap close       bubble thru and close all scanners
+this heap   null     the re seeks could be slow  access hdfs  free up memory asap
+// let the next() call handle re-creating and seeking
+/**
+* @return true if top of heap has changed (and keyvalueheap has to try the
+*         next kv)
+* @throws ioexception
+*/
+protected boolean checkreseek   throws ioexception
+if  this heap    null    this lasttop    null
+resetscannerstack this lasttop
+if  this heap peek      null
+store getcomparator   comparerows this lasttop  this heap peek       0
+log debug
+this lasttop tostring         this heap peek
+this lasttop   null
+return true
+this lasttop   null     gone
+// else dont need to reseek
+return false
+protected void resetscannerstack keyvalue lasttopkey  throws ioexception
+if  heap    null
+throw new runtimeexception
+/* when we have the scan object, should we not pass it to getscanners()
+* to get a limited set of scanners? we did so in the constructor and we
+* could have done it now by storing the scan object from the constructor */
+list<keyvaluescanner> scanners   getscannersnocompaction
+if   isparallelseekenabled
+for  keyvaluescanner scanner   scanners
+scanner seek lasttopkey
+else
+parallelseek scanners  lasttopkey
+// combine all seeked scanners with a heap
+heap   new keyvalueheap scanners  store getcomparator
+// reset the state of the query matcher and set to top row.
+// only reset and call setrow if the row changes; avoids confusing the
+// query matcher if scanning intra-row.
+keyvalue kv   heap peek
+if  kv    null
+kv   lasttopkey
+byte row   kv getbuffer
+int offset   kv getrowoffset
+short length   kv getrowlength
+if   matcher row    null      bytes equals row  offset  length  matcher row
+matcher rowoffset  matcher rowlength
+this countperrow   0
+matcher reset
+matcher setrow row  offset  length
+@override
+public synchronized boolean reseek keyvalue kv  throws ioexception
+//heap will not be null, if this is called from next() which.
+//if called from regionscanner.reseek(...) make sure the scanner
+//stack is reset if needed.
+checkreseek
+if  explicitcolumnquery    lazyseekenabledglobally
+return heap requestseek kv  true  userowcolbloom
+return heap reseek kv
+@override
+public long getsequenceid
+return 0
+/**
+* seek storefiles in parallel to optimize io latency as much as possible
+* @param scanners the list {@link keyvaluescanner}s to be read from
+* @param kv the keyvalue on which the operation is being requested
+* @throws ioexception
+*/
+private void parallelseek final list<? extends keyvaluescanner>
+scanners  final keyvalue kv  throws ioexception
+if  scanners isempty    return
+int storefilescannercount   scanners size
+countdownlatch latch   new countdownlatch storefilescannercount
+list<parallelseekhandler> handlers
+new arraylist<parallelseekhandler> storefilescannercount
+for  keyvaluescanner scanner   scanners
+if  scanner instanceof storefilescanner
+parallelseekhandler seekhandler   new parallelseekhandler scanner  kv
+multiversionconsistencycontrol getthreadreadpoint    latch
+executor submit seekhandler
+handlers add seekhandler
+else
+scanner seek kv
+latch countdown
+try
+latch await
+catch  interruptedexception ie
+throw new interruptedioexception ie getmessage
+for  parallelseekhandler handler   handlers
+if  handler geterr      null
+throw new ioexception handler geterr
+/**
+* used in testing.
+* @return all scanners in no particular order
+*/
+list<keyvaluescanner> getallscannersfortesting
+list<keyvaluescanner> allscanners   new arraylist<keyvaluescanner>
+keyvaluescanner current   heap getcurrentfortesting
+if  current    null
+allscanners add current
+for  keyvaluescanner scanner   heap getheap
+allscanners add scanner
+return allscanners
+static void enablelazyseekglobally boolean enable
+lazyseekenabledglobally   enable

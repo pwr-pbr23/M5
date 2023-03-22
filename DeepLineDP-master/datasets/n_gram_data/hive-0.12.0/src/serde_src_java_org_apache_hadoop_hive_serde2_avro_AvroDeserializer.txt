@@ -1,0 +1,232 @@
+/*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*    http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive serde2 avro
+import java io bytearrayinputstream
+import java io bytearrayoutputstream
+import java io ioexception
+import java nio bytebuffer
+import java util arraylist
+import java util hashmap
+import java util list
+import java util map
+import org apache avro schema
+import org apache avro schema type
+import org apache avro generic genericdata
+import org apache avro generic genericdata fixed
+import org apache avro generic genericdatumreader
+import org apache avro generic genericdatumwriter
+import org apache avro generic genericrecord
+import org apache avro io binarydecoder
+import org apache avro io binaryencoder
+import org apache avro io decoderfactory
+import org apache avro io encoderfactory
+import org apache avro util utf8
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop hive serde2 objectinspector standardunionobjectinspector
+import org apache hadoop hive serde2 typeinfo listtypeinfo
+import org apache hadoop hive serde2 typeinfo maptypeinfo
+import org apache hadoop hive serde2 typeinfo primitivetypeinfo
+import org apache hadoop hive serde2 typeinfo structtypeinfo
+import org apache hadoop hive serde2 typeinfo typeinfo
+import org apache hadoop hive serde2 typeinfo uniontypeinfo
+import org apache hadoop io writable
+class avrodeserializer
+private static final log log   logfactory getlog avrodeserializer class
+/**
+* when encountering a record with an older schema than the one we're trying
+* to read, it is necessary to re-encode with a reader against the newer schema.
+* because hive doesn't provide a way to pass extra information to the
+* inputformat, we're unable to provide the newer schema when we have it and it
+* would be most useful - when the inputformat is reading the file.
+*
+* this is a slow process, so we try to cache as many of the objects as possible.
+*/
+static class schemareencoder
+private final bytearrayoutputstream baos   new bytearrayoutputstream
+private final genericdatumwriter<genericrecord> gdw   new genericdatumwriter<genericrecord>
+private binarydecoder binarydecoder   null
+private final instancecache<readerwriterschemapair  genericdatumreader<genericrecord>> gdrcache
+new instancecache<readerwriterschemapair  genericdatumreader<genericrecord>>
+@override
+protected genericdatumreader<genericrecord> makeinstance readerwriterschemapair hv
+return new genericdatumreader<genericrecord> hv getwriter    hv getreader
+public genericrecord reencode genericrecord r  schema readerschema
+throws avroserdeexception
+baos reset
+binaryencoder be   encoderfactory get   directbinaryencoder baos  null
+gdw setschema r getschema
+try
+gdw write r  be
+bytearrayinputstream bais   new bytearrayinputstream baos tobytearray
+binarydecoder   decoderfactory defaultfactory   createbinarydecoder bais  binarydecoder
+readerwriterschemapair pair   new readerwriterschemapair r getschema    readerschema
+genericdatumreader<genericrecord> gdr   gdrcache retrieve pair
+return gdr read r  binarydecoder
+catch  ioexception e
+throw new avroserdeexception    e
+private list<object> row
+private schemareencoder reencoder
+/**
+* deserialize an avro record, recursing into its component fields and
+* deserializing them as well.  fields of the record are matched by name
+* against fields in the hive row.
+*
+* because avro has some data types that hive does not, these are converted
+* during deserialization to types hive will work with.
+*
+* @param columnnames list of columns hive is expecting from record.
+* @param columntypes list of column types matched by index to names
+* @param writable instance of genericavrowritable to deserialize
+* @param readerschema schema of the writable to deserialize
+* @return a list of objects suitable for hive to work with further
+* @throws avroserdeexception for any exception during deseriliazation
+*/
+public object deserialize list<string> columnnames  list<typeinfo> columntypes
+writable writable  schema readerschema  throws avroserdeexception
+if   writable instanceof avrogenericrecordwritable
+throw new avroserdeexception
+if row    null    row size      columnnames size
+row   new arraylist<object> columnnames size
+else
+row clear
+avrogenericrecordwritable recordwritable    avrogenericrecordwritable  writable
+genericrecord r   recordwritable getrecord
+// check if we're working with an evolved schema
+if  r getschema   equals readerschema
+log warn
+r getschema   tostring false
+if reencoder    null
+reencoder   new schemareencoder
+r   reencoder reencode r  readerschema
+workerbase row  columnnames  columntypes  r
+return row
+// the actual deserialization may involve nested records, which require recursion.
+private list<object> workerbase list<object> objectrow  list<string> columnnames
+list<typeinfo> columntypes  genericrecord record
+throws avroserdeexception
+for int i   0  i < columnnames size    i
+typeinfo columntype   columntypes get i
+string columnname   columnnames get i
+object datum   record get columnname
+schema datumschema   record getschema   getfield columnname  schema
+objectrow add worker datum  datumschema  columntype
+return objectrow
+private object worker object datum  schema recordschema  typeinfo columntype
+throws avroserdeexception
+// klaxon! klaxon! klaxon!
+// avro requires nullable types to be defined as unions of some type t
+// and null.  this is annoying and we're going to hide it from the user.
+if avroserdeutils isnullabletype recordschema
+return deserializenullableunion datum  recordschema  columntype
+switch columntype getcategory
+case struct
+return deserializestruct  genericdata record  datum   structtypeinfo  columntype
+case union
+return deserializeunion datum  recordschema   uniontypeinfo  columntype
+case list
+return deserializelist datum  recordschema   listtypeinfo  columntype
+case map
+return deserializemap datum  recordschema   maptypeinfo  columntype
+case primitive
+return deserializeprimitive datum  recordschema   primitivetypeinfo  columntype
+default
+throw new avroserdeexception     columntype getcategory
+private object deserializeprimitive object datum  schema recordschema
+primitivetypeinfo columntype  throws avroserdeexception
+switch  columntype getprimitivecategory
+case string
+return datum tostring       to workaround avroutf8
+// this also gets us around the enum issue since we just take the value
+// and convert it to a string. yay!
+case binary
+if  recordschema gettype      type fixed
+fixed fixed    fixed  datum
+return fixed bytes
+else if  recordschema gettype      type bytes
+bytebuffer bb    bytebuffer  datum
+bb rewind
+byte result   new byte
+bb get result
+return result
+else
+throw new avroserdeexception     recordschema gettype
+default
+return datum
+/**
+* extract either a null or the correct type from a nullable type.  this is
+* horrible in that we rebuild the typeinfo every time.
+*/
+private object deserializenullableunion object datum  schema recordschema
+typeinfo columntype  throws avroserdeexception
+int tag   genericdata get   resolveunion recordschema  datum      determine index of value
+schema schema   recordschema gettypes   get tag
+if schema gettype   equals schema type null
+return null
+return worker datum  schema  schematotypeinfo generatetypeinfo schema
+private object deserializestruct genericdata record datum  structtypeinfo columntype
+throws avroserdeexception
+// no equivalent java type for the backing structure, need to recurse and build a list
+arraylist<typeinfo> innerfieldtypes   columntype getallstructfieldtypeinfos
+arraylist<string> innerfieldnames   columntype getallstructfieldnames
+list<object> innerobjectrow   new arraylist<object> innerfieldtypes size
+return workerbase innerobjectrow  innerfieldnames  innerfieldtypes  datum
+private object deserializeunion object datum  schema recordschema
+uniontypeinfo columntype  throws avroserdeexception
+int tag   genericdata get   resolveunion recordschema  datum      determine index of value
+object desered   worker datum  recordschema gettypes   get tag
+columntype getallunionobjecttypeinfos   get tag
+return new standardunionobjectinspector standardunion  byte tag  desered
+private object deserializelist object datum  schema recordschema
+listtypeinfo columntype  throws avroserdeexception
+// need to check the original schema to see if this is actually a fixed.
+if recordschema gettype   equals schema type fixed
+// we're faking out hive to work through a type system impedence mismatch.
+// pull out the backing array and convert to a list.
+genericdata fixed fixed    genericdata fixed  datum
+list<byte> aslist   new arraylist<byte> fixed bytes   length
+for int j   0  j < fixed bytes   length  j
+aslist add fixed bytes
+return aslist
+else if recordschema gettype   equals schema type bytes
+// this is going to be slow... hold on.
+bytebuffer bb    bytebuffer datum
+list<byte> aslist   new arraylist<byte> bb capacity
+byte array   bb array
+for int j   0  j < array length  j
+aslist add array
+return aslist
+else      an actual list  deser its values
+list listdata    list  datum
+schema listschema   recordschema getelementtype
+list<object> listcontents   new arraylist<object> listdata size
+for object obj   listdata
+listcontents add worker obj  listschema  columntype getlistelementtypeinfo
+return listcontents
+private object deserializemap object datum  schema mapschema  maptypeinfo columntype
+throws avroserdeexception
+// avro only allows maps with strings for keys, so we only have to worry
+// about deserializing the values
+map<string  object> map   new hashmap<string  object>
+map<utf8  object> mapdatum    map datum
+schema valueschema   mapschema getvaluetype
+typeinfo valuetypeinfo   columntype getmapvaluetypeinfo
+for  utf8 key   mapdatum keyset
+object value   mapdatum get key
+map put key tostring    worker value  valueschema  valuetypeinfo
+return map

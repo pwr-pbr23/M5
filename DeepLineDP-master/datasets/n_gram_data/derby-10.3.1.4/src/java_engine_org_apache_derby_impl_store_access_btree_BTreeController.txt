@@ -1,0 +1,1011 @@
+/*
+derby - class org.apache.derby.impl.store.access.btree.btreecontroller
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store access btree
+import java util properties
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby iapi store access conglomerate logicalundo
+import org apache derby iapi store access conglomerate transactionmanager
+import org apache derby iapi store access accessfactoryglobals
+import org apache derby iapi store access conglomeratecontroller
+import org apache derby iapi store access dynamiccompiledopenconglominfo
+import org apache derby iapi store access rowlocationretrowsource
+import org apache derby iapi store access rowutil
+import org apache derby iapi store access staticcompiledopenconglominfo
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi store raw containerhandle
+import org apache derby iapi store raw fetchdescriptor
+import org apache derby iapi store raw lockingpolicy
+import org apache derby iapi store raw page
+import org apache derby iapi store raw transaction
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi types rowlocation
+import org apache derby iapi services io formatablebitset
+import org apache derby impl store access conglomerate conglomerateutil
+import org apache derby impl store access conglomerate templaterow
+/**
+a b-tree controller corresponds to an instance of an open b-tree conglomerate.
+<p>
+<b>concurrency notes<\b>
+<p>
+the concurrency rules are derived from openbtree.
+<p>
+@see openbtree
+**/
+public class btreecontroller extends openbtree implements conglomeratecontroller
+transient datavaluedescriptor scratch_template   null
+/**
+* whether to get lock on the row being inserted, usually this lock
+* has already been gotten when the row was inserted into the base table.
+**/
+boolean get_insert_row_lock
+/* constructors: */
+public btreecontroller
+/*
+** private methods of btreecontroller
+*/
+/**
+* attempt to reclaim committed deleted rows from the page.
+* <p>
+* get exclusive latch on page, and then loop backward through
+* page searching for deleted rows which are committed.  the routine
+* assumes that it is called from a transaction which cannot have
+* deleted any rows on the page.  for each deleted row on the page
+* it attempts to get an exclusive lock on the deleted row, nowait.
+* if it succeeds, and since this row did not delete the row then the
+* row must have been deleted by a transaction which has committed, so
+* it is safe to purge the row.  it then purges the row from the page.
+* <p>
+* note that this routine may remove all rows from the page, it will not
+* attempt a merge in this situation.  this is because this routine is
+* called from split which is attempting an insert on the given page, so
+* it would be a waste to merge the page only to split it again to allow
+* the insert of the row causing the split.
+*
+* @return true if at least one row was purged.
+*
+* @param open_btree the already open btree to use to get latch on page.
+* @param pageno     the page number of the leaf to attempt the reclaim on.
+*
+* @exception  standardexception  standard exception policy.
+**/
+private boolean reclaim_deleted_rows
+openbtree   open_btree
+long        pageno
+throws standardexception
+boolean     purged_at_least_one_row   false
+controlrow  controlrow                null
+try
+if   controlrow   controlrow get open_btree  pageno      null
+return false
+leafcontrolrow leaf          leafcontrolrow  controlrow
+btreelockingpolicy  btree_locking_policy
+open_btree getlockingpolicy
+// the number records that can be reclaimed is:
+// total recs - control row - recs_not_deleted
+int num_possible_commit_delete
+leaf page recordcount     1   leaf page nondeletedrecordcount
+if   num_possible_commit_delete > 0
+btree_locking_policy lockscanforreclaimspace leaf
+// need to get an exclusive scan lock on the page before we can
+// do any sort of purges, otherwise other concurrent scans would
+// not work.  if we can't get the lock nowait, just give up on
+// purging rows and do the split without reclaiming rows.
+page page     leaf page
+// rowlocation column is in last column of template.
+fetchdescriptor lock_fetch_desc
+rowutil getfetchdescriptorconstant
+scratch_template length   1
+// loop backward so that purges which affect the slot table
+// don't affect the loop (ie. they only move records we
+// have already looked at).
+for  int slot_no   page recordcount     1
+slot_no > 0
+slot_no
+if  page isdeletedatslot slot_no
+// try to get an exclusive lock on the row, if we can
+// then the row is a committed deleted row and it is
+// safe to purge it.
+if  btree_locking_policy lockscancommitteddeletedrow
+open_btree  leaf  scratch_template
+lock_fetch_desc  slot_no
+// the row is a committed deleted row, purge it.
+page purgeatslot slot_no  1  true
+purged_at_least_one_row   true
+catch  java lang classcastexception cce
+// because we give up the latch on the leaf before entering this
+// routine, the page might change from a leaf to branch.  if that
+// happens this routine will get a classcastexception, and we
+// just give up trying to reclaim space.
+finally
+if  controlrow    null
+controlrow release
+return purged_at_least_one_row
+/**
+* start an internal transaction and do the split.
+* <p>
+* this routine starts a new transaction, and handles any errors that
+* may come during the transaction.  this transation must not obtain any
+* locks as they are likely to conflict with the current user transaction.
+* <p>
+* if attempt_to_reclaim_deleted_rows is true this routine will
+* attempt to reclaim space on the leaf page input, by purging
+* committed deleted rows from the leaf.  if it succeeds in purging at
+* least one row, then it will commit the internal transaction and return
+* without actually performing a split.
+*
+* @param scratch_template  a scratch template used to search a page.
+* @param rowtoinsert       the row to insert, make sure during split to
+*                          make room for this row.
+*
+* @exception  standardexception  standard exception policy.
+**/
+private long
+start_xact_and_dosplit
+boolean                 attempt_to_reclaim_deleted_rows
+long                    leaf_pageno
+datavaluedescriptor   scratch_template
+datavaluedescriptor   rowtoinsert
+int                     flag
+throws standardexception
+transactionmanager split_xact         null
+openbtree          split_open_btree   null
+controlrow         root               null
+// get an internal transaction to be used for the split.
+split_xact   this init_open_user_scans getinternaltransaction
+// open the btree again so that actions on it take place in the
+// split_xact, don't get any locks in this transaction.
+if  sanitymanager debug
+if    getopenmode     containerhandle mode_forupdate
+containerhandle mode_forupdate
+sanitymanager throwassert
+boolean do_split   true
+if  attempt_to_reclaim_deleted_rows
+// get lock on base table.
+conglomeratecontroller base_cc   null
+try
+base_cc
+this getconglomerate   locktable
+split_xact
+containerhandle mode_forupdate
+containerhandle mode_lock_nowait
+transactioncontroller mode_record
+transactioncontroller isolation_repeatable_read
+catch  standardexception se
+// any error just don't try to reclaim deleted rows.  the
+// expected error is that we can't get the lock, which the
+// current interface throws as a containernotfound exception.
+if  base_cc    null
+// we got ix lock on the base table, so can try reclaim space.
+// we can only reclaim space by opening the btree in row lock
+// mode.  table level lock row recovery is hard as we can't
+// determine if the deleted rows we encounter have been
+// deleted by our parent caller and have been committed or
+// not.  we will have to get those rows offline.
+split_open_btree   new openbtree
+split_open_btree init
+this init_open_user_scans
+split_xact
+null                               open the container
+split_xact getrawstorexact
+false
+containerhandle mode_forupdate
+containerhandle mode_lock_nowait
+transactionmanager mode_record
+this getconglomerate   getbtreelockingpolicy
+split_xact getrawstorexact
+transactioncontroller mode_record
+lockingpolicy mode_record
+transactioncontroller isolation_repeatable_read
+conglomeratecontroller  base_cc
+split_open_btree
+this getconglomerate
+logicalundo  null
+dynamiccompiledopenconglominfo  null
+// don't split if we reclaim any rows.
+do_split    reclaim_deleted_rows split_open_btree  leaf_pageno
+split_open_btree close
+long new_leaf_pageno   leaf_pageno
+if  do_split
+split_open_btree   new openbtree
+split_open_btree init
+this init_open_user_scans
+split_xact
+null                               open the container
+split_xact getrawstorexact
+false
+getopenmode                        use same mode this controller
+// was opened with
+transactionmanager mode_none
+this getconglomerate   getbtreelockingpolicy
+split_xact getrawstorexact
+this init_lock_level
+lockingpolicy mode_record
+transactioncontroller isolation_repeatable_read
+conglomeratecontroller  null     no base row locks during split
+split_open_btree
+this getconglomerate
+logicalundo  null
+dynamiccompiledopenconglominfo  null
+// get the root page back, and perform a split following the
+// to-be-inserted key.  the split releases the root page latch.
+root   controlrow get split_open_btree  btree rootpageid
+if  sanitymanager debug
+sanitymanager assert root page islatched
+new_leaf_pageno
+root splitfor
+split_open_btree  scratch_template
+null  rowtoinsert  flag
+split_open_btree close
+split_xact commit
+split_xact destroy
+return new_leaf_pageno
+/**
+insert a row into the conglomerate.
+@param rowtoinsert the row to insert into the conglomerate.  the stored
+representations of the row's columns are copied into a new row
+somewhere in the conglomerate.
+@return returns 0 if insert succeeded.  returns
+conglomeratecontroller.rowisduplicate if conglomerate supports uniqueness
+checks and has been created to disallow duplicates, and the row inserted
+had key columns which were duplicate of a row already in the table.  other
+insert failures will raise standardexception's.
+@exception standardexception standard exception policy.
+**/
+private int doins datavaluedescriptor rowtoinsert
+throws standardexception
+leafcontrolrow  targetleaf                        null
+leafcontrolrow  save_targetleaf                   null
+int             insert_slot                       0
+int             result_slot                       0
+int             ret_val                           0
+boolean         reclaim_deleted_rows_attempted    false
+if  scratch_template    null
+scratch_template   runtime_mem get_template getrawtran
+if  sanitymanager debug
+this isindexablerowconsistent rowtoinsert
+// create the objects needed for the insert.
+// resolve (mikem) - should we cache this in the controller?
+searchparameters sp
+new searchparameters
+rowtoinsert
+searchparameters position_left_of_partial_key_match
+scratch_template  this  false
+// rowlocation column is in last column of template.
+fetchdescriptor lock_fetch_desc
+rowutil getfetchdescriptorconstant
+scratch_template length   1
+rowlocation lock_row_loc
+rowlocation  scratch_template
+// row locking - lock the row being inserted.
+if  get_insert_row_lock
+// i don't hold any latch yet so i can wait on this lock, so i
+// don't care about return value from this call.  this
+// lock can only wait if the base table row was inserted in a
+// separate transaction which never happens in sql tables, but
+// does happen in the sparse indexes that synchronization builds.
+this getlockingpolicy   locknonscanrow
+this getconglomerate
+leafcontrolrow  null
+leafcontrolrow  null
+rowtoinsert
+conglomeratecontroller lock_ins
+conglomeratecontroller lock_upd
+while  true
+// search the location at which the new row should be inserted.
+if  sanitymanager debug
+sanitymanager assert this container    null
+targetleaf    leafcontrolrow
+controlrow get this  btree rootpageid  search sp
+// row locking - first lock row previous to row being inserted:
+//     o if (sp.resultexact) then the row must be deleted and
+//           we will be replacing it with the new row, lock
+//           the row before the slot as the previous key.
+//     o else
+//           we will be inserting after the current slot so
+//           lock the current slot as the previous key.
+//
+int slot_after_previous
+sp resultexact ? sp resultslot   sp resultslot   1
+boolean latch_released   false
+latch_released
+this getlockingpolicy   locknonscanpreviousrow
+this getconglomerate
+targetleaf
+slot_after_previous
+lock_fetch_desc
+scratch_template
+lock_row_loc
+this
+conglomeratecontroller lock_ins_prevkey
+conglomeratecontroller lock_upd
+transactionmanager lock_instant_duration
+// special test to see if latch release code works
+if  sanitymanager debug
+latch_released
+test_errors
+this
+false
+this getlockingpolicy
+targetleaf  latch_released
+if  latch_released
+// had to release latch in order to get the lock, probably
+// because of a forward scanner, research tree, and try again.
+targetleaf   null
+continue
+// if the row is there already, simply undelete it.
+// the rationale for this is, since the index does
+// not support duplicates, the only way we could
+// find a duplicate is if we found a deleted row.
+// if we could lock it, then no other transaction
+// is deleting it; either this transaction deleted
+// it earlier, or it's simply a row that the space
+// reclaimer hasn't reclaimed yet.
+// since inserts are done directly (i.e., not to a
+// location provided by a scan, we will see the
+// deleted row).
+if  sp resultexact
+result_slot   insert_slot   sp resultslot
+if  this getconglomerate   nkeyfields
+this getconglomerate   nuniquecolumns
+// the key fields match, but not the row location.  we
+// must wait on the lock on the other row location before
+// preceding, so as to serialize behind any work being done
+// to the row as part of another transaction.
+latch_released
+this getlockingpolicy   locknonscanrowonpage
+this getconglomerate    targetleaf  insert_slot
+lock_fetch_desc  scratch_template  lock_row_loc
+conglomeratecontroller lock_upd
+if  latch_released
+// had to release latch in order to get the lock,
+// probably to wait for deleting xact to commit or
+// abort.  research tree, and try again.
+targetleaf   null
+continue
+// the row better be deleted, or something is very wrong.
+if    targetleaf page isdeletedatslot insert_slot
+// attempt to insert a duplicate into the index.
+ret_val   conglomeratecontroller rowisduplicate
+break
+else
+if  this getconglomerate   nkeyfields
+this getconglomerate   nuniquecolumns
+// the row that we found deleted is exactly the new row.
+targetleaf page deleteatslot
+insert_slot  false  this btree_undo
+break
+else if  this getconglomerate   nuniquecolumns
+this getconglomerate   nkeyfields   1
+// the row that we found deleted has matching keys
+// which form the unique key fields,
+// but the nonkey fields may differ (for now the
+// heap rowlocation is the only nonkey field
+// allowed).
+// resolve bt39 (mikem) - when/if heap row location
+// is not fixed we must handle update failing for
+// out of space and split if it does.  for now
+// if the update fails because of lack of space
+// an exception is thrown and the statement is
+// backed out.  should not happen very often.
+targetleaf page deleteatslot
+insert_slot  false  this btree_undo
+boolean update_succeeded   true
+try
+int rowloc_index
+this getconglomerate   nkeyfields   1
+targetleaf page updatefieldatslot
+insert_slot  rowloc_index
+datavaluedescriptor  rowutil getcolumn
+rowtoinsert
+formatablebitset  null  rowloc_index
+this btree_undo
+catch  standardexception se
+// check if the exception is for out of space
+if   se getmessageid   equals sqlstate data_no_space_for_record
+throw se
+// the statement exception is
+// because the update failed for out of
+// space (ie. the field got longer and there
+// is no room on the page for the expanded
+// field).  address this error by falling
+// through the code and doing a split.
+update_succeeded   false                              update failed
+targetleaf page deleteatslot
+insert_slot  true  this btree_undo
+if  update_succeeded
+break
+else
+// can only happen with non key fields in the btree.
+throw
+standardexception newexception
+sqlstate btree_unimplemented_feature
+else if  targetleaf page recordcount     1 <
+this getconglomerate   maxrowsperpage
+// the row wasn't there, so try to insert it
+// on the page returned by the search.
+insert_slot   sp resultslot   1
+result_slot   insert_slot   1
+// by default maxrowsperpage is set to maxint, some tests
+// set it small to cause splitting to happen quicker with
+// less data.
+if  targetleaf page insertatslot
+insert_slot
+rowtoinsert   formatablebitset  null
+this btree_undo
+page insert_default
+accessfactoryglobals btree_overflow_threshold     null
+// insert succeeded, so we're done.
+break
+// resolve (mikem) - another long row issue.
+// for now if a row does not fit on a page and there
+// is only the control row on the page and at most one
+// other row on the page, throw an exception
+if  targetleaf page recordcount   <  2
+throw standardexception newexception
+sqlstate btree_no_space_for_key
+// start splitting ...
+// create some space by splitting pages.
+// determine where in page/table row causing split would go
+int flag   0
+if  insert_slot    1
+flag    controlrow split_flag_first_on_page
+if  targetleaf isleftmostleaf
+flag    controlrow split_flag_first_in_table
+else if  insert_slot    targetleaf page recordcount
+flag    controlrow split_flag_last_on_page
+if  targetleaf isrightmostleaf
+flag    controlrow split_flag_last_in_table
+long targetleaf_pageno   targetleaf page getpagenumber
+if   targetleaf page recordcount
+targetleaf page nondeletedrecordcount    <  0
+// don't do reclaim work if there are no deleted records.
+reclaim_deleted_rows_attempted   true
+branchrow branchrow
+branchrow createbranchrowfromoldleafrow
+rowtoinsert  targetleaf_pageno
+// release the target page because (a) it may change as a
+// result of the split, (b) the latch ordering requires us
+// to acquire latches from top to bottom, and (c) this
+// loop should be done in a system transaction.
+targetleaf release
+targetleaf   null
+start_xact_and_dosplit
+reclaim_deleted_rows_attempted  targetleaf_pageno
+scratch_template  branchrow getrow    flag
+// only attempt to reclaim deleted rows once, otherwise the
+// split loop could loop forever, trying to reclaim a deleted
+// row that was not committed.
+reclaim_deleted_rows_attempted   true
+// resolve (mikem) possible optimization could be to save
+// split location and look there first, if this has
+// already caused a split.  or even return a latched page
+// from splitfor().  for now just execute the loop again
+// searching the tree for somewhere to put the row.
+// set in-memory hint of where last row on page was inserted.
+targetleaf last_search_result   result_slot
+// check that page just updated is consistent.
+if  sanitymanager debug
+if  sanitymanager debug_on
+targetleaf checkconsistency this  null  true
+// done with the target page.
+targetleaf release
+targetleaf   null
+// return the status about insert - 0 is ok, or duplicate status.
+return ret_val
+/**
+* just insert the row on the current page/slot if it fits.
+* <p>
+* @exception  standardexception  standard exception policy.
+**/
+private boolean do_load_insert
+datavaluedescriptor   rowtoinsert
+leafcontrolrow          leaf
+int                     insert_slot
+throws standardexception
+leafcontrolrow old_leaf           null
+boolean        row_inserted       false
+int            num_rows_on_page   leaf page recordcount     1
+if  sanitymanager debug
+sanitymanager assert insert_slot    leaf page recordcount
+sanitymanager assert
+leaf getrightsiblingpagenumber
+containerhandle invalid_page_number
+this isindexablerowconsistent rowtoinsert
+if  num_rows_on_page < this getconglomerate   maxrowsperpage
+// by default maxrowsperpage is set to maxint, some tests
+// set it small to cause splitting to happen quicker with
+// less data.
+if  sanitymanager debug
+// caller should have sorted and done duplicate checking.
+if  insert_slot > 1
+// verify that the row inserted is >= than previous row.
+int compare_result
+controlrow compareindexrowfrompagetokey
+leaf
+insert_slot   1
+scratch_template
+rowtoinsert
+this getconglomerate   nuniquecolumns
+0
+this getconglomerate   ascdescinfo
+if  compare_result >  0
+// rows must be presented in order, so the row we are
+// inserting must always be greater than the previous
+// row on the page.
+sanitymanager throwassert     compare_result
+if  leaf page insertatslot
+insert_slot
+rowtoinsert
+formatablebitset  null
+this btree_undo
+page insert_default
+accessfactoryglobals btree_overflow_threshold     null
+// insert succeeded, so we're done.
+row_inserted   true
+else
+// resolve (mikem) - another long row issue.
+// for now if a row does not fit on a page and there
+// is only the control row on the page and at most one
+// other row on the page, throw an exception
+if  leaf page recordcount   <  2
+throw standardexception newexception
+sqlstate btree_no_space_for_key
+// check that page just updated is consistent.
+if  sanitymanager debug
+if  sanitymanager debug_on
+leaf checkconsistency this  null  true
+return row_inserted
+/**
+* create room to insert a row to the right of the largest key in table.
+* <p>
+* perform a split pass on the tree which will move the largest key in
+* leaf right to a new leaf, splitting parent branch pages as necessary.
+*
+* @exception  standardexception  standard exception policy.
+**/
+private leafcontrolrow do_load_split
+datavaluedescriptor   rowtoinsert
+leafcontrolrow          leaf
+throws standardexception
+leafcontrolrow new_leaf   null
+branchrow branchrow
+branchrow createbranchrowfromoldleafrow
+rowtoinsert  leaf page getpagenumber
+// release the target page because (a) it may change as a
+// result of the split, (b) the latch ordering requires us
+// to acquire latches from top to bottom, and (c) this
+// loop should be done in a system transaction.
+long old_leafpage   leaf page getpagenumber
+leaf release
+leaf   null
+long new_leaf_pageno
+start_xact_and_dosplit
+false    don't try to reclaim deleted rows
+old_leafpage
+scratch_template
+branchrow getrow
+controlrow split_flag_last_on_page
+controlrow split_flag_last_in_table
+new_leaf    leafcontrolrow  controlrow get this  new_leaf_pageno
+// the leaf must be the rightmost leaf in the table, the first time
+// the root grows from leaf to branch it will be a leaf with many
+// rows which will probably have to be split soon, after that it will
+// be a leaf with only one row.  the current algorithm requires that
+// there be at least one row for duplicate checking (the duplicate
+// checking code does not handle going left to the previous leaf) -
+// this is the way the split at rightmost leaf row works currently.
+if  sanitymanager debug
+if  new_leaf getrightsiblingpagenumber
+containerhandle invalid_page_number
+sanitymanager throwassert
+new_leaf getrightsiblingpagenumber
+if  new_leaf page recordcount   <  1
+sanitymanager throwassert
+new_leaf page recordcount
+return new_leaf
+/*
+** public methods of btreecontroller
+*/
+/**
+initialize the controller for use.
+<p>
+any changes to this method will probably have to be reflected in close as
+well.
+<p>
+currently delegates to openbtree.  if the btree controller ends up not
+having any state of its own, we can remove this method (the vm will
+dispatch to openbtree), gaining some small efficiency.  for now, this
+method remains for clarity.
+@exception standardexception standard exception policy.
+**/
+public void init
+transactionmanager              xact_manager
+boolean                         hold
+containerhandle                 container
+transaction                     rawtran
+int					            open_mode
+int                             lock_level
+btreelockingpolicy              btree_locking_policy
+btree                           conglomerate
+logicalundo                     undo
+staticcompiledopenconglominfo   static_info
+dynamiccompiledopenconglominfo  dynamic_info
+throws standardexception
+get_insert_row_lock
+open_mode
+transactioncontroller openmode_baserow_insert_locked     0
+super init
+xact_manager  xact_manager
+container  rawtran  hold  open_mode
+lock_level  btree_locking_policy
+conglomerate  undo  dynamic_info
+/*
+** methods of conglomeratecontroller
+*/
+/**
+close the conglomerate controller.
+<p>
+any changes to this method will probably have to be reflected in close as
+well.
+<p>
+currently delegates to openbtree.  if the btree controller ends up not
+having any state of its own, we can remove this method (the vm will
+dispatch to openbtree), gaining some small efficiency.  for now, this
+method remains for clarity.
+@see conglomeratecontroller#close
+**/
+public void close
+throws standardexception
+super close
+// if we are closed due to catching an error in the middle of init,
+// xact_manager may not be set yet.
+if  getxactmgr      null
+getxactmgr   closeme this
+/**
+* close conglomerate controller as part of terminating a transaction.
+* <p>
+* use this call to close the conglomerate controller resources as part of
+* committing or aborting a transaction.  the normal close() routine may
+* do some cleanup that is either unnecessary, or not correct due to the
+* unknown condition of the controller following a transaction ending error.
+* use this call when closing all controllers as part of an abort of a
+* transaction.
+* <p)
+* this call is meant to only be used internally by the storage system,
+* clients of the storage system should use the simple close() interface.
+* <p>
+* resolve (mikem) - move this call to conglomeratemanager so it is
+* obvious that non-access clients should not call this.
+*
+* @param closeheldscan     if true, means to close controller even if
+*                          it has been opened to be kept opened
+*                          across commit.  this is
+*                          used to close these controllers on abort.
+*
+* @return boolean indicating that the close has resulted in a real close
+*                 of the controller.  a held scan will return false if
+*                 called by closeforendtransaction(false), otherwise it
+*                 will return true.  a non-held scan will always return
+*                 true.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public boolean closeforendtransaction boolean closeheldscan
+throws standardexception
+super close
+if    gethold       closeheldscan
+// if we are closed due to catching an error in the middle of init,
+// xact_manager may not be set yet.
+if  getxactmgr      null
+getxactmgr   closeme this
+return true
+else
+return false
+/**
+insert a row into the conglomerate.
+@see conglomeratecontroller#insert
+@param row the row to insert into the conglomerate.  the stored
+representations of the row's columns are copied into a new row
+somewhere in the conglomerate.
+@return returns 0 if insert succeeded.  returns
+conglomeratecontroller.rowisduplicate if conglomerate supports uniqueness
+checks and has been created to disallow duplicates, and the row inserted
+had key columns which were duplicate of a row already in the table.  other
+insert failures will raise standardexception's.
+@exception standardexception standard exception policy.
+**/
+public int insert datavaluedescriptor row
+throws standardexception
+if  isclosed
+if  gethold
+reopen
+else
+throw standardexception newexception
+sqlstate btree_is_closed
+new long err_containerid
+if  sanitymanager debug
+sanitymanager assert this container    null
+templaterow checkpartialcolumntypes
+this getconglomerate   format_ids
+formatablebitset  null   int   null  row
+return doins row
+/**
+return whether this is a keyed conglomerate.
+<p>
+all b-trees are keyed.
+@see conglomeratecontroller#iskeyed
+**/
+public boolean iskeyed
+return true
+/*
+* request the system properties associated with a table.
+* <p>
+* request the value of properties that are associated with a table.  the
+* following properties can be requested:
+*     derby.storage.pagesize
+*     derby.storage.pagereservedspace
+*     derby.storage.minimumrecordsize
+*     derby.storage.initialpages
+* <p>
+* to get the value of a particular property add it to the property list,
+* and on return the value of the property will be set to it's current
+* value.  for example:
+*
+* get_prop(conglomeratecontroller cc)
+* {
+*     properties prop = new properties();
+*     prop.put("derby.storage.pagesize", "");
+*     cc.gettableproperties(prop);
+*
+*     system.out.println(
+*         "table's page size = " +
+*         prop.getproperty("derby.storage.pagesize");
+* }
+*
+* @param prop   property list to fill in.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void gettableproperties properties prop
+throws standardexception
+if  this container    null
+throw standardexception newexception
+sqlstate btree_is_closed
+new long err_containerid
+container getcontainerproperties prop
+return
+/**
+* request set of properties associated with a table.
+* <p>
+* returns a property object containing all properties that the store
+* knows about, which are stored persistently by the store.  this set
+* of properties may vary from implementation to implementation of the
+* store.
+* <p>
+* this call is meant to be used only for internal query of the properties
+* by jbms, for instance by language during bulk insert so that it can
+* create a new conglomerate which exactly matches the properties that
+* the original container was created with.  this call should not be used
+* by the user interface to present properties to users as it may contain
+* properties that are meant to be internal to jbms.  some properties are
+* meant only to be specified by jbms code and not by users on the command
+* line.
+* <p>
+* note that not all properties passed into createconglomerate() are stored
+* persistently, and that set may vary by store implementation.
+*
+* @param prop   property list to add properties to.  if null, routine will
+*               create a new properties object, fill it in and return it.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public properties getinternaltablepropertyset properties prop
+throws standardexception
+properties  ret_properties
+conglomerateutil createrawstorepropertyset prop
+gettableproperties ret_properties
+return ret_properties
+/**
+* load rows from rowsource into the opened btree.
+* <p>
+* efficiently load rows into the already opened btree.  the btree must
+* be table locked, as no row locks will be requested by this routine.
+* on exit from this routine the conglomerate will be closed (on both
+* error or success).
+* <p>
+* this routine does an almost bottom up build of a btree.  it assumes
+* all rows arrive in sorted order, and inserts them directly into the
+* next (to the right) spot in the current leaf until there is no space.
+* then it calls the generic split code to add the next leaf (resolve -
+* in the future we could optimize this to split bottom up rather than
+* top down for create index).
+*
+* @exception standardexception standard exception policy.  if conglomerate
+*                              supports uniqueness checks and has been
+*                              created to disallow duplicates, and one of
+*                              the rows being loaded had key columns which
+*                              were duplicate of a row already in the
+*                              conglomerate, then raise
+*                              sqlstate.store_conglomerate_duplicate_key_exception.
+*
+* @see org.apache.derby.iapi.store.access.conglomerate.conglomerate#load
+**/
+public long load
+transactionmanager      xact_manager
+boolean                 createconglom
+rowlocationretrowsource rowsource
+throws standardexception
+long num_rows_loaded   0
+if  sanitymanager debug
+sanitymanager assert createconglom
+if  scratch_template    null
+scratch_template   runtime_mem get_template getrawtran
+leafcontrolrow current_leaf   null
+try
+// btree must just have been created and empty, so there must
+// be one root leaf page which is empty except for the control row.
+current_leaf
+leafcontrolrow  controlrow get this  btree rootpageid
+int current_insert_slot   1
+if  sanitymanager debug
+// root must be empty except for the control row.
+sanitymanager assert current_leaf page recordcount      1
+// now loop thru the row source and insert into the btree
+formatablebitset  validcolumns   rowsource getvalidcolumns
+// get the next row and its valid columns from the rowsource
+datavaluedescriptor row
+while   row   rowsource getnextrowfromrowsource       null
+num_rows_loaded
+if  sanitymanager debug
+sanitymanager assert
+validcolumns    null
+while  true
+if  do_load_insert row  current_leaf  current_insert_slot
+// row inserted successfully.
+break
+else
+// if insert fails, do a split pass. there is an edge
+// case where multiple split passes are necessary if
+// branch splits are necessary, thus the loop.  it is
+// most likely that only a single split pass will be
+// necessary.
+current_leaf   do_load_split row  current_leaf
+current_insert_slot   current_leaf page recordcount
+current_insert_slot
+current_leaf release
+current_leaf   null
+// loading done, must flush all pages to disk since it is unlogged.
+if   this getconglomerate   istemporary
+container flushcontainer
+finally
+this close
+return num_rows_loaded
+/*
+** methods of conglomeratecontroller which are not supported.
+*/
+/**
+delete a row from the conglomerate.
+@see conglomeratecontroller#delete
+@exception standardexception standard exception policy.
+**/
+public boolean delete rowlocation loc
+throws standardexception
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+/**
+fetch the row at the given location.
+@see conglomeratecontroller#fetch
+@exception standardexception standard exception policy.
+**/
+public boolean fetch
+rowlocation loc
+datavaluedescriptor   row
+formatablebitset                 validcolumns
+throws standardexception
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+/**
+fetch the row at the given location.
+@see conglomeratecontroller#fetch
+@exception standardexception standard exception policy.
+**/
+public boolean fetch
+rowlocation             loc
+datavaluedescriptor   row
+formatablebitset                 validcolumns
+boolean                 waitforlock
+throws standardexception
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+/**
+insert a row into the conglomerate, and store its location in the
+provided template row location.
+unimplemented by btree.
+@see conglomeratecontroller#insertandfetchlocation
+@exception standardexception standard exception policy.
+**/
+public void insertandfetchlocation
+datavaluedescriptor	row
+rowlocation             templaterowlocation
+throws standardexception
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+/**
+return a row location object of the correct type to be
+used in calls to insertandfetchlocation.
+@see conglomeratecontroller#newrowlocationtemplate
+@exception standardexception standard exception policy.
+**/
+public rowlocation newrowlocationtemplate
+throws standardexception
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+/**
+* lock the given row location.
+* <p>
+* should only be called by access.
+* <p>
+* this call can be made on a conglomeratecontroller that was opened
+* for locking only.
+* <p>
+* resolve (mikem) - move this call to conglomeratemanager so it is
+* obvious that non-access clients should not call this.
+*
+* @return true if lock was granted, only can be false if wait was false.
+*
+* @param loc    the "rowlocation" which describes the exact row to lock.
+* @param wait   should the lock call wait to be granted?
+*
+* @exception  standardexception  standard exception policy.
+**/
+public boolean lockrow
+rowlocation loc
+int         lock_operation
+boolean     wait
+int         lock_duration
+throws standardexception
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+public boolean lockrow
+long        page_num
+int         record_id
+int         lock_operation
+boolean     wait
+int         lock_duration
+throws standardexception
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+public void unlockrowafterread
+rowlocation     loc
+boolean         forupdate
+boolean         row_qualifies
+throws standardexception
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+/**
+replace the entire row at the given location.
+@see conglomeratecontroller#replace
+@exception standardexception standard exception policy.
+**/
+public boolean replace
+rowlocation             loc
+datavaluedescriptor   row
+formatablebitset                 validcolumns
+throws standardexception
+throw standardexception newexception
+sqlstate btree_unimplemented_feature

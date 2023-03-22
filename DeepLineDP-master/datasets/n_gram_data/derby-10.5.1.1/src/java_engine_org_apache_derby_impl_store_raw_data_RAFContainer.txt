@@ -1,0 +1,1055 @@
+/*
+derby - class org.apache.derby.impl.store.raw.data.rafcontainer
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store raw data
+import org apache derby iapi reference sqlstate
+import org apache derby impl store raw data basecontainer
+import org apache derby impl store raw data basecontainerhandle
+import org apache derby impl store raw data basepage
+import org apache derby iapi services cache cacheable
+import org apache derby iapi services context contextservice
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services diag performance
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services io formatidutil
+import org apache derby iapi error standardexception
+import org apache derby iapi store raw containerhandle
+import org apache derby iapi store raw containerkey
+import org apache derby iapi store raw loggable
+import org apache derby iapi store raw log loginstant
+import org apache derby iapi store raw xact rawtransaction
+import org apache derby io storagefactory
+import org apache derby io writablestoragefactory
+import org apache derby io storagefile
+import org apache derby io storagerandomaccessfile
+import org apache derby iapi services io fileutil
+import java util vector
+import java io datainput
+import java io ioexception
+import java io file
+import java io randomaccessfile
+import java security accesscontroller
+import java security privilegedexceptionaction
+import java security privilegedactionexception
+/**
+rafcontainer (short for randomaccessfilecontainer) is a concrete subclass of filecontainer
+for filecontainers which are implemented on java.io.randomaccessfile.
+*/
+class rafcontainer extends filecontainer implements privilegedexceptionaction
+/*
+* immutable fields
+*/
+protected storagerandomaccessfile filedata
+/*
+** mutable fields, only valid when the identity is valid.
+*/
+protected boolean			needssync
+/* privileged actions */
+private int actioncode
+private static final int get_file_name_action   1
+private static final int create_container_action   2
+private static final int remove_file_action   3
+private static final int open_container_action   4
+private static final int stubbify_action   5
+private static final int backup_container_action   6
+private static final int get_random_access_file_action   7
+private containerkey actionidentity
+private boolean actionstub
+private boolean actionerrorok
+private boolean actiontryalternatepath
+private storagefile actionfile
+private loginstant actioninstant
+private string actionbackuplocation
+private basecontainerhandle actioncontainerhandle
+private boolean inbackup   false
+private boolean inremove   false
+/*
+* constructors
+*/
+rafcontainer basedatafilefactory factory
+super factory
+/*
+** methods overriding super-class
+*/
+synchronized public boolean isdirty
+return super isdirty      needssync
+/*
+** methods of cacheable
+*/
+/**
+set container's identity
+@exception standardexception standard derby error policy
+*/
+public cacheable setidentity object key  throws standardexception
+containerkey newidentity    containerkey  key
+// if this is an open for a temp container then return an object of that type
+if  newidentity getsegmentid      containerhandle temporary_segment
+temprafcontainer tmpcontainer   new temprafcontainer datafactory
+return tmpcontainer setident newidentity
+return setident newidentity
+/**
+@exception standardexception standard derby error policy
+*/
+public cacheable createidentity object key  object createparameter  throws standardexception
+containerkey newidentity    containerkey  key
+if  newidentity getsegmentid      containerhandle temporary_segment
+temprafcontainer tmpcontainer   new temprafcontainer datafactory
+return tmpcontainer createident newidentity  createparameter
+return createident newidentity  createparameter
+/*
+** container creation, opening, and closing
+*/
+/**
+remove the container
+@exception standardexception standard derby error policy
+*/
+protected void removecontainer loginstant instant  boolean leavestub
+throws standardexception
+try
+synchronized this
+inremove   true
+// wait until the thread that is doing the backup stops
+// before proceeding with the remove.
+while inbackup
+try
+wait
+catch  interruptedexception ie
+throw standardexception interrupt ie
+// discard all of my pages in the cache
+pagecache discard identity
+stubbify instant
+finally
+synchronized this
+inremove   false
+notifyall
+// resolve: leavestub false
+void closecontainer
+if  filedata    null
+try
+filedata close
+catch  ioexception ioe
+finally
+filedata   null
+/*
+** methods used solely by storedpage
+*/
+/**
+read a page into the supplied array.
+<br> mt - thread safe
+@exception ioexception exception reading page
+@exception standardexception standard derby error policy
+*/
+protected void readpage long pagenumber  byte pagedata
+throws ioexception  standardexception
+if  sanitymanager debug
+sanitymanager assert  getcommitteddropstate
+long pageoffset   pagenumber   pagesize
+synchronized  this
+filedata seek pageoffset
+filedata readfully pagedata  0  pagesize
+if  datafactory databaseencrypted
+pagenumber    first_alloc_page_number
+decryptpage pagedata  pagesize
+/**
+write a page from the supplied array.
+<br> mt - thread safe
+@exception standardexception standard derby error policy
+@exception ioexception io error accessing page
+*/
+protected void writepage long pagenumber  byte pagedata  boolean syncpage
+throws ioexception  standardexception
+synchronized this
+if  getcommitteddropstate
+// committed and dropped, do nothing.
+// this file container may only be a stub
+return
+///////////////////////////////////////////////////
+//
+// resolve: right now, no logical -> physical mapping.
+// we can calculate the offset.  in the future, we may need to
+// look at the allocation page or the in memory translation table
+// to figure out where the page should go
+//
+/////////////////////////////////////////////////
+long pageoffset   pagenumber   pagesize
+byte  encryptionbuf   null
+if  datafactory databaseencrypted
+pagenumber    first_alloc_page_number
+// we cannot encrypt the page in place because pagedata is
+// still being accessed as clear text.  the encryption
+// buffer is shared by all who access this container and can
+// only be used within the synchronized block.
+encryptionbuf   getencryptionbuffer
+byte datatowrite
+updatepagearray pagenumber  pagedata  encryptionbuf  false
+try
+filedata seek pageoffset
+/**
+on epoc (www.symbian.com) a seek beyond the end of
+a file just moves the file pointer to the end of the file.
+*/
+if  filedata getfilepointer      pageoffset
+padfile filedata  pageoffset
+datafactory writeinprogress
+try
+filedata write datatowrite  0  pagesize
+finally
+datafactory writefinished
+catch  ioexception ioe
+// on some platforms, if we seek beyond the end of file, or try
+// to write beyond the end of file (not appending to it, but
+// skipping some bytes), it will give ioexception.
+// try writing zeros from the current end of file to pageoffset
+// and see if we can then do the seek/write.  the difference
+// between pageoffset and current end of file is almost always
+// going to be the multiple of pagesize
+if   padfile filedata  pageoffset
+throw ioe 	   not writing beyond eof  rethrow exception
+if  sanitymanager debug
+sanitymanager assert
+filedata length   >  pageoffset
+filedata seek pageoffset
+datafactory writeinprogress
+try
+filedata write datatowrite  0  pagesize
+finally
+datafactory writefinished
+if  syncpage
+datafactory writeinprogress
+try
+if   datafactory datanotsyncedatallocation
+filedata sync  false
+finally
+datafactory writefinished
+else
+needssync   true
+/**
+* update the page array with container header if the page is a first alloc
+* page and encrypt the page data if the database is encrypted.
+* @param pagenumber the page number of the page
+* @param pagedata  byte array that has the actual page data.
+* @param encryptionbuf buffer that is used to store encryted version of the
+* page.
+* @return byte array of the the page data as it should be on the disk.
+*/
+protected byte updatepagearray long pagenumber
+byte pagedata
+byte encryptionbuf
+boolean encryptwithnewengine
+throws standardexception  ioexception
+if  pagenumber    first_alloc_page_number
+// write header into the alloc page array regardless of dirty
+// bit because the alloc page have zero'ed out the borrowed
+// space
+writeheader pagedata
+if  sanitymanager debug
+if  formatidutil readformatidinteger pagedata     allocpage format_number
+sanitymanager throwassert
+allocpage format_number
+formatidutil readformatidinteger pagedata
+return pagedata
+else
+if  datafactory databaseencrypted      encryptwithnewengine
+return encryptpage pagedata
+pagesize
+encryptionbuf
+encryptwithnewengine
+else
+return pagedata
+/**
+pad the file upto the passed in page offset.
+returns true if the file needed padding.
+*/
+private boolean padfile storagerandomaccessfile file  long pageoffset
+throws ioexception  standardexception
+long currenteof   file length
+if  currenteof >  pageoffset
+return false
+// all objects in java are by definition initialized
+byte zero   new byte
+file seek currenteof
+while currenteof < pageoffset
+datafactory writeinprogress
+try
+long len   pageoffset   currenteof
+if  len > pagesize
+len   pagesize
+file write zero  0   int  len
+finally
+datafactory writefinished
+currenteof    pagesize
+return true
+/**
+* clean the container.
+* <p>
+* write out the container header and sync all dirty pages of this
+* container to disk before returning.
+* <p>
+* checkpoint calls this interface through callbacks by telling
+* the cache manager to clean all containers in the open container
+* cache.  this sync of the file happens as part of writing and then
+* syncing the container header in writerafheader().
+* <p>
+*
+* @param forremove is clean called because container is being removed?
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void clean boolean forremove  throws standardexception
+boolean waited   false
+synchronized  this
+// committed and dropped, do nothing.
+// this file container has already been stubbified
+if  getcommitteddropstate
+cleardirty
+return
+// the container is about to change, need to wait till it is really
+// changed.  we are in the predirty state only for the duration
+// where the log record that changed the container has been sent to
+// the log and before the change actually happened.
+while predirty    true
+waited   true
+try
+wait
+catch  interruptedexception ie
+throw standardexception interrupt ie
+if  waited
+// someone else may have stubbified this while we waited
+if  getcommitteddropstate
+cleardirty
+return
+if  forremove
+//				removefile()
+//				cleardirty();
+else if  isdirty
+try
+// cannot get the alloc page and write it out
+// because in order to do so, the alloc page will need to
+// find this container object.  but this container object
+// is in the middle of being cleaned and may not be
+// 'found' and we will hang.
+//
+// instead, just clobber the container info, which is
+// checksum'ed seperately from the alloc page
+//
+writerafheader filedata
+false      don't create  container exists
+true       syncfile
+cleardirty
+catch  ioexception ioe
+throw datafactory markcorrupt
+standardexception newexception
+sqlstate file_container_exception  ioe  this
+private void cleardirty
+isdirty   false
+needssync   false
+/**
+preallocate some pages if need be
+*/
+protected int preallocate long lastpreallocpagenum
+int preallocsize
+/* we had a condition here , that looks at the file size before
+* preallocation to handle the optimization cases like , we
+* preallocated the space and then crashed, as we don;t log the
+* preallocated length, we don't have updated value until alocextent
+* page get flushed to the disk. only way to find out that the pages
+* we want already exist  is to look at the file length.
+* althought it was nice thing to do, we had bug no: 3813 from
+* customer , who for some unexplainable reasons he gets lots of
+* junk at the end of the file. as junk is not initialized with
+* format-id , we get into recovery problem.
+* to avoid such unforseen conditions, removed the file size check
+* condition , as it is better not to fail in recovery than
+* losing some special case performance improvement.
+*/
+int n   dopreallocatepages lastpreallocpagenum  preallocsize
+if  n > 0 				   sync the file
+synchronized this
+boolean inwrite   false
+try
+datafactory writeinprogress
+inwrite   true
+if   datafactory datanotsyncedatallocation
+filedata sync false
+catch  ioexception ioe
+// the disk may have run out of space.
+// don't error out in pre-allocation since the user may not
+// actually need this page.
+n   0
+catch  standardexception se
+// some problem calling writeinprogress
+n   0
+finally
+if  inwrite
+datafactory writefinished
+return n
+/**
+* truncate pages of a container.
+* <p>
+* truncate all pages from lastvalidpagenum+1 through the end of the file.
+* <p>
+*
+* @param lastvalidpagenum  the page number of the last valid page of the
+*                          file.  all pages after this one are truncated.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected void truncatepages
+long lastvalidpagenum
+throws standardexception
+synchronized this
+boolean inwrite   false
+try
+datafactory writeinprogress
+inwrite   true
+filedata setlength  lastvalidpagenum   1    pagesize
+catch  ioexception ioe
+// the disk may have run out of space.
+// don't error out in un-allocation since application can
+// still function even if allocation fails.
+catch  standardexception se
+// some problem calling writeinprogress
+finally
+if  inwrite
+datafactory writefinished
+return
+/**
+write the header of a random access file and sync it
+@param create if true, the container is being created
+if false, the container already exist
+@param syncfile if true, sync the file
+*/
+private void writerafheader storagerandomaccessfile file  boolean create
+boolean syncfile
+throws ioexception  standardexception
+byte epage
+if  create
+// the file doesn't exist yet, get an embryonic page buffer
+// allocating allocpage.max_borrowed_space bytes for the
+// embryonic page should be enough, but we want to leave
+// the end of the file at a page boundary. this is to work
+// around bugs in the epoc jvm where a seek beyond the end
+// of a file does not throw an exception but just moves
+// the offset to the end of the file. this only occurs
+// when the second page is written after the header has
+// been written, ending up with the page at the incorrect
+// offset.
+epage   new byte
+else
+epage   getembryonicpage file  first_alloc_page_offset
+// need to check for frozen state
+writeheader file  create  epage
+if  syncfile
+datafactory writeinprogress
+try
+if   datafactory datanotsyncedatcheckpoint
+file sync false
+finally
+datafactory writefinished
+/**
+flush the cache to ensure all of my pages are written to disk
+@exception standardexception standard derby error policy
+*/
+protected void flushall   throws standardexception
+pagecache clean identity
+// now clean myself which will sync all my pages.
+clean false
+synchronized storagefile getfilename containerkey identity  boolean stub
+boolean errorok  boolean tryalternatepath
+throws standardexception
+// resolve - read only
+actioncode   get_file_name_action
+actionidentity   identity
+actionstub   stub
+actionerrorok   errorok
+actiontryalternatepath   tryalternatepath
+try
+return  storagefile  accesscontroller doprivileged  this
+catch  privilegedactionexception pae   throw  standardexception  pae getexception
+finally  actionidentity   null
+protected storagefile privgetfilename containerkey identity  boolean stub
+boolean errorok  boolean tryalternatepath
+throws standardexception
+storagefile container   datafactory getcontainerpath  identity  stub
+// retry with small case 'c' and 'd'
+// bug fix for track 3444
+if   container exists      tryalternatepath
+container   datafactory getalternatecontainerpath  identity  stub
+if   container exists
+storagefile directory   container getparentdir
+if   directory exists
+// make sure only 1 thread can create a segment at one time
+synchronized datafactory
+if   directory exists
+if   directory mkdirs
+if  errorok
+return null
+else
+throw standardexception newexception
+sqlstate file_cannot_create_segment
+directory
+return container
+end of privgetfilename
+synchronized void createcontainer containerkey newidentity
+throws standardexception
+if  sanitymanager debug
+if   sparespace < 0      sparespace > 100
+sanitymanager throwassert     sparespace
+actioncode   create_container_action
+actionidentity   newidentity
+try
+accesscontroller doprivileged  this
+catch  privilegedactionexception pae   throw  standardexception  pae getexception
+finally  actionidentity   null
+end of createcontainer
+synchronized boolean removefile storagefile file
+throws securityexception  standardexception
+actioncode   remove_file_action
+actionfile   file
+try
+return accesscontroller doprivileged  this     null
+catch  privilegedactionexception pae   throw  standardexception  pae getexception
+finally  actionfile   null
+end of removefile
+private boolean privremovefile storagefile file
+throws standardexception
+closecontainer
+datafactory writeinprogress
+try
+if  file exists
+return file delete
+finally
+datafactory writefinished
+return true
+end of privremovefile
+synchronized boolean opencontainer containerkey newidentity
+throws standardexception
+actioncode   open_container_action
+actionidentity   newidentity
+try
+return accesscontroller doprivileged  this     null
+catch  privilegedactionexception pae
+closecontainer
+throw  standardexception  pae getexception
+catch  runtimeexception e
+closecontainer
+throw e
+finally
+actionidentity   null
+private synchronized void stubbify loginstant instant
+throws standardexception
+// update header, synchronized this in case the cache is cleaning
+// this container at the same time.  make sure the clean and
+// stubbify is mutually exclusive.
+setdroppedstate true
+setcommitteddropstate true
+// the whole container should be shrunk into a 'stub'.
+// if the file system supports truncation, we can just truncate the
+// file after the header.  since it doesn't, we need to write out a
+// seperate file (the stub), then reset filedata to point to that,
+// then remove the current file.
+//
+// there may still be dirty pages that belongs to this file which are
+// still in the page cache.  they need not really
+// be written since they don't really exist anymore
+//
+// there are 3 pieces of information on disk :
+// 1) the log operation that caused this file to be stubbified
+// 2) the stub
+// 3) the file
+//
+// the order of event, as far as persisent store is concerned, is
+// a) stub shows up
+// b) the file disappear
+// c) the log operation got flushed
+// (b and c may swap order)
+//
+// if neither a or b happens (we crashed before the sync call),
+// then nothing happened.
+//
+// if a happened but b and c did not, then when we recover, we will not
+// know the file has been stubbified.  hopefully, it will be stubbified
+// again if the post-commit queue manager is alerted to the fact.
+//
+// if a and b happened but c did not, then the file is stubbified but
+// there is no log record to indicate that.  this is undesirable but
+// still safe because the only time we stubbify is on a post commit
+// operation, i.e., either a create container has rolled back or a
+// dropped container has committed.  we end up having a a container
+// stub which behaves the same as a dropped container - only that all
+// the redo work is unnecessary because we 'know' it will
+// eventually be dropped and committed.
+//
+// if a and c happened and not b, then during redo, this stubbify
+// routine will be called again and the file will be deleted again
+//
+// the reason why a has to be sync'ed out is that we don't want b to
+// happen but a did not and the system crashed.  then we are left
+// with neither the file nor the stub and maybe even no log record.
+// then the system is not recoverable.
+actionidentity    containerkey getidentity
+actioninstant   instant
+actioncode   stubbify_action
+try
+accesscontroller doprivileged  this
+catch  privilegedactionexception pae   throw  standardexception  pae getexception
+finally
+actionidentity   null
+actioninstant   null
+/**
+* backup the  container.
+*
+* @param handle the container handle.
+* @param backuplocation location of the backup container.
+* @exception standardexception standard derby error policy
+*/
+protected void backupcontainer basecontainerhandle handle 	string backuplocation
+throws standardexception
+actioncontainerhandle   handle
+actionbackuplocation   backuplocation
+actioncode   backup_container_action
+try
+accesscontroller doprivileged this
+catch  privilegedactionexception pae   throw  standardexception  pae getexception
+finally
+actioncontainerhandle   null
+actionbackuplocation   null
+/**
+* backup the  container.
+*
+* the container is written to the backup by reading  the pages
+* through the page cache, and then writing into the backup container.
+* if the container is dropped(commitetd drop), only container stub is
+* copied to the  backup using simple file copy.
+*
+* mt -
+* at any given time only one backup thread is allowed, but when backup in
+* progress dml/ddl operations can run in parallel. pages are latched while
+* writing them to the backup to avoid copying partial changes to the pages.
+* online backup does not acquire any user level locks , so users can drop
+* tables when backup is in progress. so it is possible that container
+* removal request can come in when container backup is in progress.
+* this case is handled by using the synchronization on this object monitor
+* and using inremove and inbackup flags. conatiner removal checks if backup
+* is in progress and wait for the backup to yield to continue the removal.
+* basic idea is to give preference to remove by stopping the backup of the
+* container temporarily,  when the remove container is requested by another
+* thread. generally, it takes more  time to backup a regular container than
+* the stub becuase  stub is just one page. after each page copy, a check is
+* made to find  if a remove is requested and if it is then backup of the
+* container is aborted and the backup thread puts itself into the wait state until
+* remove  request thread notifies that the remove is complete. when
+* remove request compeletes stub is copied into the backup.
+*
+* compress is blocked when backup is in progesss, so truncation of the
+* container can not happen when backup is in progess. no need to
+* synchronize backup of the container with truncation.
+*
+*
+* @param handle the container handle.
+* @param backuplocation location of the backup container.
+* @exception standardexception derby standard error policy
+*
+*/
+private void privbackupcontainer basecontainerhandle handle
+string backuplocation
+throws standardexception
+boolean backupcompleted   false
+file backupfile   null
+randomaccessfile backupraf   null
+boolean isstub   false
+basepage page   null
+while  backupcompleted
+try
+synchronized  this
+// wait if some one is removing the
+// container because of a drop.
+while  inremove
+try
+wait
+catch  interruptedexception ie
+throw standardexception interrupt ie
+if  getcommitteddropstate
+isstub   true
+inbackup   true
+// create container at the backup location.
+if  isstub
+// get the stub ( it is a committted drop table container )
+storagefile file   privgetfilename  containerkey getidentity
+true  false  true
+backupfile   new file backuplocation  file getname
+// directly copy the stub to the backup
+if  fileutil copyfile datafactory getstoragefactory
+file  backupfile
+throw standardexception newexception
+sqlstate rawstore_error_copying_file
+file  backupfile
+else
+// regular container file
+long lastpagenumber  getlastpagenumber handle
+if  lastpagenumber    containerhandle invalid_page_number
+// last page number is invalid if there are no pages in
+// the container yet. no need to backup this container,
+// this container creation is yet to complete.the reason
+// backup is getting called on such a container is
+// because container handle appears in the cache after
+// the file is created on the disk but before it's
+// first page is allocated.
+return
+storagefile file
+privgetfilename
+containerkey getidentity    false  false  true
+backupfile   new file backuplocation   file getname
+backupraf    new randomaccessfile backupfile
+byte encryptionbuf   null
+if  datafactory databaseencrypted
+// backup uses seperate encryption buffer to encrypt the
+// page instead of encryption buffer used by the regular
+// conatiner writes. otherwise writes to the backup
+// has to be synchronized with regualar database writes
+// because backup can run in parallel to container
+// writes.
+encryptionbuf   new byte
+// copy all the pages of the container from the database
+// to the backup location by reading through the page cache.
+for  long pagenumber   first_alloc_page_number
+pagenumber <  lastpagenumber  pagenumber
+page   getlatchedpage handle  pagenumber
+// update the page array before writing to the disk
+// with container header and encrypt it if the database
+// is encrypted.
+byte datatowrite   updatepagearray pagenumber
+page getpagearray
+encryptionbuf  false
+backupraf write datatowrite  0  pagesize
+// unlatch releases page from cache, see
+// storedpage.releaseexclusive()
+page unlatch
+page   null
+// check if some one wants to commit drop the table while
+// conatiner is being written to the backup. if so,
+// abort  the backup and restart it once the drop
+// is complete.
+synchronized  this
+if  inremove
+break
+// sync and close the backup conatiner. incase of a stub,
+// it is already synced and closed while doing the copy.
+if  isstub
+backupraf getfd   sync
+backupraf close
+backupraf   null
+// backup of the conatiner is complete.
+backupcompleted   true
+catch  ioexception ioe
+throw standardexception newexception
+sqlstate backup_file_io_error
+ioe
+backupfile
+finally
+synchronized  this
+inbackup   false
+notifyall
+if  page    null
+page unlatch
+page   null
+// if backup of container is not complete, close the file
+// handles and  remove the container file from the backup
+// if it exists
+if   backupcompleted    backupfile    null
+if  backupraf    null
+try
+backupraf close
+backupraf   null
+catch  ioexception ioe
+throw standardexception newexception
+sqlstate backup_file_io_error
+ioe
+backupfile
+if backupfile exists
+if   backupfile delete
+throw standardexception newexception
+sqlstate unable_to_delete_file
+backupfile
+/**
+* create encrypted version of the  container with the
+* user specified encryption properties.
+*
+* read all the pages of the container from the original container
+* through the page cache, encrypt each page data with new encryption
+* mechanism and  write to the specified container file.
+*
+* @param handle the container handle.
+* @param newfilepath file to store the new encrypted version of
+*                    the container
+* @exception standardexception derby standard error policy
+*
+*/
+protected void encryptcontainer basecontainerhandle handle
+string newfilepath
+throws standardexception
+basepage page   null
+storagefile newfile
+datafactory getstoragefactory   newstoragefile newfilepath
+storagerandomaccessfile newraf   null
+try
+long lastpagenumber  getlastpagenumber handle
+newraf   privgetrandomaccessfile newfile
+byte encryptionbuf   null
+encryptionbuf   new byte
+// copy all the pages from the current container to the
+// new container file after encryting the pages.
+for  long pagenumber   first_alloc_page_number
+pagenumber <  lastpagenumber  pagenumber
+page   getlatchedpage handle  pagenumber
+// update the page array before writing to the disk
+// with container header and encrypt it.
+byte datatowrite   updatepagearray pagenumber
+page getpagearray
+encryptionbuf
+true
+newraf write datatowrite  0  pagesize
+// unlatch releases page from cache.
+page unlatch
+page   null
+// sync the new version of the container.
+newraf sync true
+newraf close
+newraf   null
+catch  ioexception ioe
+throw standardexception newexception
+sqlstate file_container_exception
+ioe
+newfile
+finally
+if  page    null
+page unlatch
+page   null
+if  newraf    null
+try
+newraf close
+catch  ioexception ioe
+newraf   null
+throw standardexception newexception
+sqlstate file_container_exception
+ioe
+newfile
+synchronized storagerandomaccessfile privgetrandomaccessfile storagefile file
+throws securityexception  standardexception
+actioncode   get_random_access_file_action
+actionfile   file
+try
+return  storagerandomaccessfile accesscontroller doprivileged this
+catch  privilegedactionexception pae
+throw  standardexception  pae getexception
+finally  actionfile   null
+// privilegedexceptionaction method
+public object run   throws standardexception  ioexception
+switch  actioncode
+case get_file_name_action
+return privgetfilename  actionidentity  actionstub  actionerrorok  actiontryalternatepath
+case create_container_action
+storagefile file   privgetfilename  actionidentity  false  false  false
+try
+if  file exists
+// note i'm left in the no-identity state as fillinidentity()
+// hasn't been called.
+throw standardexception newexception  sqlstate file_exists  file
+catch  securityexception se
+throw standardexception newexception  sqlstate file_create  se  file
+try
+// ok not to force wal here, in fact, this operation preceeds the
+// creation of the log record to ensure sufficient space.
+datafactory writeinprogress
+try
+filedata   file getrandomaccessfile
+finally
+datafactory writefinished
+// this container format specifies that the first page is an
+// allocation page and the container information is stored within
+// it.  the allocation page needs to be somewhat formatted
+// because if the system crashed after the create container log
+// operation is written, it needs to be well formed enough to get
+// the container information back out of it.
+//
+// don't try to go thru the page cache here because the container
+// object cannot be found in the container cache at this point
+// yet.  however, if we use the page cache to store the first
+// allocation page, then in order to write itself out, it needs to
+// ask the container to do so, which is going to create a
+// deadlock.  the allocation page cannot write itself out without
+// going thru the container because it doesn't know where its
+// offset is.  here we effectively hardwired page 0 at offset 0 of
+// the container file to be the first allocation page.
+// create an embryonic page - if this is not a temporary container,
+// synchronously write out the file header.
+writerafheader filedata  true
+actionidentity getsegmentid      containerhandle temporary_segment
+catch  securityexception se
+// only thrown by the randomeaccessfile constructor,
+// so the file won't exist
+throw standardexception newexception  sqlstate file_create  se  file
+catch  ioexception ioe
+boolean filedeleted
+try
+filedeleted   privremovefile file
+catch  securityexception se
+throw standardexception newexception  sqlstate file_create_no_cleanup  ioe  file  se tostring
+if   filedeleted
+throw standardexception newexception  sqlstate file_create_no_cleanup  ioe  file  ioe tostring
+throw standardexception newexception  sqlstate file_create  ioe  file
+canupdate   true
+return null
+end of case create_container_action
+case remove_file_action
+return privremovefile  actionfile  ? this   null
+case open_container_action
+boolean isstub   false 	   is this a stub?
+storagefile file   privgetfilename  actionidentity  false  true  true
+if  file    null
+return null
+try
+if   file exists
+// file does not exist, may be it has been stubbified
+file   privgetfilename  actionidentity  true  true  true
+if   file exists
+return null
+isstub   true
+catch  securityexception se
+throw standardexception newexception
+sqlstate data_unexpected_exception  se
+canupdate   false
+try
+if   datafactory isreadonly      file canwrite
+canupdate   true
+catch  securityexception se
+// just means we can't write to it.
+try
+filedata   file getrandomaccessfile canupdate ?
+readheader getembryonicpage filedata
+first_alloc_page_offset
+if  sanitymanager debug
+if  isstub
+sanitymanager assert getdroppedstate      getcommitteddropstate
+catch  ioexception ioe
+if  isstub
+throw datafactory
+markcorrupt standardexception
+newexception sqlstate
+file_container_exception
+ioe  this
+// maybe it is being stubbified... try that
+storagefile stub
+privgetfilename actionidentity  true  true  true
+if  stub exists
+try
+boolean delete_status   privremovefile file
+if  sanitymanager debug
+if   delete_status
+sanitymanager throwassert
+file
+filedata
+stub getrandomaccessfile canupdate ?
+readheader getembryonicpage filedata
+first_alloc_page_offset
+catch  ioexception ioe2
+throw datafactory
+markcorrupt standardexception
+newexception sqlstate
+file_container_exception
+ioe2  this
+// resolve: this is a temporary hack
+else
+throw datafactory
+markcorrupt standardexception
+newexception sqlstate
+file_container_exception
+ioe  this
+return this
+end of case open_container_action
+case stubbify_action
+storagefile file   privgetfilename  actionidentity  false  false  true
+storagefile stub   privgetfilename  actionidentity  true  false  false
+storagerandomaccessfile stubdata   null
+try
+// !!!!!
+// bumpcontainerversion();
+//
+// do not bump the container version.  we want the stubbify
+// operation to get redone every time.  this is because this
+// operation first writes out the stub and then remove the
+// container file.  if we bump the version, then the stub will
+// contain the new version.  and if the system crashes right then,
+// then we will skip the whole operation during redo even though
+// the container file may not have been removed.  since we don't
+// want to have the remove happen before the stub is written, we
+// cannot sync it and therefore cannot be sure the remove
+// happened before the system crashed.
+if   stub exists
+// write the header to the stub
+stubdata   stub getrandomaccessfile
+writerafheader stubdata
+true     create
+true      sync
+stubdata close
+stubdata   null
+// force wal and check for database corruption before removing file.
+// this is one operation where the container is changed on disk
+// directly without going thru the container cache, which otherwise
+// would have force wal.  take care of it here.
+datafactory flush actioninstant
+// try to remove the container file
+// filedate is not null only if we are redoing a removecontainer
+// (stubbify) operation.  then filedata acutally is opened against
+// the stub and the original container file does not exist.
+// then we need to close it here because this method is called by
+// cache.remove and nobody will be able to see filedata after this.
+privremovefile file
+catch  securityexception se
+throw standardexception
+newexception sqlstate file_cannot_remove_file  se  file
+se tostring
+catch  ioexception ioe
+// exception thrown while in creating the stub.  remove the
+// (half-baked) stub
+try
+if  stubdata    null
+stubdata close
+stub delete
+stubdata   null
+if  filedata    null
+filedata close
+filedata   null
+catch  ioexception ioe2
+throw standardexception newexception
+sqlstate file_cannot_remove_file  ioe2  file  ioe tostring
+catch  securityexception se
+throw standardexception newexception
+sqlstate file_cannot_remove_file  se  file  stub
+//let the data factory know about this the stub file;it
+// could  remove when next checkpoint occurs if it's not necessary for recovery
+datafactory stubfiletoremoveaftercheckpoint stub actioninstant  getidentity
+return null
+end of case stubbify_action
+case backup_container_action
+privbackupcontainer actioncontainerhandle  actionbackuplocation
+return null
+end of case backup_container_action
+case get_random_access_file_action
+return actionfile getrandomaccessfile
+end of case backup_container_action
+end of switch
+return null
+end of run

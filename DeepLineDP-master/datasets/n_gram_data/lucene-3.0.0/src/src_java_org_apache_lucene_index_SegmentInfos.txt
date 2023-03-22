@@ -1,0 +1,681 @@
+package org apache lucene index
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+import org apache lucene store directory
+import org apache lucene store indexinput
+import org apache lucene store indexoutput
+import org apache lucene store checksumindexoutput
+import org apache lucene store checksumindexinput
+import org apache lucene store nosuchdirectoryexception
+import org apache lucene util threadinterruptedexception
+import java io filenotfoundexception
+import java io ioexception
+import java io printstream
+import java util vector
+import java util arrays
+import java util collection
+import java util collections
+import java util hashset
+import java util hashmap
+import java util map
+/**
+* a collection of segmentinfo objects with methods for operating on
+* those segments in relation to the file system.
+*
+* <p><b>note:</b> this api is new and still experimental
+* (subject to change suddenly in the next release)</p>
+*/
+public final class segmentinfos extends vector<segmentinfo>
+/** the file format version, a negative number. */
+/* works since counter, the old 1st entry, is always >= 0 */
+public static final int format    1
+/** this format adds details used for lockless commits.  it differs
+* slightly from the previous format in that file names
+* are never re-used (write once).  instead, each file is
+* written to the next generation.  for example,
+* segments_1, segments_2, etc.  this allows us to not use
+* a commit lock.  see <a
+* href="http://lucene.apache.org/java/docs/fileformats.html">file
+* formats</a> for details.
+*/
+public static final int format_lockless    2
+/** this format adds a "hassinglenormfile" flag into each segment info.
+* see <a href="http://issues.apache.org/jira/browse/lucene-756">lucene-756</a>
+* for details.
+*/
+public static final int format_single_norm_file    3
+/** this format allows multiple segments to share a single
+* vectors and stored fields file. */
+public static final int format_shared_doc_store    4
+/** this format adds a checksum at the end of the file to
+*  ensure all bytes were successfully written. */
+public static final int format_checksum    5
+/** this format adds the deletion count for each segment.
+*  this way indexwriter can efficiently report numdocs(). */
+public static final int format_del_count    6
+/** this format adds the boolean hasprox to record if any
+*  fields in the segment store prox information (ie, have
+*  omittermfreqandpositions==false) */
+public static final int format_has_prox    7
+/** this format adds optional commit userdata (string) storage. */
+public static final int format_user_data    8
+/** this format adds optional per-segment string
+*  diagnostics storage, and switches userdata to map */
+public static final int format_diagnostics    9
+/* this must always point to the most recent file format. */
+static final int current_format   format_diagnostics
+public int counter   0        used to name new segments
+/**
+* counts how often the index has been changed by adding or deleting docs.
+* starting with the current time in milliseconds forces to create unique version numbers.
+*/
+private long version   system currenttimemillis
+private long generation   0         generation of the   for the next commit
+private long lastgeneration   0     generation of the   file we last successfully read
+// or wrote; this is normally the same as generation except if
+// there was an ioexception that had interrupted a commit
+private map<string string> userdata   collections <string string>emptymap             opaque map<string  string> that user can specify during indexwriter commit
+/**
+* if non-null, information about loading segments_n files
+* will be printed here.  @see #setinfostream.
+*/
+private static printstream infostream
+public final segmentinfo info int i
+return get i
+/**
+* get the generation (n) of the current segments_n file
+* from a list of files.
+*
+* @param files -- array of file names to check
+*/
+public static long getcurrentsegmentgeneration string files
+if  files    null
+return  1
+long max    1
+for  int i   0  i < files length  i
+string file   files
+if  file startswith indexfilenames segments      file equals indexfilenames segments_gen
+long gen   generationfromsegmentsfilename file
+if  gen > max
+max   gen
+return max
+/**
+* get the generation (n) of the current segments_n file
+* in the directory.
+*
+* @param directory -- directory to search for the latest segments_n file
+*/
+public static long getcurrentsegmentgeneration directory directory  throws ioexception
+try
+return getcurrentsegmentgeneration directory listall
+catch  nosuchdirectoryexception nsde
+return  1
+/**
+* get the filename of the current segments_n file
+* from a list of files.
+*
+* @param files -- array of file names to check
+*/
+public static string getcurrentsegmentfilename string files  throws ioexception
+return indexfilenames filenamefromgeneration indexfilenames segments
+getcurrentsegmentgeneration files
+/**
+* get the filename of the current segments_n file
+* in the directory.
+*
+* @param directory -- directory to search for the latest segments_n file
+*/
+public static string getcurrentsegmentfilename directory directory  throws ioexception
+return indexfilenames filenamefromgeneration indexfilenames segments
+getcurrentsegmentgeneration directory
+/**
+* get the segments_n filename in use by this segment infos.
+*/
+public string getcurrentsegmentfilename
+return indexfilenames filenamefromgeneration indexfilenames segments
+lastgeneration
+/**
+* parse the generation off the segments file name and
+* return it.
+*/
+public static long generationfromsegmentsfilename string filename
+if  filename equals indexfilenames segments
+return 0
+else if  filename startswith indexfilenames segments
+return long parselong filename substring 1 indexfilenames segments length
+character max_radix
+else
+throw new illegalargumentexception
+/**
+* get the next segments_n filename that will be written.
+*/
+public string getnextsegmentfilename
+long nextgeneration
+if  generation     1
+nextgeneration   1
+else
+nextgeneration   generation 1
+return indexfilenames filenamefromgeneration indexfilenames segments
+nextgeneration
+/**
+* read a particular segmentfilename.  note that this may
+* throw an ioexception if a commit is in process.
+*
+* @param directory -- directory containing the segments file
+* @param segmentfilename -- segment file to load
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public final void read directory directory  string segmentfilename  throws corruptindexexception  ioexception
+boolean success   false
+// clear any previous segments:
+clear
+checksumindexinput input   new checksumindexinput directory openinput segmentfilename
+generation   generationfromsegmentsfilename segmentfilename
+lastgeneration   generation
+try
+int format   input readint
+if format < 0          file contains explicit format info
+// check that it is a format we can understand
+if  format < current_format
+throw new corruptindexexception     format
+version   input readlong       read version
+counter   input readint       read counter
+else         file is in old format without explicit format info
+counter   format
+for  int i   input readint    i > 0  i         read segmentinfos
+add new segmentinfo directory  format  input
+if format >  0         in old format the version number may be at the end of the file
+if  input getfilepointer   >  input length
+version   system currenttimemillis       old file format without version number
+else
+version   input readlong       read version
+if  format <  format_user_data
+if  format <  format_diagnostics
+userdata   input readstringstringmap
+else if  0    input readbyte
+userdata   collections singletonmap    input readstring
+else
+userdata   collections <string string>emptymap
+else
+userdata   collections <string string>emptymap
+if  format <  format_checksum
+final long checksumnow   input getchecksum
+final long checksumthen   input readlong
+if  checksumnow    checksumthen
+throw new corruptindexexception
+success   true
+finally
+input close
+if   success
+// clear any segment infos we had loaded so we
+// have a clean slate on retry:
+clear
+/**
+* this version of read uses the retry logic (for lock-less
+* commits) to find the right segments file to load.
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public final void read directory directory  throws corruptindexexception  ioexception
+generation   lastgeneration    1
+new findsegmentsfile directory
+@override
+protected object dobody string segmentfilename  throws corruptindexexception  ioexception
+read directory  segmentfilename
+return null
+run
+// only non-null after preparecommit has been called and
+// before finishcommit is called
+checksumindexoutput pendingsegnoutput
+private final void write directory directory  throws ioexception
+string segmentfilename   getnextsegmentfilename
+// always advance the generation on write:
+if  generation     1
+generation   1
+else
+generation
+checksumindexoutput segnoutput   new checksumindexoutput directory createoutput segmentfilename
+boolean success   false
+try
+segnoutput writeint current_format      write format
+segnoutput writelong   version      every write changes
+// the index
+segnoutput writeint counter      write counter
+segnoutput writeint size        write infos
+for  int i   0  i < size    i
+info i  write segnoutput
+segnoutput writestringstringmap userdata
+segnoutput preparecommit
+success   true
+pendingsegnoutput   segnoutput
+finally
+if   success
+// we hit an exception above; try to close the file
+// but suppress any exception:
+try
+segnoutput close
+catch  throwable t
+// suppress so we keep throwing the original exception
+try
+// try not to leave a truncated segments_n file in
+// the index:
+directory deletefile segmentfilename
+catch  throwable t
+// suppress so we keep throwing the original exception
+/**
+* returns a copy of this instance, also copying each
+* segmentinfo.
+*/
+@override
+public object clone
+segmentinfos sis    segmentinfos  super clone
+for int i 0 i<sis size   i
+sis set i   segmentinfo  sis info i  clone
+sis userdata   new hashmap<string  string> userdata
+return sis
+/**
+* version number when this segmentinfos was generated.
+*/
+public long getversion
+return version
+public long getgeneration
+return generation
+public long getlastgeneration
+return lastgeneration
+/**
+* current version number from segments file.
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public static long readcurrentversion directory directory
+throws corruptindexexception  ioexception
+// fully read the segments file: this ensures that it's
+// completely written so that if
+// indexwriter.preparecommit has been called (but not
+// yet commit), then the reader will still see itself as
+// current:
+segmentinfos sis   new segmentinfos
+sis read directory
+return sis version
+/**
+* returns userdata from latest segments file
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public static map<string string> readcurrentuserdata directory directory
+throws corruptindexexception  ioexception
+segmentinfos sis   new segmentinfos
+sis read directory
+return sis getuserdata
+/** if non-null, information about retries when loading
+* the segments file will be printed to this.
+*/
+public static void setinfostream printstream infostream
+segmentinfos infostream   infostream
+/* advanced configuration of retry logic in loading
+segments_n file */
+private static int defaultgenfileretrycount   10
+private static int defaultgenfileretrypausemsec   50
+private static int defaultgenlookaheadcount   10
+/**
+* advanced: set how many times to try loading the
+* segments.gen file contents to determine current segment
+* generation.  this file is only referenced when the
+* primary method (listing the directory) fails.
+*/
+public static void setdefaultgenfileretrycount int count
+defaultgenfileretrycount   count
+/**
+* @see #setdefaultgenfileretrycount
+*/
+public static int getdefaultgenfileretrycount
+return defaultgenfileretrycount
+/**
+* advanced: set how many milliseconds to pause in between
+* attempts to load the segments.gen file.
+*/
+public static void setdefaultgenfileretrypausemsec int msec
+defaultgenfileretrypausemsec   msec
+/**
+* @see #setdefaultgenfileretrypausemsec
+*/
+public static int getdefaultgenfileretrypausemsec
+return defaultgenfileretrypausemsec
+/**
+* advanced: set how many times to try incrementing the
+* gen when loading the segments file.  this only runs if
+* the primary (listing directory) and secondary (opening
+* segments.gen file) methods fail to find the segments
+* file.
+*/
+public static void setdefaultgenlookaheadcount int count
+defaultgenlookaheadcount   count
+/**
+* @see #setdefaultgenlookaheadcount
+*/
+public static int getdefaultgenlookahedcount
+return defaultgenlookaheadcount
+/**
+* @see #setinfostream
+*/
+public static printstream getinfostream
+return infostream
+private static void message string message
+if  infostream    null
+infostream println     thread currentthread   getname         message
+/**
+* utility class for executing code that needs to do
+* something with the current segments file.  this is
+* necessary with lock-less commits because from the time
+* you locate the current segments file name, until you
+* actually open it, read its contents, or check modified
+* time, etc., it could have been deleted due to a writer
+* commit finishing.
+*/
+public abstract static class findsegmentsfile
+final directory directory
+public findsegmentsfile directory directory
+this directory   directory
+public object run   throws corruptindexexception  ioexception
+return run null
+public object run indexcommit commit  throws corruptindexexception  ioexception
+if  commit    null
+if  directory    commit getdirectory
+throw new ioexception
+return dobody commit getsegmentsfilename
+string segmentfilename   null
+long lastgen    1
+long gen   0
+int genlookaheadcount   0
+ioexception exc   null
+boolean retry   false
+int method   0
+// loop until we succeed in calling dobody() without
+// hitting an ioexception.  an ioexception most likely
+// means a commit was in process and has finished, in
+// the time it took us to load the now-old infos files
+// (and segments files).  it's also possible it's a
+// true error (corrupt index).  to distinguish these,
+// on each retry we must see "forward progress" on
+// which generation we are trying to load.  if we
+// don't, then the original error is real and we throw
+// it.
+// we have three methods for determining the current
+// generation.  we try the first two in parallel, and
+// fall back to the third when necessary.
+while true
+if  0    method
+// method 1: list the directory and use the highest
+// segments_n file.  this method works well as long
+// as there is no stale caching on the directory
+// contents (note: nfs clients often have such stale
+// caching):
+string files   null
+long gena    1
+files   directory listall
+if  files    null
+gena   getcurrentsegmentgeneration files
+message     gena
+// method 2: open segments.gen and read its
+// contents.  then we take the larger of the two
+// gen's.  this way, if either approach is hitting
+// a stale cache (nfs) we have a better chance of
+// getting the right generation.
+long genb    1
+for int i 0 i<defaultgenfileretrycount i
+indexinput geninput   null
+try
+geninput   directory openinput indexfilenames segments_gen
+catch  filenotfoundexception e
+message     e
+break
+catch  ioexception e
+message     e
+if  geninput    null
+try
+int version   geninput readint
+if  version    format_lockless
+long gen0   geninput readlong
+long gen1   geninput readlong
+message     gen0       gen1
+if  gen0    gen1
+// the file is consistent.
+genb   gen0
+break
+catch  ioexception err2
+// will retry
+finally
+geninput close
+try
+thread sleep defaultgenfileretrypausemsec
+catch  interruptedexception ie
+throw new threadinterruptedexception ie
+message indexfilenames segments_gen       genb
+// pick the larger of the two gen's:
+if  gena > genb
+gen   gena
+else
+gen   genb
+if  gen     1
+// neither approach found a generation
+throw new filenotfoundexception     directory       arrays tostring files
+// third method (fallback if first & second methods
+// are not reliable): since both directory cache and
+// file contents cache seem to be stale, just
+// advance the generation.
+if  1    method     0    method    lastgen    gen    retry
+method   1
+if  genlookaheadcount < defaultgenlookaheadcount
+gen
+genlookaheadcount
+message     gen
+if  lastgen    gen
+// this means we're about to try the same
+// segments_n last tried.  this is allowed,
+// exactly once, because writer could have been in
+// the process of writing segments_n last time.
+if  retry
+// ok, we've tried the same segments_n file
+// twice in a row, so this must be a real
+// error.  we throw the original exception we
+// got.
+throw exc
+else
+retry   true
+else if  0    method
+// segment file has advanced since our last loop, so
+// reset retry:
+retry   false
+lastgen   gen
+segmentfilename   indexfilenames filenamefromgeneration indexfilenames segments
+gen
+try
+object v   dobody segmentfilename
+if  exc    null
+message     segmentfilename
+return v
+catch  ioexception err
+// save the original root cause:
+if  exc    null
+exc   err
+message     segmentfilename       err       retry       gen
+if   retry    gen > 1
+// this is our first time trying this segments
+// file (because retry is false), and, there is
+// possibly a segments_(n-1) (because gen > 1).
+// so, check if the segments_(n-1) exists and
+// try it if so:
+string prevsegmentfilename   indexfilenames filenamefromgeneration indexfilenames segments
+gen 1
+final boolean prevexists
+prevexists   directory fileexists prevsegmentfilename
+if  prevexists
+message     prevsegmentfilename
+try
+object v   dobody prevsegmentfilename
+if  exc    null
+message     prevsegmentfilename
+return v
+catch  ioexception err2
+message     prevsegmentfilename       err2
+/**
+* subclass must implement this.  the assumption is an
+* ioexception will be thrown if something goes wrong
+* during the processing that could have been caused by
+* a writer committing.
+*/
+protected abstract object dobody string segmentfilename  throws corruptindexexception  ioexception
+/**
+* returns a new segmentinfos containing the segmentinfo
+* instances in the specified range first (inclusive) to
+* last (exclusive), so total number of segments returned
+* is last-first.
+*/
+public segmentinfos range int first  int last
+segmentinfos infos   new segmentinfos
+infos addall super sublist first  last
+return infos
+// carry over generation numbers from another segmentinfos
+void updategeneration segmentinfos other
+lastgeneration   other lastgeneration
+generation   other generation
+version   other version
+final void rollbackcommit directory dir  throws ioexception
+if  pendingsegnoutput    null
+try
+pendingsegnoutput close
+catch  throwable t
+// suppress so we keep throwing the original exception
+// in our caller
+// must carefully compute filename from "generation"
+// since lastgeneration isn't incremented:
+try
+final string segmentfilename   indexfilenames filenamefromgeneration indexfilenames segments
+generation
+dir deletefile segmentfilename
+catch  throwable t
+// suppress so we keep throwing the original exception
+// in our caller
+pendingsegnoutput   null
+/** call this to start a commit.  this writes the new
+*  segments file, but writes an invalid checksum at the
+*  end, so that it is not visible to readers.  once this
+*  is called you must call {@link #finishcommit} to complete
+*  the commit or {@link #rollbackcommit} to abort it. */
+final void preparecommit directory dir  throws ioexception
+if  pendingsegnoutput    null
+throw new illegalstateexception
+write dir
+/** returns all file names referenced by segmentinfo
+*  instances matching the provided directory (ie files
+*  associated with any "external" segments are skipped).
+*  the returned collection is recomputed on each
+*  invocation.  */
+public collection<string> files directory dir  boolean includesegmentsfile  throws ioexception
+hashset<string> files   new hashset<string>
+if  includesegmentsfile
+files add getcurrentsegmentfilename
+final int size   size
+for int i 0 i<size i
+final segmentinfo info   info i
+if  info dir    dir
+files addall info i  files
+return files
+final void finishcommit directory dir  throws ioexception
+if  pendingsegnoutput    null
+throw new illegalstateexception
+boolean success   false
+try
+pendingsegnoutput finishcommit
+pendingsegnoutput close
+pendingsegnoutput   null
+success   true
+finally
+if   success
+rollbackcommit dir
+// note: if we crash here, we have left a segments_n
+// file in the directory in a possibly corrupt state (if
+// some bytes made it to stable storage and others
+// didn't).  but, the segments_n file includes checksum
+// at the end, which should catch this case.  so when a
+// reader tries to read it, it will throw a
+// corruptindexexception, which should cause the retry
+// logic in segmentinfos to kick in and load the last
+// good (previous) segments_n-1 file.
+final string filename   indexfilenames filenamefromgeneration indexfilenames segments
+generation
+success   false
+try
+dir sync filename
+success   true
+finally
+if   success
+try
+dir deletefile filename
+catch  throwable t
+// suppress so we keep throwing the original exception
+lastgeneration   generation
+try
+indexoutput genoutput   dir createoutput indexfilenames segments_gen
+try
+genoutput writeint format_lockless
+genoutput writelong generation
+genoutput writelong generation
+finally
+genoutput close
+catch  throwable t
+// it's ok if we fail to write this file since it's
+// used only as one of the retry fallbacks.
+/** writes & syncs to the directory dir, taking care to
+*  remove the segments file on exception */
+final void commit directory dir  throws ioexception
+preparecommit dir
+finishcommit dir
+public synchronized string segstring directory directory
+stringbuilder buffer   new stringbuilder
+final int count   size
+for int i   0  i < count  i
+if  i > 0
+buffer append
+final segmentinfo info   info i
+buffer append info segstring directory
+if  info dir    directory
+buffer append
+return buffer tostring
+public map<string string> getuserdata
+return userdata
+void setuserdata map<string string> data
+if  data    null
+userdata   collections <string string>emptymap
+else
+userdata   data
+/** replaces all segments in this instance, but keeps
+*  generation, version, counter so that future commits
+*  remain write once.
+*/
+void replace segmentinfos other
+clear
+addall other
+lastgeneration   other lastgeneration
+// used only for testing
+public boolean hasexternalsegments directory dir
+final int numsegments   size
+for int i 0 i<numsegments i
+if  info i  dir    dir
+return true
+return false

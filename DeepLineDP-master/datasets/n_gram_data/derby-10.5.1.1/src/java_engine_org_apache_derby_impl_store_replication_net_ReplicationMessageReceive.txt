@@ -1,0 +1,417 @@
+/*
+derby - class org.apache.derby.impl.store.replication.net.replicationmessagereceive
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store replication net
+import java io ioexception
+import java net serversocket
+import java net socket
+import java security accesscontroller
+import java security privilegedactionexception
+import java security privilegedexceptionaction
+import javax net serversocketfactory
+import org apache derby iapi error standardexception
+import org apache derby iapi reference messageid
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services monitor monitor
+import org apache derby impl store raw log logcounter
+/**
+* this class is the receiver (viz. socket server or listener) part of the
+* network communication. it receives the message from the master and
+* performs appropriate action depending on the type of the message.
+*/
+public class replicationmessagereceive
+/**
+* contains the address (hostname and port number) of the slave
+* to replicate to.
+*/
+private final slaveaddress slaveaddress
+/**
+* contains the <code>serversocket</code> used to listen for
+* connections from the replication master. */
+private serversocket serversocket
+/**
+* contains the methods used to read and write to the object streams
+* obtained from a <code>socket</code> connection.
+*/
+private socketconnection socketconn
+/* -- ping-thread related fields start -- */
+/** the maximum number of millis to wait before giving up waiting for
+* a ping response*/
+private static final int default_ping_timeout   5000     5 seconds
+/** thread used to send ping messages to master to check if the connection
+* is working. the ping message must be sent from a separate thread
+* because failed message shipping over tcp does not timeout for two
+* minutes (not configurable). */
+private thread pingthread   null
+/** used to terminate the ping thread. */
+private boolean killpingthread   false
+/** whether or not the connection with the master is confirmed to be
+* working. set to false by isconnectedtomaster, set to true when
+* a pong (i.e., a response to a ping) is received. field protected by
+* receivepongsemephore */
+private boolean connectionconfirmed   false
+/** used for synchronization of the ping thread */
+private final object sendpingsemaphore   new object
+/** used for synchronization when waiting for a ping reply message */
+private final object receivepongsemaphore   new object
+/* -- ping-thread related fields stop -- */
+/**
+* constructor initializes the slave address used in replication. accepts
+* the host name and port number that constitute the slave address as
+* parameters.
+*
+* @param slaveaddress the address (host name and port number) of the slave
+*                     to connect to.
+* @param dbname the name of the database.
+*/
+public replicationmessagereceive slaveaddress slaveaddress
+string dbname
+this slaveaddress   slaveaddress
+monitor logtextmessage messageid replication_slave_network_listen
+dbname
+slaveaddress gethostaddress   gethostname
+string valueof slaveaddress getportnumber
+/**
+* used to create the server socket, listen on the socket
+* for connections from the master and verify compatibility
+* with the database version of the master.
+*
+* @param timeout the amount of time, in milliseconds, this method
+* will wait for a connection to be established. if no connection
+* has been established before the timeout, a
+* privilegedexceptionaction is raised with cause
+* java.net.sockettimeoutexception
+* @param synchoninstant the slave log instant, used to check that
+* the master and slave log files are in synch. if no chunks of log
+* records have been received from the master yet, this is the
+* end position in the current log file. if a chunk of log has been
+* received, this is the instant of the log record received last.
+* note that there is a difference!
+* @param dbname the name of the replicated database
+*
+* @throws privilegedactionexception if an exception occurs while trying
+*                                   to open a connection.
+*
+* @throws ioexception if an exception occurs while trying to create the
+*                     <code>socketconnection</code> class.
+*
+* @throws classnotfoundexception class of a serialized object cannot
+*                                be found.
+* @throws standardexception if an incompatible database version is found.
+*
+*/
+public void initconnection int timeout  long synchoninstant  string dbname
+throws
+privilegedactionexception
+ioexception
+standardexception
+classnotfoundexception
+// create the serversocket object if this is the first
+// initconnection attempt. otherwise, we reuse the existing
+// server socket
+if  serversocket    null
+serversocket   createserversocket
+serversocket setsotimeout timeout
+//start listening on the socket and accepting the connection
+socket client
+socket
+accesscontroller doprivileged new privilegedexceptionaction
+public object run   throws ioexception
+return serversocket accept
+//create the socketconnection object using the client connection.
+socketconn   new socketconnection client
+// exchange initiator messages to check that master and slave are at
+// the same version...
+parseandackversion readmessage    dbname
+// ...and have equal log files
+parseandackinstant readmessage    synchoninstant  dbname
+killpingthread   false
+pingthread   new slavepingthread dbname
+pingthread setdaemon true
+pingthread start
+/**
+* used to create a <code>serversocket</code> for listening to connections
+* from the master.
+*
+* @return an instance of the <code>serversocket</code> class.
+*
+* @throws privilegedactionexception if an exception occurs while trying
+*                                   to open a connection.
+*/
+private serversocket createserversocket   throws privilegedactionexception
+//create a serversocket at the specified host name and the
+//port number.
+return    serversocket  accesscontroller doprivileged
+new privilegedexceptionaction
+public object run   throws ioexception  standardexception
+serversocketfactory sf   serversocketfactory getdefault
+return sf createserversocket slaveaddress getportnumber
+0  slaveaddress gethostaddress
+/**
+* used to close the <code>serversocket</code> and the resources
+* associated with it.
+*
+* @throws ioexception if an exception occurs while trying to
+*                     close the socket or the associated resources.
+*/
+public void teardown   throws ioexception
+synchronized  sendpingsemaphore
+killpingthread   true
+sendpingsemaphore notify
+// socketconn.teardown() may fail if the master has crashed. we still
+// want to close the server socket if an exception is thrown, so that
+// we don't prevent starting a new slave listening to the same port.
+// therefore, use try/finally. derby-3878
+try
+if  socketconn    null
+socketconn teardown
+finally
+if  serversocket    null
+serversocket close
+/**
+* used to parse the initiator message from the master and check if the
+* slave is compatible with the master by comparing the uid of the
+* <code>replicationmessage</code> class of the master, that is wrapped
+* in the initiator message, with the uid of the same class in the slave.
+*
+* @param initiatormessage the object containing the uid.
+* @param dbname the name of the replicated database
+*
+* @throws ioexception if an exception occurs while sending the
+*                     acknowledgment.
+*
+* @throws standardexception if the uid's do not match.
+*/
+private void parseandackversion replicationmessage initiatormessage
+string dbname
+throws ioexception  standardexception
+//holds the replication message that will be sent
+//to the master.
+replicationmessage ack   null
+//check if this message is an initiate version message, if not
+//throw an exception
+if  initiatormessage gettype
+replicationmessage type_initiate_version
+// the message format was not recognized. notify master and throw
+// an exception
+string expectedmsgid   string
+valueof replicationmessage type_initiate_version
+string receivedmsgid   string valueof initiatormessage gettype
+handleunexpectedmessage dbname  expectedmsgid  receivedmsgid
+//get the uid of the master
+long masterversion     long initiatormessage getmessage    longvalue
+//if the uid's are equal send the acknowledgment message
+if  masterversion    replicationmessage serialversionuid
+ack   new replicationmessage
+replicationmessage type_ack
+sendmessage ack
+else
+//if the uid's are not equal send an error message. the
+//object of a type_error message must be a string[]
+ack   new replicationmessage
+replicationmessage type_error
+new string sqlstate
+replication_master_slave_version_mismatch
+sendmessage ack
+//the uid's do not match.
+throw standardexception newexception
+sqlstate replication_master_slave_version_mismatch
+/**
+* used to parse the log instant initiator message from the master and
+* check that the master and slave log files are in synch.
+*
+* @param initiatormessage the object containing the uid.
+* @param synchoninstant the slave log instant, used to check that
+* the master and slave log files are in synch. if no chunks of log
+* records have been received from the master yet, this is the
+* end position in the current log file. if a chunk of log has been
+* received, this is the instant of the log record received last.
+* note that there is a difference!
+* @param dbname the name of the replicated database
+*
+* @throws ioexception if an exception occurs while sending the
+*                     acknowledgment.
+*
+* @throws standardexception if the log files are not in synch
+*/
+private void parseandackinstant replicationmessage initiatormessage
+long synchoninstant  string dbname
+throws ioexception  standardexception
+replicationmessage ack   null
+//check if this message is a log synch message, if not throw
+//an exception
+if  initiatormessage gettype
+replicationmessage type_initiate_instant
+// the message format was not recognized. notify master and throw
+// an exception
+string expectedmsgid   string
+valueof replicationmessage type_initiate_instant
+string receivedmsgid   string valueof initiatormessage gettype
+handleunexpectedmessage dbname  expectedmsgid  receivedmsgid
+// get the log instant of the master
+long masterinstant     long initiatormessage getmessage    longvalue
+if  masterinstant    synchoninstant
+// notify the master that the logs are in synch
+ack   new replicationmessage
+replicationmessage type_ack
+sendmessage ack
+else
+// notify master that the logs are out of synch
+// see replicationmessage#type_error
+string exception   new string
+exception   dbname
+exception   string valueof logcounter
+getlogfilenumber masterinstant
+exception   string valueof logcounter
+getlogfileposition masterinstant
+exception   string valueof logcounter
+getlogfilenumber synchoninstant
+exception   string valueof logcounter
+getlogfileposition synchoninstant
+exception   sqlstate replication_log_out_of_synch
+ack   new replicationmessage replicationmessage type_error
+exception
+sendmessage ack
+throw standardexception
+newexception sqlstate replication_log_out_of_synch  exception
+/**
+* notify other replication peer that the message type was unexpected and
+* throw a standardexception
+*
+* @param dbname the name of the replicated database
+* @param expextedmsgid the expected message type
+* @param receivedmsgid the received message type
+*
+* @throws standardexception exception describing that an unexpected
+* message was received is always thrown
+* @throws java.io.ioexception thrown if an exception occurs while sending
+* the error message
+*/
+private void handleunexpectedmessage string dbname
+string expextedmsgid
+string receivedmsgid
+throws standardexception  ioexception
+string exception   new string
+exception   dbname
+exception   expextedmsgid
+exception   receivedmsgid
+exception   sqlstate replication_unexpected_messageid
+replicationmessage ack
+new replicationmessage replicationmessage type_error  exception
+sendmessage ack
+throw standardexception
+newexception sqlstate replication_unexpected_messageid  exception
+/**
+* used to send a replication message to the master.
+*
+* @param message a <code>replicationmessage</code> object that contains
+*                the message to be transmitted.
+*
+* @throws ioexception 1) if an exception occurs while transmitting
+*                        the message,
+*                     2) if the connection handle is invalid.
+*/
+public void sendmessage replicationmessage message  throws ioexception
+checksocketconnection
+socketconn writemessage message
+/**
+* used to read a replication message sent by the master. this method
+* would wait on the connection from the master until a message is received
+* or a connection failure occurs. replication network layer specific
+* messages (i.e. ping/pong messages) are handled internally and are not
+* returned.
+*
+* @return a <code>replicationmessage</code> object that contains
+*         the reply that is sent.
+*
+* @throws classnotfoundexception class of a serialized object cannot
+*                                be found.
+*
+* @throws ioexception 1) if an exception occurs while reading from the
+*                        stream,
+*                     2) if the connection handle is invalid.
+*/
+public replicationmessage readmessage   throws
+classnotfoundexception  ioexception
+checksocketconnection
+replicationmessage msg    replicationmessage socketconn readmessage
+if  msg gettype      replicationmessage type_pong
+// if a pong is received, connection is confirmed to be working.
+synchronized  receivepongsemaphore
+connectionconfirmed   true
+receivepongsemaphore notify
+// pong messages are network layer specific. do not return these
+return readmessage
+else
+return msg
+/**
+* verifies if the <code>socketconnection</code> is valid.
+*
+* @throws ioexception if the socket connection object is not
+*                     valid (is null).
+*/
+private void checksocketconnection   throws ioexception
+if  socketconn    null
+throw new ioexception
+messageid replication_invalid_connection_handle
+/**
+* check if the repliation network is working. tries to send a ping
+* message to the master and returns the network status based on the
+* success or failure of sending this message and receiving a pong reply.
+* mt: currently, only one thread is allowed to check the network status at
+* any time to keep the code complexity down.
+* @return true if the pong message was received before timing out after
+* default_ping_timeout millis, false otherwise
+* @see #default_ping_timeout
+*/
+public synchronized boolean isconnectedtomaster
+// synchronize on receivepongsemaphore so that this thread is
+// guaraneed to get to receivepongsemaphore.wait before the pong
+// message is processed in readmessage
+synchronized  receivepongsemaphore
+connectionconfirmed   false
+synchronized  sendpingsemaphore
+// make ping thread send a ping message to the master
+sendpingsemaphore notify
+try
+// wait for the pong response message
+receivepongsemaphore wait default_ping_timeout
+catch  interruptedexception ex
+return connectionconfirmed
+/////////////////
+// inner class //
+/////////////////
+/**
+* thread that sends ping messages to the master on request to check if the
+* replication network is working
+*/
+private class slavepingthread extends thread
+private final replicationmessage pingmsg
+new replicationmessage replicationmessage type_ping  null
+slavepingthread string dbname
+super     dbname
+public void run
+try
+while   killpingthread
+synchronized  sendpingsemaphore
+sendpingsemaphore wait
+if  killpingthread
+// the thread was notified to terminate
+break
+sendmessage pingmsg
+catch  interruptedexception ie
+catch  ioexception ioe
+// for both exceptions: do nothing. isconnectedtomaster will return
+// 'false' and appropriate action will be taken.

@@ -1,0 +1,210 @@
+/**
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase master handler
+import java io ioexception
+import java io interruptedioexception
+import java util list
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase exceptions notallmetaregionsonlineexception
+import org apache hadoop hbase server
+import org apache hadoop hbase exceptions tableexistsexception
+import org apache hadoop hbase catalog catalogtracker
+import org apache hadoop hbase catalog metaeditor
+import org apache hadoop hbase catalog metareader
+import org apache hadoop hbase executor eventhandler
+import org apache hadoop hbase executor eventtype
+import org apache hadoop hbase master assignmentmanager
+import org apache hadoop hbase master hmaster
+import org apache hadoop hbase master mastercoprocessorhost
+import org apache hadoop hbase master masterfilesystem
+import org apache hadoop hbase master masterservices
+import org apache hadoop hbase master tablelockmanager
+import org apache hadoop hbase master tablelockmanager tablelock
+import org apache hadoop hbase util fstabledescriptors
+import org apache hadoop hbase util modifyregionutils
+import org apache zookeeper keeperexception
+/**
+* handler to create a table.
+*/
+@interfaceaudience private
+public class createtablehandler extends eventhandler
+private static final log log   logfactory getlog createtablehandler class
+protected final masterfilesystem filesystemmanager
+protected final htabledescriptor htabledescriptor
+protected final configuration conf
+private final assignmentmanager assignmentmanager
+private final catalogtracker catalogtracker
+private final tablelockmanager tablelockmanager
+private final hregioninfo  newregions
+private final tablelock tablelock
+public createtablehandler server server  masterfilesystem filesystemmanager
+htabledescriptor htabledescriptor  configuration conf  hregioninfo  newregions
+masterservices masterservices
+super server  eventtype c_m_create_table
+this filesystemmanager   filesystemmanager
+this htabledescriptor   htabledescriptor
+this conf   conf
+this newregions   newregions
+this catalogtracker   masterservices getcatalogtracker
+this assignmentmanager   masterservices getassignmentmanager
+this tablelockmanager   masterservices gettablelockmanager
+this tablelock   this tablelockmanager writelock this htabledescriptor getname
+eventtype c_m_create_table tostring
+public createtablehandler prepare
+throws notallmetaregionsonlineexception  tableexistsexception  ioexception
+int timeout   conf getint    10000
+// need meta availability to create a table
+try
+if catalogtracker waitformeta timeout     null
+throw new notallmetaregionsonlineexception
+catch  interruptedexception e
+log warn    e
+interruptedioexception ie   new interruptedioexception e getmessage
+ie initcause e
+throw ie
+//acquire the table write lock, blocking. make sure that it is released.
+this tablelock acquire
+boolean success   false
+try
+string tablename   this htabledescriptor getnameasstring
+if  metareader tableexists catalogtracker  tablename
+throw new tableexistsexception tablename
+// if we have multiple client threads trying to create the table at the
+// same time, given the async nature of the operation, the table
+// could be in a state where .meta. table hasn't been updated yet in
+// the process() function.
+// use enabling state to tell if there is already a request for the same
+// table in progress. this will introduce a new zookeeper call. given
+// createtable isn't a frequent operation, that should be ok.
+//todo: now that we have table locks, re-evaluate above
+try
+if   this assignmentmanager getzktable   checkandsetenablingtable tablename
+throw new tableexistsexception tablename
+catch  keeperexception e
+throw new ioexception
+e
+success   true
+finally
+if   success
+releasetablelock
+return this
+@override
+public string tostring
+string name
+if server    null    server getservername      null
+name   server getservername   tostring
+return getclass   getsimplename         name       getseqid
+this htabledescriptor getnameasstring
+@override
+public void process
+string tablename   this htabledescriptor getnameasstring
+log info     tablename
+try
+mastercoprocessorhost cphost     hmaster  this server  getcoprocessorhost
+if  cphost    null
+cphost precreatetablehandler this htabledescriptor  this newregions
+handlecreatetable tablename
+completed null
+if  cphost    null
+cphost postcreatetablehandler this htabledescriptor  this newregions
+catch  throwable e
+log error     tablename  e
+completed e
+/**
+* called after that process() is completed.
+* @param exception null if process() is successful or not null if something has failed.
+*/
+protected void completed final throwable exception
+releasetablelock
+if  exception    null
+// try deleting the enabling node in case of error
+// if this does not happen then if the client tries to create the table
+// again with the same active master
+// it will block the creation saying tablealreadyexists.
+this assignmentmanager getzktable   removeenablingtable
+this htabledescriptor getnameasstring
+/**
+* responsible of table creation (on-disk and meta) and assignment.
+* - create the table directory and descriptor (temp folder)
+* - create the on-disk regions (temp folder)
+*   [if something fails here: we've just some trash in temp]
+* - move the table from temp to the root directory
+*   [if something fails here: we've the table in place but some of the rows required
+*    present in meta. (hbck needed)]
+* - add regions to meta
+*   [if something fails here: we don't have regions assigned: table disabled]
+* - assign regions to region servers
+*   [if something fails here: we still have the table in disabled state]
+* - update zookeeper with the enabled state
+*/
+private void handlecreatetable string tablename  throws ioexception  keeperexception
+path tempdir   filesystemmanager gettempdir
+filesystem fs   filesystemmanager getfilesystem
+// 1. create table descriptor
+fstabledescriptors createtabledescriptor fs  tempdir  this htabledescriptor
+path temptabledir   new path tempdir  tablename
+path tabledir   new path filesystemmanager getrootdir    tablename
+// 2. create regions
+list<hregioninfo> regioninfos   handlecreatehdfsregions tempdir  tablename
+// 3. move table temp directory to the hbase root location
+if   fs rename temptabledir  tabledir
+throw new ioexception     temptabledir
+tabledir
+if  regioninfos    null    regioninfos size   > 0
+// 4. add regions to meta
+metaeditor addregionstometa this catalogtracker  regioninfos
+// 5. trigger immediate assignment of the regions in round-robin fashion
+try
+assignmentmanager getregionstates   createregionstates regioninfos
+assignmentmanager assign regioninfos
+catch  interruptedexception e
+log error     e
+interruptedioexception ie   new interruptedioexception e getmessage
+ie initcause e
+throw ie
+// 6. set table enabled flag up in zk.
+try
+assignmentmanager getzktable   setenabledtable tablename
+catch  keeperexception e
+throw new ioexception     tablename
+e
+private void releasetablelock
+if  this tablelock    null
+try
+this tablelock release
+catch  ioexception ex
+log warn    ex
+/**
+* create the on-disk structure for the table, and returns the regions info.
+* @param tablerootdir directory where the table is being created
+* @param tablename name of the table under construction
+* @return the list of regions created
+*/
+protected list<hregioninfo> handlecreatehdfsregions final path tablerootdir
+final string tablename
+throws ioexception
+return modifyregionutils createregions conf  tablerootdir
+htabledescriptor  newregions  null

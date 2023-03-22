@@ -1,0 +1,944 @@
+/*
+* copyright 2003-2007 the original author or authors.
+*
+* licensed under the apache license, version 2.0 (the "license");
+* you may not use this file except in compliance with the license.
+* you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org codehaus groovy ast
+import org codehaus groovy groovybugerror
+import org codehaus groovy ast expr classexpression
+import org codehaus groovy ast expr expression
+import org codehaus groovy ast expr tupleexpression
+import org codehaus groovy ast stmt statement
+import org codehaus groovy ast stmt blockstatement
+import org codehaus groovy control compilephase
+import org codehaus groovy transform asttransformation
+import org codehaus groovy transform groovyasttransformation
+import org codehaus groovy vmplugin vmpluginfactory
+import org objectweb asm opcodes
+import java lang reflect array
+import java util
+import groovy lang groovyobject
+/**
+* represents a class in the ast.<br/>
+* a classnode should be created using the methods in classhelper.
+* this classnode may be used to represent a class declaration or
+* any other type. this class uses a proxy mechanism allowing to
+* create a class for a plain name at ast creation time. in another
+* phase of the compiler the real classnode for the plain name may be
+* found. to avoid the need of exchanging this classnode with an
+* instance of the correct classnode the correct classnode is set as
+* redirect. most method calls are then redirected to that classnode.
+* <br>
+* there are three types of classnodes:
+* <br>
+* <ol>
+* <li> primary classnodes:<br>
+* a primary classnode is one where we have a source representation
+* which is to be compiled by groovy and which we have an ast for.
+* the groovy compiler will output one class for each such classnode
+* that passes through asmbytecodegenerator... not more, not less.
+* that means for example closures become such classnodes too at
+* some point.
+*
+* <li> classnodes create through different sources (typically created
+* from a java.lang.reflect.class object):<br>
+* the compiler will not output classes from these, the methods
+* usually do not contain bodies. these kind of classnodes will be
+* used in different checks, but not checks that work on the method
+* bodies. for example if such a classnode is a super class to a primary
+* classnode, then the abstract method test and others will be done
+* with data based on these. theoretically it is also possible to mix both
+* (1 and 2) kind of classes in a hierarchy, but this probably works only
+*  in the newest groovy versions. such classnodes normally have to
+*  isresolved() returning true without having a redirect.in the groovy
+*  compiler the only version of this, that exists, is a classnode created
+*  through a class instance
+*
+* <li> labels:<br>
+* classnodes created through classhelper.makewithoutcaching. they
+* are place holders, its redirect points to the real structure, which can
+* be a label too, but following all redirects it should end with a classnode
+* from one of the other two categories. if resolvevisitor finds such a
+* node, it tries to set the redirects. any such label created after
+* resolvevisitor has done its work needs to have a redirect pointing to
+* case 1 or 2. if not the compiler may react strange... this can be considered
+* as a kind of dangling pointer.
+* <br>
+* <b>note:</b> the redirect mechanism is only allowed for classes
+* that are not primary classnodes. typically this is done for classes
+* created by name only.  the redirect itself can be any type of classnode.
+* <br>
+* to describe generic type signature see {@link #getgenericstypes()} and
+* {@link #setgenericstypes(genericstype[])}. these methods are not proxied,
+* they describe the type signature used at the point of declaration or the
+* type signatures provided by the class. if the type signatures provided
+* by the class are needed, then a call to {@link #redirect()} will help.
+*
+* @see org.codehaus.groovy.ast.classhelper
+*
+* @author <a href="mailto:james@coredevelopers.net">james strachan</a>
+* @author jochen theodorou
+* @version $revision$
+*/
+public class classnode extends annotatednode implements opcodes
+private static class mapoflists
+private map map   new hashmap
+public list get object key
+return  list  map get key
+public list getnotnull object key
+list ret   get key
+if  ret  null  ret   collections empty_list
+return ret
+public void put object key  object value
+if  map containskey key
+get key  add value
+else
+arraylist list   new arraylist 2
+list add value
+map put key  list
+public static classnode empty_array   new classnode
+public static classnode this   new classnode object class
+public static classnode super   new classnode object class
+private string name
+private final int modifiers
+private classnode interfaces
+private mixinnode mixins
+private list constructors   new arraylist
+private list  objectinitializers   new arraylist
+private mapoflists methods
+private list<methodnode> methodslist
+private linkedlist<fieldnode> fields   new linkedlist<fieldnode>
+private list properties   new arraylist
+private map fieldindex   new hashmap
+private modulenode module
+private compileunit compileunit
+private boolean staticclass   false
+private boolean scriptbody   false
+private boolean script
+private classnode superclass
+protected boolean isprimarynode
+/**
+* the asttransformations to be applied to the class
+*/
+private map<compilephase  map<class<? extends asttransformation>  set<astnode>>> transforminstances
+// use this to synchronize access for the lazy init
+protected object lazyinitlock   new object
+// clazz!=null when resolved
+protected class clazz
+// only false when this classnode is constructed from a class
+private boolean lazyinitdone true
+// not null if if the classnode is an array
+private classnode componenttype   null
+// if not null this instance is handled as proxy
+// for the redirect
+private classnode redirect null
+// flag if the classes or its members are annotated
+private boolean annotated
+// type spec for generics
+private genericstype genericstypes null
+private boolean usesgenerics false
+// if set to true the name getgenericstypes consists
+// of 1 element describing the name of the placeholder
+private boolean placeholder
+/**
+* returns the classnode this classnode is redirecting to.
+*/
+public classnode redirect
+if  redirect  null  return this
+return redirect redirect
+/**
+* sets this instance as proxy for the given classnode.
+* @param cn the class to redirect to. if set to null the redirect will be removed
+*/
+public void setredirect classnode cn
+if  isprimarynode  throw new groovybugerror   getname     cn getname
+if  cn  null  cn   cn redirect
+if  cn  this  return
+redirect   cn
+/**
+* returns a classnode representing an array of the class
+* represented by this classnode
+*/
+public classnode makearray
+if  redirect  null  return redirect   makearray
+classnode cn
+if  clazz  null
+class ret   array newinstance clazz 0  getclass
+// don't use the classhelper here!
+cn   new classnode ret this
+else
+cn   new classnode this
+return cn
+/**
+* returns if this instance is a primary classnode
+*/
+public boolean isprimaryclassnode
+return redirect   isprimarynode     componenttype   null    componenttype isprimaryclassnode
+/**
+* constructor used by makearray() if no real class is available
+*/
+private classnode classnode componenttype
+this componenttype getname      acc_public  classhelper object_type
+this componenttype   componenttype redirect
+isprimarynode false
+/**
+* constructor used by makearray() if a real class is available
+*/
+private classnode class c  classnode componenttype
+this c
+this componenttype   componenttype
+isprimarynode false
+/**
+* creates a classnode from a real class. the resulting
+* classnode will not be a primary classnode.
+*/
+public classnode class c
+this c getname    c getmodifiers    null  null  mixinnode empty_array
+clazz c
+lazyinitdone false
+compileunit cu   getcompileunit
+if  cu  null  cu addclass this
+isprimarynode false
+/**
+* the complete class structure will be initialized only when really
+* needed to avoid having too many objects during compilation
+*/
+private void lazyclassinit
+synchronized  lazyinitlock
+if  lazyinitdone  return
+vmpluginfactory getplugin   configureclassnode compileunit this
+lazyinitdone   true
+// added to track the enclosing method for local inner classes
+private methodnode enclosingmethod   null
+public methodnode getenclosingmethod
+return redirect   enclosingmethod
+public void setenclosingmethod methodnode enclosingmethod
+redirect   enclosingmethod   enclosingmethod
+/**
+* @param name       is the full name of the class
+* @param modifiers  the modifiers,
+* @param superclass the base class name - use "java.lang.object" if no direct
+*                   base class
+* @see org.objectweb.asm.opcodes
+*/
+public classnode string name  int modifiers  classnode superclass
+this name  modifiers  superclass  empty_array  mixinnode empty_array
+/**
+* @param name       is the full name of the class
+* @param modifiers  the modifiers,
+* @param superclass the base class name - use "java.lang.object" if no direct
+*                   base class
+* @see org.objectweb.asm.opcodes
+*/
+public classnode string name  int modifiers  classnode superclass  classnode interfaces  mixinnode mixins
+this name   name
+this modifiers   modifiers
+this superclass   superclass
+this interfaces   interfaces
+this mixins   mixins
+isprimarynode   true
+if  superclass  null
+usesgenerics   superclass isusinggenerics
+if   usesgenerics    interfaces  null
+for  int i   0  i < interfaces length  i
+usesgenerics   usesgenerics    interfaces isusinggenerics
+this methods   new mapoflists
+this methodslist   new arraylist
+if   modifiers   acc_interface     0
+addfield    acc_static acc_public acc_final acc_synthetic  classhelper class_type  new classexpression this   setsynthetic true
+transforminstances   new enummap<compilephase  map<class <? extends asttransformation>  set<astnode>>> compilephase class
+for  compilephase phase   compilephase values
+transforminstances put phase  new hashmap<class <? extends asttransformation>  set<astnode>>
+/**
+* sets the superclass of this classnode
+*/
+public void setsuperclass classnode superclass
+redirect   superclass   superclass
+/**
+* returns a list containing fieldnode objects for
+* each field in the class represented by this classnode
+*/
+public list<fieldnode> getfields
+if   lazyinitdone
+lazyclassinit
+if  redirect  null  return redirect   getfields
+return fields
+/**
+* returns an array of classnodes representing the
+* interfaces the class implements
+*/
+public classnode getinterfaces
+if   lazyinitdone
+lazyclassinit
+if  redirect  null  return redirect   getinterfaces
+return interfaces
+public void setinterfaces classnode interfaces
+if  redirect  null
+redirect   setinterfaces interfaces
+else
+this interfaces   interfaces
+public mixinnode getmixins
+return redirect   mixins
+/**
+* returns a list containing methodnode objects for
+* each method in the class represented by this classnode
+*/
+public list<methodnode> getmethods
+if   lazyinitdone  lazyclassinit
+if  redirect  null  return redirect   getmethods
+return methodslist
+/**
+* returns a list containing methodnode objects for
+* each abstract method in the class represented by
+* this classnode
+*/
+public list getabstractmethods
+hashset abstractnodes   new hashset
+// let us collect the abstract super classes and stop at the
+// first non abstract super class. if such a class still
+// contains abstract methods, then loading that class will fail.
+// no need to be extra careful here for that.
+classnode parent   this redirect
+do
+abstractnodes add parent
+classnode interfaces   parent getinterfaces
+list interfacelist   new arraylist arrays aslist interfaces
+while   interfacelist isempty
+final classnode interfacenode    classnode  interfacelist get 0
+interfacelist remove 0
+abstractnodes add interfacenode redirect
+interfacelist addall arrays aslist interfacenode getinterfaces
+parent   parent getsuperclass   redirect
+while  parent  null      parent getmodifiers     opcodes acc_abstract     0
+list result   new arraylist
+for  object o   getalldeclaredmethods
+methodnode method    methodnode  o
+// add only abstract methods from abtract classes that
+// are not overwritten
+if   abstractnodes contains method getdeclaringclass   redirect
+method getmodifiers     opcodes acc_abstract     0
+result add method
+if  result isempty
+return null
+else
+return result
+public list getalldeclaredmethods
+return new arraylist getdeclaredmethodsmap   values
+public set getallinterfaces
+set res   new hashset
+getallinterfaces res
+return res
+private void getallinterfaces set res
+if  isinterface
+res add this
+classnode interfaces   getinterfaces
+for  int i   0  i < interfaces length  i
+res add interfaces
+interfaces getallinterfaces res
+public map getdeclaredmethodsmap
+// start off with the methods from the superclass.
+classnode parent   getsuperclass
+map result   null
+if  parent    null
+result   parent getdeclaredmethodsmap
+else
+result   new hashmap
+// add in unimplemented abstract methods from the interfaces
+classnode interfaces   getinterfaces
+for  int i   0  i < interfaces length  i
+classnode iface   interfaces
+map ifacemethodsmap   iface getdeclaredmethodsmap
+for  object o   ifacemethodsmap keyset
+string methsig    string  o
+if   result containskey methsig
+methodnode methnode    methodnode  ifacemethodsmap get methsig
+result put methsig  methnode
+// and add in the methods implemented in this class.
+for  object o   getmethods
+methodnode method    methodnode  o
+string sig   method gettypedescriptor
+result put sig  method
+return result
+public string getname
+return redirect   name
+public string setname string name
+return redirect   name name
+public int getmodifiers
+return redirect   modifiers
+public list getproperties
+return redirect   properties
+public list getdeclaredconstructors
+if   lazyinitdone
+lazyclassinit
+return redirect   constructors
+public modulenode getmodule
+return redirect   module
+public void setmodule modulenode module
+redirect   module   module
+if  module    null
+redirect   compileunit   module getunit
+public void addfield fieldnode node
+node setdeclaringclass redirect
+node setowner redirect
+redirect   fields add node
+redirect   fieldindex put node getname    node
+public void addproperty propertynode node
+node setdeclaringclass redirect
+fieldnode field   node getfield
+addfield field
+redirect   properties add node
+public propertynode addproperty string name
+int modifiers
+classnode type
+expression initialvalueexpression
+statement getterblock
+statement setterblock
+for  object o   getproperties
+propertynode pn    propertynode  o
+if  pn getname   equals name
+if  pn getinitialexpression      null    initialvalueexpression    null
+pn getfield   setinitialvalueexpression initialvalueexpression
+if  pn getgetterblock      null    getterblock    null
+pn setgetterblock getterblock
+if  pn getsetterblock      null    setterblock    null
+pn setsetterblock setterblock
+return pn
+propertynode node
+new propertynode name  modifiers  type  redirect    initialvalueexpression  getterblock  setterblock
+addproperty node
+return node
+public boolean hasproperty string name
+return getproperty name   null
+public propertynode getproperty string name
+for  object o   getproperties
+propertynode pn    propertynode  o
+if  pn getname   equals name   return pn
+return null
+public void addconstructor constructornode node
+node setdeclaringclass this
+redirect   constructors add node
+public constructornode addconstructor int modifiers  parameter parameters  classnode exceptions  statement code
+constructornode node   new constructornode modifiers  parameters  exceptions  code
+addconstructor node
+return node
+public void addmethod methodnode node
+node setdeclaringclass this
+redirect   methodslist add node
+redirect   methods put node getname    node
+/**
+* if a method with the given name and parameters is already defined then it is returned
+* otherwise the given method is added to this node. this method is useful for
+* default method adding like getproperty() or invokemethod() where there may already
+* be a method defined in a class and so the default implementations should not be added
+* if already present.
+*/
+public methodnode addmethod string name
+int modifiers
+classnode returntype
+parameter parameters
+classnode exceptions
+statement code
+methodnode other   getdeclaredmethod name  parameters
+// let's not add duplicate methods
+if  other    null
+return other
+methodnode node   new methodnode name  modifiers  returntype  parameters  exceptions  code
+addmethod node
+return node
+/**
+* @see #getdeclaredmethod(string, parameter[])
+*/
+public boolean hasdeclaredmethod string name  parameter parameters
+methodnode other   getdeclaredmethod name  parameters
+return other    null
+/**
+* @see #getmethod(string, parameter[])
+*/
+public boolean hasmethod string name  parameter parameters
+methodnode other   getmethod name  parameters
+return other    null
+/**
+* adds a synthetic method as part of the compilation process
+*/
+public methodnode addsyntheticmethod string name
+int modifiers
+classnode returntype
+parameter parameters
+classnode exceptions
+statement code
+methodnode answer   addmethod name  modifiers acc_synthetic  returntype  parameters  exceptions  code
+answer setsynthetic true
+return answer
+public fieldnode addfield string name  int modifiers  classnode type  expression initialvalue
+fieldnode node   new fieldnode name  modifiers  type  redirect    initialvalue
+addfield node
+return node
+public void addinterface classnode type
+// lets check if it already implements an interface
+boolean skip   false
+classnode interfaces   redirect   interfaces
+for  int i   0  i < interfaces length  i
+if  type equals interfaces
+skip   true
+if   skip
+classnode newinterfaces   new classnode
+system arraycopy interfaces  0  newinterfaces  0  interfaces length
+newinterfaces   type
+redirect   interfaces   newinterfaces
+public boolean equals object o
+if  redirect  null  return redirect   equals o
+classnode cn    classnode  o
+return  cn getname   equals getname
+public void addmixin mixinnode mixin
+// lets check if it already uses a mixin
+mixinnode mixins   redirect   mixins
+boolean skip   false
+for  int i   0  i < mixins length  i
+if  mixin equals mixins
+skip   true
+if   skip
+mixinnode newmixins   new mixinnode
+system arraycopy mixins  0  newmixins  0  mixins length
+newmixins   mixin
+redirect   mixins   newmixins
+/**
+* finds a field matching the given name in this class.
+*
+* @param name the name of the field of interest
+* @return the method matching the given name and parameters or null
+*/
+public fieldnode getdeclaredfield string name
+return  fieldnode  redirect   fieldindex get name
+/**
+* finds a field matching the given name in this class or a parent class.
+*
+* @param name the name of the field of interest
+* @return the method matching the given name and parameters or null
+*/
+public fieldnode getfield string name
+classnode node   this
+while  node    null
+fieldnode fn   node getdeclaredfield name
+if  fn    null  return fn
+node   node getsuperclass
+return null
+/**
+* @return the field node on the outer class or null if this is not an
+*         inner class
+*/
+public fieldnode getouterfield string name
+return null
+/**
+* helper method to avoid casting to inner class
+*/
+public classnode getouterclass
+return null
+public void addobjectinitializerstatements statement statements
+objectinitializers add statements
+public list getobjectinitializerstatements
+return objectinitializers
+public void addstaticinitializerstatements list staticstatements  boolean fieldinit
+methodnode method   null
+list declaredmethods   getdeclaredmethods
+if  declaredmethods isempty
+method
+addmethod    acc_static  classhelper void_type  parameter empty_array  classnode empty_array  new blockstatement
+method setsynthetic true
+else
+method    methodnode  declaredmethods get 0
+blockstatement block   null
+statement statement   method getcode
+if  statement    null
+block   new blockstatement
+else if  statement instanceof blockstatement
+block    blockstatement  statement
+else
+block   new blockstatement
+block addstatement statement
+// while anything inside a static initializer block is appended
+// we don't want to append in the case we have a initialization
+// expression of a static field. in that case we want to add
+// before the other statements
+if   fieldinit
+block addstatements staticstatements
+else
+list blockstatements   block getstatements
+staticstatements addall blockstatements
+blockstatements clear
+blockstatements addall staticstatements
+/**
+* this methods returns a list of all methods of the given name
+* defined in the current class
+* @return the method list
+* @see #getmethods(string)
+*/
+public list getdeclaredmethods string name
+if   lazyinitdone  lazyclassinit
+if  redirect  null  return redirect   getdeclaredmethods name
+return methods getnotnull name
+/**
+* this methods creates a list of all methods with this name of the
+* current class and of all super classes
+* @return the methods list
+* @see #getdeclaredmethods(string)
+*/
+public list getmethods string name
+list answer   new arraylist
+classnode node   this
+while  node    null
+answer addall node getdeclaredmethods name
+node   node getsuperclass
+return answer
+/**
+* finds a method matching the given name and parameters in this class.
+*
+* @return the method matching the given name and parameters or null
+*/
+public methodnode getdeclaredmethod string name  parameter parameters
+for  object o    getdeclaredmethods name
+methodnode method    methodnode  o
+if  parametersequal method getparameters    parameters
+return method
+return null
+/**
+* finds a method matching the given name and parameters in this class
+* or any parent class.
+*
+* @return the method matching the given name and parameters or null
+*/
+public methodnode getmethod string name  parameter parameters
+for  object o   getmethods name
+methodnode method    methodnode  o
+if  parametersequal method getparameters    parameters
+return method
+return null
+/**
+* @param type the classnode of interest
+* @return true if this node is derived from the given classnode
+*/
+public boolean isderivedfrom classnode type
+if  type equals classhelper object_type   return true
+classnode node   this
+while  node    null
+if  type equals node
+return true
+node   node getsuperclass
+return false
+/**
+* @return true if this class is derived from a groovy object
+*         i.e. it implements groovyobject
+*/
+public boolean isderivedfromgroovyobject
+return implementsinterface classhelper make groovyobject class
+/**
+* @param classnode the class node for the interface
+* @return true if this class or any base class implements the given interface
+*/
+public boolean implementsinterface classnode classnode
+classnode node   redirect
+do
+if  node declaresinterface classnode
+return true
+node   node getsuperclass
+while  node    null
+return false
+/**
+* @param classnode the class node for the interface
+* @return true if this class declares that it implements the given interface
+* or if one of its interfaces extends directly or indirectly the interface
+*/
+public boolean declaresinterface classnode classnode
+classnode interfaces   redirect   getinterfaces
+if  declaresinterfacedirect interfaces  classnode   return true
+list superinterfaces   arrays aslist interfaces
+while  superinterfaces size   > 0
+list keep   new arraylist
+for  int i   0  i < superinterfaces size    i
+classnode cn    classnode  superinterfaces get i
+if  cn declaresinterface classnode   return true
+keep addall arrays aslist cn getinterfaces
+superinterfaces   keep
+return false
+private boolean declaresinterfacedirect classnode interfaces  classnode classnode
+int size   interfaces length
+for  int i   0  i < size  i
+if  interfaces equals classnode
+return true
+return false
+/**
+* @return the classnode of the super class of this type
+*/
+public classnode getsuperclass
+if   lazyinitdone     isresolved
+throw new groovybugerror   getname
+classnode sn   redirect   getunresolvedsuperclass
+if  sn  null  sn sn redirect
+return sn
+public classnode getunresolvedsuperclass
+return getunresolvedsuperclass true
+public classnode getunresolvedsuperclass boolean useredirect
+if   useredirect  return superclass
+if   lazyinitdone
+lazyclassinit
+return redirect   superclass
+public void setunresolvedsuperclass classnode sn
+superclass   sn
+public compileunit getcompileunit
+if  redirect  null  return redirect   getcompileunit
+if  compileunit    null    module    null
+compileunit   module getunit
+return compileunit
+protected void setcompileunit compileunit cu
+if  redirect  null  redirect   setcompileunit cu
+if  compileunit   null  compileunit   cu
+/**
+* @return true if the two arrays are of the same size and have the same contents
+*/
+protected boolean parametersequal parameter a  parameter b
+if  a length    b length
+boolean answer   true
+for  int i   0  i < a length  i
+if   a gettype   equals b gettype
+answer   false
+break
+return answer
+return false
+/**
+* @return the package name of this class
+*/
+public string getpackagename
+int idx   getname   lastindexof
+if  idx > 0
+return getname   substring 0  idx
+return null
+public string getnamewithoutpackage
+int idx   getname   lastindexof
+if  idx > 0
+return getname   substring idx   1
+return getname
+public void visitcontents groovyclassvisitor visitor
+// now let's visit the contents of the class
+for  object o   getproperties
+propertynode pn    propertynode  o
+visitor visitproperty pn
+for  object o   getfields
+fieldnode fn    fieldnode  o
+visitor visitfield fn
+for  object o   getdeclaredconstructors
+constructornode cn    constructornode  o
+visitor visitconstructor cn
+for  object o   getmethods
+methodnode mn    methodnode  o
+visitor visitmethod mn
+public methodnode getgettermethod string gettername
+for  object o   getdeclaredmethods gettername
+methodnode method    methodnode  o
+if  gettername equals method getname
+classhelper void_type  method getreturntype
+method getparameters   length    0
+return method
+classnode parent   getsuperclass
+if  parent  null  return parent getgettermethod gettername
+return null
+public methodnode getsettermethod string settername
+for  object o   getdeclaredmethods settername
+methodnode method    methodnode  o
+if  settername equals method getname
+classhelper void_type  method getreturntype
+method getparameters   length    1
+return method
+classnode parent   getsuperclass
+if  parent  null  return parent getsettermethod settername
+return null
+/**
+* is this class delcared in a static method (such as a closure / inner class declared in a static method)
+*/
+public boolean isstaticclass
+return redirect   staticclass
+public void setstaticclass boolean staticclass
+redirect   staticclass   staticclass
+/**
+* @return returns true if this inner class or closure was declared inside a script body
+*/
+public boolean isscriptbody
+return redirect   scriptbody
+public void setscriptbody boolean scriptbody
+redirect   scriptbody   scriptbody
+public boolean isscript
+return redirect   script    isderivedfrom classhelper script_type
+public void setscript boolean script
+redirect   script   script
+public string tostring
+string ret   getname
+if  genericstypes    null
+ret
+for  int i   0  i < genericstypes length  i
+if  i    0  ret
+ret    genericstypes
+ret
+if  redirect    null
+ret        redirect   tostring
+return ret
+/**
+* returns true if the given method has a possibly matching instance method with the given name and arguments.
+*
+* @param name      the name of the method of interest
+* @param arguments the arguments to match against
+* @return true if a matching method was found
+*/
+public boolean haspossiblemethod string name  expression arguments
+int count   0
+if  arguments instanceof tupleexpression
+tupleexpression tuple    tupleexpression  arguments
+// todo this won't strictly be true when using list expansion in argument calls
+count   tuple getexpressions   size
+classnode node   this
+do
+for  object o   getmethods name
+methodnode method    methodnode  o
+if  method getparameters   length    count
+return true
+node   node getsuperclass
+while  node    null
+return false
+public methodnode tryfindpossiblemethod string name  expression arguments
+int count   0
+if  arguments instanceof tupleexpression
+tupleexpression tuple    tupleexpression  arguments
+// todo this won't strictly be true when using list expansion in argument calls
+count   tuple getexpressions   size
+else
+return null
+methodnode res   null
+classnode node   this
+tupleexpression args    tupleexpression  arguments
+do
+for  object o   node getmethods name
+methodnode method    methodnode  o
+if  method getparameters   length    count
+boolean match   true
+for  int i   0  i    count    i
+if   args gettype   isderivedfrom method getparameters   gettype
+match   false
+break
+if  match
+if  res    null
+res   method
+else
+if  res getparameters   length    count
+return null
+if  node equals this
+return null
+match   true
+for  int i   0  i    count    i
+if   res getparameters   gettype   equals method getparameters   gettype
+match   false
+break
+if   match
+return null
+node   node getsuperclass
+while  node    null
+return res
+/**
+* returns true if the given method has a possibly matching static method with the given name and arguments.
+*
+* @param name      the name of the method of interest
+* @param arguments the arguments to match against
+* @return true if a matching method was found
+*/
+public boolean haspossiblestaticmethod string name  expression arguments
+int count   0
+if  arguments instanceof tupleexpression
+tupleexpression tuple    tupleexpression  arguments
+// todo this won't strictly be true when using list expansion in argument calls
+count   tuple getexpressions   size
+for  object o   getmethods name
+methodnode method    methodnode  o
+if  method getparameters   length    count    method isstatic
+return true
+// handle varargs case
+if  method isstatic      method getparameters   length > 0
+method getparameters   gettype   isarray
+if  count >  method getparameters   length   1  return true
+return false
+public boolean isinterface
+return  getmodifiers     opcodes acc_interface  > 0
+public boolean isresolved
+return redirect   clazz  null     componenttype    null    componenttype isresolved
+public boolean isarray
+return componenttype  null
+public classnode getcomponenttype
+return componenttype
+public class gettypeclass
+class c   redirect   clazz
+if  c  null  return c
+classnode component   redirect   componenttype
+if  component  null    component isresolved
+classnode cn   component makearray
+setredirect cn
+return redirect   clazz
+throw new groovybugerror   getname
+public boolean haspackagename
+return redirect   name indexof   >0
+/**
+* marks if the current class uses annotations or not
+* @param flag
+*/
+public void setannotated boolean flag
+this annotated   flag
+public boolean isannotated
+return this annotated
+public genericstype getgenericstypes
+return genericstypes
+public void setgenericstypes genericstype genericstypes
+usesgenerics   usesgenerics    genericstypes  null
+this genericstypes   genericstypes
+public void setgenericsplaceholder boolean b
+usesgenerics   usesgenerics    b
+placeholder   b
+public boolean isgenericsplaceholder
+return placeholder
+public boolean isusinggenerics
+return usesgenerics
+public void setusinggenerics boolean b
+usesgenerics   b
+public classnode getplainnodereference
+if  classhelper isprimitivetype this   return this
+classnode n   new classnode getname   getmodifiers   getsuperclass   null null
+n isprimarynode   false
+n setredirect this redirect
+return n
+public boolean isannotationdefinition
+return redirect   isprimarynode
+isinterface
+getmodifiers     opcodes acc_annotation   0
+public list getannotations
+if  redirect  null  return redirect getannotations
+lazyclassinit
+return super getannotations
+public list getannotations classnode type
+if  redirect  null  return redirect getannotations type
+lazyclassinit
+return super getannotations type
+public void addtransform class<? extends asttransformation> transform  astnode node
+groovyasttransformation annotation   transform getannotation groovyasttransformation class
+set<astnode> nodes   transforminstances get annotation phase    get transform
+if  nodes    null
+nodes   new linkedhashset
+transforminstances get annotation phase    put transform  nodes
+nodes add node
+public map<class <? extends asttransformation>  set<astnode>> gettransforms compilephase phase
+return transforminstances get phase
+public void renamefield string oldname  string newname
+final map index   redirect   fieldindex
+index put newname  index remove oldname

@@ -1,0 +1,1478 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql io orc
+import java io ioexception
+import java io outputstream
+import java nio bytebuffer
+import java sql timestamp
+import java util arraylist
+import java util list
+import java util map
+import java util treemap
+import com google protobuf bytestring
+import com google protobuf codedoutputstream
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs fsdataoutputstream
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive common type hivedecimal
+import org apache hadoop hive ql io orc orcproto rowindexentry
+import org apache hadoop hive ql io orc orcproto type
+import org apache hadoop hive serde2 io datewritable
+import org apache hadoop hive serde2 objectinspector listobjectinspector
+import org apache hadoop hive serde2 objectinspector mapobjectinspector
+import org apache hadoop hive serde2 objectinspector objectinspector
+import org apache hadoop hive serde2 objectinspector primitiveobjectinspector
+import org apache hadoop hive serde2 objectinspector structfield
+import org apache hadoop hive serde2 objectinspector structobjectinspector
+import org apache hadoop hive serde2 objectinspector unionobjectinspector
+import org apache hadoop hive serde2 objectinspector primitive binaryobjectinspector
+import org apache hadoop hive serde2 objectinspector primitive booleanobjectinspector
+import org apache hadoop hive serde2 objectinspector primitive byteobjectinspector
+import org apache hadoop hive serde2 objectinspector primitive dateobjectinspector
+import org apache hadoop hive serde2 objectinspector primitive doubleobjectinspector
+import org apache hadoop hive serde2 objectinspector primitive floatobjectinspector
+import org apache hadoop hive serde2 objectinspector primitive hivedecimalobjectinspector
+import org apache hadoop hive serde2 objectinspector primitive hivevarcharobjectinspector
+import org apache hadoop hive serde2 objectinspector primitive intobjectinspector
+import org apache hadoop hive serde2 objectinspector primitive longobjectinspector
+import org apache hadoop hive serde2 objectinspector primitive shortobjectinspector
+import org apache hadoop hive serde2 objectinspector primitive stringobjectinspector
+import org apache hadoop hive serde2 objectinspector primitive timestampobjectinspector
+import org apache hadoop hive serde2 typeinfo parameterizedprimitivetypeutils
+import org apache hadoop hive serde2 typeinfo varchartypeparams
+import org apache hadoop io byteswritable
+import org apache hadoop io text
+/**
+* an orc file writer. the file is divided into stripes, which is the natural
+* unit of work when reading. each stripe is buffered in memory until the
+* memory reaches the stripe size and then it is written out broken down by
+* columns. each column is written by a treewriter that is specific to that
+* type of column. treewriters may have children treewriters that handle the
+* sub-types. each of the treewriters writes the column's data as a set of
+* streams.
+*
+* this class is synchronized so that multi-threaded access is ok. in
+* particular, because the memorymanager is shared between writers, this class
+* assumes that checkmemory may be called from a separate thread.
+*/
+class writerimpl implements writer  memorymanager callback
+private static final log log   logfactory getlog writerimpl class
+private static final int hdfs_buffer_size   256   1024
+private static final int min_row_index_stride   1000
+// hdfs requires blocks < 2gb and multiples of 512, so pick 1.5gb
+private static final long max_block_size   1536   1024   1024
+private final filesystem fs
+private final path path
+private final long stripesize
+private final int rowindexstride
+private final compressionkind compress
+private final compressioncodec codec
+private final boolean addblockpadding
+private final int buffersize
+private final long blocksize
+// the streams that make up the current stripe
+private final map<streamname  bufferedstream> streams
+new treemap<streamname  bufferedstream>
+private fsdataoutputstream rawwriter   null
+// the compressed metadata information outstream
+private outstream writer   null
+// a protobuf outstream around streamfactory
+private codedoutputstream protobufwriter   null
+private long headerlength
+private int columncount
+private long rowcount   0
+private long rowsinstripe   0
+private int rowsinindex   0
+private final list<orcproto stripeinformation> stripes
+new arraylist<orcproto stripeinformation>
+private final map<string  bytestring> usermetadata
+new treemap<string  bytestring>
+private final streamfactory streamfactory   new streamfactory
+private final treewriter treewriter
+private final orcproto rowindex builder rowindex
+orcproto rowindex newbuilder
+private final boolean buildindex
+private final memorymanager memorymanager
+private final orcfile version version
+private final configuration conf
+writerimpl filesystem fs
+path path
+configuration conf
+objectinspector inspector
+long stripesize
+compressionkind compress
+int buffersize
+int rowindexstride
+memorymanager memorymanager
+boolean addblockpadding
+orcfile version version  throws ioexception
+this fs   fs
+this path   path
+this conf   conf
+this stripesize   stripesize
+this version   version
+this addblockpadding   addblockpadding
+// pick large block size to minimize block over or under hangs
+this blocksize   math min max_block_size  2   stripesize
+this compress   compress
+this buffersize   buffersize
+this rowindexstride   rowindexstride
+this memorymanager   memorymanager
+buildindex   rowindexstride > 0
+codec   createcodec compress
+treewriter   createtreewriter inspector  streamfactory  false
+if  buildindex    rowindexstride < min_row_index_stride
+throw new illegalargumentexception
+min_row_index_stride
+// ensure that we are able to handle callbacks before we register ourselves
+memorymanager addwriter path  stripesize  this
+static compressioncodec createcodec compressionkind kind
+switch  kind
+case none
+return null
+case zlib
+return new zlibcodec
+case snappy
+return new snappycodec
+case lzo
+try
+class<? extends compressioncodec> lzo
+class<? extends compressioncodec>
+class forname
+return lzo newinstance
+catch  classnotfoundexception e
+throw new illegalargumentexception    e
+catch  instantiationexception e
+throw new illegalargumentexception    e
+catch  illegalaccessexception e
+throw new illegalargumentexception    e
+default
+throw new illegalargumentexception
+kind
+@override
+public synchronized boolean checkmemory double newscale  throws ioexception
+long limit    long  math round stripesize   newscale
+long size   estimatestripesize
+if  log isdebugenabled
+log debug     path       size
+limit
+if  size > limit
+flushstripe
+return true
+return false
+/**
+* this class is used to hold the contents of streams as they are buffered.
+* the treewriters write to the outstream and the codec compresses the
+* data as buffers fill up and stores them in the output list. when the
+* stripe is being written, the whole stream is written to the file.
+*/
+private class bufferedstream implements outstream outputreceiver
+private final outstream outstream
+private final list<bytebuffer> output   new arraylist<bytebuffer>
+bufferedstream string name  int buffersize
+compressioncodec codec  throws ioexception
+outstream   new outstream name  buffersize  codec  this
+/**
+* receive a buffer from the compression codec.
+* @param buffer the buffer to save
+* @throws ioexception
+*/
+@override
+public void output bytebuffer buffer
+output add buffer
+/**
+* get the number of bytes in buffers that are allocated to this stream.
+* @return number of bytes in buffers
+*/
+public long getbuffersize
+long result   0
+for bytebuffer buf  output
+result    buf capacity
+return outstream getbuffersize     result
+/**
+* flush the stream to the codec.
+* @throws ioexception
+*/
+public void flush   throws ioexception
+outstream flush
+/**
+* clear all of the buffers.
+* @throws ioexception
+*/
+public void clear   throws ioexception
+outstream clear
+output clear
+/**
+* check the state of suppress flag in output stream
+* @return value of suppress flag
+*/
+public boolean issuppressed
+return outstream issuppressed
+/**
+* get the number of bytes that will be written to the output. assumes
+* the stream has already been flushed.
+* @return the number of bytes
+*/
+public long getoutputsize
+long result   0
+for bytebuffer buffer  output
+result    buffer remaining
+return result
+/**
+* write the saved compressed buffers to the outputstream.
+* @param out the stream to write to
+* @throws ioexception
+*/
+void spillto outputstream out  throws ioexception
+for bytebuffer buffer  output
+out write buffer array    buffer arrayoffset     buffer position
+buffer remaining
+@override
+public string tostring
+return outstream tostring
+/**
+* an output receiver that writes the bytebuffers to the output stream
+* as they are received.
+*/
+private class directstream implements outstream outputreceiver
+private final fsdataoutputstream output
+directstream fsdataoutputstream output
+this output   output
+@override
+public void output bytebuffer buffer  throws ioexception
+output write buffer array    buffer arrayoffset     buffer position
+buffer remaining
+private static class rowindexpositionrecorder implements positionrecorder
+private final orcproto rowindexentry builder builder
+rowindexpositionrecorder orcproto rowindexentry builder builder
+this builder   builder
+@override
+public void addposition long position
+builder addpositions position
+/**
+* interface from the writer to the treewriters. this limits the visibility
+* that the treewriters have into the writer.
+*/
+private class streamfactory
+/**
+* create a stream to store part of a column.
+* @param column the column id for the stream
+* @param kind the kind of stream
+* @return the output outstream that the section needs to be written to.
+* @throws ioexception
+*/
+public outstream createstream int column
+orcproto stream kind kind
+throws ioexception
+streamname name   new streamname column  kind
+bufferedstream result   streams get name
+if  result    null
+result   new bufferedstream name tostring    buffersize  codec
+streams put name  result
+return result outstream
+/**
+* get the next column id.
+* @return a number from 0 to the number of columns - 1
+*/
+public int getnextcolumnid
+return columncount
+/**
+* get the stride rate of the row index.
+*/
+public int getrowindexstride
+return rowindexstride
+/**
+* should be building the row index.
+* @return true if we are building the index
+*/
+public boolean buildindex
+return buildindex
+/**
+* is the orc file compressed?
+* @return are the streams compressed
+*/
+public boolean iscompressed
+return codec    null
+/**
+* get the writer's configuration.
+* @return configuration
+*/
+public configuration getconfiguration
+return conf
+/**
+* get the version of the file to write.
+*/
+public orcfile version getversion
+return version
+/**
+* the parent class of all of the writers for each column. each column
+* is written by an instance of this class. the compound types (struct,
+* list, map, and union) have children tree writers that write the children
+* types.
+*/
+private abstract static class treewriter
+protected final int id
+protected final objectinspector inspector
+private final bitfieldwriter ispresent
+private final boolean iscompressed
+protected final columnstatisticsimpl indexstatistics
+private final columnstatisticsimpl filestatistics
+protected treewriter childrenwriters
+protected final rowindexpositionrecorder rowindexposition
+private final orcproto rowindex builder rowindex
+private final orcproto rowindexentry builder rowindexentry
+private final positionedoutputstream rowindexstream
+private boolean foundnulls
+private outstream ispresentoutstream
+protected final boolean usedirectv2encoding
+/**
+* create a tree writer.
+* @param columnid the column id of the column to write
+* @param inspector the object inspector to use
+* @param streamfactory limited access to the writer's data.
+* @param nullable can the value be null?
+* @throws ioexception
+*/
+treewriter int columnid  objectinspector inspector
+streamfactory streamfactory
+boolean nullable  throws ioexception
+this iscompressed   streamfactory iscompressed
+this id   columnid
+this inspector   inspector
+this usedirectv2encoding   true
+if  nullable
+ispresentoutstream   streamfactory createstream id
+orcproto stream kind present
+ispresent   new bitfieldwriter ispresentoutstream  1
+else
+ispresent   null
+this foundnulls   false
+indexstatistics   columnstatisticsimpl create inspector
+filestatistics   columnstatisticsimpl create inspector
+childrenwriters   new treewriter
+rowindex   orcproto rowindex newbuilder
+rowindexentry   orcproto rowindexentry newbuilder
+rowindexposition   new rowindexpositionrecorder rowindexentry
+if  streamfactory buildindex
+rowindexstream   streamfactory createstream id
+orcproto stream kind row_index
+else
+rowindexstream   null
+protected orcproto rowindex builder getrowindex
+return rowindex
+protected columnstatisticsimpl getfilestatistics
+return filestatistics
+protected orcproto rowindexentry builder getrowindexentry
+return rowindexentry
+integerwriter createintegerwriter positionedoutputstream output
+boolean signed  boolean isdirectv2
+if  isdirectv2
+return new runlengthintegerwriterv2 output  signed
+else
+return new runlengthintegerwriter output  signed
+boolean isnewwriteformat streamfactory writer
+return writer getversion      orcfile version v_0_11
+/**
+* add a new value to the column.
+* @param obj
+* @throws ioexception
+*/
+void write object obj  throws ioexception
+if  obj    null
+indexstatistics increment
+if  ispresent    null
+ispresent write obj    null ? 0   1
+if obj    null
+foundnulls   true
+private void removeispresentpositions
+for int i 0  i < rowindex getentrycount      i
+rowindexentry builder entry   rowindex getentrybuilder i
+list<long> positions   entry getpositionslist
+// bit streams use 3 positions if uncompressed, 4 if compressed
+positions   positions sublist iscompressed ? 4   3  positions size
+entry clearpositions
+entry addallpositions positions
+/**
+* write the stripe out to the file.
+* @param builder the stripe footer that contains the information about the
+*                layout of the stripe. the treewriter is required to update
+*                the footer with its information.
+* @param requiredindexentries the number of index entries that are
+*                             required. this is to check to make sure the
+*                             row index is well formed.
+* @throws ioexception
+*/
+void writestripe orcproto stripefooter builder builder
+int requiredindexentries  throws ioexception
+if  ispresent    null
+ispresent flush
+// if no nulls are found in a stream, then suppress the stream
+if  foundnulls
+ispresentoutstream suppress
+// since ispresent bitstream is suppressed, update the index to
+// remove the positions of the ispresent stream
+if  rowindexstream    null
+removeispresentpositions
+// reset the flag for next stripe
+foundnulls   false
+builder addcolumns getencoding
+if  rowindexstream    null
+if  rowindex getentrycount      requiredindexentries
+throw new illegalargumentexception
+rowindexentry
+requiredindexentries
+rowindex build   writeto rowindexstream
+rowindexstream flush
+rowindex clear
+rowindexentry clear
+treewriter getchildrenwriters
+return childrenwriters
+/**
+* get the encoding for this column.
+* @return the information about the encoding of this column
+*/
+orcproto columnencoding getencoding
+return orcproto columnencoding newbuilder   setkind
+orcproto columnencoding kind direct  build
+/**
+* create a row index entry with the previous location and the current
+* index statistics. also merges the index statistics into the file
+* statistics before they are cleared. finally, it records the start of the
+* next index and ensures all of the children columns also create an entry.
+* @throws ioexception
+*/
+void createrowindexentry   throws ioexception
+filestatistics merge indexstatistics
+rowindexentry setstatistics indexstatistics serialize
+indexstatistics reset
+rowindex addentry rowindexentry
+rowindexentry clear
+recordposition rowindexposition
+for treewriter child  childrenwriters
+child createrowindexentry
+/**
+* record the current position in each of this column's streams.
+* @param recorder where should the locations be recorded
+* @throws ioexception
+*/
+void recordposition positionrecorder recorder  throws ioexception
+if  ispresent    null
+ispresent getposition recorder
+/**
+* estimate how much memory the writer is consuming excluding the streams.
+* @return the number of bytes.
+*/
+long estimatememory
+long result   0
+for  treewriter child  childrenwriters
+result    child estimatememory
+return result
+private static class booleantreewriter extends treewriter
+private final bitfieldwriter writer
+booleantreewriter int columnid
+objectinspector inspector
+streamfactory writer
+boolean nullable  throws ioexception
+super columnid  inspector  writer  nullable
+positionedoutputstream out   writer createstream id
+orcproto stream kind data
+this writer   new bitfieldwriter out  1
+recordposition rowindexposition
+@override
+void write object obj  throws ioexception
+super write obj
+if  obj    null
+boolean val     booleanobjectinspector  inspector  get obj
+indexstatistics updateboolean val
+writer write val ? 1   0
+@override
+void writestripe orcproto stripefooter builder builder
+int requiredindexentries  throws ioexception
+super writestripe builder  requiredindexentries
+writer flush
+recordposition rowindexposition
+@override
+void recordposition positionrecorder recorder  throws ioexception
+super recordposition recorder
+writer getposition recorder
+private static class bytetreewriter extends treewriter
+private final runlengthbytewriter writer
+bytetreewriter int columnid
+objectinspector inspector
+streamfactory writer
+boolean nullable  throws ioexception
+super columnid  inspector  writer  nullable
+this writer   new runlengthbytewriter writer createstream id
+orcproto stream kind data
+recordposition rowindexposition
+@override
+void write object obj  throws ioexception
+super write obj
+if  obj    null
+byte val     byteobjectinspector  inspector  get obj
+indexstatistics updateinteger val
+writer write val
+@override
+void writestripe orcproto stripefooter builder builder
+int requiredindexentries  throws ioexception
+super writestripe builder  requiredindexentries
+writer flush
+recordposition rowindexposition
+@override
+void recordposition positionrecorder recorder  throws ioexception
+super recordposition recorder
+writer getposition recorder
+private static class integertreewriter extends treewriter
+private final integerwriter writer
+private final shortobjectinspector shortinspector
+private final intobjectinspector intinspector
+private final longobjectinspector longinspector
+private boolean isdirectv2   true
+integertreewriter int columnid
+objectinspector inspector
+streamfactory writer
+boolean nullable  throws ioexception
+super columnid  inspector  writer  nullable
+positionedoutputstream out   writer createstream id
+orcproto stream kind data
+this isdirectv2   isnewwriteformat writer
+this writer   createintegerwriter out  true  isdirectv2
+if  inspector instanceof intobjectinspector
+intinspector    intobjectinspector  inspector
+shortinspector   null
+longinspector   null
+else
+intinspector   null
+if  inspector instanceof longobjectinspector
+longinspector    longobjectinspector  inspector
+shortinspector   null
+else
+shortinspector    shortobjectinspector  inspector
+longinspector   null
+recordposition rowindexposition
+@override
+orcproto columnencoding getencoding
+if  isdirectv2
+return orcproto columnencoding newbuilder
+setkind orcproto columnencoding kind direct_v2  build
+return orcproto columnencoding newbuilder
+setkind orcproto columnencoding kind direct  build
+@override
+void write object obj  throws ioexception
+super write obj
+if  obj    null
+long val
+if  intinspector    null
+val   intinspector get obj
+else if  longinspector    null
+val   longinspector get obj
+else
+val   shortinspector get obj
+indexstatistics updateinteger val
+writer write val
+@override
+void writestripe orcproto stripefooter builder builder
+int requiredindexentries  throws ioexception
+super writestripe builder  requiredindexentries
+writer flush
+recordposition rowindexposition
+@override
+void recordposition positionrecorder recorder  throws ioexception
+super recordposition recorder
+writer getposition recorder
+private static class floattreewriter extends treewriter
+private final positionedoutputstream stream
+floattreewriter int columnid
+objectinspector inspector
+streamfactory writer
+boolean nullable  throws ioexception
+super columnid  inspector  writer  nullable
+this stream   writer createstream id
+orcproto stream kind data
+recordposition rowindexposition
+@override
+void write object obj  throws ioexception
+super write obj
+if  obj    null
+float val     floatobjectinspector  inspector  get obj
+indexstatistics updatedouble val
+serializationutils writefloat stream  val
+@override
+void writestripe orcproto stripefooter builder builder
+int requiredindexentries  throws ioexception
+super writestripe builder  requiredindexentries
+stream flush
+recordposition rowindexposition
+@override
+void recordposition positionrecorder recorder  throws ioexception
+super recordposition recorder
+stream getposition recorder
+private static class doubletreewriter extends treewriter
+private final positionedoutputstream stream
+doubletreewriter int columnid
+objectinspector inspector
+streamfactory writer
+boolean nullable  throws ioexception
+super columnid  inspector  writer  nullable
+this stream   writer createstream id
+orcproto stream kind data
+recordposition rowindexposition
+@override
+void write object obj  throws ioexception
+super write obj
+if  obj    null
+double val     doubleobjectinspector  inspector  get obj
+indexstatistics updatedouble val
+serializationutils writedouble stream  val
+@override
+void writestripe orcproto stripefooter builder builder
+int requiredindexentries  throws ioexception
+super writestripe builder  requiredindexentries
+stream flush
+recordposition rowindexposition
+@override
+void recordposition positionrecorder recorder  throws ioexception
+super recordposition recorder
+stream getposition recorder
+private static class stringtreewriter extends treewriter
+private static final int initial_dictionary_size   4096
+private final outstream stringoutput
+private final integerwriter lengthoutput
+private final integerwriter rowoutput
+private final stringredblacktree dictionary
+new stringredblacktree initial_dictionary_size
+private final dynamicintarray rows   new dynamicintarray
+private final positionedoutputstream directstreamoutput
+private final integerwriter directlengthoutput
+private final list<orcproto rowindexentry> savedrowindex
+new arraylist<orcproto rowindexentry>
+private final boolean buildindex
+private final list<long> rowindexvaluecount   new arraylist<long>
+// if the number of keys in a dictionary is greater than this fraction of
+//the total number of non-null rows, turn off dictionary encoding
+private final float dictionarykeysizethreshold
+private boolean usedictionaryencoding   true
+private boolean isdirectv2   true
+stringtreewriter int columnid
+objectinspector inspector
+streamfactory writer
+boolean nullable  throws ioexception
+super columnid  inspector  writer  nullable
+this isdirectv2   isnewwriteformat writer
+stringoutput   writer createstream id
+orcproto stream kind dictionary_data
+lengthoutput   createintegerwriter writer createstream id
+orcproto stream kind length   false  isdirectv2
+rowoutput   createintegerwriter writer createstream id
+orcproto stream kind data   false  isdirectv2
+recordposition rowindexposition
+rowindexvaluecount add 0l
+buildindex   writer buildindex
+directstreamoutput   writer createstream id  orcproto stream kind data
+directlengthoutput   createintegerwriter writer createstream id
+orcproto stream kind length   false  isdirectv2
+dictionarykeysizethreshold   writer getconfiguration   getfloat
+hiveconf confvars hive_orc_dictionary_key_size_threshold varname
+hiveconf confvars hive_orc_dictionary_key_size_threshold
+defaultfloatval
+/**
+* method to retrieve string values from the value object, which can be overridden
+* by subclasses.
+* @param obj  value
+* @return string value from obj
+*/
+string getstringvalue object obj
+return   stringobjectinspector  inspector  getprimitivejavaobject obj
+@override
+void write object obj  throws ioexception
+super write obj
+if  obj    null
+string val   getstringvalue obj
+rows add dictionary add val
+indexstatistics updatestring val
+@override
+void writestripe orcproto stripefooter builder builder
+int requiredindexentries  throws ioexception
+// set the flag indicating whether or not to use dictionary encoding
+// based on whether or not the fraction of distinct keys over number of
+// non-null rows is less than the configured threshold
+usedictionaryencoding
+isdirectv2      rows size   > 0
+float  dictionary size      rows size   <
+dictionarykeysizethreshold
+final int dumporder   new int
+if  usedictionaryencoding
+// write the dictionary by traversing the red-black tree writing out
+// the bytes and lengths; and creating the map from the original order
+// to the final sorted order.
+dictionary visit new stringredblacktree visitor
+private int currentid   0
+@override
+public void visit stringredblacktree visitorcontext context
+throws ioexception
+context writebytes stringoutput
+lengthoutput write context getlength
+dumporder   currentid
+else
+// for direct encoding, we don't want the dictionary data stream
+stringoutput suppress
+int length   rows size
+int rowindexentry   0
+orcproto rowindex builder rowindex   getrowindex
+text text   new text
+// write the values translated into the dump order.
+for int i   0  i <  length    i
+// now that we are writing out the row values, we can finalize the
+// row index
+if  buildindex
+while  i    rowindexvaluecount get rowindexentry
+rowindexentry < savedrowindex size
+orcproto rowindexentry builder base
+savedrowindex get rowindexentry    tobuilder
+if  usedictionaryencoding
+rowoutput getposition new rowindexpositionrecorder base
+else
+positionrecorder posn   new rowindexpositionrecorder base
+directstreamoutput getposition posn
+directlengthoutput getposition posn
+rowindex addentry base build
+if  i    length
+if  usedictionaryencoding
+rowoutput write dumporder
+else
+dictionary gettext text  rows get i
+directstreamoutput write text getbytes    0  text getlength
+directlengthoutput write text getlength
+// we need to build the rowindex before calling super, since it
+// writes it out.
+super writestripe builder  requiredindexentries
+stringoutput flush
+lengthoutput flush
+rowoutput flush
+directstreamoutput flush
+directlengthoutput flush
+// reset all of the fields to be ready for the next stripe.
+dictionary clear
+rows clear
+savedrowindex clear
+rowindexvaluecount clear
+recordposition rowindexposition
+rowindexvaluecount add 0l
+@override
+orcproto columnencoding getencoding
+// returns the encoding used for the last call to writestripe
+if  usedictionaryencoding
+if isdirectv2
+return orcproto columnencoding newbuilder   setkind
+orcproto columnencoding kind dictionary_v2
+setdictionarysize dictionary size    build
+return orcproto columnencoding newbuilder   setkind
+orcproto columnencoding kind dictionary
+setdictionarysize dictionary size    build
+else
+if isdirectv2
+return orcproto columnencoding newbuilder   setkind
+orcproto columnencoding kind direct_v2  build
+return orcproto columnencoding newbuilder   setkind
+orcproto columnencoding kind direct  build
+/**
+* this method doesn't call the super method, because unlike most of the
+* other treewriters, this one can't record the position in the streams
+* until the stripe is being flushed. therefore it saves all of the entries
+* and augments them with the final information as the stripe is written.
+* @throws ioexception
+*/
+@override
+void createrowindexentry   throws ioexception
+getfilestatistics   merge indexstatistics
+orcproto rowindexentry builder rowindexentry   getrowindexentry
+rowindexentry setstatistics indexstatistics serialize
+indexstatistics reset
+savedrowindex add rowindexentry build
+rowindexentry clear
+recordposition rowindexposition
+rowindexvaluecount add long valueof rows size
+@override
+long estimatememory
+return rows getsizeinbytes     dictionary getsizeinbytes
+/**
+* under the covers, varchar is written to orc the same way as string.
+*/
+private static class varchartreewriter extends stringtreewriter
+varchartreewriter int columnid
+objectinspector inspector
+streamfactory writer
+boolean nullable  throws ioexception
+super columnid  inspector  writer  nullable
+/**
+* override base class implementation to support varchar values.
+*/
+@override
+string getstringvalue object obj
+return    hivevarcharobjectinspector  inspector
+getprimitivejavaobject obj   getvalue
+private static class binarytreewriter extends treewriter
+private final positionedoutputstream stream
+private final integerwriter length
+private boolean isdirectv2   true
+binarytreewriter int columnid
+objectinspector inspector
+streamfactory writer
+boolean nullable  throws ioexception
+super columnid  inspector  writer  nullable
+this stream   writer createstream id
+orcproto stream kind data
+this isdirectv2   isnewwriteformat writer
+this length   createintegerwriter writer createstream id
+orcproto stream kind length   false  isdirectv2
+recordposition rowindexposition
+@override
+orcproto columnencoding getencoding
+if  isdirectv2
+return orcproto columnencoding newbuilder
+setkind orcproto columnencoding kind direct_v2  build
+return orcproto columnencoding newbuilder
+setkind orcproto columnencoding kind direct  build
+@override
+void write object obj  throws ioexception
+super write obj
+if  obj    null
+byteswritable val
+binaryobjectinspector  inspector  getprimitivewritableobject obj
+stream write val getbytes    0  val getlength
+length write val getlength
+@override
+void writestripe orcproto stripefooter builder builder
+int requiredindexentries  throws ioexception
+super writestripe builder  requiredindexentries
+stream flush
+length flush
+recordposition rowindexposition
+@override
+void recordposition positionrecorder recorder  throws ioexception
+super recordposition recorder
+stream getposition recorder
+length getposition recorder
+static final int millis_per_second   1000
+static final long base_timestamp
+timestamp valueof    gettime     millis_per_second
+private static class timestamptreewriter extends treewriter
+private final integerwriter seconds
+private final integerwriter nanos
+private final boolean isdirectv2
+timestamptreewriter int columnid
+objectinspector inspector
+streamfactory writer
+boolean nullable  throws ioexception
+super columnid  inspector  writer  nullable
+this isdirectv2   isnewwriteformat writer
+this seconds   createintegerwriter writer createstream id
+orcproto stream kind data   true  isdirectv2
+this nanos   createintegerwriter writer createstream id
+orcproto stream kind secondary   false  isdirectv2
+recordposition rowindexposition
+@override
+orcproto columnencoding getencoding
+if  isdirectv2
+return orcproto columnencoding newbuilder
+setkind orcproto columnencoding kind direct_v2  build
+return orcproto columnencoding newbuilder
+setkind orcproto columnencoding kind direct  build
+@override
+void write object obj  throws ioexception
+super write obj
+if  obj    null
+timestamp val
+timestampobjectinspector  inspector
+getprimitivejavaobject obj
+seconds write  val gettime     millis_per_second    base_timestamp
+nanos write formatnanos val getnanos
+@override
+void writestripe orcproto stripefooter builder builder
+int requiredindexentries  throws ioexception
+super writestripe builder  requiredindexentries
+seconds flush
+nanos flush
+recordposition rowindexposition
+private static long formatnanos int nanos
+if  nanos    0
+return 0
+else if  nanos % 100    0
+return   long  nanos  << 3
+else
+nanos    100
+int trailingzeros   1
+while  nanos % 10    0    trailingzeros < 7
+nanos    10
+trailingzeros    1
+return   long  nanos  << 3   trailingzeros
+@override
+void recordposition positionrecorder recorder  throws ioexception
+super recordposition recorder
+seconds getposition recorder
+nanos getposition recorder
+private static class datetreewriter extends treewriter
+private final integerwriter writer
+private final boolean isdirectv2
+datetreewriter int columnid
+objectinspector inspector
+streamfactory writer
+boolean nullable  throws ioexception
+super columnid  inspector  writer  nullable
+positionedoutputstream out   writer createstream id
+orcproto stream kind data
+this isdirectv2   isnewwriteformat writer
+this writer   createintegerwriter out  true  isdirectv2
+recordposition rowindexposition
+@override
+void write object obj  throws ioexception
+super write obj
+if  obj    null
+// using the writable here as it's used directly for writing as well as for stats.
+datewritable val     dateobjectinspector  inspector  getprimitivewritableobject obj
+indexstatistics updatedate val
+writer write val getdays
+@override
+void writestripe orcproto stripefooter builder builder
+int requiredindexentries  throws ioexception
+super writestripe builder  requiredindexentries
+writer flush
+recordposition rowindexposition
+@override
+void recordposition positionrecorder recorder  throws ioexception
+super recordposition recorder
+writer getposition recorder
+@override
+orcproto columnencoding getencoding
+if  isdirectv2
+return orcproto columnencoding newbuilder
+setkind orcproto columnencoding kind direct_v2  build
+return orcproto columnencoding newbuilder
+setkind orcproto columnencoding kind direct  build
+private static class decimaltreewriter extends treewriter
+private final positionedoutputstream valuestream
+private final integerwriter scalestream
+private final boolean isdirectv2
+decimaltreewriter int columnid
+objectinspector inspector
+streamfactory writer
+boolean nullable  throws ioexception
+super columnid  inspector  writer  nullable
+this isdirectv2   isnewwriteformat writer
+valuestream   writer createstream id  orcproto stream kind data
+this scalestream   createintegerwriter writer createstream id
+orcproto stream kind secondary   true  isdirectv2
+recordposition rowindexposition
+@override
+orcproto columnencoding getencoding
+if  isdirectv2
+return orcproto columnencoding newbuilder
+setkind orcproto columnencoding kind direct_v2  build
+return orcproto columnencoding newbuilder
+setkind orcproto columnencoding kind direct  build
+@override
+void write object obj  throws ioexception
+super write obj
+if  obj    null
+hivedecimal decimal     hivedecimalobjectinspector  inspector
+getprimitivejavaobject obj
+serializationutils writebiginteger valuestream
+decimal unscaledvalue
+scalestream write decimal scale
+indexstatistics updatedecimal decimal
+@override
+void writestripe orcproto stripefooter builder builder
+int requiredindexentries  throws ioexception
+super writestripe builder  requiredindexentries
+valuestream flush
+scalestream flush
+recordposition rowindexposition
+@override
+void recordposition positionrecorder recorder  throws ioexception
+super recordposition recorder
+valuestream getposition recorder
+scalestream getposition recorder
+private static class structtreewriter extends treewriter
+private final list<? extends structfield> fields
+structtreewriter int columnid
+objectinspector inspector
+streamfactory writer
+boolean nullable  throws ioexception
+super columnid  inspector  writer  nullable
+structobjectinspector structobjectinspector
+structobjectinspector  inspector
+fields   structobjectinspector getallstructfieldrefs
+childrenwriters   new treewriter
+for int i 0  i < childrenwriters length    i
+childrenwriters   createtreewriter
+fields get i  getfieldobjectinspector    writer  true
+recordposition rowindexposition
+@override
+void write object obj  throws ioexception
+super write obj
+if  obj    null
+structobjectinspector insp    structobjectinspector  inspector
+for int i   0  i < fields size      i
+structfield field   fields get i
+treewriter writer   childrenwriters
+writer write insp getstructfielddata obj  field
+@override
+void writestripe orcproto stripefooter builder builder
+int requiredindexentries  throws ioexception
+super writestripe builder  requiredindexentries
+for treewriter child  childrenwriters
+child writestripe builder  requiredindexentries
+recordposition rowindexposition
+private static class listtreewriter extends treewriter
+private final integerwriter lengths
+private final boolean isdirectv2
+listtreewriter int columnid
+objectinspector inspector
+streamfactory writer
+boolean nullable  throws ioexception
+super columnid  inspector  writer  nullable
+this isdirectv2   isnewwriteformat writer
+listobjectinspector listobjectinspector    listobjectinspector  inspector
+childrenwriters   new treewriter
+childrenwriters
+createtreewriter listobjectinspector getlistelementobjectinspector
+writer  true
+lengths   createintegerwriter writer createstream columnid
+orcproto stream kind length   false  isdirectv2
+recordposition rowindexposition
+@override
+orcproto columnencoding getencoding
+if  isdirectv2
+return orcproto columnencoding newbuilder
+setkind orcproto columnencoding kind direct_v2  build
+return orcproto columnencoding newbuilder
+setkind orcproto columnencoding kind direct  build
+@override
+void write object obj  throws ioexception
+super write obj
+if  obj    null
+listobjectinspector insp    listobjectinspector  inspector
+int len   insp getlistlength obj
+lengths write len
+for int i 0  i < len    i
+childrenwriters write insp getlistelement obj  i
+@override
+void writestripe orcproto stripefooter builder builder
+int requiredindexentries  throws ioexception
+super writestripe builder  requiredindexentries
+lengths flush
+for treewriter child  childrenwriters
+child writestripe builder  requiredindexentries
+recordposition rowindexposition
+@override
+void recordposition positionrecorder recorder  throws ioexception
+super recordposition recorder
+lengths getposition recorder
+private static class maptreewriter extends treewriter
+private final integerwriter lengths
+private final boolean isdirectv2
+maptreewriter int columnid
+objectinspector inspector
+streamfactory writer
+boolean nullable  throws ioexception
+super columnid  inspector  writer  nullable
+this isdirectv2   isnewwriteformat writer
+mapobjectinspector insp    mapobjectinspector  inspector
+childrenwriters   new treewriter
+childrenwriters
+createtreewriter insp getmapkeyobjectinspector    writer  true
+childrenwriters
+createtreewriter insp getmapvalueobjectinspector    writer  true
+lengths   createintegerwriter writer createstream columnid
+orcproto stream kind length   false  isdirectv2
+recordposition rowindexposition
+@override
+orcproto columnencoding getencoding
+if  isdirectv2
+return orcproto columnencoding newbuilder
+setkind orcproto columnencoding kind direct_v2  build
+return orcproto columnencoding newbuilder
+setkind orcproto columnencoding kind direct  build
+@override
+void write object obj  throws ioexception
+super write obj
+if  obj    null
+mapobjectinspector insp    mapobjectinspector  inspector
+int len   insp getmapsize obj
+lengths write len
+// this sucks, but it will have to do until we can get a better
+// accessor in the mapobjectinspector.
+map<?  ?> valuemap   insp getmap obj
+for map entry<?  ?> entry  valuemap entryset
+childrenwriters write entry getkey
+childrenwriters write entry getvalue
+@override
+void writestripe orcproto stripefooter builder builder
+int requiredindexentries  throws ioexception
+super writestripe builder  requiredindexentries
+lengths flush
+for treewriter child  childrenwriters
+child writestripe builder  requiredindexentries
+recordposition rowindexposition
+@override
+void recordposition positionrecorder recorder  throws ioexception
+super recordposition recorder
+lengths getposition recorder
+private static class uniontreewriter extends treewriter
+private final runlengthbytewriter tags
+uniontreewriter int columnid
+objectinspector inspector
+streamfactory writer
+boolean nullable  throws ioexception
+super columnid  inspector  writer  nullable
+unionobjectinspector insp    unionobjectinspector  inspector
+list<objectinspector> choices   insp getobjectinspectors
+childrenwriters   new treewriter
+for int i 0  i < childrenwriters length    i
+childrenwriters   createtreewriter choices get i   writer  true
+tags
+new runlengthbytewriter writer createstream columnid
+orcproto stream kind data
+recordposition rowindexposition
+@override
+void write object obj  throws ioexception
+super write obj
+if  obj    null
+unionobjectinspector insp    unionobjectinspector  inspector
+byte tag   insp gettag obj
+tags write tag
+childrenwriters write insp getfield obj
+@override
+void writestripe orcproto stripefooter builder builder
+int requiredindexentries  throws ioexception
+super writestripe builder  requiredindexentries
+tags flush
+for treewriter child  childrenwriters
+child writestripe builder  requiredindexentries
+recordposition rowindexposition
+@override
+void recordposition positionrecorder recorder  throws ioexception
+super recordposition recorder
+tags getposition recorder
+private static treewriter createtreewriter objectinspector inspector
+streamfactory streamfactory
+boolean nullable  throws ioexception
+switch  inspector getcategory
+case primitive
+switch    primitiveobjectinspector  inspector  getprimitivecategory
+case boolean
+return new booleantreewriter streamfactory getnextcolumnid
+inspector  streamfactory  nullable
+case byte
+return new bytetreewriter streamfactory getnextcolumnid
+inspector  streamfactory  nullable
+case short
+case int
+case long
+return new integertreewriter streamfactory getnextcolumnid
+inspector  streamfactory  nullable
+case float
+return new floattreewriter streamfactory getnextcolumnid
+inspector  streamfactory  nullable
+case double
+return new doubletreewriter streamfactory getnextcolumnid
+inspector  streamfactory  nullable
+case string
+return new stringtreewriter streamfactory getnextcolumnid
+inspector  streamfactory  nullable
+case varchar
+return new varchartreewriter streamfactory getnextcolumnid
+inspector  streamfactory  nullable
+case binary
+return new binarytreewriter streamfactory getnextcolumnid
+inspector  streamfactory  nullable
+case timestamp
+return new timestamptreewriter streamfactory getnextcolumnid
+inspector  streamfactory  nullable
+case date
+return new datetreewriter streamfactory getnextcolumnid
+inspector  streamfactory  nullable
+case decimal
+return new decimaltreewriter streamfactory getnextcolumnid
+inspector  streamfactory   nullable
+default
+throw new illegalargumentexception
+primitiveobjectinspector  inspector  getprimitivecategory
+case struct
+return new structtreewriter streamfactory getnextcolumnid    inspector
+streamfactory  nullable
+case map
+return new maptreewriter streamfactory getnextcolumnid    inspector
+streamfactory  nullable
+case list
+return new listtreewriter streamfactory getnextcolumnid    inspector
+streamfactory  nullable
+case union
+return new uniontreewriter streamfactory getnextcolumnid    inspector
+streamfactory  nullable
+default
+throw new illegalargumentexception
+inspector getcategory
+private static void writetypes orcproto footer builder builder
+treewriter treewriter
+orcproto type builder type   orcproto type newbuilder
+switch  treewriter inspector getcategory
+case primitive
+switch    primitiveobjectinspector  treewriter inspector
+getprimitivecategory
+case boolean
+type setkind orcproto type kind boolean
+break
+case byte
+type setkind orcproto type kind byte
+break
+case short
+type setkind orcproto type kind short
+break
+case int
+type setkind orcproto type kind int
+break
+case long
+type setkind orcproto type kind long
+break
+case float
+type setkind orcproto type kind float
+break
+case double
+type setkind orcproto type kind double
+break
+case string
+type setkind orcproto type kind string
+break
+case varchar
+// the varchar length needs to be written to file and should be available
+// from the object inspector
+varchartypeparams varcharparams    varchartypeparams
+parameterizedprimitivetypeutils gettypeparamsfromprimitiveobjectinspector
+primitiveobjectinspector  treewriter inspector
+if  varcharparams    null
+throw new illegalargumentexception
+type setkind type kind varchar
+type setmaximumlength varcharparams getlength
+break
+case binary
+type setkind orcproto type kind binary
+break
+case timestamp
+type setkind orcproto type kind timestamp
+break
+case date
+type setkind orcproto type kind date
+break
+case decimal
+type setkind orcproto type kind decimal
+break
+default
+throw new illegalargumentexception
+primitiveobjectinspector  treewriter inspector
+getprimitivecategory
+break
+case list
+type setkind orcproto type kind list
+type addsubtypes treewriter childrenwriters id
+break
+case map
+type setkind orcproto type kind map
+type addsubtypes treewriter childrenwriters id
+type addsubtypes treewriter childrenwriters id
+break
+case struct
+type setkind orcproto type kind struct
+for treewriter child  treewriter childrenwriters
+type addsubtypes child id
+for structfield field    structtreewriter  treewriter  fields
+type addfieldnames field getfieldname
+break
+case union
+type setkind orcproto type kind union
+for treewriter child  treewriter childrenwriters
+type addsubtypes child id
+break
+default
+throw new illegalargumentexception
+treewriter inspector getcategory
+builder addtypes type
+for treewriter child  treewriter childrenwriters
+writetypes builder  child
+private void ensurewriter   throws ioexception
+if  rawwriter    null
+rawwriter   fs create path  false  hdfs_buffer_size
+fs getdefaultreplication    blocksize
+rawwriter writebytes orcfile magic
+headerlength   rawwriter getpos
+writer   new outstream    buffersize  codec
+new directstream rawwriter
+protobufwriter   codedoutputstream newinstance writer
+private void createrowindexentry   throws ioexception
+treewriter createrowindexentry
+rowsinindex   0
+private void flushstripe   throws ioexception
+ensurewriter
+if  buildindex    rowsinindex    0
+createrowindexentry
+if  rowsinstripe    0
+// finalize the data for the stripe
+int requiredindexentries   rowindexstride    0 ? 0
+int    rowsinstripe   rowindexstride   1    rowindexstride
+orcproto stripefooter builder builder
+orcproto stripefooter newbuilder
+treewriter writestripe builder  requiredindexentries
+long indexsize   0
+long datasize   0
+for map entry<streamname  bufferedstream> pair  streams entryset
+bufferedstream stream   pair getvalue
+if   stream issuppressed
+stream flush
+streamname name   pair getkey
+long streamsize   pair getvalue   getoutputsize
+builder addstreams orcproto stream newbuilder
+setcolumn name getcolumn
+setkind name getkind
+setlength streamsize
+if  streamname area index    name getarea
+indexsize    streamsize
+else
+datasize    streamsize
+orcproto stripefooter footer   builder build
+// do we need to pad the file so the stripe doesn't straddle a block
+// boundary?
+long start   rawwriter getpos
+long stripesize   indexsize   datasize   footer getserializedsize
+if  addblockpadding
+stripesize < blocksize
+start % blocksize    stripesize > blocksize
+long padding   blocksize    start % blocksize
+byte pad   new byte
+start    padding
+while  padding > 0
+int writelen    int  math min padding  pad length
+rawwriter write pad  0  writelen
+padding    writelen
+// write out the data streams
+for map entry<streamname  bufferedstream> pair  streams entryset
+bufferedstream stream   pair getvalue
+if   stream issuppressed
+stream spillto rawwriter
+stream clear
+footer writeto protobufwriter
+protobufwriter flush
+writer flush
+long footerlength   rawwriter getpos     start   datasize   indexsize
+orcproto stripeinformation direntry
+orcproto stripeinformation newbuilder
+setoffset start
+setnumberofrows rowsinstripe
+setindexlength indexsize
+setdatalength datasize
+setfooterlength footerlength  build
+stripes add direntry
+rowcount    rowsinstripe
+rowsinstripe   0
+private orcproto compressionkind writecompressionkind compressionkind kind
+switch  kind
+case none  return orcproto compressionkind none
+case zlib  return orcproto compressionkind zlib
+case snappy  return orcproto compressionkind snappy
+case lzo  return orcproto compressionkind lzo
+default
+throw new illegalargumentexception     kind
+private void writefilestatistics orcproto footer builder builder
+treewriter writer  throws ioexception
+builder addstatistics writer filestatistics serialize
+for treewriter child  writer getchildrenwriters
+writefilestatistics builder  child
+private int writefooter long bodylength  throws ioexception
+ensurewriter
+orcproto footer builder builder   orcproto footer newbuilder
+builder setcontentlength bodylength
+builder setheaderlength headerlength
+builder setnumberofrows rowcount
+builder setrowindexstride rowindexstride
+// serialize the types
+writetypes builder  treewriter
+// add the stripe information
+for orcproto stripeinformation stripe  stripes
+builder addstripes stripe
+// add the column statistics
+writefilestatistics builder  treewriter
+// add all of the user metadata
+for map entry<string  bytestring> entry  usermetadata entryset
+builder addmetadata orcproto usermetadataitem newbuilder
+setname entry getkey    setvalue entry getvalue
+long startposn   rawwriter getpos
+orcproto footer footer   builder build
+footer writeto protobufwriter
+protobufwriter flush
+writer flush
+return  int   rawwriter getpos     startposn
+private int writepostscript int footerlength  throws ioexception
+orcproto postscript builder builder
+orcproto postscript newbuilder
+setcompression writecompressionkind compress
+setfooterlength footerlength
+setmagic orcfile magic
+addversion version getmajor
+addversion version getminor
+if  compress    compressionkind none
+builder setcompressionblocksize buffersize
+orcproto postscript ps   builder build
+// need to write this uncompressed
+long startposn   rawwriter getpos
+ps writeto rawwriter
+long length   rawwriter getpos     startposn
+if  length > 255
+throw new illegalargumentexception     length
+return  int  length
+private long estimatestripesize
+long result   0
+for bufferedstream stream  streams values
+result    stream getbuffersize
+result    treewriter estimatememory
+return result
+@override
+public synchronized void addusermetadata string name  bytebuffer value
+usermetadata put name  bytestring copyfrom value
+@override
+public void addrow object row  throws ioexception
+synchronized  this
+treewriter write row
+rowsinstripe    1
+if  buildindex
+rowsinindex    1
+if  rowsinindex >  rowindexstride
+createrowindexentry
+memorymanager addedrow
+@override
+public void close   throws ioexception
+// remove us from the memory manager so that we don't get any callbacks
+memorymanager removewriter path
+// actually close the file
+synchronized  this
+flushstripe
+int footerlength   writefooter rawwriter getpos
+rawwriter writebyte writepostscript footerlength
+rawwriter close

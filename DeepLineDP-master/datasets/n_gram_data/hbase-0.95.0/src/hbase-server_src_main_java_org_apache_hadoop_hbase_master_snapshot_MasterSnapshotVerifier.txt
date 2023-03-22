@@ -1,0 +1,189 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase master snapshot
+import java io ioexception
+import java util list
+import java util set
+import org apache hadoop classification interfaceaudience
+import org apache hadoop classification interfacestability
+import org apache hadoop fs fsdatainputstream
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop fs pathfilter
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase servername
+import org apache hadoop hbase catalog metareader
+import org apache hadoop hbase master masterservices
+import org apache hadoop hbase protobuf generated hbaseprotos snapshotdescription
+import org apache hadoop hbase regionserver hregion
+import org apache hadoop hbase regionserver hregionfilesystem
+import org apache hadoop hbase regionserver storefileinfo
+import org apache hadoop hbase exceptions corruptedsnapshotexception
+import org apache hadoop hbase snapshot snapshotdescriptionutils
+import org apache hadoop hbase snapshot takesnapshotutils
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util fstabledescriptors
+import org apache hadoop hbase util fsutils
+import org apache hadoop hbase util hfilearchiveutil
+/**
+* general snapshot verification on the master.
+* <p>
+* this is a light-weight verification mechanism for all the files in a snapshot. it doesn't
+* attempt to verify that the files are exact copies (that would be paramount to taking the
+* snapshot again!), but instead just attempts to ensure that the files match the expected
+* files and are the same length.
+* <p>
+* taking an online snapshots can race against other operations and this is an last line of
+* defense.  for example, if meta changes between when snapshots are taken not all regions of a
+* table may be present.  this can be caused by a region split (daughters present on this scan,
+* but snapshot took parent), or move (snapshots only checks lists of region servers, a move could
+* have caused a region to be skipped or done twice).
+* <p>
+* current snapshot files checked:
+* <ol>
+* <li>snapshotdescription is readable</li>
+* <li>table info is readable</li>
+* <li>regions</li>
+* <ul>
+* <li>matching regions in the snapshot as currently in the table</li>
+* <li>{@link hregioninfo} matches the current and stored regions</li>
+* <li>all referenced hfiles have valid names</li>
+* <li>all the hfiles are present (either in .archive directory in the region)</li>
+* <li>all recovered.edits files are present (by name) and have the correct file size</li>
+* </ul>
+* </ol>
+*/
+@interfaceaudience private
+@interfacestability unstable
+public final class mastersnapshotverifier
+private snapshotdescription snapshot
+private filesystem fs
+private path rootdir
+private string tablename
+private masterservices services
+/**
+* @param services services for the master
+* @param snapshot snapshot to check
+* @param rootdir root directory of the hbase installation.
+*/
+public mastersnapshotverifier masterservices services  snapshotdescription snapshot  path rootdir
+this fs   services getmasterfilesystem   getfilesystem
+this services   services
+this snapshot   snapshot
+this rootdir   rootdir
+this tablename   snapshot gettable
+/**
+* verify that the snapshot in the directory is a valid snapshot
+* @param snapshotdir snapshot directory to check
+* @param snapshotservers {@link servername} of the servers that are involved in the snapshot
+* @throws corruptedsnapshotexception if the snapshot is invalid
+* @throws ioexception if there is an unexpected connection issue to the filesystem
+*/
+public void verifysnapshot path snapshotdir  set<string> snapshotservers
+throws corruptedsnapshotexception  ioexception
+// verify snapshot info matches
+verifysnapshotdescription snapshotdir
+// check that tableinfo is a valid table description
+verifytableinfo snapshotdir
+// check that each region is valid
+verifyregions snapshotdir
+/**
+* check that the snapshot description written in the filesystem matches the current snapshot
+* @param snapshotdir snapshot directory to check
+*/
+private void verifysnapshotdescription path snapshotdir  throws corruptedsnapshotexception
+snapshotdescription found   snapshotdescriptionutils readsnapshotinfo fs  snapshotdir
+if   this snapshot equals found
+throw new corruptedsnapshotexception     found
+snapshot      snapshot
+/**
+* check that the table descriptor for the snapshot is a valid table descriptor
+* @param snapshotdir snapshot directory to check
+*/
+private void verifytableinfo path snapshotdir  throws ioexception
+fstabledescriptors gettabledescriptor fs  snapshotdir
+/**
+* check that all the regions in the snapshot are valid, and accounted for.
+* @param snapshotdir snapshot directory to check
+* @throws ioexception if we can't reach .meta. or read the files from the fs
+*/
+private void verifyregions path snapshotdir  throws ioexception
+list<hregioninfo> regions   metareader gettableregions this services getcatalogtracker
+bytes tobytes tablename
+for  hregioninfo region   regions
+// if offline split parent, skip it
+if  region isoffline       region issplit      region issplitparent
+continue
+verifyregion fs  snapshotdir  region
+/**
+* verify that the region (regioninfo, hfiles) are valid
+* @param fs the filesystem instance
+* @param snapshotdir snapshot directory to check
+* @param region the region to check
+*/
+private void verifyregion filesystem fs  path snapshotdir  hregioninfo region  throws ioexception
+// make sure we have region in the snapshot
+path regiondir   new path snapshotdir  region getencodedname
+if   fs exists regiondir
+// could happen due to a move or split race.
+throw new corruptedsnapshotexception     region
+snapshot
+// make sure we have the region info in the snapshot
+path regioninfo   new path regiondir  hregionfilesystem region_info_file
+// make sure the file exists
+if   fs exists regioninfo
+throw new corruptedsnapshotexception     region  snapshot
+hregioninfo found   hregionfilesystem loadregioninfofilecontent fs  regiondir
+if   region equals found
+throw new corruptedsnapshotexception     found
+region  snapshot
+// make sure we have the expected recovered edits files
+takesnapshotutils verifyrecoverededits fs  snapshotdir  found  snapshot
+// check for the existance of each hfile
+pathfilter familiesdirs   new fsutils familydirfilter fs
+filestatus columnfamilies   fsutils liststatus fs  regiondir  familiesdirs
+// should we do some checking here to make sure the cfs are correct?
+if  columnfamilies    null  return
+// setup the suffixes for the snapshot directories
+path tablenamesuffix   new path tablename
+path regionnamesuffix   new path tablenamesuffix  region getencodedname
+// get the potential real paths
+path archivedregion   new path hfilearchiveutil getarchivepath services getconfiguration
+regionnamesuffix
+path realregion   new path rootdir  regionnamesuffix
+// loop through each cf and check we can find each of the hfiles
+for  filestatus cf   columnfamilies
+filestatus hfiles   fsutils liststatus fs  cf getpath    null
+// should we check if there should be hfiles?
+if  hfiles    null    hfiles length    0  continue
+path realcfdir   new path realregion  cf getpath   getname
+path archivedcfdir   new path archivedregion  cf getpath   getname
+for  filestatus hfile   hfiles
+// make sure the name is correct
+if   storefileinfo validatestorefilename hfile getpath   getname
+throw new corruptedsnapshotexception     hfile getpath
+snapshot
+// check to see if hfile is present in the real table
+string filename   hfile getpath   getname
+path file   new path realcfdir  filename
+path archived   new path archivedcfdir  filename
+if   fs exists file      file equals archived
+throw new corruptedsnapshotexception     hfile getpath
+realcfdir       archivedcfdir
+snapshot

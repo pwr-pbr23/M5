@@ -1,0 +1,466 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq state
+import java io ioexception
+import java util iterator
+import java util linkedhashmap
+import java util map
+import java util vector
+import java util map entry
+import java util concurrent concurrenthashmap
+import javax jms transactionrolledbackexception
+import javax transaction xa xaresource
+import org apache activemq command command
+import org apache activemq command connectionid
+import org apache activemq command connectioninfo
+import org apache activemq command consumercontrol
+import org apache activemq command consumerid
+import org apache activemq command consumerinfo
+import org apache activemq command destinationinfo
+import org apache activemq command exceptionresponse
+import org apache activemq command integerresponse
+import org apache activemq command message
+import org apache activemq command messagepull
+import org apache activemq command producerid
+import org apache activemq command producerinfo
+import org apache activemq command response
+import org apache activemq command sessionid
+import org apache activemq command sessioninfo
+import org apache activemq command transactioninfo
+import org apache activemq transport transport
+import org apache activemq util ioexceptionsupport
+import org slf4j logger
+import org slf4j loggerfactory
+/**
+* tracks the state of a connection so a newly established transport can be
+* re-initialized to the state that was tracked.
+*
+*
+*/
+public class connectionstatetracker extends commandvisitoradapter
+private static final logger log   loggerfactory getlogger connectionstatetracker class
+private static final tracked tracked_response_marker   new tracked null
+private static final int message_pull_size   400
+protected final concurrenthashmap<connectionid  connectionstate> connectionstates   new concurrenthashmap<connectionid  connectionstate>
+private boolean tracktransactions
+private boolean restoresessions   true
+private boolean restoreconsumers   true
+private boolean restoreproducers   true
+private boolean restoretransaction   true
+private boolean trackmessages   true
+private boolean tracktransactionproducers   true
+private int maxcachesize   128   1024
+private int currentcachesize
+private map<object command> messagecache   new linkedhashmap<object command>
+protected boolean removeeldestentry map entry<object command> eldest
+boolean result   currentcachesize > maxcachesize
+if  result
+if  eldest getvalue   instanceof message
+currentcachesize      message eldest getvalue    getsize
+else if  eldest getvalue   instanceof messagepull
+currentcachesize    message_pull_size
+if  log istraceenabled
+log trace     eldest getkey
+return result
+private class removetransactionaction implements responsehandler
+private final transactioninfo info
+public removetransactionaction transactioninfo info
+this info   info
+public void onresponse command response
+connectionid connectionid   info getconnectionid
+connectionstate cs   connectionstates get connectionid
+if  cs    null
+cs removetransactionstate info gettransactionid
+private class preparereadonlytransactionaction extends removetransactionaction
+public preparereadonlytransactionaction transactioninfo info
+super info
+public void onresponse command command
+integerresponse response    integerresponse  command
+if  xaresource xa_rdonly    response getresult
+// all done, no commit or rollback from tm
+super onresponse command
+/**
+*
+*
+* @param command
+* @return null if the command is not state tracked.
+* @throws ioexception
+*/
+public tracked track command command  throws ioexception
+try
+return  tracked command visit this
+catch  ioexception e
+throw e
+catch  throwable e
+throw ioexceptionsupport create e
+public void trackback command command
+if  command    null
+if  trackmessages    command ismessage
+message message    message  command
+if  message gettransactionid    null
+currentcachesize   currentcachesize    message getsize
+else if  command instanceof messagepull
+// just needs to be a rough estimate of size, ~4 identifiers
+currentcachesize    message_pull_size
+public void restore transport transport  throws ioexception
+// restore the connections.
+for  iterator<connectionstate> iter   connectionstates values   iterator    iter hasnext
+connectionstate connectionstate   iter next
+connectionstate getinfo   setfailoverreconnect true
+if  log isdebugenabled
+log debug     connectionstate getinfo   getconnectionid
+transport oneway connectionstate getinfo
+restoretempdestinations transport  connectionstate
+if  restoresessions
+restoresessions transport  connectionstate
+if  restoretransaction
+restoretransactions transport  connectionstate
+//now flush messages
+for  command msg messagecache values
+if  log isdebugenabled
+log debug      msg ismessage   ?   message  msg  getmessageid     msg
+transport oneway msg
+private void restoretransactions transport transport  connectionstate connectionstate  throws ioexception
+vector<transactioninfo> torollback   new vector<transactioninfo>
+for  transactionstate transactionstate   connectionstate gettransactionstates
+if  log isdebugenabled
+log debug     transactionstate getid
+// rollback any completed transactions - no way to know if commit got there
+// or if reply went missing
+//
+if   transactionstate getcommands   isempty
+command lastcommand   transactionstate getcommands   get transactionstate getcommands   size     1
+if  lastcommand instanceof transactioninfo
+transactioninfo transactioninfo    transactioninfo  lastcommand
+if  transactioninfo gettype      transactioninfo commit_one_phase
+if  log isdebugenabled
+log debug     transactionstate getid
+torollback add transactioninfo
+continue
+// replay short lived producers that may have been involved in the transaction
+for  producerstate producerstate   transactionstate getproducerstates   values
+if  log isdebugenabled
+log debug     producerstate getinfo
+transport oneway producerstate getinfo
+for  command command   transactionstate getcommands
+if  log isdebugenabled
+log debug     command
+transport oneway command
+for  producerstate producerstate   transactionstate getproducerstates   values
+if  log isdebugenabled
+log debug     producerstate getinfo
+transport oneway producerstate getinfo   createremovecommand
+for  transactioninfo command  torollback
+// respond to the outstanding commit
+exceptionresponse response   new exceptionresponse
+response setexception new transactionrolledbackexception     command gettransactionid
+response setcorrelationid command getcommandid
+transport gettransportlistener   oncommand response
+/**
+* @param transport
+* @param connectionstate
+* @throws ioexception
+*/
+protected void restoresessions transport transport  connectionstate connectionstate  throws ioexception
+// restore the connection's sessions
+for  iterator iter2   connectionstate getsessionstates   iterator    iter2 hasnext
+sessionstate sessionstate    sessionstate iter2 next
+if  log isdebugenabled
+log debug     sessionstate getinfo   getsessionid
+transport oneway sessionstate getinfo
+if  restoreproducers
+restoreproducers transport  sessionstate
+if  restoreconsumers
+restoreconsumers transport  sessionstate
+/**
+* @param transport
+* @param sessionstate
+* @throws ioexception
+*/
+protected void restoreconsumers transport transport  sessionstate sessionstate  throws ioexception
+// restore the session's consumers but possibly in pull only (prefetch 0 state) till recovery complete
+final connectionstate connectionstate   connectionstates get sessionstate getinfo   getsessionid   getparentid
+final boolean connectioninterruptionprocessingcomplete   connectionstate isconnectioninterruptprocessingcomplete
+for  consumerstate consumerstate   sessionstate getconsumerstates
+consumerinfo infotosend   consumerstate getinfo
+if   connectioninterruptionprocessingcomplete    infotosend getprefetchsize   > 0
+infotosend   consumerstate getinfo   copy
+connectionstate getrecoveringpullconsumers   put infotosend getconsumerid    consumerstate getinfo
+infotosend setprefetchsize 0
+if  log isdebugenabled
+log debug     infotosend getconsumerid         consumerstate getinfo   getprefetchsize
+if  log isdebugenabled
+log debug     infotosend getconsumerid
+transport oneway infotosend
+/**
+* @param transport
+* @param sessionstate
+* @throws ioexception
+*/
+protected void restoreproducers transport transport  sessionstate sessionstate  throws ioexception
+// restore the session's producers
+for  iterator iter3   sessionstate getproducerstates   iterator    iter3 hasnext
+producerstate producerstate    producerstate iter3 next
+if  log isdebugenabled
+log debug     producerstate getinfo   getproducerid
+transport oneway producerstate getinfo
+/**
+* @param transport
+* @param connectionstate
+* @throws ioexception
+*/
+protected void restoretempdestinations transport transport  connectionstate connectionstate
+throws ioexception
+// restore the connection's temp destinations.
+for  iterator iter2   connectionstate gettempdestinations   iterator    iter2 hasnext
+destinationinfo info    destinationinfo iter2 next
+transport oneway info
+if  log isdebugenabled
+log debug     info getdestination
+public response processadddestination destinationinfo info
+if  info    null
+connectionstate cs   connectionstates get info getconnectionid
+if  cs    null    info getdestination   istemporary
+cs addtempdestination info
+return tracked_response_marker
+public response processremovedestination destinationinfo info
+if  info    null
+connectionstate cs   connectionstates get info getconnectionid
+if  cs    null    info getdestination   istemporary
+cs removetempdestination info getdestination
+return tracked_response_marker
+public response processaddproducer producerinfo info
+if  info    null    info getproducerid      null
+sessionid sessionid   info getproducerid   getparentid
+if  sessionid    null
+connectionid connectionid   sessionid getparentid
+if  connectionid    null
+connectionstate cs   connectionstates get connectionid
+if  cs    null
+sessionstate ss   cs getsessionstate sessionid
+if  ss    null
+ss addproducer info
+return tracked_response_marker
+public response processremoveproducer producerid id
+if  id    null
+sessionid sessionid   id getparentid
+if  sessionid    null
+connectionid connectionid   sessionid getparentid
+if  connectionid    null
+connectionstate cs   connectionstates get connectionid
+if  cs    null
+sessionstate ss   cs getsessionstate sessionid
+if  ss    null
+ss removeproducer id
+return tracked_response_marker
+public response processaddconsumer consumerinfo info
+if  info    null
+sessionid sessionid   info getconsumerid   getparentid
+if  sessionid    null
+connectionid connectionid   sessionid getparentid
+if  connectionid    null
+connectionstate cs   connectionstates get connectionid
+if  cs    null
+sessionstate ss   cs getsessionstate sessionid
+if  ss    null
+ss addconsumer info
+return tracked_response_marker
+public response processremoveconsumer consumerid id  long lastdeliveredsequenceid
+if  id    null
+sessionid sessionid   id getparentid
+if  sessionid    null
+connectionid connectionid   sessionid getparentid
+if  connectionid    null
+connectionstate cs   connectionstates get connectionid
+if  cs    null
+sessionstate ss   cs getsessionstate sessionid
+if  ss    null
+ss removeconsumer id
+return tracked_response_marker
+public response processaddsession sessioninfo info
+if  info    null
+connectionid connectionid   info getsessionid   getparentid
+if  connectionid    null
+connectionstate cs   connectionstates get connectionid
+if  cs    null
+cs addsession info
+return tracked_response_marker
+public response processremovesession sessionid id  long lastdeliveredsequenceid
+if  id    null
+connectionid connectionid   id getparentid
+if  connectionid    null
+connectionstate cs   connectionstates get connectionid
+if  cs    null
+cs removesession id
+return tracked_response_marker
+public response processaddconnection connectioninfo info
+if  info    null
+connectionstates put info getconnectionid    new connectionstate info
+return tracked_response_marker
+public response processremoveconnection connectionid id  long lastdeliveredsequenceid  throws exception
+if  id    null
+connectionstates remove id
+return tracked_response_marker
+public response processmessage message send  throws exception
+if  send    null
+if  tracktransactions    send gettransactionid      null
+producerid producerid   send getproducerid
+connectionid connectionid   producerid getparentid   getparentid
+if  connectionid    null
+connectionstate cs   connectionstates get connectionid
+if  cs    null
+transactionstate transactionstate   cs gettransactionstate send gettransactionid
+if  transactionstate    null
+transactionstate addcommand send
+if  tracktransactionproducers
+// for jmstemplate, track the producer in case it is closed before commit
+// and needs to be replayed
+sessionstate ss   cs getsessionstate producerid getparentid
+producerstate producerstate   ss getproducerstate producerid
+producerstate settransactionstate transactionstate
+return tracked_response_marker
+else if  trackmessages
+messagecache put send getmessageid    send
+return null
+public response processbegintransaction transactioninfo info
+if  tracktransactions    info    null    info gettransactionid      null
+connectionid connectionid   info getconnectionid
+if  connectionid    null
+connectionstate cs   connectionstates get connectionid
+if  cs    null
+cs addtransactionstate info gettransactionid
+transactionstate state   cs gettransactionstate info gettransactionid
+state addcommand info
+return tracked_response_marker
+return null
+public response processpreparetransaction transactioninfo info  throws exception
+if  tracktransactions    info    null
+connectionid connectionid   info getconnectionid
+if  connectionid    null
+connectionstate cs   connectionstates get connectionid
+if  cs    null
+transactionstate transactionstate   cs gettransactionstate info gettransactionid
+if  transactionstate    null
+transactionstate addcommand info
+return new tracked new preparereadonlytransactionaction info
+return null
+public response processcommittransactiononephase transactioninfo info  throws exception
+if  tracktransactions    info    null
+connectionid connectionid   info getconnectionid
+if  connectionid    null
+connectionstate cs   connectionstates get connectionid
+if  cs    null
+transactionstate transactionstate   cs gettransactionstate info gettransactionid
+if  transactionstate    null
+transactionstate addcommand info
+return new tracked new removetransactionaction info
+return null
+public response processcommittransactiontwophase transactioninfo info  throws exception
+if  tracktransactions    info    null
+connectionid connectionid   info getconnectionid
+if  connectionid    null
+connectionstate cs   connectionstates get connectionid
+if  cs    null
+transactionstate transactionstate   cs gettransactionstate info gettransactionid
+if  transactionstate    null
+transactionstate addcommand info
+return new tracked new removetransactionaction info
+return null
+public response processrollbacktransaction transactioninfo info  throws exception
+if  tracktransactions    info    null
+connectionid connectionid   info getconnectionid
+if  connectionid    null
+connectionstate cs   connectionstates get connectionid
+if  cs    null
+transactionstate transactionstate   cs gettransactionstate info gettransactionid
+if  transactionstate    null
+transactionstate addcommand info
+return new tracked new removetransactionaction info
+return null
+public response processendtransaction transactioninfo info  throws exception
+if  tracktransactions    info    null
+connectionid connectionid   info getconnectionid
+if  connectionid    null
+connectionstate cs   connectionstates get connectionid
+if  cs    null
+transactionstate transactionstate   cs gettransactionstate info gettransactionid
+if  transactionstate    null
+transactionstate addcommand info
+return tracked_response_marker
+return null
+@override
+public response processmessagepull messagepull pull  throws exception
+if  pull    null
+// leave a single instance in the cache
+final string id   pull getdestination         pull getconsumerid
+messagecache put id intern    pull
+return null
+public boolean isrestoreconsumers
+return restoreconsumers
+public void setrestoreconsumers boolean restoreconsumers
+this restoreconsumers   restoreconsumers
+public boolean isrestoreproducers
+return restoreproducers
+public void setrestoreproducers boolean restoreproducers
+this restoreproducers   restoreproducers
+public boolean isrestoresessions
+return restoresessions
+public void setrestoresessions boolean restoresessions
+this restoresessions   restoresessions
+public boolean istracktransactions
+return tracktransactions
+public void settracktransactions boolean tracktransactions
+this tracktransactions   tracktransactions
+public boolean istracktransactionproducers
+return this tracktransactionproducers
+public void settracktransactionproducers boolean tracktransactionproducers
+this tracktransactionproducers   tracktransactionproducers
+public boolean isrestoretransaction
+return restoretransaction
+public void setrestoretransaction boolean restoretransaction
+this restoretransaction   restoretransaction
+public boolean istrackmessages
+return trackmessages
+public void settrackmessages boolean trackmessages
+this trackmessages   trackmessages
+public int getmaxcachesize
+return maxcachesize
+public void setmaxcachesize int maxcachesize
+this maxcachesize   maxcachesize
+public void connectioninterruptprocessingcomplete transport transport  connectionid connectionid
+connectionstate connectionstate   connectionstates get connectionid
+if  connectionstate    null
+connectionstate setconnectioninterruptprocessingcomplete true
+map<consumerid  consumerinfo> stalledconsumers   connectionstate getrecoveringpullconsumers
+for  entry<consumerid  consumerinfo> entry  stalledconsumers entryset
+consumercontrol control   new consumercontrol
+control setconsumerid entry getkey
+control setprefetch entry getvalue   getprefetchsize
+control setdestination entry getvalue   getdestination
+try
+if  log isdebugenabled
+log debug     control getconsumerid         control getprefetch
+transport oneway control
+catch  exception ex
+if  log isdebugenabled
+log debug     control getconsumerid
+control getprefetch    ex
+stalledconsumers clear
+public void transportinterrupted connectionid connectionid
+connectionstate connectionstate   connectionstates get connectionid
+if  connectionstate    null
+connectionstate setconnectioninterruptprocessingcomplete false

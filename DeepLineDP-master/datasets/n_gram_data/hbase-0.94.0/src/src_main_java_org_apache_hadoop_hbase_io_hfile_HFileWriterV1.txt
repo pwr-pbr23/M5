@@ -1,0 +1,369 @@
+/*
+* copyright 2011 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase io hfile
+import java io bytearrayoutputstream
+import java io dataoutputstream
+import java io ioexception
+import java io outputstream
+import java nio bytebuffer
+import java util arraylist
+import java util list
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs fsdataoutputstream
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase keyvalue keycomparator
+import org apache hadoop hbase io encoding datablockencoding
+import org apache hadoop hbase io hfile compression algorithm
+import org apache hadoop hbase io hfile hfile fileinfo
+import org apache hadoop hbase io hfile hfile writer
+import org apache hadoop hbase regionserver memstore
+import org apache hadoop hbase regionserver metrics schemametrics
+import org apache hadoop hbase util checksumtype
+import org apache hadoop hbase util bloomfilterwriter
+import org apache hadoop hbase util bytes
+import org apache hadoop io writable
+import org apache hadoop io compress compressor
+/**
+* writes version 1 hfiles. mainly used for testing backwards-compatibility.
+*/
+public class hfilewriterv1 extends abstracthfilewriter
+/** meta data block name for bloom filter parameters. */
+static final string bloom_filter_meta_key
+/** meta data block name for bloom filter bits. */
+public static final string bloom_filter_data_key
+private static final log log   logfactory getlog hfilewriterv1 class
+// a stream made per block written.
+private dataoutputstream out
+// offset where the current block began.
+private long blockbegin
+// first keys of every block.
+private arraylist<byte> blockkeys   new arraylist<byte>
+// block offset in backing stream.
+private arraylist<long> blockoffsets   new arraylist<long>
+// raw (decompressed) data size.
+private arraylist<integer> blockdatasizes   new arraylist<integer>
+private compressor compressor
+// additional byte array output stream used to fill block cache
+private bytearrayoutputstream baos
+private dataoutputstream baosdos
+private int blocknumber   0
+static class writerfactoryv1 extends hfile writerfactory
+writerfactoryv1 configuration conf  cacheconfig cacheconf
+super conf  cacheconf
+@override
+public writer createwriter filesystem fs  path path
+fsdataoutputstream ostream  int blocksize
+algorithm compressalgo  hfiledatablockencoder datablockencoder
+keycomparator comparator  final checksumtype checksumtype
+final int bytesperchecksum  throws ioexception
+// version 1 does not implement checksums
+return new hfilewriterv1 conf  cacheconf  fs  path  ostream  blocksize
+compressalgo  datablockencoder  comparator
+/** constructor that takes a path, creates and closes the output stream. */
+public hfilewriterv1 configuration conf  cacheconfig cacheconf
+filesystem fs  path path  fsdataoutputstream ostream
+int blocksize  compression algorithm compress
+hfiledatablockencoder blockencoder
+final keycomparator comparator  throws ioexception
+super cacheconf  ostream    null ? createoutputstream conf  fs  path    ostream  path
+blocksize  compress  blockencoder  comparator
+schemametrics configureglobally conf
+/**
+* if at block boundary, opens new block.
+*
+* @throws ioexception
+*/
+private void checkblockboundary   throws ioexception
+if  this out    null    this out size   < blocksize
+return
+finishblock
+newblock
+/**
+* do the cleanup if a current block.
+*
+* @throws ioexception
+*/
+private void finishblock   throws ioexception
+if  this out    null
+return
+long starttimens   system nanotime
+int size   releasecompressingstream this out
+this out   null
+blockkeys add firstkeyinblock
+blockoffsets add long valueof blockbegin
+blockdatasizes add integer valueof size
+this totaluncompressedbytes    size
+hfile offerwritelatency system nanotime     starttimens
+if  cacheconf shouldcachedataonwrite
+baosdos flush
+// we do not do data block encoding on disk for hfile v1
+byte bytes   baos tobytearray
+hfileblock block   new hfileblock blocktype data
+int   outputstream getpos     blockbegin   bytes length   1
+bytebuffer wrap bytes  0  bytes length   hfileblock fill_header
+blockbegin  memstore no_persistent_ts
+hfileblock minor_version_no_checksum            minor version
+0                                             bytesperchecksum
+checksumtype null getcode                     checksum type
+int   outputstream getpos     blockbegin
+hfileblock header_size_no_checksum            ondiskdatasizewithheader
+block   blockencoder disktocacheformat block  false
+passschemametricsto block
+cacheconf getblockcache   cacheblock
+new blockcachekey name  blockbegin  datablockencoding none
+block getblocktype     block
+baosdos close
+blocknumber
+/**
+* ready a new block for writing.
+*
+* @throws ioexception
+*/
+private void newblock   throws ioexception
+// this is where the next block begins.
+blockbegin   outputstream getpos
+this out   getcompressingstream
+blocktype data write out
+firstkeyinblock   null
+if  cacheconf shouldcachedataonwrite
+this baos   new bytearrayoutputstream
+this baosdos   new dataoutputstream baos
+baosdos write hfileblock dummy_header_no_checksum
+/**
+* sets up a compressor and creates a compression stream on top of
+* this.outputstream. get one per block written.
+*
+* @return a compressing stream; if 'none' compression, returned stream does
+* not compress.
+*
+* @throws ioexception
+*
+* @see {@link #releasecompressingstream(dataoutputstream)}
+*/
+private dataoutputstream getcompressingstream   throws ioexception
+this compressor   compressalgo getcompressor
+// get new dos compression stream. in tfile, the dos, is not closed,
+// just finished, and that seems to be fine over there. todo: check
+// no memory retention of the dos. should i disable the 'flush' on the
+// dos as the bcfile over in tfile does? it wants to make it so flushes
+// don't go through to the underlying compressed stream. flush on the
+// compressed downstream should be only when done. i was going to but
+// looks like when we call flush in here, its legitimate flush that
+// should go through to the compressor.
+outputstream os   this compressalgo createcompressionstream
+this outputstream  this compressor  0
+return new dataoutputstream os
+/**
+* let go of block compressor and compressing stream gotten in call {@link
+* #getcompressingstream}.
+*
+* @param dos
+*
+* @return how much was written on this stream since it was taken out.
+*
+* @see #getcompressingstream()
+*
+* @throws ioexception
+*/
+private int releasecompressingstream final dataoutputstream dos
+throws ioexception
+dos flush
+this compressalgo returncompressor this compressor
+this compressor   null
+return dos size
+/**
+* add a meta block to the end of the file. call before close(). metadata
+* blocks are expensive. fill one with a bunch of serialized data rather than
+* do a metadata block per metadata instance. if metadata is small, consider
+* adding to file info using {@link #appendfileinfo(byte[], byte[])}
+*
+* @param metablockname
+*          name of the block
+* @param content
+*          will call readfields to get data later (do not reuse)
+*/
+public void appendmetablock string metablockname  writable content
+byte key   bytes tobytes metablockname
+int i
+for  i   0  i < metanames size      i
+// stop when the current key is greater than our own
+byte cur   metanames get i
+if  bytes bytes_rawcomparator compare cur  0  cur length  key  0
+key length  > 0
+break
+metanames add i  key
+metadata add i  content
+/**
+* add key/value to file. keys must be added in an order that agrees with the
+* comparator passed on construction.
+*
+* @param kv
+*          keyvalue to add. cannot be empty nor null.
+* @throws ioexception
+*/
+public void append final keyvalue kv  throws ioexception
+append kv getbuffer    kv getkeyoffset    kv getkeylength
+kv getbuffer    kv getvalueoffset    kv getvaluelength
+/**
+* add key/value to file. keys must be added in an order that agrees with the
+* comparator passed on construction.
+*
+* @param key
+*          key to add. cannot be empty nor null.
+* @param value
+*          value to add. cannot be empty nor null.
+* @throws ioexception
+*/
+public void append final byte key  final byte value  throws ioexception
+append key  0  key length  value  0  value length
+/**
+* add key/value to file. keys must be added in an order that agrees with the
+* comparator passed on construction.
+*
+* @param key
+* @param koffset
+* @param klength
+* @param value
+* @param voffset
+* @param vlength
+* @throws ioexception
+*/
+private void append final byte key  final int koffset  final int klength
+final byte value  final int voffset  final int vlength
+throws ioexception
+boolean dupkey   checkkey key  koffset  klength
+checkvalue value  voffset  vlength
+if   dupkey
+checkblockboundary
+// write length of key and value and then actual key and value bytes.
+this out writeint klength
+totalkeylength    klength
+this out writeint vlength
+totalvaluelength    vlength
+this out write key  koffset  klength
+this out write value  voffset  vlength
+// are we the first key in this block?
+if  this firstkeyinblock    null
+// copy the key.
+this firstkeyinblock   new byte
+system arraycopy key  koffset  this firstkeyinblock  0  klength
+this lastkeybuffer   key
+this lastkeyoffset   koffset
+this lastkeylength   klength
+this entrycount
+// if we are pre-caching blocks on write, fill byte array stream
+if  cacheconf shouldcachedataonwrite
+this baosdos writeint klength
+this baosdos writeint vlength
+this baosdos write key  koffset  klength
+this baosdos write value  voffset  vlength
+public void close   throws ioexception
+if  this outputstream    null
+return
+// write out the end of the data blocks, then write meta data blocks.
+// followed by fileinfo, data block index and meta block index.
+finishblock
+fixedfiletrailer trailer   new fixedfiletrailer 1
+hfileblock minor_version_no_checksum
+// write out the metadata blocks if any.
+arraylist<long> metaoffsets   null
+arraylist<integer> metadatasizes   null
+if  metanames size   > 0
+metaoffsets   new arraylist<long> metanames size
+metadatasizes   new arraylist<integer> metanames size
+for  int i   0  i < metanames size      i
+// store the beginning offset
+long curpos   outputstream getpos
+metaoffsets add curpos
+// write the metadata content
+dataoutputstream dos   getcompressingstream
+blocktype meta write dos
+metadata get i  write dos
+int size   releasecompressingstream dos
+// store the metadata size
+metadatasizes add size
+writefileinfo trailer  outputstream
+// write the data block index.
+trailer setloadonopenoffset writeblockindex this outputstream
+this blockkeys  this blockoffsets  this blockdatasizes
+log info     this blockkeys size
+if  metanames size   > 0
+// write the meta index.
+writeblockindex this outputstream  metanames  metaoffsets  metadatasizes
+// now finish off the trailer.
+trailer setdataindexcount blockkeys size
+finishclose trailer
+@override
+protected void finishfileinfo   throws ioexception
+super finishfileinfo
+// in version 1, we store comparator name in the file info.
+fileinfo append fileinfo comparator
+bytes tobytes comparator getclass   getname     false
+@override
+public void addinlineblockwriter inlineblockwriter bloomwriter
+// inline blocks only exist in hfile format version 2.
+throw new unsupportedoperationexception
+/**
+* version 1 general bloom filters are stored in two meta blocks with two different
+* keys.
+*/
+@override
+public void addgeneralbloomfilter bloomfilterwriter bfw
+appendmetablock bloom_filter_meta_key
+bfw getmetawriter
+writable datawriter   bfw getdatawriter
+if  datawriter    null
+appendmetablock bloom_filter_data_key  datawriter
+@override
+public void adddeletefamilybloomfilter bloomfilterwriter bfw
+throws ioexception
+throw new ioexception
+/**
+* write out the index in the version 1 format. this conforms to the legacy
+* version 1 format, but can still be read by
+* {@link hfileblockindex.blockindexreader#readrootindex(java.io.datainputstream,
+* int)}.
+*
+* @param out the stream to write to
+* @param keys
+* @param offsets
+* @param uncompressedsizes in contrast with a version 2 root index format,
+*          the sizes stored in the version 1 are uncompressed sizes
+* @return
+* @throws ioexception
+*/
+private static long writeblockindex final fsdataoutputstream out
+final list<byte> keys  final list<long> offsets
+final list<integer> uncompressedsizes  throws ioexception
+long pos   out getpos
+// don't write an index if nothing in the index.
+if  keys size   > 0
+blocktype index_v1 write out
+// write the index.
+for  int i   0  i < keys size      i
+out writelong offsets get i  longvalue
+out writeint uncompressedsizes get i  intvalue
+byte key   keys get i
+bytes writebytearray out  key
+return pos

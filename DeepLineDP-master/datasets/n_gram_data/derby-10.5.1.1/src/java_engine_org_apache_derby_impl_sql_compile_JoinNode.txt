@@ -1,0 +1,1457 @@
+/*
+derby - class org.apache.derby.impl.sql.compile.joinnode
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package	org apache derby impl sql compile
+import org apache derby iapi services context contextmanager
+import org apache derby iapi services compiler methodbuilder
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby iapi sql compile optimizable
+import org apache derby iapi sql compile optimizablepredicate
+import org apache derby iapi sql compile optimizablepredicatelist
+import org apache derby iapi sql compile optimizer
+import org apache derby iapi sql compile visitable
+import org apache derby iapi sql compile visitor
+import org apache derby iapi sql compile costestimate
+import org apache derby iapi sql compile rowordering
+import org apache derby iapi sql compile c_nodetypes
+import org apache derby iapi sql dictionary datadictionary
+import org apache derby iapi sql dictionary tabledescriptor
+import org apache derby iapi sql dictionary conglomeratedescriptor
+import org apache derby iapi types typeid
+import org apache derby iapi types datatypedescriptor
+import org apache derby iapi reference sqlstate
+import org apache derby iapi reference classname
+import org apache derby iapi sql activation
+import org apache derby iapi sql resultset
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi services loader generatedmethod
+import org apache derby impl sql compile activationclassbuilder
+import org apache derby iapi util jbitset
+import org apache derby iapi util propertyutil
+import org apache derby iapi services classfile vmopcode
+import java util properties
+import java util vector
+/**
+* a joinnode represents a join result set for either of the basic dml
+* operations: select and insert.  for insert - select, any of the
+* fields in a joinnode can be used (the joinnode represents
+* the (join) select statement in the insert - select).  for insert,
+* the resultcolumns in the selectlist will contain the names of the columns
+* being inserted into or updated.
+*
+*/
+public class joinnode extends tableoperatornode
+/* join semantics */
+public static final int innerjoin   1
+public static final int crossjoin   2
+public static final int leftouterjoin   3
+public static final int rightouterjoin   4
+public static final int fullouterjoin   5
+public static final int unionjoin   6
+private boolean optimized
+private predicatelist leftpredicatelist
+private predicatelist rightpredicatelist
+protected boolean flattenablejoin   true
+vector				aggregatevector
+subquerylist		subquerylist
+valuenode			joinclause
+boolean	            joinclausenormalized
+predicatelist		joinpredicates
+resultcolumnlist	usingclause
+//user provided optimizer overrides
+properties joinorderstrategyproperties
+/**
+* initializer for a joinnode.
+*
+* @param leftresult	the resultsetnode on the left side of this join
+* @param rightresult	the resultsetnode on the right side of this join
+* @param onclause		the on clause
+* @param usingclause	the using clause
+* @param selectlist	the result column list for the join
+* @param tableproperties	properties list associated with the table
+* @param joinorderstrategyproperties	user provided optimizer overrides
+*
+* @exception standardexception		thrown on error
+*/
+public void init
+object leftresult
+object rightresult
+object onclause
+object usingclause
+object selectlist
+object tableproperties
+object joinorderstrategyproperties
+throws standardexception
+super init leftresult  rightresult  tableproperties
+resultcolumns    resultcolumnlist  selectlist
+joinclause    valuenode  onclause
+joinclausenormalized   false
+this usingclause    resultcolumnlist  usingclause
+this joinorderstrategyproperties    properties joinorderstrategyproperties
+/* joinnodes can be generated in the parser or at the end of optimization.
+* those generated in the parser do not have resultcolumns yet.
+*/
+if  resultcolumns    null
+/* a longer term assertion */
+if  sanitymanager debug
+sanitymanager assert  leftresultset getreferencedtablemap      null
+rightresultset getreferencedtablemap      null
+leftresultset getreferencedtablemap      null
+rightresultset getreferencedtablemap      null
+/* build the referenced table map (left || right) */
+if  leftresultset getreferencedtablemap      null
+referencedtablemap    jbitset  leftresultset getreferencedtablemap   clone
+referencedtablemap or  jbitset  rightresultset getreferencedtablemap
+joinpredicates    predicatelist  getnodefactory   getnode
+c_nodetypes predicate_list
+getcontextmanager
+/*
+*  optimizable interface
+*/
+/**
+* @see org.apache.derby.iapi.sql.compile.optimizable#optimizeit
+*
+* @exception standardexception		thrown on error
+*/
+public costestimate optimizeit
+optimizer optimizer
+optimizablepredicatelist predlist
+costestimate outercost
+rowordering rowordering
+throws standardexception
+optimizer trace optimizer calling_on_join_node  0  0  0 0  null
+// it's possible that a call to optimize the left/right will cause
+// a new "truly the best" plan to be stored in the underlying base
+// tables.  if that happens and then we decide to skip that plan
+// (which we might do if the call to "considercost()" below decides
+// the current path is infeasible or not the best) we need to be
+// able to revert back to the "truly the best" plans that we had
+// saved before we got here.  so with this next call we save the
+// current plans using "this" node as the key.  if needed, we'll
+// then make the call to revert the plans in optimizerimpl's
+// getnextdecoratedpermutation() method.
+updatebestplanmap add_plan  this
+/*
+** resolve: most types of optimizables only implement estimatecost(),
+** and leave it up to optimizeit() in fromtable to figure out the
+** total cost of the join.  for joins, though, we want to figure out
+** the best plan for the join knowing how many outer rows there are -
+** it could affect the join strategy significantly.  so we implement
+** optimizeit() here, which overrides the optimizeit() in fromtable.
+** this assumes that the join strategy for which this join node is
+** the inner table is a nested loop join, which will not be a valid
+** assumption when we implement other strategies like materialization
+** (hash join can work only on base tables).
+*/
+/* resolve - need to figure out how to really optimize this node. */
+// resolve: need to set row ordering of sources in the row ordering
+// that was passed in.
+leftresultset   optimizesource
+optimizer
+leftresultset
+getleftpredicatelist
+outercost
+/* move all joinpredicates down to the right.
+* resolve - when we consider the reverse join order then
+* we will have to pull them back up and then push them
+* down to the other side when considering the reverse
+* join order.
+* resolve - this logic needs to be looked at when we
+* implement full outer join.
+*/
+// walk joinpredicates backwards due to possible deletes
+for  int index   joinpredicates size     1  index >  0  index
+jbitset	  curbitset
+predicate predicate
+predicate    predicate  joinpredicates elementat index
+if    predicate getpushable
+continue
+joinpredicates removeelementat index
+getrightpredicatelist   addelement predicate
+rightresultset   optimizesource
+optimizer
+rightresultset
+getrightpredicatelist
+leftresultset getcostestimate
+costestimate   getcostestimate optimizer
+/*
+** we add the costs for the inner and outer table, but the number
+** of rows is that for the inner table only.
+*/
+costestimate setcost
+leftresultset getcostestimate   getestimatedcost
+rightresultset getcostestimate   getestimatedcost
+rightresultset getcostestimate   rowcount
+rightresultset getcostestimate   rowcount
+/*
+** some types of joins (e.g. outer joins) will return a different
+** number of rows than is predicted by optimizeit() in joinnode.
+** so, adjust this value now. this method does nothing for most
+** join types.
+*/
+adjustnumberofrowsreturned costestimate
+/*
+** get the cost of this result set in the context of the whole plan.
+*/
+getcurrentaccesspath
+getjoinstrategy
+estimatecost
+this
+predlist
+conglomeratedescriptor  null
+outercost
+optimizer
+costestimate
+optimizer considercost this  predlist  costestimate  outercost
+/* optimize subqueries only once, no matter how many times we're called */
+if      optimized      subquerylist    null
+/* resolve - need to figure out how to really optimize this node.
+* also need to figure out the pushing of the joinclause.
+*/
+subquerylist optimize optimizer getdatadictionary
+costestimate rowcount
+subquerylist modifyaccesspaths
+optimized   true
+return costestimate
+/**
+* @see optimizable#pushoptpredicate
+*
+* @exception standardexception		thrown on error
+*/
+public boolean pushoptpredicate optimizablepredicate optimizablepredicate
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert optimizablepredicate instanceof predicate
+sanitymanager assert   optimizablepredicate hassubquery
+optimizablepredicate hasmethodcall
+/* add the matching predicate to the joinpredicates */
+joinpredicates addpredicate  predicate  optimizablepredicate
+/* remap all of the columnreferences to point to the
+* source of the values.
+*/
+remapcrsvisitor rcrv   new remapcrsvisitor true
+predicate  optimizablepredicate  getandnode   accept rcrv
+return true
+/**
+* @see optimizable#modifyaccesspath
+*
+* @exception standardexception		thrown on error
+*/
+public optimizable modifyaccesspath jbitset outertables  throws standardexception
+super modifyaccesspath outertables
+/* by the time we're done here, both the left and right
+* predicate lists should be empty because we pushed everything
+* down.
+*/
+if  sanitymanager debug
+if  getleftpredicatelist   size      0
+sanitymanager throwassert
+getleftpredicatelist   size
+if  getrightpredicatelist   size      0
+sanitymanager throwassert
+getrightpredicatelist   size
+return this
+/**
+*  some types of joins (e.g. outer joins) will return a different
+*  number of rows than is predicted by optimizeit() in joinnode.
+*  so, adjust this value now. this method does nothing for most
+*  join types.
+*/
+protected void adjustnumberofrowsreturned costestimate costestimate
+/**
+* return a resultcolumnlist with all of the columns in this table.
+* (used in expanding '*'s.)
+* note: since this method is for expanding a "*" in the select list,
+* resultcolumn.expression will be a columnreference.
+*
+* @param alltablename		the qualifier on the "*"
+*
+* @return resultcolumnlist	list of result columns from this table.
+*
+* @exception standardexception		thrown on error
+*/
+public resultcolumnlist getallresultcolumns tablename alltablename
+throws standardexception
+/* we need special processing when there is a using clause.
+* the resulting table will be the join columns from
+* the outer table followed by the non-join columns from
+* left side plus the non-join columns from the right side.
+*/
+if  usingclause    null
+return getallresultcolumnsnousing alltablename
+/* get the logical left side of the join.
+* this is where the join columns come from.
+* (for right outer join, the left is the right
+* and the right is the left and the join is the nioj).
+*/
+resultsetnode	logicalleftrs   getlogicalleftresultset
+// get the join columns
+resultcolumnlist joinrcl   logicalleftrs getallresultcolumns
+
+getjoincolumns usingclause
+// get the left and right rcls
+resultcolumnlist leftrcl   leftresultset getallresultcolumns alltablename
+resultcolumnlist rightrcl   rightresultset getallresultcolumns alltablename
+/* chop the join columns out of the both left and right.
+* thanks to the ansi committee, the join columns
+* do not belong to either table.
+*/
+if  leftrcl    null
+leftrcl removejoincolumns usingclause
+if  rightrcl    null
+rightrcl removejoincolumns usingclause
+/* if alltablename is null, then we want to return the splicing
+* of the join columns followed by the non-join columns from
+* the left followed by the non-join columns from the right.
+* if not, then at most 1 side should match.
+* note: we need to make sure that the rc's virtualcolumnids
+* are correct (1 .. size).
+*/
+if  leftrcl    null
+rightrcl resetvirtualcolumnids
+return rightrcl
+else if  rightrcl    null
+leftrcl resetvirtualcolumnids
+return leftrcl
+else
+/* both sides are non-null.  this should only happen
+* if alltablename is null.
+*/
+if  sanitymanager debug
+if  alltablename    null
+sanitymanager throwassert
+alltablename
+joinrcl destructiveappend leftrcl
+joinrcl destructiveappend rightrcl
+joinrcl resetvirtualcolumnids
+return joinrcl
+/**
+* return a resultcolumnlist with all of the columns in this table.
+* (used in expanding '*'s.)
+* note: since this method is for expanding a "*" in the select list,
+* resultcolumn.expression will be a columnreference.
+* note: this method is handles the case when there is no using clause.
+* the caller handles the case when there is a using clause.
+*
+* @param alltablename		the qualifier on the "*"
+*
+* @return resultcolumnlist	list of result columns from this table.
+*
+* @exception standardexception		thrown on error
+*/
+private resultcolumnlist getallresultcolumnsnousing tablename alltablename
+throws standardexception
+resultcolumnlist leftrcl   leftresultset getallresultcolumns alltablename
+resultcolumnlist rightrcl   rightresultset getallresultcolumns alltablename
+/* if alltablename is null, then we want to return the spliced
+* left and right rcls.  if not, then at most 1 side should match.
+*/
+if  leftrcl    null
+return rightrcl
+else if  rightrcl    null
+return leftrcl
+else
+/* both sides are non-null.  this should only happen
+* if alltablename is null.
+*/
+if  sanitymanager debug
+if  alltablename    null
+sanitymanager throwassert
+alltablename
+// return a spliced copy of the 2 lists
+resultcolumnlist templist
+resultcolumnlist  getnodefactory   getnode
+c_nodetypes result_column_list
+getcontextmanager
+templist nondestructiveappend leftrcl
+templist nondestructiveappend rightrcl
+return templist
+/**
+* try to find a resultcolumn in the table represented by this fromtable
+* that matches the name in the given columnreference.
+*
+* @param columnreference	the columnreference whose name we're looking
+*				for in the given table.
+*
+* @return	a resultcolumn whose expression is the columnnode
+*			that matches the columnreference.
+*		returns null if there is no match.
+*
+* @exception standardexception		thrown on error
+*/
+public resultcolumn getmatchingcolumn columnreference columnreference  throws standardexception
+/* get the logical left and right sides of the join.
+* (for right outer join, the left is the right
+* and the right is the left and the join is the nioj).
+*/
+resultsetnode	logicalleftrs   getlogicalleftresultset
+resultsetnode	logicalrightrs   getlogicalrightresultset
+resultcolumn	leftrc   null
+resultcolumn	resultcolumn   null
+resultcolumn	rightrc   null
+resultcolumn	usingrc   null
+leftrc   logicalleftrs getmatchingcolumn columnreference
+if  leftrc    null
+resultcolumn   leftrc
+/* find out if the column is in the using clause */
+if  usingclause    null
+usingrc   usingclause getresultcolumn leftrc getname
+/* we only search on the right if the column isn't in the
+* using clause.
+*/
+if  usingrc    null
+rightrc   logicalrightrs getmatchingcolumn columnreference
+if  rightrc    null
+/* we must catch ambiguous column references for joins here,
+* since fromlist only checks for ambiguous references between
+* nodes, not within a node.
+*/
+if  leftrc    null
+throw standardexception newexception sqlstate lang_ambiguous_column_name
+columnreference getsqlcolumnname
+resultcolumn   rightrc
+/* insert will bind the underlying result sets which have
+* tables twice. on the 2nd bind, resultcolumns != null,
+* we must return the rc from the joinnode's rcl which is above
+* the rc that we just found above.  (otherwise, the source
+* for the columnreference will be from the wrong resultset
+* at generate().)
+*/
+if  resultcolumns    null
+int rclsize   resultcolumns size
+for  int index   0  index < rclsize  index
+resultcolumn rc    resultcolumn  resultcolumns elementat index
+virtualcolumnnode vcn    virtualcolumnnode  rc getexpression
+if  resultcolumn    vcn getsourcecolumn
+resultcolumn   rc
+break
+return resultcolumn
+/**
+* bind the result columns of this resultsetnode when there is no
+* base table to bind them to.  this is useful for select statements,
+* where the result columns get their types from the expressions that
+* live under them.
+*
+* @param fromlistparam		fromlist to use/append to.
+*
+* @exception standardexception		thrown on error
+*/
+public void bindresultcolumns fromlist fromlistparam
+throws standardexception
+super bindresultcolumns fromlistparam
+/* now we build our rcl */
+buildrcl
+/* we cannot bind the join clause until after we've bound our
+* result columns. this is because the resultcolumns from the
+* children are propagated and merged to create our resultcolumns
+* in super.bindrcs().  if we bind the join clause prior to that
+* call, then the columnreferences in the join clause will point
+* to the children's rcls at the time that they are bound, but
+* will end up pointing above themselves, to our resultcolumns,
+* after the call to super.bindrcs().
+*/
+deferredbindexpressions fromlistparam
+/**
+* bind the result columns for this resultsetnode to a base table.
+* this is useful for insert and update statements, where the
+* result columns get their types from the table being updated or
+* inserted into.
+* if a result column list is specified, then the verification that the
+* result column list does not contain any duplicates will be done when
+* binding them by name.
+*
+* @param targettabledescriptor	the tabledescriptor for the table being
+*				updated or inserted into
+* @param targetcolumnlist	for insert statements, the user
+*					does not have to supply column
+*					names (for example, "insert into t
+*					values (1,2,3)".  when this
+*					parameter is null, it means that
+*					the user did not supply column
+*					names, and so the binding should
+*					be done based on order.  when it
+*					is not null, it means do the binding
+*					by name, not position.
+* @param statement			calling dmlstatementnode (insert or update)
+* @param fromlistparam		fromlist to use/append to.
+*
+* @exception standardexception		thrown on error
+*/
+public void bindresultcolumns tabledescriptor targettabledescriptor
+fromvti targetvti
+resultcolumnlist targetcolumnlist
+dmlstatementnode statement
+fromlist fromlistparam
+throws standardexception
+super bindresultcolumns targettabledescriptor
+targetvti
+targetcolumnlist  statement
+fromlistparam
+/* now we build our rcl */
+buildrcl
+/* we cannot bind the join clause until after we've bound our
+* result columns. this is because the resultcolumns from the
+* children are propagated and merged to create our resultcolumns
+* in super.bindrcs().  if we bind the join clause prior to that
+* call, then the columnreferences in the join clause will point
+* to the children's rcls at the time that they are bound, but
+* will end up pointing above themselves, to our resultcolumns,
+* after the call to super.bindrcs().
+*/
+deferredbindexpressions fromlistparam
+/**
+* build the rcl for this node.  we propagate the rcls up from the
+* children and splice them to form this node's rcl.
+*
+* @exception standardexception		thrown on error
+*/
+private void buildrcl   throws standardexception
+/* note - we only need to build this list if it does not already
+* exist.  this can happen in the degenerate case of an insert
+* select with a join expression in a derived table within the select.
+*/
+if  resultcolumns    null
+return
+resultcolumnlist leftrcl
+resultcolumnlist rightrcl
+resultcolumnlist tmprcl
+/* we get a shallow copy of the left's resultcolumnlist and its
+* resultcolumns.  (copy maintains resultcolumn.expression for now.)
+*/
+resultcolumns   leftresultset getresultcolumns
+leftrcl   resultcolumns copylistandobjects
+leftresultset setresultcolumns leftrcl
+/* replace resultcolumn.expression with new virtualcolumnnodes
+* in the projectrestrictnode's resultcolumnlist.  (virtualcolumnnodes include
+* pointers to source resultsetnode, this, and source resultcolumn.)
+*/
+resultcolumns genvirtualcolumnnodes leftresultset  leftrcl  false
+/*
+** if this is a right outer join, we can get nulls on the left side,
+** so change the types of the left result set to be nullable.
+*/
+if  this instanceof halfouterjoinnode      halfouterjoinnode this  isrightouterjoin
+resultcolumns setnullability true
+/* now, repeat the process with the right's rcl */
+tmprcl   rightresultset getresultcolumns
+rightrcl   tmprcl copylistandobjects
+rightresultset setresultcolumns rightrcl
+/* replace resultcolumn.expression with new virtualcolumnnodes
+* in the projectrestrictnode's resultcolumnlist.  (virtualcolumnnodes include
+* pointers to source resultsetnode, this, and source resultcolumn.)
+*/
+tmprcl genvirtualcolumnnodes rightresultset  rightrcl  false
+tmprcl adjustvirtualcolumnids resultcolumns size
+/*
+** if this is a left outer join, we can get nulls on the right side,
+** so change the types of the right result set to be nullable.
+*/
+if  this instanceof halfouterjoinnode       halfouterjoinnode this  isrightouterjoin
+tmprcl setnullability true
+/* now we append the propagated rcl from the right to the one from
+* the left and call it our own.
+*/
+resultcolumns nondestructiveappend tmprcl
+private void deferredbindexpressions fromlist fromlistparam
+throws standardexception
+/* bind the expressions in the join clause */
+subquerylist    subquerylist  getnodefactory   getnode
+c_nodetypes subquery_list
+getcontextmanager
+aggregatevector   new vector
+/* on clause */
+if  joinclause    null
+/* create a new fromlist with only left and right children before
+* binding the join clause. valid column references in the join clause
+* are limited to columns from the 2 tables being joined. this
+* algorithm enforces that.
+*/
+fromlist	fromlist    fromlist  getnodefactory   getnode
+c_nodetypes from_list
+getnodefactory   dojoinorderoptimization
+getcontextmanager
+fromlist addelement  fromtable  leftresultset
+fromlist addelement  fromtable  rightresultset
+/* first bind with all tables in the from clause, to detect ambiguous
+* references. push the left and right children to the front of the
+* fromlistparam before binding the join clause.  (we will
+* remove it before returning.)  valid column references in
+* the join clause are limited to columns from the 2 tables being
+* joined
+*/
+fromlistparam insertelementat rightresultset  0
+fromlistparam insertelementat leftresultset  0
+joinclause   joinclause bindexpression
+fromlistparam  subquerylist
+aggregatevector
+/* now bind with two tables being joined. if this raises column not found exception,
+* then we have a reference to other tables in the from clause. raise invalid
+* on clause error to match db2.
+*/
+try
+joinclause   joinclause bindexpression
+fromlist  subquerylist
+aggregatevector
+catch  standardexception se
+if  se getsqlstate   equals sqlstate lang_column_not_found
+throw standardexception newexception sqlstate lang_db2_on_clause_invalid
+throw se
+/* db2 doesn't allow subquerries in the on clause */
+if  subquerylist size   > 0
+throw standardexception newexception sqlstate lang_db2_on_clause_invalid
+/*
+** we cannot have aggregates in the on clause.
+** in the future, if we relax this, we'll need
+** to be able to pass the aggregatevector up
+** the tree.
+*/
+if  aggregatevector size   > 0
+throw standardexception newexception sqlstate lang_no_aggregates_in_on_clause
+fromlistparam removeelementat 0
+fromlistparam removeelementat 0
+/* using clause */
+else if  usingclause    null
+/* build a join clause from the usingclause, using the
+* exposed names in the left and right rsns.
+* for each column in the list, we generate 2 columnreferences,
+* 1 for the left and 1 for the right.  we bind each of these
+* to the appropriate side and build an equality predicate
+* between the 2.  we bind the = and and nodes by hand because
+* we have to bind the columnreferences a side at a time.
+* we need to bind the crs a side at a time to ensure that
+* we don't find an bogus ambiguous column reference. (bug 377)
+*/
+joinclause    andnode  getnodefactory   getnode
+c_nodetypes and_node
+
+
+getcontextmanager
+andnode	currand    andnode  joinclause
+valuenode truenode    valuenode  getnodefactory   getnode
+c_nodetypes boolean_constant_node
+boolean true
+getcontextmanager
+int usingsize   usingclause size
+for  int index   0  index < usingsize  index
+binarycomparisonoperatornode equalsnode
+columnreference leftcr
+columnreference rightcr
+resultcolumn	rc    resultcolumn  usingclause elementat index
+/* currand starts as first point of insertion (leftoperand == null)
+* and becomes last point of insertion.
+*/
+if  currand getleftoperand      null
+currand setrightoperand
+andnode  getnodefactory   getnode
+c_nodetypes and_node
+
+
+getcontextmanager
+currand    andnode  currand getrightoperand
+/* create and bind the left cr */
+fromlistparam insertelementat leftresultset  0
+leftcr    columnreference  getnodefactory   getnode
+c_nodetypes column_reference
+rc getname
+fromtable  leftresultset  gettablename
+getcontextmanager
+leftcr    columnreference  leftcr bindexpression
+fromlistparam  subquerylist
+aggregatevector
+fromlistparam removeelementat 0
+/* create and bind the right cr */
+fromlistparam insertelementat rightresultset  0
+rightcr    columnreference  getnodefactory   getnode
+c_nodetypes column_reference
+rc getname
+fromtable  rightresultset  gettablename
+getcontextmanager
+rightcr    columnreference  rightcr bindexpression
+fromlistparam  subquerylist
+aggregatevector
+fromlistparam removeelementat 0
+/* create and insert the new = condition */
+equalsnode    binarycomparisonoperatornode
+getnodefactory   getnode
+c_nodetypes binary_equals_operator_node
+leftcr
+rightcr
+getcontextmanager
+equalsnode bindcomparisonoperator
+currand setleftoperand equalsnode
+/* the right deep chain of andnodes ends in a binarytruenode.
+* note: we set it for every andnode, even though we will
+* overwrite it if this is not the last column in the list,
+* because postbindfixup() expects both the andnode to have
+* both the left and right operands.
+*/
+currand setrightoperand truenode
+currand postbindfixup
+if  joinclause    null
+/* if joinclause is a parameter, (where ?), then we assume
+* it will be a nullable boolean.
+*/
+if  joinclause requirestypefromcontext
+joinclause settype new datatypedescriptor typeid boolean_id  true
+/*
+** is the datatype of the join clause boolean?
+**
+** note: this test is not necessary in sql92 entry level, because
+** it is syntactically impossible to have a non-boolean join clause
+** in that level of the standard.  but we intend to extend the
+** language to allow boolean user functions in the join clause,
+** so we need to test for the error condition.
+*/
+typeid jointypeid   joinclause gettypeid
+/* if the where clause is not a built-in type, then generate a bound
+* conversion tree to a built-in type.
+*/
+if  jointypeid usertype
+joinclause   joinclause gensqljavasqltree
+if    joinclause gettypeservices   gettypeid   equals
+typeid boolean_id
+throw standardexception newexception sqlstate lang_non_boolean_join_clause
+joinclause gettypeservices   gettypeid   getsqltypename
+/**
+* put a projectrestrictnode on top of each fromtable in the fromlist.
+* columnreferences must continue to point to the same resultcolumn, so
+* that resultcolumn must percolate up to the new prn.  however,
+* that resultcolumn will point to a new expression, a virtualcolumnnode,
+* which points to the fromtable and the resultcolumn that is the source for
+* the columnreference.
+* (the new prn will have the original of the resultcolumnlist and
+* the resultcolumns from that list.  the fromtable will get shallow copies
+* of the resultcolumnlist and its resultcolumns.  resultcolumn.expression
+* will remain at the fromtable, with the prn getting a new
+* virtualcolumnnode for each resultcolumn.expression.)
+* we then project out the non-referenced columns.  if there are no referenced
+* columns, then the prn's resultcolumnlist will consist of a single resultcolumn
+* whose expression is 1.
+*
+* @param numtables			number of tables in the dml statement
+* @param gbl				the group by list, if any
+* @param fromlist			the from list, if any
+*
+* @return the generated projectrestrictnode atop the original fromtable.
+*
+* @exception standardexception		thrown on error
+*/
+public resultsetnode preprocess int numtables
+groupbylist gbl
+fromlist fromlist
+throws standardexception
+resultsetnode newtreetop
+newtreetop   super preprocess numtables  gbl  fromlist
+/* put the expression trees in conjunctive normal form.
+* note - this needs to occur before we preprocess the subqueries
+* because the subquery transformations assume that any subquery operator
+* negation has already occurred.
+*/
+if  joinclause    null
+normexpressions
+/* preprocess any subqueries in the join clause */
+if  subquerylist    null
+/* resolve - in order to flatten a subquery in
+* the on clause of an inner join we'd have to pass
+* the various lists from the outer select through to
+* resultsetnode.preprocess() and overload
+* normexpressions in halfouterjoinnode.  that's not
+* worth the effort, so we say that the on clause
+* is not under a top level and in normexpressions()
+* to ensure that subqueries in the on clause do not
+* get flattened.  that allows us to pass empty lists
+* to joinclause.preprocess() because we know that no
+* flattening will take place. (bug #1206)
+*/
+joinclause preprocess
+numtables
+fromlist  getnodefactory   getnode
+c_nodetypes from_list
+getnodefactory   dojoinorderoptimization
+getcontextmanager
+subquerylist  getnodefactory   getnode
+c_nodetypes subquery_list
+getcontextmanager
+predicatelist  getnodefactory   getnode
+c_nodetypes predicate_list
+getcontextmanager
+/* pull apart the expression trees */
+joinpredicates pullexpressions numtables  joinclause
+joinpredicates categorize
+joinclause   null
+return newtreetop
+/**
+* find the unreferenced result columns and project them out. this is used in pre-processing joins
+* that are not flattened into the where clause.
+*/
+void projectresultcolumns   throws standardexception
+leftresultset projectresultcolumns
+rightresultset projectresultcolumns
+resultcolumns pullvirtualisreferenced
+super projectresultcolumns
+/** put the expression trees in conjunctive normal form
+*
+* @exception standardexception		thrown on error
+*/
+public void normexpressions
+throws standardexception
+if  joinclausenormalized    true  return
+/* for each expression tree:
+*	o eliminate nots (eliminatenots())
+*	o ensure that there is an andnode on top of every
+*	  top level expression. (putandsontop())
+*	o finish the job (changetocnf())
+*/
+joinclause   joinclause eliminatenots false
+if  sanitymanager debug
+if    joinclause verifyeliminatenots
+joinclause treeprint
+sanitymanager throwassert
+joinclause
+joinclause   joinclause putandsontop
+if  sanitymanager debug
+if      joinclause instanceof andnode
+joinclause verifyputandsontop
+joinclause treeprint
+sanitymanager throwassert
+joinclause
+/* resolve - on clause is temporarily "not under a top
+* top level and" until we figure out how to deal with
+* subqueries in the on clause. (bug 1206)
+*/
+joinclause   joinclause changetocnf false
+if  sanitymanager debug
+if      joinclause instanceof andnode
+joinclause verifychangetocnf
+joinclause treeprint
+sanitymanager throwassert
+joinclause
+joinclausenormalized   true
+/**
+* push expressions down to the first resultsetnode which can do expression
+* evaluation and has the same referenced table map.
+* resolve - this means only pushing down single table expressions to
+* distinctnodes today.  once we have a better understanding of how
+* the optimizer will work, we can push down join clauses.
+*
+* @param outerpredicatelist	the predicatelist from the outer rs.
+*
+* @exception standardexception		thrown on error
+*/
+public void pushexpressions predicatelist outerpredicatelist
+throws standardexception
+fromtable		leftfromtable    fromtable  leftresultset
+fromtable		rightfromtable    fromtable  rightresultset
+/* outerjoinnodes are responsible for overriding this
+* method since they have different rules about where predicates
+* can be applied.
+*/
+if  sanitymanager debug
+if  this instanceof halfouterjoinnode
+sanitymanager throwassert
+getclass   getname
+/* we try to push "pushable"
+* predicates to 1 of 3 places:
+*	o predicates that only reference tables
+*	  on the left are pushed to the leftpredicatelist.
+*	o predicates that only reference tables
+*	  on the right are pushed to the rightpredicatelist.
+*	o predicates which reference tables on both
+*	  sides (and no others) are pushed to
+*	  the joinpredicates and may be pushed down
+*	  further during optimization.
+*/
+// left only
+pushexpressionstoleft outerpredicatelist
+leftfromtable pushexpressions getleftpredicatelist
+// right only
+pushexpressionstoright outerpredicatelist
+rightfromtable pushexpressions getrightpredicatelist
+// join predicates
+grabjoinpredicates outerpredicatelist
+/* by the time we're done here, both the left and right
+* predicate lists should be empty because we pushed everything
+* down.
+*/
+if  sanitymanager debug
+if  getleftpredicatelist   size      0
+sanitymanager throwassert
+getleftpredicatelist   size
+if  getrightpredicatelist   size      0
+sanitymanager throwassert
+getrightpredicatelist   size
+protected void pushexpressionstoleft predicatelist outerpredicatelist
+throws standardexception
+fromtable		leftfromtable    fromtable  leftresultset
+jbitset		leftreferencedtablemap   leftfromtable getreferencedtablemap
+/* build a list of the single table predicates on left result set
+* that we can push down
+*/
+// walk outerpredicatelist backwards due to possible deletes
+for  int index   outerpredicatelist size     1  index >  0  index
+jbitset	  curbitset
+predicate predicate
+predicate    predicate  outerpredicatelist elementat index
+if    predicate getpushable
+continue
+curbitset   predicate getreferencedset
+/* do we have a match? */
+if  leftreferencedtablemap contains curbitset
+/* add the matching predicate to the push list */
+getleftpredicatelist   addpredicate predicate
+/* remap all of the columnreferences to point to the
+* source of the values.
+* the tree is something like:
+*			prn1
+*			  |
+*			 jn (this)
+*		   /    \
+*		prn2	prn3
+*        |       |
+*		fbt1	fbt2
+*
+* the columnreferences start off pointing to the rcl off of
+* prn1.  for optimization, we want them to point to the
+* rcl off of prn2.  in order to do that, we remap them
+* twice here.  if optimization pushes them down to the
+* base table, it will remap them again.
+*/
+remapcrsvisitor rcrv   new remapcrsvisitor true
+predicate getandnode   accept rcrv
+predicate getandnode   accept rcrv
+/* remove the matching predicate from the outer list */
+outerpredicatelist removeelementat index
+private void pushexpressionstoright predicatelist outerpredicatelist
+throws standardexception
+fromtable		rightfromtable    fromtable  rightresultset
+jbitset		rightreferencedtablemap   rightfromtable getreferencedtablemap
+/* build a list of the single table predicates on right result set
+* that we can push down
+*/
+// walk outerpredicatelist backwards due to possible deletes
+for  int index   outerpredicatelist size     1  index >  0  index
+jbitset	  curbitset
+predicate predicate
+predicate    predicate  outerpredicatelist elementat index
+if    predicate getpushable
+continue
+curbitset   predicate getreferencedset
+/* do we have a match? */
+if  rightreferencedtablemap contains curbitset
+/* add the matching predicate to the push list */
+getrightpredicatelist   addpredicate predicate
+/* remap all of the columnreferences to point to the
+* source of the values.
+* the tree is something like:
+*			prn1
+*			  |
+*			 jn (this)
+*		   /    \
+*		prn2	prn3
+*        |       |
+*		fbt1	fbt2
+*
+* the columnreferences start off pointing to the rcl off of
+* prn1.  for optimization, we want them to point to the
+* rcl off of prn3.  in order to do that, we remap them
+* twice here.  if optimization pushes them down to the
+* base table, it will remap them again.
+*/
+remapcrsvisitor rcrv   new remapcrsvisitor true
+predicate getandnode   accept rcrv
+predicate getandnode   accept rcrv
+/* remove the matching predicate from the outer list */
+outerpredicatelist removeelementat index
+private void grabjoinpredicates predicatelist outerpredicatelist
+throws standardexception
+fromtable		leftfromtable    fromtable  leftresultset
+fromtable		rightfromtable    fromtable  rightresultset
+jbitset		leftreferencedtablemap   leftfromtable getreferencedtablemap
+jbitset		rightreferencedtablemap   rightfromtable getreferencedtablemap
+/* build a list of the join predicates that we can push down */
+// walk outerpredicatelist backwards due to possible deletes
+for  int index   outerpredicatelist size     1  index >  0  index
+jbitset	  curbitset
+predicate predicate
+predicate    predicate  outerpredicatelist elementat index
+if    predicate getpushable
+continue
+curbitset   predicate getreferencedset
+/* do we have a match? */
+jbitset innerbitset    jbitset  rightreferencedtablemap clone
+innerbitset or leftreferencedtablemap
+if  innerbitset contains curbitset
+/* add the matching predicate to the push list */
+joinpredicates addpredicate predicate
+/* remap all of the columnreferences to point to the
+* source of the values.
+* the tree is something like:
+*			prn1
+*			  |
+*			 jn (this)
+*		   /    \
+*		prn2	prn3
+*        |       |
+*		fbt1	fbt2
+*
+* the columnreferences start off pointing to the rcl off of
+* prn1.  for optimization, we want them to point to the
+* rcl off of prn2 or prn3.  in order to do that, we remap them
+* twice here.  if optimization pushes them down to the
+* base table, it will remap them again.
+*/
+remapcrsvisitor rcrv   new remapcrsvisitor true
+predicate getandnode   accept rcrv
+predicate getandnode   accept rcrv
+/* remove the matching predicate from the outer list */
+outerpredicatelist removeelementat index
+/**
+* flatten this joinnode into the outer query block. the steps in
+* flattening are:
+*	o  mark all resultcolumns as redundant, so that they are "skipped over"
+*	   at generate().
+*	o  append the joinpredicates to the outer list.
+*	o  create a fromlist from the tables being joined and return
+*	   that list so that the caller will merge the 2 lists
+*
+* @param rcl				the rcl from the outer query
+* @param outerplist		predicatelist to append wherepredicates to.
+* @param sql				the subquerylist from the outer query
+* @param gbl				the group by list, if any
+*
+* @return fromlist		the fromlist from the underlying selectnode.
+*
+* @exception standardexception		thrown on error
+*/
+public fromlist flatten resultcolumnlist rcl
+predicatelist outerplist
+subquerylist sql
+groupbylist gbl
+throws standardexception
+/* outerjoinnodes should never get here.
+* (they can be transformed, but never
+* flattened directly.)
+*/
+if  sanitymanager debug
+if  this instanceof halfouterjoinnode
+sanitymanager throwassert
+getclass   getname
+/* build a new fromlist composed of left and right children
+* note: we must call fl.addelement() instead of fl.addfromtable()
+* since there is no exposed name. (and even if there was,
+* we could care less about unique exposed name checking here.)
+*/
+fromlist	fromlist    fromlist  getnodefactory   getnode
+c_nodetypes from_list
+getnodefactory   dojoinorderoptimization
+getcontextmanager
+fromlist addelement  fromtable  leftresultset
+fromlist addelement  fromtable  rightresultset
+/* mark our rcl as redundant */
+resultcolumns setredundant
+/* remap all columnreferences from the outer query to this node.
+* (we replace those columnreferences with clones of the matching
+* expression in the left and right's rcl.
+*/
+rcl remapcolumnreferencestoexpressions
+outerplist remapcolumnreferencestoexpressions
+if  gbl    null
+gbl remapcolumnreferencestoexpressions
+if  joinpredicates size   > 0
+outerplist destructiveappend joinpredicates
+if  subquerylist    null    subquerylist size   > 0
+sql destructiveappend subquerylist
+return fromlist
+/**
+* currently we don't reordering any outer join w/ inner joins.
+*/
+public boolean loj_reorderable int numtables
+throws standardexception
+return false
+/**
+* transform any outer join into an inner join where applicable.
+* (based on the existence of a null intolerant
+* predicate on the inner table.)
+*
+* @param predicatetree	the predicate tree for the query block
+*
+* @return the new tree top (outerjoin or innerjoin).
+*
+* @exception standardexception		thrown on error
+*/
+public fromtable transformouterjoins valuenode predicatetree  int numtables
+throws standardexception
+/* can't flatten if no predicates in where clause. */
+if  predicatetree    null
+return this
+/* see if left or right sides can be transformed */
+leftresultset     fromtable  leftresultset  transformouterjoins predicatetree  numtables
+rightresultset     fromtable  rightresultset  transformouterjoins predicatetree  numtables
+return this
+/**
+* for joins, the tree will be (nodes are left out if the clauses
+* are empty):
+*
+*      projectrestrictresultset -- for the having and the select list
+*      sortresultset -- for the group by list
+*      projectrestrictresultset -- for the where and the select list (if no group or having)
+*      the result set for the fromlist
+*
+*
+* @exception standardexception		thrown on error
+*/
+public void generate activationclassbuilder acb
+methodbuilder mb
+throws standardexception
+generatecore acb  mb  innerjoin  null  null
+/**
+* generate the code for a qualified join node.
+*
+* @exception standardexception		thrown on error
+*/
+public void generatecore activationclassbuilder acb
+methodbuilder mb
+int jointype
+throws standardexception
+generatecore acb  mb  jointype  joinclause  subquerylist
+/**
+* do the generation work for the join node hierarchy.
+*
+* @param acb			the activationclassbuilder
+* @param mb the method the code is to go into
+* @param jointype		the join type
+* @param joinclause	the join clause, if any
+* @param subquerys		the list of subqueries in the join clause, if any
+*
+* @exception standardexception		thrown on error
+*/
+protected void generatecore activationclassbuilder acb
+methodbuilder mb
+int jointype
+valuenode joinclause
+subquerylist subquerys
+throws standardexception
+/* put the predicates back into the tree */
+if  joinpredicates    null
+joinclause   joinpredicates restorepredicates
+joinpredicates   null
+/* get the next resultset #, so that we can number this resultsetnode, its
+* resultcolumnlist and resultset.
+*/
+assignresultsetnumber
+/* set the point of attachment in all subqueries attached
+* to this node.
+*/
+if  subquerys    null    subquerys size   > 0
+subquerys setpointofattachment resultsetnumber
+// build up the tree.
+/* generate the joinresultset */
+/* nested loop and hash are the only join strategy currently supporteds.
+* right outer joins are transformed into left outer joins.
+*/
+string			joinresultsetstring
+if  jointype    leftouterjoin
+joinresultsetstring
+optimizable  rightresultset  gettrulythebestaccesspath
+getjoinstrategy   halfouterjoinresultsetmethodname
+else
+joinresultsetstring
+optimizable  rightresultset  gettrulythebestaccesspath
+getjoinstrategy   joinresultsetmethodname
+acb pushgetresultsetfactoryexpression mb
+int nargs   getjoinarguments acb  mb  joinclause
+mb callmethod vmopcode invokeinterface   string  null  joinresultsetstring  classname noputresultset  nargs
+/**
+* get the arguments to the join result set.
+*
+* @param acb	the activationclassbuilder for the class we're building.
+* @param mb the method the generated code is going into
+* @param joinclause	the join clause, if any
+*
+* @return	the array of arguments to the join result set
+*
+* @exception standardexception		thrown on error
+*/
+private int getjoinarguments activationclassbuilder acb
+methodbuilder mb
+valuenode joinclause
+throws standardexception
+int numargs   getnumjoinarguments
+leftresultset generate acb  mb      arg 1
+mb push leftresultset resultcolumns size        arg 2
+rightresultset generate acb  mb      arg 3
+mb push rightresultset resultcolumns size        arg 4
+// get our final cost estimate based on child estimates.
+costestimate   getfinalcostestimate
+// for the join clause, we generate an exprfun
+// that evaluates the expression of the clause
+// against the current row of the child's result.
+// if the join clause is empty, we generate a function
+// that just returns true. (performance tradeoff: have
+// this function for the empty join clause, or have
+// all non-empty join clauses check for a null at runtime).
+// generate the function and initializer:
+// note: boolean lets us return nulls (boolean would not)
+// private boolean exprn()
+// {
+//   return <<joinclause.generate(ps)>>;
+// }
+// static method exprn = method pointer to exprn;
+// if there is no join clause, we just pass a null expression.
+if  joinclause    null
+mb pushnull classname generatedmethod      arg 5
+else
+// this sets up the method and the static field.
+// generates:
+// 	object userexprfun { }
+methodbuilder userexprfun   acb newuserexprfun
+// join clause knows it is returning its value;
+/* generates:
+*    return <joinclause.generate(acb)>;
+* and adds it to userexprfun
+*/
+joinclause generate acb  userexprfun
+userexprfun methodreturn
+// we are done modifying userexprfun, complete it.
+userexprfun complete
+// join clause is used in the final result set as an access of the new static
+// field holding a reference to this new method.
+// generates:
+//	activationclass.userexprfun
+// which is the static field that "points" to the userexprfun
+// that evaluates the where clause.
+acb pushmethodreference mb  userexprfun      arg 5
+mb push resultsetnumber      arg 6
+addouterjoinarguments acb  mb
+// does right side return a single row
+onerowrightside acb  mb
+// estimated row count
+mb push costestimate rowcount
+// estimated cost
+mb push costestimate getestimatedcost
+//user may have supplied optimizer overrides in the sql
+//pass them onto execute phase so it can be shown in
+//run time statistics.
+if  joinorderstrategyproperties    null
+mb push propertyutil sortproperties joinorderstrategyproperties
+else
+mb pushnull
+return numargs
+/**
+* @see resultsetnode#getfinalcostestimate
+*
+* get the final costestimate for this joinnode.
+*
+* @return	the final costestimate for this joinnode, which is sum
+*  the costs for the inner and outer table.  the number of rows,
+*  though, is that for the inner table only.
+*/
+public costestimate getfinalcostestimate
+throws standardexception
+// if we already found it, just return it.
+if  finalcostestimate    null
+return finalcostestimate
+costestimate leftce   leftresultset getfinalcostestimate
+costestimate rightce   rightresultset getfinalcostestimate
+finalcostestimate   getnewcostestimate
+finalcostestimate setcost
+leftce getestimatedcost     rightce getestimatedcost
+rightce rowcount
+rightce rowcount
+return finalcostestimate
+protected void onerowrightside activationclassbuilder acb
+methodbuilder mb
+throws standardexception
+mb push rightresultset isonerowresultset
+mb push rightresultset isnotexists        join is for not exists
+/**
+* return the number of arguments to the join result set.  this will
+* be overridden for other types of joins (for example, outer joins).
+*/
+protected int getnumjoinarguments
+return 11
+/**
+* generate	and add any arguments specifict to outer joins.
+* (expected to be overriden, where appropriate, in subclasses.)
+*
+* @param acb		the activationclassbuilder
+* @param mb the method  the generated code is to go into
+*
+* return the number of args added
+*
+* @exception standardexception		thrown on error
+*/
+protected int addouterjoinarguments activationclassbuilder acb
+methodbuilder mb
+throws standardexception
+return 0
+/**
+* convert the jointype to a string.
+*
+* @param jointype			the jointype as an int.
+*
+* @return string		the jointype as a string.
+*/
+public static string jointypetostring int jointype
+switch jointype
+case innerjoin
+return
+case crossjoin
+return
+case leftouterjoin
+return
+case rightouterjoin
+return
+case fullouterjoin
+return
+case unionjoin
+return
+default
+if  sanitymanager debug
+sanitymanager assert false
+return null
+protected predicatelist getleftpredicatelist   throws standardexception
+if  leftpredicatelist    null
+leftpredicatelist    predicatelist  getnodefactory   getnode
+c_nodetypes predicate_list
+getcontextmanager
+return leftpredicatelist
+protected predicatelist getrightpredicatelist   throws standardexception
+if  rightpredicatelist    null
+rightpredicatelist    predicatelist  getnodefactory   getnode
+c_nodetypes predicate_list
+getcontextmanager
+return rightpredicatelist
+/**
+* get the lock mode for the target of an update statement
+* (a delete or update).  the update mode will always be row for
+* currentofnodes.  it will be table if there is no where clause.
+*
+* @return	the lock mode
+*/
+public int updatetargetlockmode
+/* always use row locking if we have a join node.
+* we can only have a join node if there is a subquery that
+* got flattened, hence there is a restriction.
+*/
+return transactioncontroller mode_record
+/**
+* mark this node and its children as not being a flattenable join.
+*/
+void notflattenablejoin
+flattenablejoin   false
+leftresultset notflattenablejoin
+rightresultset notflattenablejoin
+/**
+* is this fromtable a joinnode which can be flattened into
+* the parents fromlist.
+*
+* @return boolean		whether or not this fromtable can be flattened.
+*/
+public boolean isflattenablejoinnode
+return flattenablejoin
+/**
+* return whether or not the underlying resultset tree
+* is ordered on the specified columns.
+* resolve - this method currently only considers the outermost table
+* of the query block.
+*
+* @param	crs					the specified columnreference[]
+* @param	permuteordering		whether or not the order of the crs in the array can be permuted
+* @param	fbtvector			vector that is to be filled with the frombasetable
+*
+* @return	whether the underlying resultset tree
+* is ordered on the specified column.
+*
+* @exception standardexception		thrown on error
+*/
+boolean isorderedon columnreference crs  boolean permuteordering  vector fbtvector
+throws standardexception
+/* resolve - easiest thing for now is to only consider the leftmost child */
+return leftresultset isorderedon crs  permuteordering  fbtvector
+/**
+* prints the sub-nodes of this object.  see querytreenode.java for
+* how tree printing is supposed to work.
+*
+* @param depth		the depth of this node in the tree
+*/
+public void printsubnodes int depth
+if  sanitymanager debug
+super printsubnodes depth
+if  subquerylist    null
+printlabel depth
+subquerylist treeprint depth   1
+if  joinclause    null
+printlabel depth
+joinclause treeprint depth   1
+if  joinpredicates size      0
+printlabel depth
+joinpredicates treeprint depth   1
+if  usingclause    null
+printlabel depth
+usingclause treeprint depth   1
+void setsubquerylist subquerylist subquerylist
+this subquerylist   subquerylist
+void setaggregatevector vector aggregatevector
+this aggregatevector   aggregatevector
+/**
+* return the logical left result set for this qualified
+* join node.
+* (for right outer join, the left is the right
+* and the right is the left and the join is the nioj).
+*/
+resultsetnode getlogicalleftresultset
+return leftresultset
+/**
+* return the logical right result set for this qualified
+* join node.
+* (for right outer join, the left is the right
+* and the right is the left and the join is the nioj).
+*/
+resultsetnode getlogicalrightresultset
+return rightresultset
+/**
+* accept a visitor, and call v.visit()
+* on child nodes as necessary.
+*
+* @param v the visitor
+*
+* @exception standardexception on error
+*/
+public visitable accept visitor v
+throws standardexception
+if  v skipchildren this
+return v visit this
+visitable returnnode   super accept v
+if  resultcolumns    null     v stoptraversal
+resultcolumns    resultcolumnlist resultcolumns accept v
+if  joinclause    null     v stoptraversal
+joinclause    valuenode joinclause accept v
+if  usingclause    null     v stoptraversal
+usingclause    resultcolumnlist usingclause accept v
+return returnnode
+// this method returns the table references in join node, and this may be
+// needed for loj reordering.  for example, we may have the following query:
+//       (t join s) loj (x loj y)
+// the top most loj may be a join betw t and x and thus we can reorder the
+// lojs.  however, as of 10/2002, we don't reorder loj mixed with join.
+public jbitset lojgetreferencedtables int numtables
+throws standardexception
+jbitset map   new jbitset numtables
+map    jbitset  leftresultset lojgetreferencedtables numtables
+if  map    null  return null
+else map or  jbitset  rightresultset lojgetreferencedtables numtables
+return map

@@ -1,0 +1,267 @@
+/**
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase master handler
+import java io ioexception
+import java util arraylist
+import java util list
+import java util map
+import java util navigablemap
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase server
+import org apache hadoop hbase servername
+import org apache hadoop hbase catalog catalogtracker
+import org apache hadoop hbase catalog metareader
+import org apache hadoop hbase client result
+import org apache hadoop hbase executor eventhandler
+import org apache hadoop hbase executor eventtype
+import org apache hadoop hbase master assignmentmanager
+import org apache hadoop hbase master deadserver
+import org apache hadoop hbase master masterservices
+import org apache hadoop hbase master regionstate
+import org apache hadoop hbase master regionstates
+import org apache hadoop hbase master servermanager
+import org apache hadoop hbase zookeeper zkassign
+import org apache zookeeper keeperexception
+/**
+* process server shutdown.
+* server-to-handle must be already in the deadservers lists.  see
+* {@link servermanager#expireserver(servername)}
+*/
+@interfaceaudience private
+public class servershutdownhandler extends eventhandler
+private static final log log   logfactory getlog servershutdownhandler class
+protected final servername servername
+protected final masterservices services
+protected final deadserver deadservers
+protected final boolean shouldsplithlog     whether to split hlog or not
+public servershutdownhandler final server server  final masterservices services
+final deadserver deadservers  final servername servername
+final boolean shouldsplithlog
+this server  services  deadservers  servername  eventtype m_server_shutdown
+shouldsplithlog
+servershutdownhandler final server server  final masterservices services
+final deadserver deadservers  final servername servername  eventtype type
+final boolean shouldsplithlog
+super server  type
+this servername   servername
+this server   server
+this services   services
+this deadservers   deadservers
+if   this deadservers isdeadserver this servername
+log warn this servername
+this shouldsplithlog   shouldsplithlog
+@override
+public string getinformativename
+if  servername    null
+return this getclass   getsimplename         servername
+else
+return super getinformativename
+/**
+* @return true if the server we are processing was carrying <code>.meta.</code>
+*/
+boolean iscarryingmeta
+return false
+@override
+public string tostring
+string name
+if server    null    server getservername      null
+name   server getservername   tostring
+return getclass   getsimplename         name       getseqid
+@override
+public void process   throws ioexception
+final servername servername   this servername
+try
+try
+if  this shouldsplithlog
+log info     servername
+this services getmasterfilesystem   splitlog servername
+else
+log info     servername
+catch  ioexception ioe
+//typecast to ssh so that we make sure that it is the ssh instance that
+//gets submitted as opposed to mssh or some other derived instance of ssh
+this services getexecutorservice   submit  servershutdownhandler this
+this deadservers add servername
+throw new ioexception
+servername      ioe
+// we don't want worker thread in the metaservershutdownhandler
+// executor pool to block by waiting availability of .meta.
+// otherwise, it could run into the following issue:
+// 1. the current metaservershutdownhandler instance for rs1 waits for the .meta.
+//    to come online.
+// 2. the newly assigned .meta. region server rs2 was shutdown right after
+//    it opens the .meta. region. so the metaservershutdownhandler
+//    instance for rs1 will still be blocked.
+// 3. the new instance of metaservershutdownhandler for rs2 is queued.
+// 4. the newly assigned .meta. region server rs3 was shutdown right after
+//    it opens the .meta. region. so the metaservershutdownhandler
+//    instance for rs1 and rs2 will still be blocked.
+// 5. the new instance of metaservershutdownhandler for rs3 is queued.
+// 6. repeat until we run out of metaservershutdownhandler worker threads
+// the solution here is to resubmit a servershutdownhandler request to process
+// user regions on that server so that metaservershutdownhandler
+// executor pool is always available.
+//
+// if assignmentmanager hasn't finished rebuilding user regions,
+// we are not ready to assign dead regions either. so we re-queue up
+// the dead server for further processing too.
+if  iscarryingmeta       meta
+services getassignmentmanager   isfailovercleanupdone
+this services getservermanager   processdeadserver servername
+return
+// wait on meta to come online; we need it to progress.
+// todo: best way to hold strictly here?  we should build this retry logic
+// into the metareader operations themselves.
+// todo: is the reading of .meta. necessary when the master has state of
+// cluster in its head?  it should be possible to do without reading .meta.
+// in all but one case. on split, the rs updates the .meta.
+// table and then informs the master of the split via zk nodes in
+// 'unassigned' dir.  currently the rs puts ephemeral nodes into zk so if
+// the regionserver dies, these nodes do not stick around and this server
+// shutdown processing does fixup (see the fixupdaughters method below).
+// if we wanted to skip the .meta. scan, we'd have to change at least the
+// final split message to be permanent in zk so in here we'd know a split
+// completed (zk is updated after edits to .meta. have gone in).  see
+// {@link splittransaction}.  we'd also have to be figure another way for
+// doing the below .meta. daughters fixup.
+navigablemap<hregioninfo  result> hris   null
+while   this server isstopped
+try
+this server getcatalogtracker   waitformeta
+hris   metareader getserveruserregions this server getcatalogtracker
+this servername
+break
+catch  interruptedexception e
+thread currentthread   interrupt
+throw new ioexception    e
+catch  ioexception ioe
+log info
+servername      ioe
+if  this server isstopped
+throw new ioexception
+// clean out anything in regions in transition.  being conservative and
+// doing after log splitting.  could do some states before -- opening?
+// offline? -- and then others after like closing that depend on log
+// splitting.
+assignmentmanager am   services getassignmentmanager
+list<hregioninfo> regionsintransition   am processservershutdown servername
+log info       hris    null ? 0  hris size
+servername    null?    servername
+regionsintransition size
+list<hregioninfo> toassignregions   new arraylist<hregioninfo>
+toassignregions addall regionsintransition
+// iterate regions that were on this server and assign them
+if  hris    null
+regionstates regionstates   am getregionstates
+for  map entry<hregioninfo  result> e  hris entryset
+hregioninfo hri   e getkey
+if  regionsintransition contains hri
+continue
+regionstate rit   regionstates getregiontransitionstate hri
+if  processdeadregion hri  e getvalue    am  server getcatalogtracker
+servername addressfromam   regionstates getregionserverofregion hri
+if  addressfromam    null     addressfromam equals this servername
+// if this region is in transition on the dead server, it must be
+// opening or pending_open, which should have been covered by am#processservershutdown
+log info     hri getregionnameasstring
+addressfromam getservername
+continue
+if  rit    null
+if   rit isonserver servername
+rit isclosed      rit isopened      rit issplit
+// skip regions that are in transition on other server,
+// or in state closed/opened/split
+log info     rit
+continue
+try
+//clean zk node
+log info     rit
+zkassign deletenodefailsilent services getzookeeper    hri
+catch  keeperexception ke
+this server abort     hri  ke
+return
+toassignregions add hri
+else if  rit    null
+if  rit issplitting      rit issplit
+// this will happen when the rs went down and the call back for the spliiting or split
+// has not yet happened for node deleted event. in that case if the region was actually
+// split
+// but the rs had gone down before completing the split process then will not try to
+// assign the parent region again. in that case we should make the region offline and
+// also delete the region from rit.
+am regionoffline hri
+else if   rit isclosing      rit ispendingclose
+am getzktable   isdisablingordisabledtable hri gettablenameasstring
+// if the table was partially disabled and the rs went down, we should clear the rit
+// and remove the node for the region.
+// the rit that we use may be stale in case the table was in disabling state
+// but though we did assign we will not be clearing the znode in closing state.
+// doing this will have no harm. see hbase-5927
+am deleteclosingorclosednode hri
+am regionoffline hri
+else
+log warn
+rit       servername
+try
+am assign toassignregions
+catch  interruptedexception ie
+log error     ie
+throw new ioexception ie
+finally
+this deadservers finish servername
+log info     servername
+/**
+* process a dead region from a dead rs. checks if the region is disabled or
+* disabling or if the region has a partially completed split.
+* @param hri
+* @param result
+* @param assignmentmanager
+* @param catalogtracker
+* @return returns true if specified region should be assigned, false if not.
+* @throws ioexception
+*/
+public static boolean processdeadregion hregioninfo hri  result result
+assignmentmanager assignmentmanager  catalogtracker catalogtracker
+throws ioexception
+boolean tablepresent   assignmentmanager getzktable   istablepresent
+hri gettablenameasstring
+if   tablepresent
+log info     hri gettablenameasstring
+return false
+// if table is not disabled but the region is offlined,
+boolean disabled   assignmentmanager getzktable   isdisabledtable
+hri gettablenameasstring
+if  disabled
+log info     hri gettablenameasstring
+return false
+if  hri isoffline      hri issplit
+//hbase-7721: split parent and daughters are inserted into meta as an atomic operation.
+//if the meta scanner saw the parent split, then it should see the daughters as assigned
+//to the dead server. we don't have to do anything.
+return false
+boolean disabling   assignmentmanager getzktable   isdisablingtable
+hri gettablenameasstring
+if  disabling
+log info     hri gettablenameasstring
+hri getencodedname
+return false
+return true

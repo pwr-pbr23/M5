@@ -1,0 +1,213 @@
+/**
+* copyright 2011 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver
+import java util concurrent atomic atomicinteger
+import java util concurrent atomic atomicreference
+import org apache hadoop conf configuration
+import com google common base preconditions
+/**
+* a memstore-local allocation buffer.
+* <p>
+* the memstorelab is basically a bump-the-pointer allocator that allocates
+* big (2mb) byte[] chunks from and then doles it out to threads that request
+* slices into the array.
+* <p>
+* the purpose of this class is to combat heap fragmentation in the
+* regionserver. by ensuring that all keyvalues in a given memstore refer
+* only to large chunks of contiguous memory, we ensure that large blocks
+* get freed up when the memstore is flushed.
+* <p>
+* without the mslab, the byte array allocated during insertion end up
+* interleaved throughout the heap, and the old generation gets progressively
+* more fragmented until a stop-the-world compacting collection occurs.
+* <p>
+* todo: we should probably benchmark whether word-aligning the allocations
+* would provide a performance improvement - probably would speed up the
+* bytes.tolong/bytes.toint calls in keyvalue, but some of those are cached
+* anyway
+*/
+public class memstorelab
+private atomicreference<chunk> curchunk   new atomicreference<chunk>
+final static string chunk_size_key
+final static int chunk_size_default   2048   1024
+final int chunksize
+final static string max_alloc_key
+final static int max_alloc_default   256    1024     allocs bigger than this don't go through allocator
+final int maxalloc
+public memstorelab
+this new configuration
+public memstorelab configuration conf
+chunksize   conf getint chunk_size_key  chunk_size_default
+maxalloc   conf getint max_alloc_key  max_alloc_default
+// if we don't exclude allocations >chunk_size, we'd infiniteloop on one!
+preconditions checkargument
+maxalloc <  chunksize
+max_alloc_key       chunk_size_key
+/**
+* allocate a slice of the given length.
+*
+* if the size is larger than the maximum size specified for this
+* allocator, returns null.
+*/
+public allocation allocatebytes int size
+preconditions checkargument size >  0
+// callers should satisfy large allocations directly from jvm since they
+// don't cause fragmentation as badly.
+if  size > maxalloc
+return null
+while  true
+chunk c   getormakechunk
+// try to allocate from this chunk
+int allocoffset   c alloc size
+if  allocoffset     1
+// we succeeded - this is the common case - small alloc
+// from a big buffer
+return new allocation c data  allocoffset
+// not enough space!
+// try to retire this chunk
+tryretirechunk c
+/**
+* try to retire the current chunk if it is still
+* <code>c</code>. postcondition is that curchunk.get()
+* != c
+*/
+private void tryretirechunk chunk c
+@suppresswarnings
+boolean weretiredit   curchunk compareandset c  null
+// if the cas succeeds, that means that we won the race
+// to retire the chunk. we could use this opportunity to
+// update metrics on external fragmentation.
+//
+// if the cas fails, that means that someone else already
+// retired the chunk for us.
+/**
+* get the current chunk, or, if there is no current chunk,
+* allocate a new one from the jvm.
+*/
+private chunk getormakechunk
+while  true
+// try to get the chunk
+chunk c   curchunk get
+if  c    null
+return c
+// no current chunk, so we want to allocate one. we race
+// against other allocators to cas in an uninitialized chunk
+// (which is cheap to allocate)
+c   new chunk chunksize
+if  curchunk compareandset null  c
+// we won race - now we need to actually do the expensive
+// allocation step
+c init
+return c
+// someone else won race - that's fine, we'll try to grab theirs
+// in the next iteration of the loop.
+/**
+* a chunk of memory out of which allocations are sliced.
+*/
+private static class chunk
+/** actual underlying data */
+private byte data
+private static final int uninitialized    1
+private static final int oom    2
+/**
+* offset for the next allocation, or the sentinel value -1
+* which implies that the chunk is still uninitialized.
+* */
+private atomicinteger nextfreeoffset   new atomicinteger uninitialized
+/** total number of allocations satisfied from this buffer */
+private atomicinteger alloccount   new atomicinteger
+/** size of chunk in bytes */
+private final int size
+/**
+* create an uninitialized chunk. note that memory is not allocated yet, so
+* this is cheap.
+* @param size in bytes
+*/
+private chunk int size
+this size   size
+/**
+* actually claim the memory for this chunk. this should only be called from
+* the thread that constructed the chunk. it is thread-safe against other
+* threads calling alloc(), who will block until the allocation is complete.
+*/
+public void init
+assert nextfreeoffset get      uninitialized
+try
+data   new byte
+catch  outofmemoryerror e
+boolean failinit   nextfreeoffset compareandset uninitialized  oom
+assert failinit     should be true
+throw e
+// mark that it's ready for use
+boolean initted   nextfreeoffset compareandset
+uninitialized  0
+// we should always succeed the above cas since only one thread
+// calls init()!
+preconditions checkstate initted
+/**
+* try to allocate <code>size</code> bytes from the chunk.
+* @return the offset of the successful allocation, or -1 to indicate not-enough-space
+*/
+public int alloc int size
+while  true
+int oldoffset   nextfreeoffset get
+if  oldoffset    uninitialized
+// the chunk doesn't have its data allocated yet.
+// since we found this in curchunk, we know that whoever
+// cas-ed it there is allocating it right now. so spin-loop
+// shouldn't spin long!
+thread yield
+continue
+if  oldoffset    oom
+// doh we ran out of ram. return -1 to chuck this away.
+return  1
+if  oldoffset   size > data length
+return  1     alloc doesn't fit
+// try to atomically claim this chunk
+if  nextfreeoffset compareandset oldoffset  oldoffset   size
+// we got the alloc
+alloccount incrementandget
+return oldoffset
+// we raced and lost alloc, try again
+@override
+public string tostring
+return     system identityhashcode this
+alloccount get
+data length   nextfreeoffset get
+/**
+* the result of a single allocation. contains the chunk that the
+* allocation points into, and the offset in this array where the
+* slice begins.
+*/
+public static class allocation
+private final byte data
+private final int offset
+private allocation byte data  int off
+this data   data
+this offset   off
+@override
+public string tostring
+return     data
+data length
+offset
+byte getdata
+return data
+int getoffset
+return offset

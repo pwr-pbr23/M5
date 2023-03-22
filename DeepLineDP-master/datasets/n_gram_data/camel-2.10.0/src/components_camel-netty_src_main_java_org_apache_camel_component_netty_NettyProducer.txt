@@ -1,0 +1,271 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache camel component netty
+import java net inetsocketaddress
+import java util concurrent countdownlatch
+import java util concurrent executorservice
+import java util concurrent rejectedexecutionexception
+import org apache camel asynccallback
+import org apache camel camelcontext
+import org apache camel camelexception
+import org apache camel exchange
+import org apache camel notypeconversionavailableexception
+import org apache camel servicepoolaware
+import org apache camel impl defaultasyncproducer
+import org apache camel util camellogger
+import org apache camel util exchangehelper
+import org apache camel util iohelper
+import org jboss netty bootstrap clientbootstrap
+import org jboss netty bootstrap connectionlessbootstrap
+import org jboss netty channel channel
+import org jboss netty channel channelfactory
+import org jboss netty channel channelfuture
+import org jboss netty channel channelfuturelistener
+import org jboss netty channel channellocal
+import org jboss netty channel group channelgroup
+import org jboss netty channel group channelgroupfuture
+import org jboss netty channel group defaultchannelgroup
+import org jboss netty channel socket datagramchannelfactory
+import org jboss netty channel socket nio nioclientsocketchannelfactory
+import org jboss netty channel socket nio niodatagramchannelfactory
+import org slf4j logger
+import org slf4j loggerfactory
+public class nettyproducer extends defaultasyncproducer implements servicepoolaware
+private static final transient logger log   loggerfactory getlogger nettyproducer class
+private static final channelgroup all_channels   new defaultchannelgroup
+private camelcontext context
+private nettyconfiguration configuration
+private channelfactory channelfactory
+private datagramchannelfactory datagramchannelfactory
+private clientpipelinefactory pipelinefactory
+private camellogger noreplylogger
+private executorservice bossexecutor
+private executorservice workerexecutor
+private final channellocal<nettycamelstate> state   new channellocal<nettycamelstate>
+private channelfuture channelfuture
+private channel channel
+public nettyproducer nettyendpoint nettyendpoint  nettyconfiguration configuration
+super nettyendpoint
+this configuration   configuration
+this context   this getendpoint   getcamelcontext
+this noreplylogger   new camellogger log  configuration getnoreplyloglevel
+@override
+public nettyendpoint getendpoint
+return  nettyendpoint  super getendpoint
+@override
+public boolean issingleton
+// the producer should not be singleton otherwise cannot use concurrent producers and safely
+// use request/reply with correct correlation
+return false
+public camelcontext getcontext
+return context
+protected boolean istcp
+return configuration getprotocol   equalsignorecase
+@override
+protected void dostart   throws exception
+super dostart
+// setup pipeline factory
+clientpipelinefactory factory   configuration getclientpipelinefactory
+if  factory    null
+pipelinefactory   factory createpipelinefactory this
+else
+pipelinefactory   new defaultclientpipelinefactory this
+if  istcp
+setuptcpcommunication
+else
+setupudpcommunication
+if   configuration islazychannelcreation
+// ensure the connection can be established when we start up
+openandcloseconnection
+@override
+protected void dostop   throws exception
+log debug    configuration getaddress
+// close all channels
+log trace    all_channels size
+channelgroupfuture future   all_channels close
+future awaituninterruptibly
+// and then release other resources
+if  channelfactory    null
+channelfactory releaseexternalresources
+// and then shutdown the thread pools
+if  bossexecutor    null
+context getexecutorservicemanager   shutdownnow bossexecutor
+if  workerexecutor    null
+context getexecutorservicemanager   shutdownnow workerexecutor
+super dostop
+public boolean process final exchange exchange  final asynccallback callback
+if   isrunallowed
+if  exchange getexception      null
+exchange setexception new rejectedexecutionexception
+callback done true
+return true
+object body   nettypayloadhelper getin getendpoint    exchange
+if  body    null
+noreplylogger log     exchange
+callback done true
+return true
+// if textline enabled then covert to a string which must be used for textline
+if  getconfiguration   istextline
+try
+body   nettyhelper gettextlinebody body  exchange  getconfiguration   getdelimiter    getconfiguration   isautoappenddelimiter
+catch  notypeconversionavailableexception e
+exchange setexception e
+callback done true
+return true
+// set the exchange encoding property
+if  getconfiguration   getcharsetname      null
+exchange setproperty exchange charset_name  iohelper normalizecharset getconfiguration   getcharsetname
+try
+// allow to reuse channel, on this producer, to avoid creating a new connection
+// for each message being sent
+if  channelfuture    null    channel    null     channel isopen
+channel   null
+channelfuture   openconnection
+channel   openchannel channelfuture
+// setup state now we have the channel we can do this because
+// this producer is not thread safe, but pooled using servicepoolaware
+state set channel  new nettycamelstate callback  exchange
+catch  exception e
+exchange setexception e
+callback done true
+return true
+// log what we are writing
+log debug    body
+// write the body asynchronously
+channelfuture future   channel write body
+// add listener which handles the operation
+future addlistener new channelfuturelistener
+public void operationcomplete channelfuture channelfuture  throws exception
+log debug    channelfuture
+if   channelfuture issuccess
+// no success the set the caused exception and signal callback and break
+exchange setexception channelfuture getcause
+callback done false
+return
+// if we do not expect any reply then signal callback to continue routing
+if   configuration issync
+try
+// should channel be closed after complete?
+boolean close
+if  exchangehelper isoutcapable exchange
+close   exchange getout   getheader nettyconstants netty_close_channel_when_complete  boolean class
+else
+close   exchange getin   getheader nettyconstants netty_close_channel_when_complete  boolean class
+// should we disconnect, the header can override the configuration
+boolean disconnect   getconfiguration   isdisconnect
+if  close    null
+disconnect   close
+if  disconnect
+if  log isdebugenabled
+log debug    getendpoint   getconfiguration   getaddress
+nettyhelper close channel
+finally
+// signal callback to continue routing
+callback done false
+// continue routing asynchronously
+return false
+/**
+* to get the {@link nettycamelstate} from this producer.
+*/
+public nettycamelstate getstate channel channel
+return state get channel
+/**
+* to remove the {@link nettycamelstate} stored on this producer,
+* when no longer needed
+*/
+public void removestate channel channel
+state remove channel
+protected void setuptcpcommunication   throws exception
+if  channelfactory    null
+bossexecutor   context getexecutorservicemanager   newcachedthreadpool this
+workerexecutor   context getexecutorservicemanager   newcachedthreadpool this
+if  configuration getworkercount   <  0
+channelfactory   new nioclientsocketchannelfactory bossexecutor  workerexecutor
+else
+channelfactory   new nioclientsocketchannelfactory bossexecutor  workerexecutor  configuration getworkercount
+protected void setupudpcommunication   throws exception
+if  datagramchannelfactory    null
+workerexecutor   context getexecutorservicemanager   newcachedthreadpool this
+if  configuration getworkercount   <  0
+datagramchannelfactory   new niodatagramchannelfactory workerexecutor
+else
+datagramchannelfactory   new niodatagramchannelfactory workerexecutor  configuration getworkercount
+private channelfuture openconnection   throws exception
+channelfuture answer
+if  istcp
+clientbootstrap clientbootstrap   new clientbootstrap channelfactory
+clientbootstrap setoption    configuration iskeepalive
+clientbootstrap setoption    configuration istcpnodelay
+clientbootstrap setoption    configuration isreuseaddress
+clientbootstrap setoption    configuration getconnecttimeout
+// set the pipeline factory, which creates the pipeline for each newly created channels
+clientbootstrap setpipelinefactory pipelinefactory
+answer   clientbootstrap connect new inetsocketaddress configuration gethost    configuration getport
+log trace    configuration gethost    configuration getport
+return answer
+else
+connectionlessbootstrap connectionlessclientbootstrap   new connectionlessbootstrap datagramchannelfactory
+connectionlessclientbootstrap setoption    configuration iskeepalive
+connectionlessclientbootstrap setoption    configuration istcpnodelay
+connectionlessclientbootstrap setoption    configuration isreuseaddress
+connectionlessclientbootstrap setoption    configuration getconnecttimeout
+connectionlessclientbootstrap setoption    configuration isbroadcast
+connectionlessclientbootstrap setoption    configuration getsendbuffersize
+connectionlessclientbootstrap setoption    configuration getreceivebuffersize
+// set the pipeline factory, which creates the pipeline for each newly created channels
+connectionlessclientbootstrap setpipelinefactory pipelinefactory
+// bind and store channel so we can close it when stopping
+channel channel   connectionlessclientbootstrap bind new inetsocketaddress 0
+all_channels add channel
+answer   connectionlessclientbootstrap connect new inetsocketaddress configuration gethost    configuration getport
+log trace    configuration gethost    configuration getport
+return answer
+private channel openchannel channelfuture channelfuture  throws exception
+// wait until until the operation is complete
+final countdownlatch latch   new countdownlatch 1
+channelfuture addlistener new channelfuturelistener
+@override
+public void operationcomplete channelfuture channelfuture  throws exception
+log debug    channelfuture
+latch countdown
+// blocking for channel to be done
+log trace    channelfuture
+latch await
+if   channelfuture issuccess
+// clear channel as we did not connect
+channel   null
+throw new camelexception     configuration getaddress    channelfuture getcause
+channel   channelfuture getchannel
+// to keep track of all channels in use
+all_channels add channel
+log debug    configuration getaddress
+return channel
+private void openandcloseconnection   throws exception
+channelfuture future   openconnection
+channel channel   openchannel future
+nettyhelper close channel
+all_channels remove channel
+public nettyconfiguration getconfiguration
+return configuration
+public void setconfiguration nettyconfiguration configuration
+this configuration   configuration
+public channelfactory getchannelfactory
+return channelfactory
+public void setchannelfactory channelfactory channelfactory
+this channelfactory   channelfactory
+public channelgroup getallchannels
+return all_channels

@@ -1,0 +1,1349 @@
+/**
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver
+import java io datainput
+import java io filenotfoundexception
+import java io ioexception
+import java nio bytebuffer
+import java util arrays
+import java util collection
+import java util collections
+import java util comparator
+import java util map
+import java util sortedset
+import java util uuid
+import java util concurrent atomic atomicboolean
+import java util regex matcher
+import java util regex pattern
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hdfsblocksdistribution
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase keyvalue kvcomparator
+import org apache hadoop hbase client scan
+import org apache hadoop hbase io halfstorefilereader
+import org apache hadoop hbase io reference
+import org apache hadoop hbase io encoding datablockencoding
+import org apache hadoop hbase io hfile cacheconfig
+import org apache hadoop hbase io hfile blocktype
+import org apache hadoop hbase io hfile compression
+import org apache hadoop hbase io hfile hfile
+import org apache hadoop hbase io hfile hfilescanner
+import org apache hadoop hbase io hfile hfilewriterv1
+import org apache hadoop hbase io hfile hfilewriterv2
+import org apache hadoop hbase regionserver metrics schemametrics
+import org apache hadoop hbase regionserver metrics schemaconfigured
+import org apache hadoop hbase io hfile hfiledatablockencoder
+import org apache hadoop hbase io hfile noopdatablockencoder
+import org apache hadoop hbase util checksumtype
+import org apache hadoop hbase util bloomfilter
+import org apache hadoop hbase util bloomfilterfactory
+import org apache hadoop hbase util bloomfilterwriter
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util fsutils
+import org apache hadoop hbase util writables
+import org apache hadoop io rawcomparator
+import org apache hadoop io writableutils
+import com google common base function
+import com google common base preconditions
+import com google common collect immutablelist
+import com google common collect ordering
+/**
+* a store data file.  stores usually have one or more of these files.  they
+* are produced by flushing the memstore to disk.  to
+* create, instantiate a writer using {@link storefile#writerbuilder}
+* and append data. be sure to add any metadata before calling close on the
+* writer (use the appendmetadata convenience methods). on close, a storefile
+* is sitting in the filesystem.  to refer to it, create a storefile instance
+* passing filesystem and path.  to read, call {@link #createreader()}.
+* <p>storefiles may also reference store files in another store.
+*
+* the reason for this weird pattern where you use a different instance for the
+* writer and a reader is that we write once but read a lot more.
+*/
+public class storefile extends schemaconfigured
+static final log log   logfactory getlog storefile class getname
+public static enum bloomtype
+/**
+* bloomfilters disabled
+*/
+none
+/**
+* bloom enabled with table row as key
+*/
+row
+/**
+* bloom enabled with table row & column (family+qualifier) as key
+*/
+rowcol
+// keys for fileinfo values in hfile
+/** max sequence id in fileinfo */
+public static final byte  max_seq_id_key   bytes tobytes
+/** major compaction flag in fileinfo */
+public static final byte major_compaction_key
+bytes tobytes
+/** major compaction flag in fileinfo */
+public static final byte exclude_from_minor_compaction_key
+bytes tobytes
+/** bloom filter type in fileinfo */
+static final byte bloom_filter_type_key
+bytes tobytes
+/** delete family count in fileinfo */
+public static final byte delete_family_count
+bytes tobytes
+/** last bloom filter key in fileinfo */
+private static final byte last_bloom_key   bytes tobytes
+/** key for timerange information in metadata*/
+public static final byte timerange_key   bytes tobytes
+/** key for timestamp of earliest-put in metadata*/
+public static final byte earliest_put_ts   bytes tobytes
+/** type of encoding used for data blocks in hfile. stored in file info. */
+public static final byte data_block_encoding
+bytes tobytes
+// make default block size for storefiles 8k while testing.  todo: fix!
+// need to make it 8k for testing.
+public static final int default_blocksize_small   8   1024
+private final filesystem fs
+// this file's path.
+private final path path
+// if this storefile references another, this is the reference instance.
+private reference reference
+// if this storefile references another, this is the other files path.
+private path referencepath
+// block cache configuration and reference.
+private final cacheconfig cacheconf
+// what kind of data block encoding will be used
+private final hfiledatablockencoder datablockencoder
+// hdfs blocks distribution information
+private hdfsblocksdistribution hdfsblocksdistribution
+// keys for metadata stored in backing hfile.
+// set when we obtain a reader.
+private long sequenceid    1
+// max of the memstorets in the kv's in this store
+// set when we obtain a reader.
+private long maxmemstorets    1
+public long getmaxmemstorets
+return maxmemstorets
+public void setmaxmemstorets long maxmemstorets
+this maxmemstorets   maxmemstorets
+// if true, this file was product of a major compaction.  its then set
+// whenever you get a reader.
+private atomicboolean majorcompaction   null
+// if true, this file should not be included in minor compactions.
+// it's set whenever you get a reader.
+private boolean excludefromminorcompaction   false
+/** meta key set when store file is a result of a bulk load */
+public static final byte bulkload_task_key
+bytes tobytes
+public static final byte bulkload_time_key
+bytes tobytes
+/**
+* map of the metadata entries in the corresponding hfile
+*/
+private map<byte  byte> metadatamap
+/*
+* regex that will work for straight filenames and for reference names.
+* if reference, then the regex has more than just one group.  group 1 is
+* this files id.  group 2 the referenced region name, etc.
+*/
+private static final pattern ref_name_parser
+pattern compile
+// storefile.reader
+private volatile reader reader
+/**
+* bloom filter type specified in column family configuration. does not
+* necessarily correspond to the bloom filter type present in the hfile.
+*/
+private final bloomtype cfbloomtype
+// the last modification time stamp
+private long modificationtimestamp   0l
+/**
+* constructor, loads a reader and it's indices, etc. may allocate a
+* substantial amount of ram depending on the underlying files (10-20mb?).
+*
+* @param fs  the current file system to use.
+* @param p  the path of the file.
+* @param blockcache  <code>true</code> if the block cache is enabled.
+* @param conf  the current configuration.
+* @param cacheconf  the cache configuration and block cache reference.
+* @param cfbloomtype the bloom type to use for this store file as specified
+*          by column family configuration. this may or may not be the same
+*          as the bloom filter type actually present in the hfile, because
+*          column family configuration might change. if this is
+*          {@link bloomtype#none}, the existing bloom filter is ignored.
+* @param datablockencoder data block encoding algorithm.
+* @throws ioexception when opening the reader fails.
+*/
+storefile final filesystem fs
+final path p
+final configuration conf
+final cacheconfig cacheconf
+final bloomtype cfbloomtype
+final hfiledatablockencoder datablockencoder
+throws ioexception
+this fs   fs
+this path   p
+this cacheconf   cacheconf
+this datablockencoder
+datablockencoder    null ? noopdatablockencoder instance
+datablockencoder
+if  isreference p
+this reference   reference read fs  p
+this referencepath   getreferredtofile this path
+if  bloomfilterfactory isgeneralbloomenabled conf
+this cfbloomtype   cfbloomtype
+else
+log info     path
+cfbloomtype
+this cfbloomtype   bloomtype none
+// cache the modification time stamp of this store file
+filestatus stats   fsutils liststatus fs  p  null
+if  stats    null    stats length    1
+this modificationtimestamp   stats getmodificationtime
+else
+this modificationtimestamp   0
+schemametrics configureglobally conf
+/**
+* @return path or null if this storefile was made with a stream.
+*/
+public path getpath
+return this path
+/**
+* @return the store/columnfamily this file belongs to.
+*/
+byte  getfamily
+return bytes tobytes this path getparent   getname
+/**
+* @return true if this is a storefile reference; call after {@link #open()}
+* else may get wrong answer.
+*/
+boolean isreference
+return this reference    null
+/**
+* @param p path to check.
+* @return true if the path has format of a hstorefile reference.
+*/
+public static boolean isreference final path p
+return  p getname   startswith
+isreference p  ref_name_parser matcher p getname
+/**
+* @param p path to check.
+* @param m matcher to use.
+* @return true if the path has format of a hstorefile reference.
+*/
+public static boolean isreference final path p  final matcher m
+if  m    null     m matches
+log warn     p tostring
+throw new runtimeexception
+p tostring
+return m groupcount   > 1    m group 2     null
+/*
+* return path to the file referred to by a reference.  presumes a directory
+* hierarchy of <code>${hbase.rootdir}/tablename/regionname/familyname</code>.
+* @param p path to a reference file.
+* @return calculated path to parent region file.
+* @throws ioexception
+*/
+static path getreferredtofile final path p
+matcher m   ref_name_parser matcher p getname
+if  m    null     m matches
+log warn     p tostring
+throw new runtimeexception
+p tostring
+// other region name is suffix on the passed reference file name
+string otherregion   m group 2
+// tabledir is up two directories from where reference was written.
+path tabledir   p getparent   getparent   getparent
+string namestrippedofsuffix   m group 1
+// build up new path with the referenced region in place of our current
+// region in the reference path.  also strip regionname suffix from name.
+return new path new path new path tabledir  otherregion
+p getparent   getname     namestrippedofsuffix
+/**
+* @return true if this file was made by a major compaction.
+*/
+boolean ismajorcompaction
+if  this majorcompaction    null
+throw new nullpointerexception
+return this majorcompaction get
+/**
+* @return true if this file should not be part of a minor compaction.
+*/
+boolean excludefromminorcompaction
+return this excludefromminorcompaction
+/**
+* @return this files maximum edit sequence id.
+*/
+public long getmaxsequenceid
+return this sequenceid
+public long getmodificationtimestamp
+return modificationtimestamp
+/**
+* return the largest memstorets found across all storefiles in
+* the given list. store files that were created by a mapreduce
+* bulk load are ignored, as they do not correspond to any specific
+* put operation, and thus do not have a memstorets associated with them.
+* @return 0 if no non-bulk-load files are provided or, this is store that
+* does not yet have any store files.
+*/
+public static long getmaxmemstoretsinlist collection<storefile> sfs
+long max   0
+for  storefile sf   sfs
+if   sf isbulkloadresult
+max   math max max  sf getmaxmemstorets
+return max
+/**
+* return the highest sequence id found across all storefiles in
+* the given list. store files that were created by a mapreduce
+* bulk load are ignored, as they do not correspond to any edit
+* log items.
+* @return 0 if no non-bulk-load files are provided or, this is store that
+* does not yet have any store files.
+*/
+public static long getmaxsequenceidinlist collection<storefile> sfs
+long max   0
+for  storefile sf   sfs
+if   sf isbulkloadresult
+max   math max max  sf getmaxsequenceid
+return max
+/**
+* @return true if this storefile was created by hfileoutputformat
+* for a bulk load.
+*/
+boolean isbulkloadresult
+return metadatamap containskey bulkload_time_key
+/**
+* return the timestamp at which this bulk load file was generated.
+*/
+public long getbulkloadtimestamp
+return bytes tolong metadatamap get bulkload_time_key
+/**
+* @return the cached value of hdfs blocks distribution. the cached value is
+* calculated when store file is opened.
+*/
+public hdfsblocksdistribution gethdfsblockdistribution
+return this hdfsblocksdistribution
+/**
+* helper function to compute hdfs blocks distribution of a given reference
+* file.for reference file, we don't compute the exact value. we use some
+* estimate instead given it might be good enough. we assume bottom part
+* takes the first half of reference file, top part takes the second half
+* of the reference file. this is just estimate, given
+* midkey ofregion != midkey of hfile, also the number and size of keys vary.
+* if this estimate isn't good enough, we can improve it later.
+* @param fs  the filesystem
+* @param reference  the reference
+* @param reference  the referencepath
+* @return hdfs blocks distribution
+*/
+static private hdfsblocksdistribution computereffilehdfsblockdistribution
+filesystem fs  reference reference  path referencepath  throws ioexception
+if   referencepath    null
+return null
+filestatus status   fs getfilestatus referencepath
+long start   0
+long length   0
+if  reference istopfileregion reference getfileregion
+start   status getlen   2
+length   status getlen     status getlen   2
+else
+start   0
+length   status getlen   2
+return fsutils computehdfsblocksdistribution fs  status  start  length
+/**
+* helper function to compute hdfs blocks distribution of a given file.
+* for reference file, it is an estimate
+* @param fs  the filesystem
+* @param p  the path of the file
+* @return hdfs blocks distribution
+*/
+static public hdfsblocksdistribution computehdfsblockdistribution
+filesystem fs  path p  throws ioexception
+if  isreference p
+reference reference   reference read fs  p
+path referencepath   getreferredtofile p
+return computereffilehdfsblockdistribution fs  reference  referencepath
+else
+filestatus status   fs getfilestatus p
+long length   status getlen
+return fsutils computehdfsblocksdistribution fs  status  0  length
+/**
+* compute hdfs block distribution, for reference file, it is an estimate
+*/
+private void computehdfsblockdistribution   throws ioexception
+if  isreference
+this hdfsblocksdistribution   computereffilehdfsblockdistribution
+this fs  this reference  this referencepath
+else
+filestatus status   this fs getfilestatus this path
+long length   status getlen
+this hdfsblocksdistribution   fsutils computehdfsblocksdistribution
+this fs  status  0  length
+/**
+* opens reader on this store file.  called by constructor.
+* @return reader for the store file.
+* @throws ioexception
+* @see #closereader()
+*/
+private reader open   throws ioexception
+if  this reader    null
+throw new illegalaccesserror
+if  isreference
+this reader   new halfstorefilereader this fs  this referencepath
+this cacheconf  this reference
+datablockencoder getencodingincache
+else
+this reader   new reader this fs  this path  this cacheconf
+datablockencoder getencodingincache
+if  isschemaconfigured
+schemaconfigured resetschemametricsconf reader
+passschemametricsto reader
+computehdfsblockdistribution
+// load up indices and fileinfo. this also loads bloom filter type.
+metadatamap   collections unmodifiablemap this reader loadfileinfo
+// read in our metadata.
+byte  b   metadatamap get max_seq_id_key
+if  b    null
+// by convention, if halfhfile, top half has a sequence number > bottom
+// half. thats why we add one in below. its done for case the two halves
+// are ever merged back together --rare.  without it, on open of store,
+// since store files are distinguished by sequence id, the one half would
+// subsume the other.
+this sequenceid   bytes tolong b
+if  isreference
+if  reference istopfileregion this reference getfileregion
+this sequenceid    1
+this reader setsequenceid this sequenceid
+b   metadatamap get hfilewriterv2 max_memstore_ts_key
+if  b    null
+this maxmemstorets   bytes tolong b
+b   metadatamap get major_compaction_key
+if  b    null
+boolean mc   bytes toboolean b
+if  this majorcompaction    null
+this majorcompaction   new atomicboolean mc
+else
+this majorcompaction set mc
+else
+// presume it is not major compacted if it doesn't explicity say so
+// hfileoutputformat explicitly sets the major compacted key.
+this majorcompaction   new atomicboolean false
+b   metadatamap get exclude_from_minor_compaction_key
+this excludefromminorcompaction    b    null    bytes toboolean b
+bloomtype hfilebloomtype   reader getbloomfiltertype
+if  cfbloomtype    bloomtype none
+reader loadbloomfilter blocktype general_bloom_meta
+if  hfilebloomtype    cfbloomtype
+log info
+reader gethfilereader   getname         hfilebloomtype
+cfbloomtype
+else if  hfilebloomtype    bloomtype none
+log info
+reader gethfilereader   getname
+// load delete family bloom filter
+reader loadbloomfilter blocktype delete_family_bloom_meta
+try
+byte  timerangebytes   metadatamap get timerange_key
+if  timerangebytes    null
+this reader timerangetracker   new timerangetracker
+writables copywritable timerangebytes  this reader timerangetracker
+catch  illegalargumentexception e
+log error
+e
+this reader timerangetracker   null
+return this reader
+/**
+* @return reader for storefile. creates if necessary
+* @throws ioexception
+*/
+public reader createreader   throws ioexception
+if  this reader    null
+this reader   open
+return this reader
+/**
+* @return current reader.  must call createreader first else returns null.
+* @see #createreader()
+*/
+public reader getreader
+return this reader
+/**
+* @param evictonclose whether to evict blocks belonging to this file
+* @throws ioexception
+*/
+public synchronized void closereader boolean evictonclose
+throws ioexception
+if  this reader    null
+this reader close evictonclose
+this reader   null
+/**
+* delete this file
+* @throws ioexception
+*/
+public void deletereader   throws ioexception
+closereader true
+this fs delete getpath    true
+@override
+public string tostring
+return this path tostring
+isreference  ?     this referencepath       reference tostring
+/**
+* @return a length description of this storefile, suitable for debug output
+*/
+public string tostringdetailed
+stringbuilder sb   new stringbuilder
+sb append this path tostring
+sb append    append isreference
+sb append    append isbulkloadresult
+if  isbulkloadresult
+sb append    append getbulkloadtimestamp
+else
+sb append    append getmaxsequenceid
+sb append    append ismajorcompaction
+return sb tostring
+/**
+* utility to help with rename.
+* @param fs
+* @param src
+* @param tgt
+* @return true if succeeded.
+* @throws ioexception
+*/
+public static path rename final filesystem fs
+final path src
+final path tgt
+throws ioexception
+if   fs exists src
+throw new filenotfoundexception src tostring
+if   fs rename src  tgt
+throw new ioexception     src       tgt
+return tgt
+public static class writerbuilder
+private final configuration conf
+private final cacheconfig cacheconf
+private final filesystem fs
+private final int blocksize
+private compression algorithm compressalgo
+hfile default_compression_algorithm
+private hfiledatablockencoder datablockencoder
+noopdatablockencoder instance
+private keyvalue kvcomparator comparator   keyvalue comparator
+private bloomtype bloomtype   bloomtype none
+private long maxkeycount   0
+private path dir
+private path filepath
+private checksumtype checksumtype   hfile default_checksum_type
+private int bytesperchecksum   hfile default_bytes_per_checksum
+public writerbuilder configuration conf  cacheconfig cacheconf
+filesystem fs  int blocksize
+this conf   conf
+this cacheconf   cacheconf
+this fs   fs
+this blocksize   blocksize
+/**
+* use either this method or {@link #withfilepath}, but not both.
+* @param dir path to column family directory. the directory is created if
+*          does not exist. the file is given a unique name within this
+*          directory.
+* @return this (for chained invocation)
+*/
+public writerbuilder withoutputdir path dir
+preconditions checknotnull dir
+this dir   dir
+return this
+/**
+* use either this method or {@link #withoutputdir}, but not both.
+* @param filepath the storefile path to write
+* @return this (for chained invocation)
+*/
+public writerbuilder withfilepath path filepath
+preconditions checknotnull filepath
+this filepath   filepath
+return this
+public writerbuilder withcompression compression algorithm compressalgo
+preconditions checknotnull compressalgo
+this compressalgo   compressalgo
+return this
+public writerbuilder withdatablockencoder hfiledatablockencoder encoder
+preconditions checknotnull encoder
+this datablockencoder   encoder
+return this
+public writerbuilder withcomparator keyvalue kvcomparator comparator
+preconditions checknotnull comparator
+this comparator   comparator
+return this
+public writerbuilder withbloomtype bloomtype bloomtype
+preconditions checknotnull bloomtype
+this bloomtype   bloomtype
+return this
+/**
+* @param maxkeycount estimated maximum number of keys we expect to add
+* @return this (for chained invocation)
+*/
+public writerbuilder withmaxkeycount long maxkeycount
+this maxkeycount   maxkeycount
+return this
+/**
+* @param checksumtype the type of checksum
+* @return this (for chained invocation)
+*/
+public writerbuilder withchecksumtype checksumtype checksumtype
+this checksumtype   checksumtype
+return this
+/**
+* @param bytesperchecksum the number of bytes per checksum chunk
+* @return this (for chained invocation)
+*/
+public writerbuilder withbytesperchecksum int bytesperchecksum
+this bytesperchecksum   bytesperchecksum
+return this
+/**
+* create a store file writer. client is responsible for closing file when
+* done. if metadata, add before closing using
+* {@link writer#appendmetadata}.
+*/
+public writer build   throws ioexception
+if   dir    null ? 0   1     filepath    null ? 0   1     1
+throw new illegalargumentexception
+if  dir    null
+dir   filepath getparent
+if   fs exists dir
+fs mkdirs dir
+if  filepath    null
+filepath   getuniquefile fs  dir
+if   bloomfilterfactory isgeneralbloomenabled conf
+bloomtype   bloomtype none
+if  compressalgo    null
+compressalgo   hfile default_compression_algorithm
+if  comparator    null
+comparator   keyvalue comparator
+return new writer fs  filepath  blocksize  compressalgo  datablockencoder
+conf  cacheconf  comparator  bloomtype  maxkeycount  checksumtype
+bytesperchecksum
+/**
+* @param fs
+* @param dir directory to create file in.
+* @return random filename inside passed <code>dir</code>
+*/
+public static path getuniquefile final filesystem fs  final path dir
+throws ioexception
+if   fs getfilestatus dir  isdir
+throw new ioexception     dir tostring
+return getrandomfilename fs  dir
+/**
+*
+* @param fs
+* @param dir
+* @return path to a file that doesn't exist at time of this invocation.
+* @throws ioexception
+*/
+static path getrandomfilename final filesystem fs  final path dir
+throws ioexception
+return getrandomfilename fs  dir  null
+/**
+*
+* @param fs
+* @param dir
+* @param suffix
+* @return path to a file that doesn't exist at time of this invocation.
+* @throws ioexception
+*/
+static path getrandomfilename final filesystem fs
+final path dir
+final string suffix
+throws ioexception
+return new path dir  uuid randomuuid   tostring   replaceall
+suffix    null ?     suffix
+/**
+* write out a split reference.
+*
+* package local so it doesnt leak out of regionserver.
+*
+* @param fs
+* @param splitdir presumes path format is actually
+* <code>some_directory/regionname/family</code>.
+* @param f file to split.
+* @param splitrow
+* @param range
+* @return path to created reference.
+* @throws ioexception
+*/
+static path split final filesystem fs
+final path splitdir
+final storefile f
+final byte  splitrow
+final reference range range
+throws ioexception
+// a reference to the bottom half of the hsf store file.
+reference r   new reference splitrow  range
+// add the referred-to regions name as a dot separated suffix.
+// see ref_name_parser regex above.  the referred-to regions name is
+// up in the path of the passed in <code>f</code> -- parentdir is family,
+// then the directory above is the region name.
+string parentregionname   f getpath   getparent   getparent   getname
+// write reference with same file id only with the other region name as
+// suffix and into the new region location (under same family).
+path p   new path splitdir  f getpath   getname         parentregionname
+return r write fs  p
+/**
+* a storefile writer.  use this to read/write hbase store files. it is package
+* local because it is an implementation detail of the hbase regionserver.
+*/
+public static class writer
+private final bloomfilterwriter generalbloomfilterwriter
+private final bloomfilterwriter deletefamilybloomfilterwriter
+private final bloomtype bloomtype
+private byte lastbloomkey
+private int lastbloomkeyoffset  lastbloomkeylen
+private kvcomparator kvcomparator
+private keyvalue lastkv   null
+private long earliestputts   hconstants latest_timestamp
+private keyvalue lastdeletefamilykv   null
+private long deletefamilycnt   0
+protected hfiledatablockencoder datablockencoder
+/** checksum type */
+protected checksumtype checksumtype
+/** bytes per checksum */
+protected int bytesperchecksum
+timerangetracker timerangetracker   new timerangetracker
+/* istimerangetrackerset keeps track if the timerange has already been set
+* when flushing a memstore, we set timerange and use this variable to
+* indicate that it doesn't need to be calculated again while
+* appending keyvalues.
+* it is not set in cases of compactions when it is recalculated using only
+* the appended keyvalues*/
+boolean istimerangetrackerset   false
+protected hfile writer writer
+/**
+* creates an hfile.writer that also write helpful meta data.
+* @param fs file system to write to
+* @param path file name to create
+* @param blocksize hdfs block size
+* @param compress hdfs block compression
+* @param conf user configuration
+* @param comparator key comparator
+* @param bloomtype bloom filter setting
+* @param maxkeys the expected maximum number of keys to be added. was used
+*        for bloom filter size in {@link hfile} format version 1.
+* @param checksumtype the checksum type
+* @param bytesperchecksum the number of bytes per checksum value
+* @throws ioexception problem writing to fs
+*/
+private writer filesystem fs  path path  int blocksize
+compression algorithm compress
+hfiledatablockencoder datablockencoder  final configuration conf
+cacheconfig cacheconf
+final kvcomparator comparator  bloomtype bloomtype  long maxkeys
+final checksumtype checksumtype  final int bytesperchecksum
+throws ioexception
+this datablockencoder   datablockencoder    null ?
+datablockencoder   noopdatablockencoder instance
+writer   hfile getwriterfactory conf  cacheconf
+withpath fs  path
+withblocksize blocksize
+withcompression compress
+withdatablockencoder datablockencoder
+withcomparator comparator getrawcomparator
+withchecksumtype checksumtype
+withbytesperchecksum bytesperchecksum
+create
+this kvcomparator   comparator
+generalbloomfilterwriter   bloomfilterfactory creategeneralbloomatwrite
+conf  cacheconf  bloomtype
+int  math min maxkeys  integer max_value   writer
+if  generalbloomfilterwriter    null
+this bloomtype   bloomtype
+log info     path       this bloomtype
+generalbloomfilterwriter getclass   getsimplename
+else
+// not using bloom filters.
+this bloomtype   bloomtype none
+// initialize delete family bloom filter when there is no rowcol bloom
+// filter
+if  this bloomtype    bloomtype rowcol
+this deletefamilybloomfilterwriter   bloomfilterfactory
+createdeletebloomatwrite conf  cacheconf
+int  math min maxkeys  integer max_value   writer
+else
+deletefamilybloomfilterwriter   null
+if  deletefamilybloomfilterwriter    null
+log info     path
+deletefamilybloomfilterwriter getclass   getsimplename
+this checksumtype   checksumtype
+this bytesperchecksum   bytesperchecksum
+/**
+* writes meta data.
+* call before {@link #close()} since its written as meta data to this file.
+* @param maxsequenceid maximum sequence id.
+* @param majorcompaction true if this file is product of a major compaction
+* @throws ioexception problem writing to fs
+*/
+public void appendmetadata final long maxsequenceid  final boolean majorcompaction
+throws ioexception
+writer appendfileinfo max_seq_id_key  bytes tobytes maxsequenceid
+writer appendfileinfo major_compaction_key
+bytes tobytes majorcompaction
+appendtrackedtimestampstometadata
+/**
+* add timestamprange and earliest put timestamp to metadata
+*/
+public void appendtrackedtimestampstometadata   throws ioexception
+appendfileinfo timerange_key writableutils tobytearray timerangetracker
+appendfileinfo earliest_put_ts  bytes tobytes earliestputts
+/**
+* set timerangetracker
+* @param trt
+*/
+public void settimerangetracker final timerangetracker trt
+this timerangetracker   trt
+istimerangetrackerset   true
+/**
+* record the earlest put timestamp.
+*
+* if the timerangetracker is not set,
+* update timerangetracker to include the timestamp of this key
+* @param kv
+*/
+public void tracktimestamps final keyvalue kv
+if  keyvalue type put getcode      kv gettype
+earliestputts   math min earliestputts  kv gettimestamp
+if   istimerangetrackerset
+timerangetracker includetimestamp kv
+private void appendgeneralbloomfilter final keyvalue kv  throws ioexception
+if  this generalbloomfilterwriter    null
+// only add to the bloom filter on a new, unique key
+boolean newkey   true
+if  this lastkv    null
+switch bloomtype
+case row
+newkey     kvcomparator matchingrows kv  lastkv
+break
+case rowcol
+newkey     kvcomparator matchingrowcolumn kv  lastkv
+break
+case none
+newkey   false
+break
+default
+throw new ioexception     bloomtype
+if  newkey
+/*
+* http://2.bp.blogspot.com/_cib_a77v54u/stzmrzakufi/aaaaaaaaado/zhk7bgojdmq/s400/keyvalue.png
+* key = rowlen + row + familylen + column [family + qualifier] + timestamp
+*
+* 2 types of filtering:
+*  1. row = row
+*  2. rowcol = row + qualifier
+*/
+byte bloomkey
+int bloomkeyoffset  bloomkeylen
+switch  bloomtype
+case row
+bloomkey   kv getbuffer
+bloomkeyoffset   kv getrowoffset
+bloomkeylen   kv getrowlength
+break
+case rowcol
+// merge(row, qualifier)
+// todo: could save one buffer copy in case of compound bloom
+// filters when this involves creating a keyvalue
+bloomkey   generalbloomfilterwriter createbloomkey kv getbuffer
+kv getrowoffset    kv getrowlength    kv getbuffer
+kv getqualifieroffset    kv getqualifierlength
+bloomkeyoffset   0
+bloomkeylen   bloomkey length
+break
+default
+throw new ioexception     bloomtype
+generalbloomfilterwriter add bloomkey  bloomkeyoffset  bloomkeylen
+if  lastbloomkey    null
+generalbloomfilterwriter getcomparator   compare bloomkey
+bloomkeyoffset  bloomkeylen  lastbloomkey
+lastbloomkeyoffset  lastbloomkeylen  <  0
+throw new ioexception
+bytes tostringbinary bloomkey  bloomkeyoffset  bloomkeylen
+bytes tostringbinary lastbloomkey  lastbloomkeyoffset
+lastbloomkeylen
+lastbloomkey   bloomkey
+lastbloomkeyoffset   bloomkeyoffset
+lastbloomkeylen   bloomkeylen
+this lastkv   kv
+private void appenddeletefamilybloomfilter final keyvalue kv
+throws ioexception
+if   kv isdeletefamily
+return
+// increase the number of delete family in the store file
+deletefamilycnt
+if  null    this deletefamilybloomfilterwriter
+boolean newkey   true
+if  lastdeletefamilykv    null
+newkey    kvcomparator matchingrows kv  lastdeletefamilykv
+if  newkey
+this deletefamilybloomfilterwriter add kv getbuffer
+kv getrowoffset    kv getrowlength
+this lastdeletefamilykv   kv
+public void append final keyvalue kv  throws ioexception
+appendgeneralbloomfilter kv
+appenddeletefamilybloomfilter kv
+writer append kv
+tracktimestamps kv
+public path getpath
+return this writer getpath
+boolean hasgeneralbloom
+return this generalbloomfilterwriter    null
+/**
+* for unit testing only.
+*
+* @return the bloom filter used by this writer.
+*/
+bloomfilterwriter getgeneralbloomwriter
+return generalbloomfilterwriter
+private boolean closebloomfilter bloomfilterwriter bfw  throws ioexception
+boolean havebloom    bfw    null    bfw getkeycount   > 0
+if  havebloom
+bfw compactbloom
+return havebloom
+private boolean closegeneralbloomfilter   throws ioexception
+boolean hasgeneralbloom   closebloomfilter generalbloomfilterwriter
+// add the general bloom filter writer and append file info
+if  hasgeneralbloom
+writer addgeneralbloomfilter generalbloomfilterwriter
+writer appendfileinfo bloom_filter_type_key
+bytes tobytes bloomtype tostring
+if  lastbloomkey    null
+writer appendfileinfo last_bloom_key  arrays copyofrange
+lastbloomkey  lastbloomkeyoffset  lastbloomkeyoffset
+lastbloomkeylen
+return hasgeneralbloom
+private boolean closedeletefamilybloomfilter   throws ioexception
+boolean hasdeletefamilybloom   closebloomfilter deletefamilybloomfilterwriter
+// add the delete family bloom filter writer
+if  hasdeletefamilybloom
+writer adddeletefamilybloomfilter deletefamilybloomfilterwriter
+// append file info about the number of delete family kvs
+// even if there is no delete family bloom.
+writer appendfileinfo delete_family_count
+bytes tobytes this deletefamilycnt
+return hasdeletefamilybloom
+public void close   throws ioexception
+// save data block encoder metadata in the file info.
+datablockencoder savemetadata this
+boolean hasgeneralbloom   this closegeneralbloomfilter
+boolean hasdeletefamilybloom   this closedeletefamilybloomfilter
+writer close
+// log final bloom filter statistics. this needs to be done after close()
+// because compound bloom filters might be finalized as part of closing.
+storefile log info  hasgeneralbloom ?
+hasdeletefamilybloom ?
+getpath
+public void appendfileinfo byte key  byte value  throws ioexception
+writer appendfileinfo key  value
+/** for use in testing, e.g. {@link createrandomstorefile} */
+hfile writer gethfilewriter
+return writer
+/**
+* reader for a storefile.
+*/
+public static class reader extends schemaconfigured
+static final log log   logfactory getlog reader class getname
+protected bloomfilter generalbloomfilter   null
+protected bloomfilter deletefamilybloomfilter   null
+protected bloomtype bloomfiltertype
+private final hfile reader reader
+protected timerangetracker timerangetracker   null
+protected long sequenceid    1
+private byte lastbloomkey
+private long deletefamilycnt    1
+public reader filesystem fs  path path  cacheconfig cacheconf
+datablockencoding preferredencodingincache  throws ioexception
+super path
+reader   hfile createreaderwithencoding fs  path  cacheconf
+preferredencodingincache
+bloomfiltertype   bloomtype none
+/**
+* only use default constructor for unit tests
+*/
+reader
+this reader   null
+public rawcomparator<byte > getcomparator
+return reader getcomparator
+/**
+* get a scanner to scan over this storefile. do not use
+* this overload if using this scanner for compactions.
+*
+* @param cacheblocks should this scanner cache blocks?
+* @param pread use pread (for highly concurrent small readers)
+* @return a scanner
+*/
+public storefilescanner getstorefilescanner boolean cacheblocks
+boolean pread
+return getstorefilescanner cacheblocks  pread  false
+/**
+* get a scanner to scan over this storefile.
+*
+* @param cacheblocks should this scanner cache blocks?
+* @param pread use pread (for highly concurrent small readers)
+* @param iscompaction is scanner being used for compaction?
+* @return a scanner
+*/
+public storefilescanner getstorefilescanner boolean cacheblocks
+boolean pread
+boolean iscompaction
+return new storefilescanner this
+getscanner cacheblocks  pread
+iscompaction    iscompaction
+/**
+* warning: do not write further code which depends on this call. instead
+* use getstorefilescanner() which uses the storefilescanner class/interface
+* which is the preferred way to scan a store with higher level concepts.
+*
+* @param cacheblocks should we cache the blocks?
+* @param pread use pread (for concurrent small readers)
+* @return the underlying hfilescanner
+*/
+@deprecated
+public hfilescanner getscanner boolean cacheblocks  boolean pread
+return getscanner cacheblocks  pread  false
+/**
+* warning: do not write further code which depends on this call. instead
+* use getstorefilescanner() which uses the storefilescanner class/interface
+* which is the preferred way to scan a store with higher level concepts.
+*
+* @param cacheblocks
+*          should we cache the blocks?
+* @param pread
+*          use pread (for concurrent small readers)
+* @param iscompaction
+*          is scanner being used for compaction?
+* @return the underlying hfilescanner
+*/
+@deprecated
+public hfilescanner getscanner boolean cacheblocks  boolean pread
+boolean iscompaction
+return reader getscanner cacheblocks  pread  iscompaction
+public void close boolean evictonclose  throws ioexception
+reader close evictonclose
+/**
+* check if this storefile may contain keys within the timerange that
+* have not expired (i.e. not older than oldestunexpiredts).
+* @param scan the current scan
+* @param oldestunexpiredts the oldest timestamp that is not expired, as
+*          determined by the column family's ttl
+* @return false if queried keys definitely don't exist in this storefile
+*/
+boolean passestimerangefilter scan scan  long oldestunexpiredts
+if  timerangetracker    null
+return true
+else
+return timerangetracker includestimerange scan gettimerange
+timerangetracker getmaximumtimestamp   >  oldestunexpiredts
+/**
+* checks whether the given scan passes the bloom filter (if present). only
+* checks bloom filters for single-row or single-row-column scans. bloom
+* filter checking for multi-gets is implemented as part of the store
+* scanner system (see {@link storefilescanner#seekexactly}) and uses
+* the lower-level api {@link #passesgeneralbloomfilter(byte[], int, int, byte[],
+* int, int)}.
+*
+* @param scan the scan specification. used to determine the row, and to
+*          check whether this is a single-row ("get") scan.
+* @param columns the set of columns. only used for row-column bloom
+*          filters.
+* @return true if the scan with the given column set passes the bloom
+*         filter, or if the bloom filter is not applicable for the scan.
+*         false if the bloom filter is applicable and the scan fails it.
+*/
+boolean passesbloomfilter scan scan
+final sortedset<byte> columns
+// multi-column non-get scans will use bloom filters through the
+// lower-level api function that this function calls.
+if   scan isgetscan
+return true
+byte row   scan getstartrow
+switch  this bloomfiltertype
+case row
+return passesgeneralbloomfilter row  0  row length  null  0  0
+case rowcol
+if  columns    null    columns size      1
+byte column   columns first
+return passesgeneralbloomfilter row  0  row length  column  0
+column length
+// for multi-column queries the bloom filter is checked from the
+// seekexact operation.
+return true
+default
+return true
+public boolean passesdeletefamilybloomfilter byte row  int rowoffset
+int rowlen
+// cache bloom filter as a local variable in case it is set to null by
+// another thread on an io error.
+bloomfilter bloomfilter   this deletefamilybloomfilter
+// empty file or there is no delete family at all
+if  reader gettrailer   getentrycount      0    deletefamilycnt    0
+return false
+if  bloomfilter    null
+return true
+try
+if   bloomfilter supportsautoloading
+return true
+return bloomfilter contains row  rowoffset  rowlen  null
+catch  illegalargumentexception e
+log error
+e
+setdeletefamilybloomfilterfaulty
+return true
+/**
+* a method for checking bloom filters. called directly from
+* storefilescanner in case of a multi-column query.
+*
+* @param row
+* @param rowoffset
+* @param rowlen
+* @param col
+* @param coloffset
+* @param collen
+* @return true if passes
+*/
+public boolean passesgeneralbloomfilter byte row  int rowoffset
+int rowlen  byte col  int coloffset  int collen
+if  generalbloomfilter    null
+return true
+byte key
+switch  bloomfiltertype
+case row
+if  col    null
+throw new runtimeexception
+if  rowoffset    0    rowlen    row length
+throw new assertionerror
+key   row
+break
+case rowcol
+key   generalbloomfilter createbloomkey row  rowoffset  rowlen  col
+coloffset  collen
+break
+default
+return true
+// cache bloom filter as a local variable in case it is set to null by
+// another thread on an io error.
+bloomfilter bloomfilter   this generalbloomfilter
+if  bloomfilter    null
+return true
+// empty file
+if  reader gettrailer   getentrycount      0
+return false
+try
+boolean shouldcheckbloom
+bytebuffer bloom
+if  bloomfilter supportsautoloading
+bloom   null
+shouldcheckbloom   true
+else
+bloom   reader getmetablock hfilewriterv1 bloom_filter_data_key
+true
+shouldcheckbloom   bloom    null
+if  shouldcheckbloom
+boolean exists
+// whether the primary bloom key is greater than the last bloom key
+// from the file info. for row-column bloom filters this is not yet
+// a sufficient condition to return false.
+boolean keyisafterlast   lastbloomkey    null
+bloomfilter getcomparator   compare key  lastbloomkey  > 0
+if  bloomfiltertype    bloomtype rowcol
+// since a row delete is essentially a deletefamily applied to all
+// columns, a file might be skipped if using row+col bloom filter.
+// in order to ensure this file is included an additional check is
+// required looking only for a row bloom.
+byte rowbloomkey   bloomfilter createbloomkey row  0  row length
+null  0  0
+if  keyisafterlast
+bloomfilter getcomparator   compare rowbloomkey
+lastbloomkey  > 0
+exists   false
+else
+exists
+bloomfilter contains key  0  key length  bloom
+bloomfilter contains rowbloomkey  0  rowbloomkey length
+bloom
+else
+exists    keyisafterlast
+bloomfilter contains key  0  key length  bloom
+getschemametrics   updatebloommetrics exists
+return exists
+catch  ioexception e
+log error
+e
+setgeneralbloomfilterfaulty
+catch  illegalargumentexception e
+log error    e
+setgeneralbloomfilterfaulty
+return true
+public map<byte  byte> loadfileinfo   throws ioexception
+map<byte   byte > fi   reader loadfileinfo
+byte b   fi get bloom_filter_type_key
+if  b    null
+bloomfiltertype   bloomtype valueof bytes tostring b
+lastbloomkey   fi get last_bloom_key
+byte cnt   fi get delete_family_count
+if  cnt    null
+deletefamilycnt   bytes tolong cnt
+return fi
+public void loadbloomfilter
+this loadbloomfilter blocktype general_bloom_meta
+this loadbloomfilter blocktype delete_family_bloom_meta
+private void loadbloomfilter blocktype blocktype
+try
+if  blocktype    blocktype general_bloom_meta
+if  this generalbloomfilter    null
+return     bloom has been loaded
+datainput bloommeta   reader getgeneralbloomfiltermetadata
+if  bloommeta    null
+// sanity check for none bloom filter
+if  bloomfiltertype    bloomtype none
+throw new ioexception
+else
+generalbloomfilter   bloomfilterfactory createfrommeta bloommeta
+reader
+log info     bloomfiltertype tostring
+generalbloomfilter getclass   getsimplename
+reader getname
+else if  blocktype    blocktype delete_family_bloom_meta
+if  this deletefamilybloomfilter    null
+return     bloom has been loaded
+datainput bloommeta   reader getdeletebloomfiltermetadata
+if  bloommeta    null
+deletefamilybloomfilter   bloomfilterfactory createfrommeta
+bloommeta  reader
+log info
+deletefamilybloomfilter getclass   getsimplename
+reader getname
+else
+throw new runtimeexception     blocktype tostring
+catch  ioexception e
+log error     blocktype
+e
+setbloomfilterfaulty blocktype
+catch  illegalargumentexception e
+log error     blocktype
+e
+setbloomfilterfaulty blocktype
+private void setbloomfilterfaulty blocktype blocktype
+if  blocktype    blocktype general_bloom_meta
+setgeneralbloomfilterfaulty
+else if  blocktype    blocktype delete_family_bloom_meta
+setdeletefamilybloomfilterfaulty
+/**
+* the number of bloom filter entries in this store file, or an estimate
+* thereof, if the bloom filter is not loaded. this always returns an upper
+* bound of the number of bloom filter entries.
+*
+* @return an estimate of the number of bloom filter entries in this file
+*/
+public long getfilterentries
+return generalbloomfilter    null ? generalbloomfilter getkeycount
+reader getentries
+public void setgeneralbloomfilterfaulty
+generalbloomfilter   null
+public void setdeletefamilybloomfilterfaulty
+this deletefamilybloomfilter   null
+public byte getlastkey
+return reader getlastkey
+public byte midkey   throws ioexception
+return reader midkey
+public long length
+return reader length
+public long gettotaluncompressedbytes
+return reader gettrailer   gettotaluncompressedbytes
+public long getentries
+return reader getentries
+public long getdeletefamilycnt
+return deletefamilycnt
+public byte getfirstkey
+return reader getfirstkey
+public long indexsize
+return reader indexsize
+public string getcolumnfamilyname
+return reader getcolumnfamilyname
+public bloomtype getbloomfiltertype
+return this bloomfiltertype
+public long getsequenceid
+return sequenceid
+public void setsequenceid long sequenceid
+this sequenceid   sequenceid
+bloomfilter getgeneralbloomfilter
+return generalbloomfilter
+long getuncompresseddataindexsize
+return reader gettrailer   getuncompresseddataindexsize
+public long gettotalbloomsize
+if  generalbloomfilter    null
+return 0
+return generalbloomfilter getbytesize
+public int gethfileversion
+return reader gettrailer   getmajorversion
+hfile reader gethfilereader
+return reader
+void disablebloomfilterfortesting
+generalbloomfilter   null
+this deletefamilybloomfilter   null
+public long getmaxtimestamp
+return timerangetracker maximumtimestamp
+@override
+public void schemaconfigurationchanged
+passschemametricsto  schemaconfigured  reader
+/**
+* useful comparators for comparing storefiles.
+*/
+abstract static class comparators
+/**
+* comparator that compares based on the flush time of
+* the storefiles. all bulk loads are placed before all non-
+* bulk loads, and then all files are sorted by sequence id.
+* if there are ties, the path name is used as a tie-breaker.
+*/
+static final comparator<storefile> flush_time
+ordering compound immutablelist of
+ordering natural   onresultof new getbulktime
+ordering natural   onresultof new getseqid
+ordering natural   onresultof new getpathname
+private static class getbulktime implements function<storefile  long>
+@override
+public long apply storefile sf
+if   sf isbulkloadresult    return long max_value
+return sf getbulkloadtimestamp
+private static class getseqid implements function<storefile  long>
+@override
+public long apply storefile sf
+if  sf isbulkloadresult    return  1l
+return sf getmaxsequenceid
+private static class getpathname implements function<storefile  string>
+@override
+public string apply storefile sf
+return sf getpath   getname
+/**
+* file_size = descending sort storefiles (largest --> smallest in size)
+*/
+static final comparator<storefile> file_size
+ordering natural   reverse   onresultof new function<storefile  long>
+@override
+public long apply storefile sf
+return sf getreader   length

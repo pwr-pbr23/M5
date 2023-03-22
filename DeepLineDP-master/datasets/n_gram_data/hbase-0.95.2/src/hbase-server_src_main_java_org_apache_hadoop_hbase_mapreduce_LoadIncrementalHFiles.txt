@@ -1,0 +1,637 @@
+/**
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase mapreduce
+import java io filenotfoundexception
+import java io ioexception
+import java nio bytebuffer
+import java util arraylist
+import java util arrays
+import java util collection
+import java util deque
+import java util hashset
+import java util linkedlist
+import java util list
+import java util map
+import java util map entry
+import java util set
+import java util treemap
+import java util concurrent callable
+import java util concurrent executionexception
+import java util concurrent executorservice
+import java util concurrent future
+import java util concurrent linkedblockingqueue
+import java util concurrent threadpoolexecutor
+import java util concurrent timeunit
+import java util concurrent atomic atomiclong
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop classification interfacestability
+import org apache hadoop conf configuration
+import org apache hadoop conf configured
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs fileutil
+import org apache hadoop fs path
+import org apache hadoop hbase tablename
+import org apache hadoop hbase hbaseconfiguration
+import org apache hadoop hbase hcolumndescriptor
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase tablenotfoundexception
+import org apache hadoop hbase client hbaseadmin
+import org apache hadoop hbase client hconnection
+import org apache hadoop hbase client htable
+import org apache hadoop hbase client regionservercallable
+import org apache hadoop hbase client rpcretryingcallerfactory
+import org apache hadoop hbase client coprocessor securebulkloadclient
+import org apache hadoop hbase io halfstorefilereader
+import org apache hadoop hbase io reference
+import org apache hadoop hbase io compress compression algorithm
+import org apache hadoop hbase io encoding datablockencoding
+import org apache hadoop hbase io hfile cacheconfig
+import org apache hadoop hbase io hfile hfile
+import org apache hadoop hbase io hfile hfiledatablockencoder
+import org apache hadoop hbase io hfile hfiledatablockencoderimpl
+import org apache hadoop hbase io hfile hfilescanner
+import org apache hadoop hbase protobuf protobufutil
+import org apache hadoop hbase regionserver bloomtype
+import org apache hadoop hbase regionserver hstore
+import org apache hadoop hbase regionserver storefile
+import org apache hadoop hbase security user
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util pair
+import org apache hadoop security token token
+import org apache hadoop util tool
+import org apache hadoop util toolrunner
+import com google common collect hashmultimap
+import com google common collect multimap
+import com google common collect multimaps
+import com google common util concurrent threadfactorybuilder
+/**
+* tool to load the output of hfileoutputformat into an existing table.
+* @see #usage()
+*/
+@interfaceaudience public
+@interfacestability stable
+public class loadincrementalhfiles extends configured implements tool
+private static final log log   logfactory getlog loadincrementalhfiles class
+static final atomiclong regioncount   new atomiclong 0
+private hbaseadmin hbadmin
+private configuration cfg
+public static final string name
+private static final string assign_seq_ids
+private boolean assignseqids
+private boolean usesecure
+private token<?> usertoken
+private string bulktoken
+//package private for testing
+loadincrementalhfiles configuration conf  boolean usesecure  throws exception
+super conf
+this cfg   conf
+this hbadmin   new hbaseadmin conf
+//added simple for testing
+this usesecure   usesecure    null ? usesecure   user ishbasesecurityenabled conf
+public loadincrementalhfiles configuration conf  throws exception
+this conf  null
+assignseqids   conf getboolean assign_seq_ids  true
+private void usage
+system err println     name
+/**
+* represents an hfile waiting to be loaded. an queue is used
+* in this class in order to support the case where a region has
+* split during the process of the load. when this happens,
+* the hfile is split into two physical parts across the new
+* region boundary, and each part is added back into the queue.
+* the import process finishes when the queue is empty.
+*/
+static class loadqueueitem
+final byte family
+final path hfilepath
+public loadqueueitem byte family  path hfilepath
+this family   family
+this hfilepath   hfilepath
+public string tostring
+return    bytes tostring family        hfilepath tostring
+/**
+* walk the given directory for all hfiles, and return a queue
+* containing all such files.
+*/
+private void discoverloadqueue deque<loadqueueitem> ret  path hfofdir
+throws ioexception
+filesystem fs   hfofdir getfilesystem getconf
+if   fs exists hfofdir
+throw new filenotfoundexception
+hfofdir
+filestatus familydirstatuses   fs liststatus hfofdir
+if  familydirstatuses    null
+throw new filenotfoundexception     hfofdir
+for  filestatus stat   familydirstatuses
+if   stat isdir
+log warn     stat getpath
+continue
+path familydir   stat getpath
+// skip _logs, etc
+if  familydir getname   startswith     continue
+byte family   familydir getname   getbytes
+path hfiles   fileutil stat2paths fs liststatus familydir
+for  path hfile   hfiles
+if  hfile getname   startswith     continue
+ret add new loadqueueitem family  hfile
+/**
+* perform a bulk load of the given directory into the given
+* pre-existing table.  this method is not threadsafe.
+*
+* @param hfofdir the directory that was provided as the output path
+* of a job using hfileoutputformat
+* @param table the table to load into
+* @throws tablenotfoundexception if table does not yet exist
+*/
+public void dobulkload path hfofdir  final htable table
+throws tablenotfoundexception  ioexception
+final hconnection conn   table getconnection
+if   conn istableavailable table getname
+throw new tablenotfoundexception
+bytes tostringbinary table gettablename
+// initialize thread pools
+int nrthreads   cfg getint
+runtime getruntime   availableprocessors
+threadfactorybuilder builder   new threadfactorybuilder
+builder setnameformat
+executorservice pool   new threadpoolexecutor nrthreads  nrthreads
+60  timeunit seconds
+new linkedblockingqueue<runnable>
+builder build
+threadpoolexecutor pool  allowcorethreadtimeout true
+// lqi queue does not need to be threadsafe -- all operations on this queue
+// happen in this thread
+deque<loadqueueitem> queue   new linkedlist<loadqueueitem>
+try
+discoverloadqueue queue  hfofdir
+// check whether there is invalid family name in hfiles to be bulkloaded
+collection<hcolumndescriptor> families   table gettabledescriptor   getfamilies
+arraylist<string> familynames   new arraylist<string>
+for  hcolumndescriptor family   families
+familynames add family getnameasstring
+arraylist<string> unmatchedfamilies   new arraylist<string>
+for  loadqueueitem lqi   queue
+string familynameinhfile   bytes tostring lqi family
+if   familynames contains familynameinhfile
+unmatchedfamilies add familynameinhfile
+if  unmatchedfamilies size   > 0
+string msg
+unmatchedfamilies
+bytes tostring table gettablename          familynames
+log error msg
+throw new ioexception msg
+int count   0
+if  queue isempty
+log warn
+hfofdir touri
+return
+//if using secure bulk load
+//prepare staging directory and token
+if usesecure
+filesystem fs   filesystem get cfg
+//this condition is here for unit testing
+//since delegation token doesn't work in mini cluster
+if user issecurityenabled
+usertoken   fs getdelegationtoken
+bulktoken   new securebulkloadclient table  preparebulkload table getname
+// assumes that region splits can happen while this occurs.
+while   queue isempty
+// need to reload split keys each iteration.
+final pair<byte  byte> startendkeys   table getstartendkeys
+if  count    0
+log info
+count       queue size
+int maxretries   cfg getint    0
+if  maxretries    0    count >  maxretries
+log error     count
+return
+count
+// using bytebuffer for byte[] equality semantics
+multimap<bytebuffer  loadqueueitem> regiongroups   grouporsplitphase table
+pool  queue  startendkeys
+bulkloadphase table  conn  pool  queue  regiongroups
+// note: the next iteration's split / group could happen in parallel to
+// atomic bulkloads assuming that there are splits and no merges, and
+// that we can atomically pull out the groups we want to retry.
+finally
+if usesecure
+if usertoken    null
+try
+usertoken cancel cfg
+catch  exception e
+log warn    e
+if bulktoken    null
+new securebulkloadclient table  cleanupbulkload bulktoken
+pool shutdown
+if  queue    null     queue isempty
+stringbuilder err   new stringbuilder
+err append
+err append
+err append
+for  loadqueueitem q   queue
+err append    append q hfilepath  append
+log error err
+if  queue    null     queue isempty
+throw new runtimeexception
+/**
+* this takes the lqi's grouped by likely regions and attempts to bulk load
+* them.  any failures are re-queued for another pass with the
+* grouporsplitphase.
+*/
+protected void bulkloadphase final htable table  final hconnection conn
+executorservice pool  deque<loadqueueitem> queue
+final multimap<bytebuffer  loadqueueitem> regiongroups  throws ioexception
+// atomically bulk load the groups.
+set<future<list<loadqueueitem>>> loadingfutures   new hashset<future<list<loadqueueitem>>>
+for  entry<bytebuffer  ? extends collection<loadqueueitem>> e  regiongroups asmap   entryset
+final byte first   e getkey   array
+final collection<loadqueueitem> lqis    e getvalue
+final callable<list<loadqueueitem>> call   new callable<list<loadqueueitem>>
+public list<loadqueueitem> call   throws exception
+list<loadqueueitem> toretry
+tryatomicregionload conn  table getname    first  lqis
+return toretry
+loadingfutures add pool submit call
+// get all the results.
+for  future<list<loadqueueitem>> future   loadingfutures
+try
+list<loadqueueitem> toretry   future get
+// lqis that are requeued to be regrouped.
+queue addall toretry
+catch  executionexception e1
+throwable t   e1 getcause
+if  t instanceof ioexception
+// at this point something unrecoverable has happened.
+// todo implement bulk load recovery
+throw new ioexception    t
+log error    e1
+throw new illegalstateexception t
+catch  interruptedexception e1
+log error    e1
+throw new illegalstateexception e1
+/**
+* @return a multimap<startkey, loadqueueitem> that groups lqi by likely
+* bulk load region targets.
+*/
+private multimap<bytebuffer  loadqueueitem> grouporsplitphase final htable table
+executorservice pool  deque<loadqueueitem> queue
+final pair<byte  byte> startendkeys  throws ioexception
+// <region start key, lqi> need synchronized only within this scope of this
+// phase because of the puts that happen in futures.
+multimap<bytebuffer  loadqueueitem> rgs   hashmultimap create
+final multimap<bytebuffer  loadqueueitem> regiongroups   multimaps synchronizedmultimap rgs
+// drain lqis and figure out bulk load groups
+set<future<list<loadqueueitem>>> splittingfutures   new hashset<future<list<loadqueueitem>>>
+while   queue isempty
+final loadqueueitem item   queue remove
+final callable<list<loadqueueitem>> call   new callable<list<loadqueueitem>>
+public list<loadqueueitem> call   throws exception
+list<loadqueueitem> splits   grouporsplit regiongroups  item  table  startendkeys
+return splits
+splittingfutures add pool submit call
+// get all the results.  all grouping and splitting must finish before
+// we can attempt the atomic loads.
+for  future<list<loadqueueitem>> lqis   splittingfutures
+try
+list<loadqueueitem> splits   lqis get
+if  splits    null
+queue addall splits
+catch  executionexception e1
+throwable t   e1 getcause
+if  t instanceof ioexception
+log error    e1
+throw  ioexception t     would have been thrown if not parallelized
+log error    e1
+throw new illegalstateexception t
+catch  interruptedexception e1
+log error    e1
+throw new illegalstateexception e1
+return regiongroups
+// unique file name for the table
+string getuniquename tablename tablename
+string name   tablename       regioncount incrementandget
+return name
+protected list<loadqueueitem> splitstorefile final loadqueueitem item
+final htable table  byte startkey
+byte splitkey  throws ioexception
+final path hfilepath   item hfilepath
+// we use a '_' prefix which is ignored when walking directory trees
+// above.
+final path tmpdir   new path item hfilepath getparent
+log info     hfilepath
+string uniquename   getuniquename table getname
+hcolumndescriptor familydesc   table gettabledescriptor   getfamily item family
+path botout   new path tmpdir  uniquename
+path topout   new path tmpdir  uniquename
+splitstorefile getconf    hfilepath  familydesc  splitkey
+botout  topout
+// add these back at the *front* of the queue, so there's a lower
+// chance that the region will just split again before we get there.
+list<loadqueueitem> lqis   new arraylist<loadqueueitem> 2
+lqis add new loadqueueitem item family  botout
+lqis add new loadqueueitem item family  topout
+log info     botout       topout
+return lqis
+/**
+* attempt to assign the given load queue item into its target region group.
+* if the hfile boundary no longer fits into a region, physically splits
+* the hfile such that the new bottom half will fit and returns the list of
+* lqi's corresponding to the resultant hfiles.
+*
+* protected for testing
+*/
+protected list<loadqueueitem> grouporsplit multimap<bytebuffer  loadqueueitem> regiongroups
+final loadqueueitem item  final htable table
+final pair<byte  byte> startendkeys
+throws ioexception
+final path hfilepath   item hfilepath
+final filesystem fs   hfilepath getfilesystem getconf
+hfile reader hfr   hfile createreader fs  hfilepath
+new cacheconfig getconf
+final byte first  last
+try
+hfr loadfileinfo
+first   hfr getfirstrowkey
+last   hfr getlastrowkey
+finally
+hfr close
+log info     hfilepath
+bytes tostringbinary first
+bytes tostringbinary last
+if  first    null    last    null
+assert first    null    last    null
+// todo what if this is due to a bad hfile?
+log info     hfilepath
+return null
+if  bytes compareto first  last  > 0
+throw new illegalargumentexception
+bytes tostringbinary first
+bytes tostringbinary last
+int idx   arrays binarysearch startendkeys getfirst    first
+bytes bytes_comparator
+if  idx < 0
+// not on boundary, returns -(insertion index).  calculate region it
+// would be in.
+idx     idx   1    1
+final int indexforcallable   idx
+boolean lastkeyinrange
+bytes compareto last  startendkeys getsecond    < 0
+bytes equals startendkeys getsecond    hconstants empty_byte_array
+if   lastkeyinrange
+list<loadqueueitem> lqis   splitstorefile item  table
+startendkeys getfirst
+startendkeys getsecond
+return lqis
+// group regions.
+regiongroups put bytebuffer wrap startendkeys getfirst     item
+return null
+/**
+* attempts to do an atomic load of many hfiles into a region.  if it fails,
+* it returns a list of hfiles that need to be retried.  if it is successful
+* it will return an empty list.
+*
+* note: to maintain row atomicity guarantees, region server callable should
+* succeed atomically and fails atomically.
+*
+* protected for testing.
+*
+* @return empty list if success, list of items to retry on recoverable
+* failure
+*/
+protected list<loadqueueitem> tryatomicregionload final hconnection conn
+final tablename tablename
+final byte first  collection<loadqueueitem> lqis  throws ioexception
+final list<pair<byte  string>> fampaths
+new arraylist<pair<byte  string>> lqis size
+for  loadqueueitem lqi   lqis
+fampaths add pair newpair lqi family  lqi hfilepath tostring
+final regionservercallable<boolean> svrcallable
+new regionservercallable<boolean> conn  tablename  first
+@override
+public boolean call   throws exception
+securebulkloadclient secureclient   null
+boolean success   false
+try
+log debug     getlocation
+bytes tostringbinary getrow
+byte regionname   getlocation   getregioninfo   getregionname
+if  usesecure
+success   protobufutil bulkloadhfile getstub    fampaths  regionname  assignseqids
+else
+htable table   new htable conn getconfiguration    gettablename
+secureclient   new securebulkloadclient table
+success   secureclient bulkloadhfiles fampaths  usertoken  bulktoken
+getlocation   getregioninfo   getstartkey
+return success
+finally
+//best effort copying of files that might not have been imported
+//from the staging directory back to original location
+//in user directory
+if secureclient    null     success
+filesystem fs   filesystem get cfg
+for pair<byte  string> el   fampaths
+path hfilestagingpath   null
+path hfileorigpath   new path el getsecond
+try
+hfilestagingpath  new path secureclient getstagingpath bulktoken  el getfirst
+hfileorigpath getname
+if fs rename hfilestagingpath  hfileorigpath
+log debug     hfileorigpath
+hfilestagingpath
+else if fs exists hfilestagingpath
+log debug     hfileorigpath
+hfilestagingpath
+catch exception ex
+log debug     hfileorigpath
+hfilestagingpath  ex
+try
+list<loadqueueitem> toretry   new arraylist<loadqueueitem>
+configuration conf   getconf
+boolean success   rpcretryingcallerfactory instantiate conf  <boolean> newcaller
+callwithretries svrcallable
+if   success
+log warn
+bytes tostringbinary first
+tablename        lqis
+toretry addall lqis      return lqi's to retry
+// success
+return toretry
+catch  ioexception e
+log error    e
+throw e
+/**
+* split a storefile into a top and bottom half, maintaining
+* the metadata, recreating bloom filters, etc.
+*/
+static void splitstorefile
+configuration conf  path infile
+hcolumndescriptor familydesc  byte splitkey
+path bottomout  path topout  throws ioexception
+// open reader with no block cache, and not in-memory
+reference topreference   reference createtopreference splitkey
+reference bottomreference   reference createbottomreference splitkey
+copyhfilehalf conf  infile  topout  topreference  familydesc
+copyhfilehalf conf  infile  bottomout  bottomreference  familydesc
+/**
+* copy half of an hfile into a new hfile.
+*/
+private static void copyhfilehalf
+configuration conf  path infile  path outfile  reference reference
+hcolumndescriptor familydescriptor
+throws ioexception
+filesystem fs   infile getfilesystem conf
+cacheconfig cacheconf   new cacheconfig conf
+halfstorefilereader halfreader   null
+storefile writer halfwriter   null
+hfiledatablockencoder datablockencoder   new hfiledatablockencoderimpl
+familydescriptor getdatablockencodingondisk
+familydescriptor getdatablockencoding
+try
+halfreader   new halfstorefilereader fs  infile  cacheconf
+reference  datablockencoding none
+map<byte  byte> fileinfo   halfreader loadfileinfo
+int blocksize   familydescriptor getblocksize
+algorithm compression   familydescriptor getcompression
+bloomtype bloomfiltertype   familydescriptor getbloomfiltertype
+halfwriter   new storefile writerbuilder conf  cacheconf
+fs  blocksize
+withfilepath outfile
+withcompression compression
+withdatablockencoder datablockencoder
+withbloomtype bloomfiltertype
+withchecksumtype hstore getchecksumtype conf
+withbytesperchecksum hstore getbytesperchecksum conf
+build
+hfilescanner scanner   halfreader getscanner false  false  false
+scanner seekto
+do
+keyvalue kv   scanner getkeyvalue
+halfwriter append kv
+while  scanner next
+for  map entry<byte byte> entry   fileinfo entryset
+if  shouldcopyhfilemetakey entry getkey
+halfwriter appendfileinfo entry getkey    entry getvalue
+finally
+if  halfwriter    null  halfwriter close
+if  halfreader    null  halfreader close cacheconf shouldevictonclose
+private static boolean shouldcopyhfilemetakey byte key
+return  hfile isreservedfileinfokey key
+private boolean doestableexist tablename tablename  throws exception
+return hbadmin tableexists tablename
+/*
+* infers region boundaries for a new table.
+* parameter:
+*   bdrymap is a map between keys to an integer belonging to {+1, -1}
+*     if a key is a start key of a file, then it maps to +1
+*     if a key is an end key of a file, then it maps to -1
+* algo:
+* 1) poll on the keys in order:
+*    a) keep adding the mapped values to these keys (runningsum)
+*    b) each time runningsum reaches 0, add the start key from when the runningsum had started to a boundary list.
+* 2) return the boundary list.
+*/
+public static byte inferboundaries treemap<byte  integer> bdrymap
+arraylist<byte> keysarray   new arraylist<byte>
+int runningvalue   0
+byte currstartkey   null
+boolean firstboundary   true
+for  map entry<byte  integer> item  bdrymap entryset
+if  runningvalue    0  currstartkey   item getkey
+runningvalue    item getvalue
+if  runningvalue    0
+if   firstboundary  keysarray add currstartkey
+firstboundary   false
+return keysarray toarray new byte
+/*
+* if the table is created for the first time, then "completebulkload" reads the files twice.
+* more modifications necessary if we want to avoid doing it.
+*/
+private void createtable tablename tablename  string dirpath  throws exception
+path hfofdir   new path dirpath
+filesystem fs   hfofdir getfilesystem getconf
+if   fs exists hfofdir
+throw new filenotfoundexception
+hfofdir
+filestatus familydirstatuses   fs liststatus hfofdir
+if  familydirstatuses    null
+throw new filenotfoundexception     hfofdir
+htabledescriptor htd   new htabledescriptor tablename
+hcolumndescriptor hcd
+// add column families
+// build a set of keys
+byte keys
+treemap<byte  integer> map   new treemap<byte  integer> bytes bytes_comparator
+for  filestatus stat   familydirstatuses
+if   stat isdir
+log warn     stat getpath
+continue
+path familydir   stat getpath
+// skip _logs, etc
+if  familydir getname   startswith     continue
+byte family   familydir getname   getbytes
+hcd   new hcolumndescriptor family
+htd addfamily hcd
+path hfiles   fileutil stat2paths fs liststatus familydir
+for  path hfile   hfiles
+if  hfile getname   startswith     continue
+hfile reader reader   hfile createreader fs  hfile
+new cacheconfig getconf
+final byte first  last
+try
+if  hcd getcompressiontype      reader getcompressionalgorithm
+hcd setcompressiontype reader getcompressionalgorithm
+log info     hcd getcompressiontype   name
+hcd tostring
+reader loadfileinfo
+first   reader getfirstrowkey
+last    reader getlastrowkey
+log info     hfile
+bytes tostringbinary first
+bytes tostringbinary last
+// to eventually infer start key-end key boundaries
+integer value   map containskey first ? map get first  0
+map put first  value 1
+value   map containskey last ? map get last  0
+map put last  value 1
+finally
+reader close
+keys   loadincrementalhfiles inferboundaries map
+this hbadmin createtable htd keys
+log info    tablename
+@override
+public int run string args  throws exception
+if  args length    2
+usage
+return  1
+string dirpath     args
+tablename tablename   tablename valueof args
+boolean tableexists     this doestableexist tablename
+if   tableexists  this createtable tablename dirpath
+path hfofdir   new path dirpath
+htable table   new htable this cfg  tablename
+dobulkload hfofdir  table
+return 0
+public static void main string args  throws exception
+int ret   toolrunner run new loadincrementalhfiles hbaseconfiguration create     args
+system exit ret

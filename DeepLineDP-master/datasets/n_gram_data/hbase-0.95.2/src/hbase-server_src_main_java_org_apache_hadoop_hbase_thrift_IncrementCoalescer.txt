@@ -1,0 +1,266 @@
+/*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase thrift
+import java io ioexception
+import java util arrays
+import java util list
+import java util set
+import java util concurrent callable
+import java util concurrent concurrenthashmap
+import java util concurrent concurrentmap
+import java util concurrent linkedblockingqueue
+import java util concurrent threadfactory
+import java util concurrent threadpoolexecutor
+import java util concurrent timeunit
+import java util concurrent atomic atomicinteger
+import java util concurrent atomic atomiclong
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase client htable
+import org apache hadoop hbase thrift thriftserverrunner hbasehandler
+import org apache hadoop hbase thrift generated tincrement
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util threads
+import org apache hadoop metrics util mbeanutil
+import org apache thrift texception
+/**
+* this class will coalesce increments from a thift server if
+* hbase.regionserver.thrift.coalesceincrement is set to true. turning this
+* config to true will cause the thrift server to queue increments into an
+* instance of this class. the thread pool associated with this class will drain
+* the coalesced increments as the thread is able. this can cause data loss if the
+* thrift server dies or is shut down before everything in the queue is drained.
+*
+*/
+public class incrementcoalescer implements incrementcoalescermbean
+/**
+* used to identify a cell that will be incremented.
+*
+*/
+static class fullyqualifiedrow
+private byte table
+private byte rowkey
+private byte family
+private byte qualifier
+public fullyqualifiedrow byte table  byte rowkey  byte fam  byte qual
+super
+this table   table
+this rowkey   rowkey
+this family   fam
+this qualifier   qual
+public byte gettable
+return table
+public void settable byte table
+this table   table
+public byte getrowkey
+return rowkey
+public void setrowkey byte rowkey
+this rowkey   rowkey
+public byte getfamily
+return family
+public void setfamily byte fam
+this family   fam
+public byte getqualifier
+return qualifier
+public void setqualifier byte qual
+this qualifier   qual
+@override
+public int hashcode
+final int prime   31
+int result   1
+result   prime   result   arrays hashcode family
+result   prime   result   arrays hashcode qualifier
+result   prime   result   arrays hashcode rowkey
+result   prime   result   arrays hashcode table
+return result
+@override
+public boolean equals object obj
+if  this    obj  return true
+if  obj    null  return false
+if  getclass      obj getclass    return false
+fullyqualifiedrow other    fullyqualifiedrow  obj
+if   arrays equals family  other family   return false
+if   arrays equals qualifier  other qualifier   return false
+if   arrays equals rowkey  other rowkey   return false
+if   arrays equals table  other table   return false
+return true
+static class daemonthreadfactory implements threadfactory
+static final atomicinteger poolnumber   new atomicinteger 1
+final threadgroup group
+final atomicinteger threadnumber   new atomicinteger 1
+final string nameprefix
+daemonthreadfactory
+securitymanager s   system getsecuritymanager
+group    s    null  ? s getthreadgroup     thread currentthread   getthreadgroup
+nameprefix       poolnumber getandincrement
+public thread newthread runnable r
+thread t   new thread group  r  nameprefix   threadnumber getandincrement    0
+if   t isdaemon    t setdaemon true
+if  t getpriority      thread norm_priority  t setpriority thread norm_priority
+return t
+private final atomiclong failedincrements   new atomiclong
+private final atomiclong successfulcoalescings   new atomiclong
+private final atomiclong totalincrements   new atomiclong
+private final concurrentmap<fullyqualifiedrow  long> countersmap
+new concurrenthashmap<fullyqualifiedrow  long> 100000  0 75f  1500
+private final threadpoolexecutor pool
+private final hbasehandler handler
+private int maxqueuesize   500000
+private static final int core_pool_size   1
+protected final log log   logfactory getlog this getclass   getname
+@suppresswarnings
+public incrementcoalescer hbasehandler hand
+this handler   hand
+linkedblockingqueue<runnable> queue   new linkedblockingqueue<runnable>
+pool
+new threadpoolexecutor core_pool_size  core_pool_size  50  timeunit milliseconds  queue
+threads newdaemonthreadfactory
+mbeanutil registermbean       this
+public boolean queueincrement tincrement inc  throws texception
+if   canqueue
+failedincrements incrementandget
+return false
+return internalqueuetincrement inc
+public boolean queueincrements list<tincrement> incs  throws texception
+if   canqueue
+failedincrements incrementandget
+return false
+for  tincrement tinc   incs
+internalqueuetincrement tinc
+return true
+private boolean internalqueuetincrement tincrement inc  throws texception
+byte famandqf   keyvalue parsecolumn inc getcolumn
+if  famandqf length < 1  return false
+byte qual   famandqf length    1 ? new byte   famandqf
+return internalqueueincrement inc gettable    inc getrow    famandqf  qual
+inc getammount
+private boolean internalqueueincrement byte tablename  byte rowkey  byte fam
+byte qual  long ammount  throws texception
+int countersmapsize   countersmap size
+//make sure that the number of threads is scaled.
+dynamicallysetcoresize countersmapsize
+totalincrements incrementandget
+fullyqualifiedrow key   new fullyqualifiedrow tablename  rowkey  fam  qual
+long currentamount   ammount
+// spin until able to insert the value back without collisions
+while  true
+long value   countersmap remove key
+if  value    null
+// there was nothing there, create a new value
+value   long valueof currentamount
+else
+value    currentamount
+successfulcoalescings incrementandget
+// try to put the value, only if there was none
+long oldvalue   countersmap putifabsent key  value
+if  oldvalue    null
+// we were able to put it in, we're done
+break
+// someone else was able to put a value in, so let's remember our
+// current value (plus what we picked up) and retry to add it in
+currentamount   value
+// we limit the size of the queue simply because all we need is a
+// notification that something needs to be incremented. no need
+// for millions of callables that mean the same thing.
+if  pool getqueue   size   <  1000
+// queue it up
+callable<integer> callable   createinccallable
+pool submit callable
+return true
+public boolean canqueue
+return countersmap size   < maxqueuesize
+private callable<integer> createinccallable
+return new callable<integer>
+@override
+public integer call   throws exception
+int failures   0
+set<fullyqualifiedrow> keys   countersmap keyset
+for  fullyqualifiedrow row   keys
+long counter   countersmap remove row
+if  counter    null
+continue
+try
+htable table   handler gettable row gettable
+if  failures > 2
+throw new ioexception
+table incrementcolumnvalue row getrowkey    row getfamily    row getqualifier
+counter
+catch  ioexception e
+// log failure of increment
+failures
+log error     bytes tostring row gettable
+bytes tostringbinary row getrowkey
+bytes tostringbinary row getfamily
+bytes tostringbinary row getqualifier          counter  e
+return failures
+/**
+* this method samples the incoming requests and, if selected, will check if
+* the corepoolsize should be changed.
+* @param countersmapsize
+*/
+private void dynamicallysetcoresize int countersmapsize
+// here we are using countersmapsize as a random number, meaning this
+// could be a random object
+if  countersmapsize % 10    0
+return
+double currentratio    double  countersmapsize    double  maxqueuesize
+int newvalue   1
+if  currentratio < 0 1
+// it's 1
+else if  currentratio < 0 3
+newvalue   2
+else if  currentratio < 0 5
+newvalue   4
+else if  currentratio < 0 7
+newvalue   8
+else if  currentratio < 0 9
+newvalue   14
+else
+newvalue   22
+if  pool getcorepoolsize      newvalue
+pool setcorepoolsize newvalue
+// mbean get/set methods
+public int getqueuesize
+return pool getqueue   size
+public int getmaxqueuesize
+return this maxqueuesize
+public void setmaxqueuesize int newsize
+this maxqueuesize   newsize
+public long getpoolcompletedtaskcount
+return pool getcompletedtaskcount
+public long getpooltaskcount
+return pool gettaskcount
+public int getpoollargestpoolsize
+return pool getlargestpoolsize
+public int getcorepoolsize
+return pool getcorepoolsize
+public void setcorepoolsize int newcoresize
+pool setcorepoolsize newcoresize
+public int getmaxpoolsize
+return pool getmaximumpoolsize
+public void setmaxpoolsize int newmaxsize
+pool setmaximumpoolsize newmaxsize
+public long getfailedincrements
+return failedincrements get
+public long getsuccessfulcoalescings
+return successfulcoalescings get
+public long gettotalincrements
+return totalincrements get
+public long getcountersmapsize
+return countersmap size

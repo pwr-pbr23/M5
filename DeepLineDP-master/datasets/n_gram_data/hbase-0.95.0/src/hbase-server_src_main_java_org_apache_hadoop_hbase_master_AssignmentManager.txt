@@ -1,0 +1,2471 @@
+/**
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase master
+import java io ioexception
+import java util arraylist
+import java util arrays
+import java util collections
+import java util hashmap
+import java util hashset
+import java util iterator
+import java util list
+import java util map
+import java util navigablemap
+import java util set
+import java util treemap
+import java util concurrent concurrenthashmap
+import java util concurrent concurrentskiplistset
+import java util concurrent threadfactory
+import java util concurrent timeunit
+import java util concurrent atomic atomicboolean
+import java util concurrent atomic atomicinteger
+import java util concurrent locks lock
+import java util concurrent locks reentrantlock
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop hbase chore
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase regiontransition
+import org apache hadoop hbase server
+import org apache hadoop hbase servername
+import org apache hadoop hbase stoppable
+import org apache hadoop hbase catalog catalogtracker
+import org apache hadoop hbase catalog metareader
+import org apache hadoop hbase client result
+import org apache hadoop hbase exceptions deserializationexception
+import org apache hadoop hbase exceptions notservingregionexception
+import org apache hadoop hbase exceptions regionalreadyintransitionexception
+import org apache hadoop hbase exceptions regionserverstoppedexception
+import org apache hadoop hbase exceptions servernotrunningyetexception
+import org apache hadoop hbase exceptions tablenotfoundexception
+import org apache hadoop hbase executor eventhandler
+import org apache hadoop hbase executor eventtype
+import org apache hadoop hbase executor executorservice
+import org apache hadoop hbase master handler closedregionhandler
+import org apache hadoop hbase master handler disabletablehandler
+import org apache hadoop hbase master handler enabletablehandler
+import org apache hadoop hbase master handler mergedregionhandler
+import org apache hadoop hbase master handler openedregionhandler
+import org apache hadoop hbase master handler splitregionhandler
+import org apache hadoop hbase regionserver regionopeningstate
+import org apache hadoop hbase util environmentedgemanager
+import org apache hadoop hbase util keylocker
+import org apache hadoop hbase util pair
+import org apache hadoop hbase util threads
+import org apache hadoop hbase zookeeper metaregiontracker
+import org apache hadoop hbase zookeeper zkassign
+import org apache hadoop hbase zookeeper zktable
+import org apache hadoop hbase zookeeper zkutil
+import org apache hadoop hbase zookeeper zookeeperlistener
+import org apache hadoop ipc remoteexception
+import org apache zookeeper asynccallback
+import org apache zookeeper keeperexception
+import org apache zookeeper keeperexception nonodeexception
+import org apache zookeeper keeperexception nodeexistsexception
+import org apache zookeeper data stat
+import com google common base preconditions
+import com google common collect linkedhashmultimap
+/**
+* manages and performs region assignment.
+* <p>
+* monitors zookeeper for events related to regions in transition.
+* <p>
+* handles existing regions in transition during master failover.
+*/
+@interfaceaudience private
+public class assignmentmanager extends zookeeperlistener
+private static final log log   logfactory getlog assignmentmanager class
+public static final servername hbck_code_servername   new servername hconstants hbck_code_name
+1   1l
+protected final server server
+private servermanager servermanager
+private catalogtracker catalogtracker
+protected final timeoutmonitor timeoutmonitor
+private final timerupdater timerupdater
+private loadbalancer balancer
+private final tablelockmanager tablelockmanager
+final private keylocker<string> locker   new keylocker<string>
+/**
+* map of regions to reopen after the schema of a table is changed. key -
+* encoded region name, value - hregioninfo
+*/
+private final map <string  hregioninfo> regionstoreopen
+/*
+* maximum times we recurse an assignment/unassignment.
+* see below in {@link #assign()} and {@link #unassign()}.
+*/
+private final int maximumattempts
+/** plans for region movement. key is the encoded version of a region name*/
+// todo: when do plans get cleaned out?  ever? in server open and in server
+// shutdown processing -- st.ack
+// all access to this map must be synchronized.
+final navigablemap<string  regionplan> regionplans
+new treemap<string  regionplan>
+private final zktable zktable
+/**
+* contains the server which need to update timer, these servers will be
+* handled by {@link timerupdater}
+*/
+private final concurrentskiplistset<servername> serversinupdatingtimer
+private final executorservice executorservice
+//thread pool executor service for timeout monitor
+private java util concurrent executorservice threadpoolexecutorservice
+// a bunch of zk events workers. each is a single thread executor service
+private final java util concurrent executorservice zkeventworkers
+private list<eventtype> ignorestatesrsoffline   arrays aslist
+eventtype rs_zk_region_failed_open  eventtype rs_zk_region_closed
+// metrics instance to send metrics for rits
+metricsmaster metricsmaster
+private final regionstates regionstates
+// the threshold to use bulk assigning. using bulk assignment
+// only if assigning at least this many regions to at least this
+// many servers. if assigning fewer regions to fewer servers,
+// bulk assigning may be not as efficient.
+private final int bulkassignthresholdregions
+private final int bulkassignthresholdservers
+// should bulk assignment wait till all regions are assigned,
+// or it is timed out?  this is useful to measure bulk assignment
+// performance, but not needed in most use cases.
+private final boolean bulkassignwaittillallassigned
+/**
+* indicator that assignmentmanager has recovered the region states so
+* that servershutdownhandler can be fully enabled and re-assign regions
+* of dead servers. so that when re-assignment happens, assignmentmanager
+* has proper region states.
+*
+* protected to ease testing.
+*/
+protected final atomicboolean failovercleanupdone   new atomicboolean false
+/** is the timeoutmanagement activated **/
+private final boolean tomactivated
+/**
+* a map to track the count a region fails to open in a row.
+* so that we don't try to open a region forever if the failure is
+* unrecoverable.  we don't put this information in region states
+* because we don't expect this to happen frequently; we don't
+* want to copy this information over during each state transition either.
+*/
+private final concurrenthashmap<string  atomicinteger>
+failedopentracker   new concurrenthashmap<string  atomicinteger>
+/**
+* constructs a new assignment manager.
+*
+* @param server
+* @param servermanager
+* @param catalogtracker
+* @param service
+* @throws keeperexception
+* @throws ioexception
+*/
+public assignmentmanager server server  servermanager servermanager
+catalogtracker catalogtracker  final loadbalancer balancer
+final executorservice service  metricsmaster metricsmaster
+final tablelockmanager tablelockmanager  throws keeperexception  ioexception
+super server getzookeeper
+this server   server
+this servermanager   servermanager
+this catalogtracker   catalogtracker
+this executorservice   service
+this regionstoreopen   collections synchronizedmap
+new hashmap<string  hregioninfo>
+configuration conf   server getconfiguration
+this tomactivated   conf getboolean    false
+if  tomactivated
+this serversinupdatingtimer    new concurrentskiplistset<servername>
+this timeoutmonitor   new timeoutmonitor
+conf getint    30000
+server  servermanager
+conf getint    600000
+this timerupdater   new timerupdater conf getint
+10000   server
+threads setdaemonthreadrunning timerupdater getthread
+server getservername
+else
+this serversinupdatingtimer    null
+this timeoutmonitor   null
+this timerupdater   null
+this zktable   new zktable this watcher
+this maximumattempts
+this server getconfiguration   getint    10
+this balancer   balancer
+int maxthreads   conf getint    30
+this threadpoolexecutorservice   threads getboundedcachedthreadpool
+maxthreads  60l  timeunit seconds  threads newdaemonthreadfactory
+this metricsmaster   metricsmaster    can be null only with tests
+this regionstates   new regionstates server  servermanager
+this bulkassignwaittillallassigned
+conf getboolean    false
+this bulkassignthresholdregions   conf getint    7
+this bulkassignthresholdservers   conf getint    3
+int workers   conf getint    20
+threadfactory threadfactory   threads newdaemonthreadfactory
+zkeventworkers   threads getboundedcachedthreadpool workers  60l
+timeunit seconds  threadfactory
+this tablelockmanager   tablelockmanager
+void starttimeoutmonitor
+if  tomactivated
+threads setdaemonthreadrunning timeoutmonitor getthread    server getservername
+/**
+* @return instance of zktable.
+*/
+public zktable getzktable
+// these are 'expensive' to make involving trip to zk ensemble so allow
+// sharing.
+return this zktable
+/**
+* this should not be public. it is public now
+* because of some unit tests.
+*
+* todo: make it package private and keep regionstates in the master package
+*/
+public regionstates getregionstates
+return regionstates
+public regionplan getregionreopenplan hregioninfo hri
+return new regionplan hri  null  regionstates getregionserverofregion hri
+/**
+* add a regionplan for the specified region.
+* @param encodedname
+* @param plan
+*/
+public void addplan string encodedname  regionplan plan
+synchronized  regionplans
+regionplans put encodedname  plan
+/**
+* add a map of region plans.
+*/
+public void addplans map<string  regionplan> plans
+synchronized  regionplans
+regionplans putall plans
+/**
+* set the list of regions that will be reopened
+* because of an update in table schema
+*
+* @param regions
+*          list of regions that should be tracked for reopen
+*/
+public void setregionstoreopen list <hregioninfo> regions
+for hregioninfo hri   regions
+regionstoreopen put hri getencodedname    hri
+/**
+* used by the client to identify if all regions have the schema updates
+*
+* @param tablename
+* @return pair indicating the status of the alter command
+* @throws ioexception
+*/
+public pair<integer  integer> getreopenstatus byte tablename
+throws ioexception
+list <hregioninfo> hris
+metareader gettableregions this server getcatalogtracker    tablename  true
+integer pending   0
+for  hregioninfo hri   hris
+string name   hri getencodedname
+// no lock concurrent access ok: sequential consistency respected.
+if  regionstoreopen containskey name
+regionstates isregionintransition name
+pending
+return new pair<integer  integer> pending  hris size
+/**
+* used by servershutdownhandler to make sure assignmentmanager has completed
+* the failover cleanup before re-assigning regions of dead servers. so that
+* when re-assignment happens, assignmentmanager has proper region states.
+*/
+public boolean isfailovercleanupdone
+return failovercleanupdone get
+/**
+* now, failover cleanup is completed. notify server manager to
+* process queued up dead servers processing, if any.
+*/
+void failovercleanupdone
+failovercleanupdone set true
+servermanager processqueueddeadservers
+/**
+* called on startup.
+* figures whether a fresh cluster start of we are joining extant running cluster.
+* @throws ioexception
+* @throws keeperexception
+* @throws interruptedexception
+*/
+void joincluster   throws ioexception
+keeperexception  interruptedexception
+// concurrency note: in the below the accesses on regionsintransition are
+// outside of a synchronization block where usually all accesses to rit are
+// synchronized.  the presumption is that in this case it is safe since this
+// method is being played by a single thread on startup.
+// todo: regions that have a null location and are not in regionsintransitions
+// need to be handled.
+// scan meta to build list of existing regions, servers, and assignment
+// returns servers who have not checked in (assumed dead) and their regions
+map<servername  list<hregioninfo>> deadservers   rebuilduserregions
+// this method will assign all user regions if a clean server startup or
+// it will reconstruct master state and cleanup any leftovers from
+// previous master process.
+processdeadserversandregionsintransition deadservers
+recovertableindisablingstate
+recovertableinenablingstate
+/**
+* process all regions that are in transition in zookeeper and also
+* processes the list of dead servers by scanning the meta.
+* used by master joining an cluster.  if we figure this is a clean cluster
+* startup, will assign all user regions.
+* @param deadservers
+*          map of dead servers and their regions. can be null.
+* @throws keeperexception
+* @throws ioexception
+* @throws interruptedexception
+*/
+void processdeadserversandregionsintransition
+final map<servername  list<hregioninfo>> deadservers
+throws keeperexception  ioexception  interruptedexception
+list<string> nodes   zkutil listchildrennowatch watcher
+watcher assignmentznode
+if  nodes    null
+string errormessage
+server abort errormessage  new ioexception errormessage
+return
+boolean failover    servermanager getdeadservers   isempty
+if   failover
+// run through all regions.  if they are not assigned and not in rit, then
+// its a clean cluster startup, else its a failover.
+map<hregioninfo  servername> regions   regionstates getregionassignments
+for  map entry<hregioninfo  servername> e  regions entryset
+if   e getkey   ismetatable      e getvalue      null
+log debug     e
+failover   true
+break
+if  nodes contains e getkey   getencodedname
+log debug     e getkey   getregionnameasstring
+// could be a meta region.
+failover   true
+break
+// if we found user regions out on cluster, its a failover.
+if  failover
+log info
+// process list of dead servers and regions in rit.
+// see hbase-4580 for more information.
+processdeadserversandrecoverlostregions deadservers
+else
+// fresh cluster startup.
+log info
+assignalluserregions
+/**
+* if region is up in zk in transition, then do fixup and block and wait until
+* the region is assigned and out of transition.  used on startup for
+* catalog regions.
+* @param hri region to look for.
+* @return true if we processed a region in transition else false if region
+* was not up in zk in transition.
+* @throws interruptedexception
+* @throws keeperexception
+* @throws ioexception
+*/
+boolean processregionintransitionandblockuntilassigned final hregioninfo hri
+throws interruptedexception  keeperexception  ioexception
+boolean intransistion   processregionintransition hri getencodedname    hri
+if   intransistion  return intransistion
+log debug     hregioninfo prettyprint hri getencodedname
+while   this server isstopped
+this regionstates isregionintransition hri getencodedname
+// we put a timeout because we may have the region getting in just between the test
+//  and the waitforupdate
+this regionstates waitforupdate 100
+return intransistion
+/**
+* process failover of new master for region <code>encodedregionname</code>
+* up in zookeeper.
+* @param encodedregionname region to process failover for.
+* @param regioninfo if null we'll go get it from meta table.
+* @return true if we processed <code>regioninfo</code> as a rit.
+* @throws keeperexception
+* @throws ioexception
+*/
+boolean processregionintransition final string encodedregionname
+final hregioninfo regioninfo  throws keeperexception  ioexception
+// we need a lock here to ensure that we will not put the same region twice
+// it has no reason to be a lock shared with the other operations.
+// we can do the lock on the region only, instead of a global lock: what we want to ensure
+// is that we don't have two threads working on the same region.
+lock lock   locker acquirelock encodedregionname
+try
+stat stat   new stat
+byte  data   zkassign getdataandwatch watcher  encodedregionname  stat
+if  data    null  return false
+regiontransition rt
+try
+rt   regiontransition parsefrom data
+catch  deserializationexception e
+log warn    e
+return false
+hregioninfo hri   regioninfo
+if  hri    null
+hri   regionstates getregioninfo rt getregionname
+if  hri    null  return false
+processregionsintransition rt  hri  stat getversion
+return true
+finally
+lock unlock
+/**
+* this call is invoked only (1) master assign meta;
+* (2) during failover mode startup, zk assignment node processing.
+* the locker is set in the caller.
+*
+* it should be private but it is used by some test too.
+*/
+void processregionsintransition
+final regiontransition rt  final hregioninfo regioninfo
+final int expectedversion  throws keeperexception
+eventtype et   rt geteventtype
+// get servername.  could not be null.
+final servername sn   rt getservername
+string encodedregionname   regioninfo getencodedname
+log info     regioninfo getregionnameasstring         et
+if  regionstates isregionintransition encodedregionname
+// just return
+return
+switch  et
+case m_zk_region_closing
+// if zk node of the region was updated by a live server skip this
+// region and just add it into rit.
+if   servermanager isserveronline sn
+// if was not online, its closed now. force to offline and this
+// will get it reassigned if appropriate
+forceoffline regioninfo  rt
+else
+// insert into rit & resend the query to the region server: may be the previous master
+// died before sending the query the first time.
+regionstates updateregionstate rt  regionstate state closing
+final regionstate rs   regionstates getregionstate regioninfo
+this executorservice submit
+new eventhandler server  eventtype m_master_recovery
+@override
+public void process   throws ioexception
+reentrantlock lock   locker acquirelock regioninfo getencodedname
+try
+unassign regioninfo  rs  expectedversion  sn  true  null
+finally
+lock unlock
+break
+case rs_zk_region_closed
+case rs_zk_region_failed_open
+// region is closed, insert into rit and handle it
+addtoritandcallclose regioninfo  regionstate state closed  rt
+break
+case m_zk_region_offline
+// if zk node of the region was updated by a live server skip this
+// region and just add it into rit.
+if   servermanager isserveronline sn
+// region is offline, insert into rit and handle it like a closed
+addtoritandcallclose regioninfo  regionstate state offline  rt
+else
+// insert in rit and resend to the regionserver
+regionstates updateregionstate rt  regionstate state pending_open
+final regionstate rs   regionstates getregionstate regioninfo
+this executorservice submit
+new eventhandler server  eventtype m_master_recovery
+@override
+public void process   throws ioexception
+reentrantlock lock   locker acquirelock regioninfo getencodedname
+try
+assign rs  false  false
+finally
+lock unlock
+break
+case rs_zk_region_opening
+if   servermanager isserveronline sn
+forceoffline regioninfo  rt
+else
+regionstates updateregionstate rt  regionstate state opening
+break
+case rs_zk_region_opened
+if   servermanager isserveronline sn
+forceoffline regioninfo  rt
+else
+// region is opened, insert into rit and handle it
+// this could be done asynchronously, we would need then to acquire the lock in the
+//  handler.
+regionstates updateregionstate rt  regionstate state open
+new openedregionhandler server  this  regioninfo  sn  expectedversion  process
+break
+case rs_zk_region_splitting
+if   servermanager isserveronline sn
+// the regionserver started the split, but died before updating the status.
+// it means (hopefully) that the split was not finished
+// tbd - to study. in the meantime, do nothing as in the past.
+log warn     regioninfo getencodedname         et
+sn
+else
+log info     regioninfo getencodedname
+et
+// we don't do anything. the way the code is written in rs_zk_region_split management,
+//  it adds the rs_zk_region_splitting state if needed. so we don't have to do it here.
+break
+case rs_zk_region_split
+if   servermanager isserveronline sn
+forceoffline regioninfo  rt
+else
+log info     regioninfo getencodedname
+et
+// we don't do anything. the regionserver is supposed to update the znode
+// multiple times so if it's still up we will receive an update soon.
+break
+case rs_zk_region_merging
+// nothing to do
+log info     regioninfo getencodedname
+et
+break
+case rs_zk_region_merge
+if   servermanager isserveronline sn
+// servershutdownhandler would handle this region
+log warn     regioninfo getencodedname
+et       sn
+else
+log info     regioninfo getencodedname
+et
+// we don't do anything. the regionserver is supposed to update the znode
+// multiple times so if it's still up we will receive an update soon.
+break
+default
+throw new illegalstateexception     et
+/**
+* put the region <code>hri</code> into an offline state up in zk.
+*
+* you need to have lock on the region before calling this method.
+*
+* @param hri
+* @param oldrt
+* @throws keeperexception
+*/
+private void forceoffline final hregioninfo hri  final regiontransition oldrt
+throws keeperexception
+// if was on dead server, its closed now.  force to offline and then
+// handle it like a close; this will get it reassigned if appropriate
+log debug     hri getencodedname         oldrt geteventtype
+zkassign createorforcenodeoffline this watcher  hri  oldrt getservername
+addtoritandcallclose hri  regionstate state offline  oldrt
+/**
+* add to the in-memory copy of regions in transition and then call close
+* handler on passed region <code>hri</code>
+* @param hri
+* @param state
+* @param olddata
+*/
+private void addtoritandcallclose final hregioninfo hri
+final regionstate state state  final regiontransition olddata
+regionstates updateregionstate olddata  state
+new closedregionhandler this server  this  hri  process
+/**
+* when a region is closed, it should be removed from the regionstoreopen
+* @param hri hregioninfo of the region which was closed
+*/
+public void removeclosedregion hregioninfo hri
+if  regionstoreopen remove hri getencodedname       null
+log debug
+/**
+* handles various states an unassigned node can be in.
+* <p>
+* method is called when a state change is suspected for an unassigned node.
+* <p>
+* this deals with skipped transitions (we got a closed but didn't see closing
+* yet).
+* @param rt
+* @param expectedversion
+*/
+private void handleregion final regiontransition rt  int expectedversion
+if  rt    null
+log warn
+return
+final servername sn   rt getservername
+// check if this is a special hbck transition
+if  sn equals hbck_code_servername
+handlehbck rt
+return
+final long createtime   rt getcreatetime
+final byte regionname   rt getregionname
+string encodedname   hregioninfo encoderegionname regionname
+string prettyprintedregionname   hregioninfo prettyprint encodedname
+// verify this is a known server
+if   servermanager isserveronline sn
+ignorestatesrsoffline contains rt geteventtype
+log warn
+prettyprintedregionname
+return
+regionstate regionstate
+regionstates getregiontransitionstate encodedname
+long starttime   system currenttimemillis
+if  log isdebugenabled
+boolean lateevent   createtime <  starttime   15000
+log debug     rt geteventtype
+sn
+prettyprintedregionname    null ?     prettyprintedregionname
+lateevent ?
+regionstate
+// we don't do anything for this event,
+// so separate it out, no need to lock/unlock anything
+if  rt geteventtype      eventtype m_zk_region_offline
+return
+// we need a lock on the region as we could update it
+lock lock   locker acquirelock encodedname
+try
+regionstate lateststate
+regionstates getregiontransitionstate encodedname
+if   regionstate    null    lateststate    null
+regionstate    null    lateststate    null
+regionstate    null    lateststate    null
+lateststate getstate      regionstate getstate
+log warn     regionstate
+lateststate
+long waitedtime   system currenttimemillis     starttime
+if  waitedtime > 5000
+log warn     waitedtime
+regionstate   lateststate
+switch  rt geteventtype
+case rs_zk_region_splitting
+if   isinstateforsplitting regionstate   break
+regionstates updateregionstate rt  regionstate state splitting
+break
+case rs_zk_region_split
+// regionstate must be null, or splitting or pending_close.
+if   isinstateforsplitting regionstate   break
+// if null, add splitting state before going to split
+if  regionstate    null
+regionstate   regionstates updateregionstate rt
+regionstate state splitting
+string message       prettyprintedregionname
+sn
+// if still null, it means we cannot find it and it was already processed
+if  regionstate    null
+log warn message
+break
+log info message
+// check it has daughters.
+byte  payload   rt getpayload
+list<hregioninfo> daughters
+try
+daughters   hregioninfo parsedelimitedfrom payload  0  payload length
+catch  ioexception e
+log error
+prettyprintedregionname
+break
+assert daughters size      2
+// assert that we can get a serverinfo for this server.
+if   this servermanager isserveronline sn
+log error     sn
+break
+// run handler to do the rest of the split handling.
+this executorservice submit new splitregionhandler server  this
+regionstate getregion    sn  daughters
+break
+case rs_zk_region_merging
+// merged region is a new region, we can't find it in the region states now.
+// do nothing.
+break
+case rs_zk_region_merge
+// assert that we can get a serverinfo for this server.
+if   this servermanager isserveronline sn
+log error     sn
+break
+// get merged and merging regions.
+byte payloadofmerge   rt getpayload
+list<hregioninfo> mergeregions
+try
+mergeregions   hregioninfo parsedelimitedfrom payloadofmerge  0
+payloadofmerge length
+catch  ioexception e
+log error
+prettyprintedregionname
+break
+assert mergeregions size      3
+// run handler to do the rest of the merge handling.
+this executorservice submit new mergedregionhandler server  this  sn
+mergeregions
+break
+case m_zk_region_closing
+// should see closing after we have asked it to close or additional
+// times after already being in state of closing
+if  regionstate    null
+regionstate ispendingcloseorclosingonserver sn
+log warn     prettyprintedregionname
+sn       regionstate
+return
+// transition to closing (or update stamp if already closing)
+regionstates updateregionstate rt  regionstate state closing
+break
+case rs_zk_region_closed
+// should see closed after closing but possible after pending_close
+if  regionstate    null
+regionstate ispendingcloseorclosingonserver sn
+log warn     prettyprintedregionname
+sn       regionstate
+return
+// handle closed by assigning elsewhere or stopping if a disable
+// if we got here all is good.  need to update regionstate -- else
+// what follows will fail because not in expected state.
+regionstate   regionstates updateregionstate rt  regionstate state closed
+if  regionstate    null
+removeclosedregion regionstate getregion
+this executorservice submit new closedregionhandler server
+this  regionstate getregion
+break
+case rs_zk_region_failed_open
+if  regionstate    null
+regionstate ispendingopenoropeningonserver sn
+log warn     prettyprintedregionname
+sn       regionstate
+return
+// handle this the same as if it were opened and then closed.
+regionstate   regionstates updateregionstate rt  regionstate state closed
+// when there are more than one region server a new rs is selected as the
+// destination and the same is updated in the regionplan. (hbase-5546)
+if  regionstate    null
+atomicinteger failedopencount   failedopentracker get encodedname
+if  failedopencount    null
+failedopencount   new atomicinteger
+// no need to use putifabsent, or extra synchronization since
+// this whole handleregion block is locked on the encoded region
+// name, and failedopentracker is updated only in this block
+failedopentracker put encodedname  failedopencount
+if  failedopencount incrementandget   >  maximumattempts
+regionstates updateregionstate
+regionstate getregion    regionstate state failed_open
+// remove the tracking info to save memory, also reset
+// the count for next open initiative
+failedopentracker remove encodedname
+else
+getregionplan regionstate getregion    sn  true
+this executorservice submit new closedregionhandler server
+this  regionstate getregion
+break
+case rs_zk_region_opening
+// should see opening after we have asked it to open or additional
+// times after already being in state of opening
+if  regionstate    null
+regionstate ispendingopenoropeningonserver sn
+log warn     prettyprintedregionname
+sn       regionstate
+return
+// transition to opening (or update stamp if already opening)
+regionstates updateregionstate rt  regionstate state opening
+break
+case rs_zk_region_opened
+// should see opened after opening but possible after pending_open
+if  regionstate    null
+regionstate ispendingopenoropeningonserver sn
+log warn     prettyprintedregionname
+sn       regionstate
+// close it without updating the internal region states,
+// so as not to create double assignments in unlucky scenarios
+// mentioned in openregionhandler#process
+unassign regionstate getregion    null   1  null  false  sn
+return
+// handle opened by removing from transition and deleted zk node
+regionstate   regionstates updateregionstate rt  regionstate state open
+if  regionstate    null
+failedopentracker remove encodedname      reset the count  if any
+this executorservice submit new openedregionhandler
+server  this  regionstate getregion    sn  expectedversion
+break
+default
+throw new illegalstateexception
+finally
+lock unlock
+/**
+* @return returns true if this regionstate is splittable; i.e. the
+* regionstate is currently in splitting state or pending_close or
+* null (anything else will return false). (anything else will return false).
+*/
+private boolean isinstateforsplitting final regionstate rs
+if  rs    null  return true
+if  rs issplitting    return true
+if  convertpendingclosetosplitting rs   return true
+log warn     rs
+return false
+/**
+* if the passed regionstate is in pending_close, clean up pending_close
+* state and convert it to splitting instead.
+* this can happen in case where master wants to close a region at same time
+* a regionserver starts a split.  the split won.  clean out old pending_close
+* state.
+* @param rs
+* @return true if we converted from pending_close to splitting
+*/
+private boolean convertpendingclosetosplitting final regionstate rs
+if   rs ispendingclose    return false
+log debug     rs
+regionstates updateregionstate
+rs getregion    regionstate state splitting
+// clean up existing state.  clear from region plans seems all we
+// have to do here by way of clean up of pending_close.
+clearregionplan rs getregion
+return true
+/**
+* handle a zk unassigned node transition triggered by hbck repair tool.
+* <p>
+* this is handled in a separate code path because it breaks the normal rules.
+* @param rt
+*/
+private void handlehbck regiontransition rt
+string encodedname   hregioninfo encoderegionname rt getregionname
+log info     rt geteventtype
+rt getservername
+hregioninfo prettyprint encodedname
+regionstate regionstate   regionstates getregiontransitionstate encodedname
+switch  rt geteventtype
+case m_zk_region_offline
+hregioninfo regioninfo
+if  regionstate    null
+regioninfo   regionstate getregion
+else
+try
+byte  name   rt getregionname
+pair<hregioninfo  servername> p   metareader getregion catalogtracker  name
+regioninfo   p getfirst
+catch  ioexception e
+log info    e
+return
+log info
+regioninfo getregionnameasstring
+// trigger assign, node is already in offline so don't need to update zk
+assign regioninfo  false
+break
+default
+log warn     rt tostring
+break
+// zookeeper events
+/**
+* new unassigned node has been created.
+*
+* <p>this happens when an rs begins the opening or closing of a region by
+* creating an unassigned node.
+*
+* <p>when this happens we must:
+* <ol>
+*   <li>watch the node for further events</li>
+*   <li>read and handle the state in the node</li>
+* </ol>
+*/
+@override
+public void nodecreated string path
+handleassignmentevent path
+/**
+* existing unassigned node has had data changed.
+*
+* <p>this happens when an rs transitions from offline to opening, or between
+* opening/opened and closing/closed.
+*
+* <p>when this happens we must:
+* <ol>
+*   <li>watch the node for further events</li>
+*   <li>read and handle the state in the node</li>
+* </ol>
+*/
+@override
+public void nodedatachanged string path
+handleassignmentevent path
+// we  don't want to have two events on the same region managed simultaneously.
+// for this reason, we need to wait if an event on the same region is currently in progress.
+// so we track the region names of the events in progress, and we keep a waiting list.
+private final set<string> regionsinprogress   new hashset<string>
+// in a linkedhashmultimap, the put order is kept when we retrieve the collection back. we need
+//  this as we want the events to be managed in the same order as we received them.
+private final linkedhashmultimap <string  regionrunnable>
+zkeventworkerwaitinglist   linkedhashmultimap create
+/**
+* a specific runnable that works only on a region.
+*/
+private static interface regionrunnable extends runnable
+/**
+* @return - the name of the region it works on.
+*/
+public string getregionname
+/**
+* submit a task, ensuring that there is only one task at a time that working on a given region.
+* order is respected.
+*/
+protected void zkeventworkerssubmit final regionrunnable regrunnable
+synchronized  regionsinprogress
+// if we're there is already a task with this region, we add it to the
+//  waiting list and return.
+if  regionsinprogress contains regrunnable getregionname
+synchronized  zkeventworkerwaitinglist
+zkeventworkerwaitinglist put regrunnable getregionname    regrunnable
+return
+// no event in progress on this region => we can submit a new task immediately.
+regionsinprogress add regrunnable getregionname
+zkeventworkers submit new runnable
+@override
+public void run
+try
+regrunnable run
+finally
+// now that we have finished, let's see if there is an event for the same region in the
+//  waiting list. if it's the case, we can now submit it to the pool.
+synchronized  regionsinprogress
+regionsinprogress remove regrunnable getregionname
+synchronized  zkeventworkerwaitinglist
+java util set<regionrunnable> waiting   zkeventworkerwaitinglist get
+regrunnable getregionname
+if   waiting isempty
+// we want the first object only. the only way to get it is through an iterator.
+regionrunnable tosubmit   waiting iterator   next
+zkeventworkerwaitinglist remove tosubmit getregionname    tosubmit
+zkeventworkerssubmit tosubmit
+@override
+public void nodedeleted final string path
+if  path startswith watcher assignmentznode
+final string regionname   zkassign getregionname watcher  path
+zkeventworkerssubmit new regionrunnable
+@override
+public string getregionname
+return regionname
+@override
+public void run
+lock lock   locker acquirelock regionname
+try
+regionstate rs   regionstates getregiontransitionstate regionname
+if  rs    null  return
+hregioninfo regioninfo   rs getregion
+if  rs issplit
+log debug
+rs
+regionoffline rs getregion
+else
+string regionnamestr   regioninfo getregionnameasstring
+log debug     regionnamestr
+if  rs isopened
+servername servername   rs getservername
+regiononline regioninfo  servername
+log info
+regionnamestr       servername
+boolean disabled   getzktable   isdisablingordisabledtable
+regioninfo gettablenameasstring
+if   servermanager isserveronline servername      disabled
+log info     regionnamestr
+assign regioninfo  true
+else if  disabled
+// if server is offline, no hurt to unassign again
+log info     regionnamestr
+unassign regioninfo
+finally
+lock unlock
+/**
+* new unassigned node has been created.
+*
+* <p>this happens when an rs begins the opening, splitting or closing of a
+* region by creating a znode.
+*
+* <p>when this happens we must:
+* <ol>
+*   <li>watch the node for further children changed events</li>
+*   <li>watch all new children for changed events</li>
+* </ol>
+*/
+@override
+public void nodechildrenchanged string path
+if  path equals watcher assignmentznode
+zkeventworkers submit new runnable
+@override
+public void run
+try
+// just make sure we see the changes for the new znodes
+list<string> children
+zkutil listchildrenandwatchfornewchildren
+watcher  watcher assignmentznode
+if  children    null
+stat stat   new stat
+for  string child   children
+// if region is in transition, we already have a watch
+// on it, so no need to watch it again. so, as i know for now,
+// this is needed to watch splitting nodes only.
+if   regionstates isregionintransition child
+stat setversion 0
+byte data   zkassign getdataandwatch watcher
+zkutil joinznode watcher assignmentznode  child   stat
+if  data    null    stat getversion   > 0
+try
+regiontransition rt   regiontransition parsefrom data
+//see hbase-7551, handle splitting too, in case we miss the node change event
+if  rt geteventtype      eventtype rs_zk_region_splitting
+handleregion rt  stat getversion
+catch  deserializationexception de
+log error     child  de
+catch  keeperexception e
+server abort    e
+/**
+* marks the region as online.  removes it from regions in transition and
+* updates the in-memory assignment information.
+* <p>
+* used when a region has been successfully opened on a region server.
+* @param regioninfo
+* @param sn
+*/
+void regiononline hregioninfo regioninfo  servername sn
+if   servermanager isserveronline sn
+log warn
+sn       regioninfo getencodedname
+regionstates regiononline regioninfo  sn
+// remove plan if one.
+clearregionplan regioninfo
+// add the server to serversinupdatingtimer
+addtoserversinupdatingtimer sn
+/**
+* pass the assignment event to a worker for processing.
+* each worker is a single thread executor service.  the reason
+* for just one thread is to make sure all events for a given
+* region are processed in order.
+*
+* @param path
+*/
+private void handleassignmentevent final string path
+if  path startswith watcher assignmentznode
+final string regionname   zkassign getregionname watcher  path
+zkeventworkerssubmit new regionrunnable
+@override
+public string getregionname
+return regionname
+@override
+public void run
+try
+stat stat   new stat
+byte  data   zkassign getdataandwatch watcher  path  stat
+if  data    null  return
+regiontransition rt   regiontransition parsefrom data
+handleregion rt  stat getversion
+catch  keeperexception e
+server abort    e
+catch  deserializationexception e
+server abort    e
+/**
+* add the server to the set serversinupdatingtimer, then {@link timerupdater}
+* will update timers for this server in background
+* @param sn
+*/
+private void addtoserversinupdatingtimer final servername sn
+if  tomactivated
+this serversinupdatingtimer add sn
+/**
+* touch timers for all regions in transition that have the passed
+* <code>sn</code> in common.
+* call this method whenever a server checks in.  doing so helps the case where
+* a new regionserver has joined the cluster and its been given 1k regions to
+* open.  if this method is tickled every time the region reports in a
+* successful open then the 1k-th region won't be timed out just because its
+* sitting behind the open of 999 other regions.  this method is not used
+* as part of bulk assign -- there we have a different mechanism for extending
+* the regions in transition timer (we turn it off temporarily -- because
+* there is no regionplan involved when bulk assigning.
+* @param sn
+*/
+private void updatetimers final servername sn
+preconditions checkstate tomactivated
+if  sn    null  return
+// this loop could be expensive.
+// first make a copy of current regionplan rather than hold sync while
+// looping because holding sync can cause deadlock.  its ok in this loop
+// if the map we're going against is a little stale
+list<map entry<string  regionplan>> rps
+synchronized this regionplans
+rps   new arraylist<map entry<string  regionplan>> regionplans entryset
+for  map entry<string  regionplan> e   rps
+if  e getvalue      null    e getkey      null    sn equals e getvalue   getdestination
+regionstate regionstate   regionstates getregiontransitionstate e getkey
+if  regionstate    null
+regionstate updatetimestamptonow
+/**
+* marks the region as offline.  removes it from regions in transition and
+* removes in-memory assignment information.
+* <p>
+* used when a region has been closed and should remain closed.
+* @param regioninfo
+*/
+public void regionoffline final hregioninfo regioninfo
+regionstates regionoffline regioninfo
+removeclosedregion regioninfo
+// remove the region plan as well just in case.
+clearregionplan regioninfo
+public void offlinedisabledregion hregioninfo regioninfo
+// disabling so should not be reassigned, just delete the closed node
+log debug
+regioninfo getregionnameasstring
+try
+if   zkassign deleteclosednode watcher  regioninfo getencodedname
+// could also be in offline mode
+zkassign deleteofflinenode watcher  regioninfo getencodedname
+catch  keeperexception nonodeexception nne
+log debug     regioninfo
+catch  keeperexception e
+this server abort    e
+regionoffline regioninfo
+// assignment methods
+/**
+* assigns the specified region.
+* <p>
+* if a regionplan is available with a valid destination then it will be used
+* to determine what server region is assigned to.  if no regionplan is
+* available, region will be assigned to a random available server.
+* <p>
+* updates the regionstate and sends the open rpc.
+* <p>
+* this will only succeed if the region is in transition and in a closed or
+* offline state or not in transition (in-memory not zk), and of course, the
+* chosen server is up and running (it may have just crashed!).  if the
+* in-memory checks pass, the zk node is forced to offline before assigning.
+*
+* @param region server to be assigned
+* @param setofflineinzk whether zk node should be created/transitioned to an
+*                       offline state before assigning the region
+*/
+public void assign hregioninfo region  boolean setofflineinzk
+assign region  setofflineinzk  false
+/**
+* use care with forcenewplan. it could cause double assignment.
+*/
+public void assign hregioninfo region
+boolean setofflineinzk  boolean forcenewplan
+if   setofflineinzk    isdisabledordisablingregioninrit region
+return
+if  this servermanager isclustershutdown
+log info
+region getregionnameasstring
+return
+string encodedname   region getencodedname
+lock lock   locker acquirelock encodedname
+try
+regionstate state   forceregionstatetooffline region  forcenewplan
+if  state    null
+assign state  setofflineinzk  forcenewplan
+finally
+lock unlock
+/**
+* bulk assign regions to <code>destination</code>.
+* @param destination
+* @param regions regions to assign.
+* @return true if successful
+*/
+boolean assign final servername destination
+final list<hregioninfo> regions
+int regioncount   regions size
+if  regioncount    0
+return true
+log debug     regioncount
+destination tostring
+set<string> encodednames   new hashset<string> regioncount
+for  hregioninfo region   regions
+encodednames add region getencodedname
+list<hregioninfo> failedtoopenregions   new arraylist<hregioninfo>
+map<string  lock> locks   locker acquirelocks encodednames
+try
+atomicinteger counter   new atomicinteger 0
+map<string  integer> offlinenodesversions   new concurrenthashmap<string  integer>
+offlinecallback cb   new offlinecallback
+watcher  destination  counter  offlinenodesversions
+map<string  regionplan> plans   new hashmap<string  regionplan> regions size
+list<regionstate> states   new arraylist<regionstate> regions size
+for  hregioninfo region   regions
+string encodedregionname   region getencodedname
+regionstate state   forceregionstatetooffline region  true
+if  state    null    asyncsetofflineinzookeeper state  cb  destination
+regionplan plan   new regionplan region  state getservername    destination
+plans put encodedregionname  plan
+states add state
+else
+log warn
+region
+failedtoopenregions add region      assign individually later
+lock lock   locks remove encodedregionname
+lock unlock
+// wait until all unassigned nodes have been put up and watchers set.
+int total   states size
+for  int oldcounter   0   server isstopped
+int count   counter get
+if  oldcounter    count
+log info destination tostring         count
+total
+oldcounter   count
+if  count >  total  break
+threads sleep 5
+if  server isstopped
+return false
+// add region plans, so we can updatetimers when one region is opened so
+// that unnecessary timeout on rit is reduced.
+this addplans plans
+list<pair<hregioninfo  integer>> regionopeninfos
+new arraylist<pair<hregioninfo  integer>> states size
+for  regionstate state  states
+hregioninfo region   state getregion
+string encodedregionname   region getencodedname
+integer nodeversion   offlinenodesversions get encodedregionname
+if  nodeversion    null    nodeversion     1
+log warn     region
+failedtoopenregions add region      assign individually later
+lock lock   locks remove encodedregionname
+lock unlock
+else
+regionstates updateregionstate region
+regionstate state pending_open  destination
+regionopeninfos add new pair<hregioninfo  integer>
+region  nodeversion
+// move on to open regions.
+try
+// send open rpc. if it fails on a ioe or remoteexception, the
+// timeoutmonitor will pick up the pieces.
+long maxwaittime   system currenttimemillis
+this server getconfiguration
+getlong    60000
+for  int i   1  i <  maximumattempts     server isstopped    i
+try
+list<regionopeningstate> regionopeningstatelist   servermanager
+sendregionopen destination  regionopeninfos
+if  regionopeningstatelist    null
+// failed getting rpc connection to this server
+return false
+for  int k   0  n   regionopeningstatelist size    k < n  k
+regionopeningstate openingstate   regionopeningstatelist get k
+if  openingstate    regionopeningstate opened
+hregioninfo region   regionopeninfos get k  getfirst
+if  openingstate    regionopeningstate already_opened
+processalreadyopenedregion region  destination
+else if  openingstate    regionopeningstate failed_opening
+// failed opening this region, reassign it later
+failedtoopenregions add region
+else
+log warn
+openingstate       region
+break
+catch  ioexception e
+if  e instanceof remoteexception
+e     remoteexception e  unwrapremoteexception
+if  e instanceof regionserverstoppedexception
+log warn    e
+// no need to retry, the region server is a goner.
+return false
+else if  e instanceof servernotrunningyetexception
+long now   system currenttimemillis
+if  now < maxwaittime
+log debug
+maxwaittime   now       e
+thread sleep 100
+i       reset the try count
+continue
+else if  e instanceof java net sockettimeoutexception
+this servermanager isserveronline destination
+// in case socket is timed out and the region server is still online,
+// the openregion rpc could have been accepted by the server and
+// just the response didn't go through.  so we will retry to
+// open the region on the same server.
+if  log isdebugenabled
+log debug     destination
+e
+continue
+throw e
+catch  ioexception e
+// can be a socket timeout, eof, noroutetohost, etc
+log info
+e
+return false
+catch  interruptedexception e
+throw new runtimeexception e
+finally
+for  lock lock   locks values
+lock unlock
+if   failedtoopenregions isempty
+for  hregioninfo region   failedtoopenregions
+invokeassign region
+log debug     destination tostring
+return true
+/**
+* send close rpc if the server is online, otherwise, offline the region.
+*
+* the rpc will be sent only to the region sever found in the region state
+* if it is passed in, otherwise, to the src server specified. if region
+* state is not specified, we don't update region state at all, instead
+* we just send the rpc call. this is useful for some cleanup without
+* messing around the region states (see handleregion, on region opened
+* on an unexpected server scenario, for an example)
+*/
+private void unassign final hregioninfo region
+final regionstate state  final int versionofclosingnode
+final servername dest  final boolean transitioninzk
+final servername src
+servername server   src
+if  state    null
+server   state getservername
+for  int i   1  i <  this maximumattempts  i
+// closedregionhandler can remove the server from this.regions
+if   servermanager isserveronline server
+if  transitioninzk
+// delete the node. if no node exists need not bother.
+deleteclosingorclosednode region
+if  state    null
+regionoffline region
+return
+try
+// send close rpc
+if  servermanager sendregionclose server  region
+versionofclosingnode  dest  transitioninzk
+log debug     server
+region getregionnameasstring
+return
+// this never happens. currently regionserver close always return true.
+// todo; this can now happen (0.96) if there is an exception in a coprocessor
+log warn     server
+region getregionnameasstring
+catch  throwable t
+if  t instanceof remoteexception
+t     remoteexception t  unwrapremoteexception
+if  t instanceof notservingregionexception
+t instanceof regionserverstoppedexception
+if  transitioninzk
+deleteclosingorclosednode region
+if  state    null
+regionoffline region
+return
+else if  state    null
+t instanceof regionalreadyintransitionexception
+// rs is already processing this region, only need to update the timestamp
+log debug     state
+state updatetimestamptonow
+log info     server       t
+region getregionnameasstring         i
+this maximumattempts  t
+// presume retry or server will expire.
+// run out of attempts
+if   tomactivated    state    null
+regionstates updateregionstate region  regionstate state failed_close
+/**
+* set region to offline unless it is opening and forcenewplan is false.
+*/
+private regionstate forceregionstatetooffline
+final hregioninfo region  final boolean forcenewplan
+regionstate state   regionstates getregionstate region
+if  state    null
+log warn     region
+state   regionstates createregionstate region
+else
+switch  state getstate
+case open
+case opening
+case pending_open
+if   forcenewplan
+log debug
+region       state
+return null
+case closing
+case pending_close
+case failed_close
+unassign region  state   1  null  false  null
+state   regionstates getregionstate region
+if  state isoffline    break
+case failed_open
+case closed
+log debug     state
+state   regionstates updateregionstate
+region  regionstate state offline
+case offline
+break
+default
+log error     region
+state
+return null
+return state
+/**
+* caller must hold lock on the passed <code>state</code> object.
+* @param state
+* @param setofflineinzk
+* @param forcenewplan
+*/
+private void assign regionstate state
+final boolean setofflineinzk  final boolean forcenewplan
+regionstate currentstate   state
+int versionofofflinenode    1
+regionplan plan   null
+long maxregionserverstartupwaittime    1
+hregioninfo region   state getregion
+regionopeningstate regionopenstate
+for  int i   1  i <  maximumattempts     server isstopped    i
+if  plan    null       get a server for the region at first
+plan   getregionplan region  forcenewplan
+if  plan    null
+log warn     region
+if  tomactivated
+this timeoutmonitor setallregionserversoffline true
+else
+regionstates updateregionstate region  regionstate state failed_open
+return
+if  setofflineinzk    versionofofflinenode     1
+// get the version of the znode after setting it to offline.
+// versionofofflinenode will be -1 if the znode was not set to offline
+versionofofflinenode   setofflineinzookeeper currentstate  plan getdestination
+if  versionofofflinenode     1
+if  isdisabledordisablingregioninrit region
+return
+// in case of assignment from enabletablehandler table state is enabling. any how
+// enabletablehandler will set enabled after assigning all the table regions. if we
+// try to set to enabled directly then client api may think table is enabled.
+// when we have a case such as all the regions are added directly into .meta. and we call
+// assignregion then we need to make the table enabled. hence in such case the table
+// will not be in enabling or enabled state.
+string tablename   region gettablenameasstring
+if   zktable isenablingtable tablename      zktable isenabledtable tablename
+log debug     tablename
+setenabledtable tablename
+if  setofflineinzk    versionofofflinenode     1
+log info     region
+// setting offline in zk must have been failed due to zk racing or some
+// exception which may make the server to abort. if it is zk racing,
+// we should retry since we already reset the region state,
+// existing (re)assignment will fail anyway.
+if   server isaborted
+continue
+if  this server isstopped      this server isaborted
+log debug     region
+return
+log info     region getregionnameasstring
+plan getdestination   tostring
+// transition regionstate to pending_open
+currentstate   regionstates updateregionstate region
+regionstate state pending_open  plan getdestination
+boolean neednewplan
+final string assignmsg       region getregionnameasstring
+plan getdestination
+try
+regionopenstate   servermanager sendregionopen
+plan getdestination    region  versionofofflinenode
+if  regionopenstate    regionopeningstate failed_opening
+// failed opening this region, looping again on a new server.
+neednewplan   true
+log warn assignmsg
+i       this maximumattempts
+else
+// we're done
+if  regionopenstate    regionopeningstate already_opened
+processalreadyopenedregion region  plan getdestination
+return
+catch  throwable t
+if  t instanceof remoteexception
+t     remoteexception  t  unwrapremoteexception
+// should we wait a little before retrying? if the server is starting it's yes.
+// if the region is already in transition, it's yes as well: we want to be sure that
+//  the region will get opened but we don't want a double assignment.
+boolean hold    t instanceof regionalreadyintransitionexception
+t instanceof servernotrunningyetexception
+// in case socket is timed out and the region server is still online,
+// the openregion rpc could have been accepted by the server and
+// just the response didn't go through.  so we will retry to
+// open the region on the same server to avoid possible
+// double assignment.
+boolean retry    hold     t instanceof java net sockettimeoutexception
+this servermanager isserveronline plan getdestination
+if  hold
+log warn assignmsg
+i       this maximumattempts  t
+if  maxregionserverstartupwaittime < 0
+maxregionserverstartupwaittime   environmentedgemanager currenttimemillis
+this server getconfiguration
+getlong    60000
+try
+long now   environmentedgemanager currenttimemillis
+if  now < maxregionserverstartupwaittime
+log debug
+maxregionserverstartupwaittime   now       t
+thread sleep 100
+i       reset the try count
+neednewplan   false
+else
+log debug    t
+neednewplan   true
+catch  interruptedexception ie
+log warn
+region getregionnameasstring        ie
+thread currentthread   interrupt
+if   tomactivated
+regionstates updateregionstate region  regionstate state failed_open
+return
+else if  retry
+neednewplan   false
+log warn assignmsg
+i       this maximumattempts  t
+else
+neednewplan   true
+log warn assignmsg
+i       this maximumattempts  t
+if  i    this maximumattempts
+// don't reset the region state or get a new plan any more.
+// this is the last try.
+continue
+// if region opened on destination of present plan, reassigning to new
+// rs may cause double assignments. in case of regionalreadyintransitionexception
+// reassigning to same rs.
+if  neednewplan
+// force a new plan and reassign. will return null if no servers.
+// the new plan could be the same as the existing plan since we don't
+// exclude the server of the original plan, which should not be
+// excluded since it could be the only server up now.
+regionplan newplan   getregionplan region  true
+if  newplan    null
+if  tomactivated
+this timeoutmonitor setallregionserversoffline true
+else
+regionstates updateregionstate region  regionstate state failed_open
+log warn
+region getregionnameasstring
+return
+if  plan    newplan     plan getdestination   equals newplan getdestination
+// clean out plan we failed execute and one that doesn't look like it'll
+// succeed anyways; we need a new plan!
+// transition back to offline
+currentstate   regionstates updateregionstate region  regionstate state offline
+versionofofflinenode    1
+plan   newplan
+// run out of attempts
+if   tomactivated
+regionstates updateregionstate region  regionstate state failed_open
+private void processalreadyopenedregion hregioninfo region  servername sn
+// remove region from in-memory transition and unassigned node from zk
+// while trying to enable the table the regions of the table were
+// already enabled.
+log debug     region getregionnameasstring
+sn
+string encodedregionname   region getencodedname
+try
+zkassign deleteofflinenode watcher  encodedregionname
+catch  keeperexception nonodeexception e
+if  log isdebugenabled
+log debug     encodedregionname
+catch  keeperexception e
+server abort
+encodedregionname      e
+regionstates regiononline region  sn
+private boolean isdisabledordisablingregioninrit final hregioninfo region
+string tablename   region gettablenameasstring
+boolean disabled   this zktable isdisabledtable tablename
+if  disabled    this zktable isdisablingtable tablename
+log info     tablename    disabled ?
+region getregionnameasstring
+offlinedisabledregion region
+return true
+return false
+/**
+* set region as offlined up in zookeeper
+*
+* @param state
+* @return the version of the offline node if setting of the offline node was
+*         successful, -1 otherwise.
+*/
+private int setofflineinzookeeper final regionstate state  final servername destination
+if   state isclosed       state isoffline
+string msg       state
+this server abort msg  new illegalstateexception msg
+return  1
+regionstates updateregionstate state getregion
+regionstate state offline
+int versionofofflinenode
+try
+// get the version after setting the znode to offline
+versionofofflinenode   zkassign createorforcenodeoffline watcher
+state getregion    destination
+if  versionofofflinenode     1
+log warn
+state
+return  1
+catch  keeperexception e
+server abort    e
+return  1
+return versionofofflinenode
+/**
+* @param region the region to assign
+* @return plan for passed <code>region</code> (if none currently, it creates one or
+* if no servers to assign, it returns null).
+*/
+private regionplan getregionplan final hregioninfo region
+final boolean forcenewplan
+return getregionplan region  null  forcenewplan
+/**
+* @param region the region to assign
+* @param servertoexclude server to exclude (we know its bad). pass null if
+* all servers are thought to be assignable.
+* @param forcenewplan if true, then if an existing plan exists, a new plan
+* will be generated.
+* @return plan for passed <code>region</code> (if none currently, it creates one or
+* if no servers to assign, it returns null).
+*/
+private regionplan getregionplan final hregioninfo region
+final servername servertoexclude  final boolean forcenewplan
+// pickup existing plan or make a new one
+final string encodedname   region getencodedname
+final list<servername> destservers
+servermanager createdestinationserverslist servertoexclude
+if  destservers isempty
+log warn     encodedname
+return null
+regionplan randomplan   null
+boolean newplan   false
+regionplan existingplan
+synchronized  this regionplans
+existingplan   this regionplans get encodedname
+if  existingplan    null    existingplan getdestination      null
+log debug     region getregionnameasstring
+existingplan getdestination
+destservers contains existingplan getdestination
+if  forcenewplan
+existingplan    null
+existingplan getdestination      null
+destservers contains existingplan getdestination
+newplan   true
+randomplan   new regionplan region  null
+balancer randomassignment region  destservers
+this regionplans put encodedname  randomplan
+if  newplan
+if  randomplan getdestination      null
+log warn     encodedname
+return null
+log debug
+region getregionnameasstring
+randomplan
+servermanager countofregionservers
+servermanager getonlineservers   size
+destservers size
+forcenewplan
+return randomplan
+log debug
+region getregionnameasstring         existingplan
+return existingplan
+/**
+* unassign the list of regions. configuration knobs:
+* hbase.bulk.waitbetween.reopen indicates the number of milliseconds to
+* wait before unassigning another region from this region server
+*
+* @param regions
+* @throws interruptedexception
+*/
+public void unassign list<hregioninfo> regions
+int waittime   this server getconfiguration   getint
+0
+for  hregioninfo region   regions
+if  regionstates isregionintransition region
+continue
+unassign region  false
+while  regionstates isregionintransition region
+try
+thread sleep 10
+catch  interruptedexception e
+// do nothing, continue
+if  waittime > 0
+try
+thread sleep waittime
+catch  interruptedexception e
+// do nothing, continue
+/**
+* unassigns the specified region.
+* <p>
+* updates the regionstate and sends the close rpc unless region is being
+* split by regionserver; then the unassign fails (silently) because we
+* presume the region being unassigned no longer exists (its been split out
+* of existence). todo: what to do if split fails and is rolled back and
+* parent is revivified?
+* <p>
+* if a regionplan is already set, it will remain.
+*
+* @param region server to be unassigned
+*/
+public void unassign hregioninfo region
+unassign region  false
+/**
+* unassigns the specified region.
+* <p>
+* updates the regionstate and sends the close rpc unless region is being
+* split by regionserver; then the unassign fails (silently) because we
+* presume the region being unassigned no longer exists (its been split out
+* of existence). todo: what to do if split fails and is rolled back and
+* parent is revivified?
+* <p>
+* if a regionplan is already set, it will remain.
+*
+* @param region server to be unassigned
+* @param force if region should be closed even if already closing
+*/
+public void unassign hregioninfo region  boolean force  servername dest
+// todo: method needs refactoring.  ugly buried returns throughout.  beware!
+log debug
+region getregionnameasstring
+string encodedname   region getencodedname
+// grab the state of this region and synchronize on it
+int versionofclosingnode    1
+// we need a lock here as we're going to do a put later and we don't want multiple states
+//  creation
+reentrantlock lock   locker acquirelock encodedname
+regionstate state   regionstates getregiontransitionstate encodedname
+try
+if  state    null
+// create the znode in closing state
+try
+state   regionstates getregionstate region
+if  state    null    state getservername      null
+// we don't know where the region is, offline it.
+// no need to send close rpc
+regionoffline region
+return
+versionofclosingnode   zkassign createnodeclosing
+watcher  region  state getservername
+if  versionofclosingnode     1
+log debug
+region getregionnameasstring
+return
+catch  keeperexception e
+if  e instanceof nodeexistsexception
+// handle race between master initiated close and regionserver
+// orchestrated splitting. see if existing node is in a
+// splitting or split state.  if so, the regionserver started
+// an op on node before we could get our closing in.  deal.
+nodeexistsexception nee    nodeexistsexception e
+string path   nee getpath
+try
+if  issplitorsplittingormergeormerging path
+log debug path
+return
+catch  keeperexception nonodeexception ke
+log warn     path
+encodedname      ke
+return
+catch  keeperexception ke
+log error    ke
+catch  deserializationexception de
+log error    de
+// if we get here, don't understand whats going on -- abort.
+server abort    e
+return
+state   regionstates updateregionstate region  regionstate state pending_close
+else if  state isfailedopen
+// the region is not open yet
+regionoffline region
+return
+else if  force     state ispendingclose
+state isclosing      state isfailedclose
+log debug     region getregionnameasstring
+state getstate
+if  state isfailedclose
+state   regionstates updateregionstate region  regionstate state pending_close
+state updatetimestamptonow
+else
+log debug
+region getregionnameasstring
+state getstate         force
+return
+unassign region  state  versionofclosingnode  dest  true  null
+finally
+lock unlock
+public void unassign hregioninfo region  boolean force
+unassign region  force  null
+/**
+* @param region regioninfo of znode to be deleted.
+*/
+public void deleteclosingorclosednode hregioninfo region
+string encodedname   region getencodedname
+try
+if   zkassign deletenode watcher  encodedname
+eventtype m_zk_region_closing
+boolean deletenode   zkassign deletenode watcher
+encodedname  eventtype rs_zk_region_closed
+// todo : we don't abort if the delete node returns false. is there any
+// such corner case?
+if   deletenode
+log error
+encodedname       deletenode
+catch  nonodeexception e
+log debug     encodedname
+catch  keeperexception ke
+server abort
+encodedname  ke
+/**
+* @param path
+* @return true if znode is in split or splitting or merge or merging state.
+* @throws keeperexception can happen if the znode went away in meantime.
+* @throws deserializationexception
+*/
+private boolean issplitorsplittingormergeormerging final string path
+throws keeperexception  deserializationexception
+boolean result   false
+// this may fail if the split or splitting or merge or merging znode gets
+// cleaned up before we can get data from it.
+byte  data   zkassign getdata watcher  path
+if  data    null  return false
+regiontransition rt   regiontransition parsefrom data
+switch  rt geteventtype
+case rs_zk_region_split
+case rs_zk_region_splitting
+case rs_zk_region_merge
+case rs_zk_region_merging
+result   true
+break
+default
+break
+return result
+/**
+* waits until the specified region has completed assignment.
+* <p>
+* if the region is already assigned, returns immediately.  otherwise, method
+* blocks until the region is assigned.
+* @param regioninfo region to wait on assignment for
+* @throws interruptedexception
+*/
+public boolean waitforassignment hregioninfo regioninfo
+throws interruptedexception
+while   regionstates isregionassigned regioninfo
+if  regionstates isregionfailedtoopen regioninfo
+this server isstopped
+return false
+// we should receive a notification, but it's
+//  better to have a timeout to recheck the condition here:
+//  it lowers the impact of a race condition if any
+regionstates waitforupdate 100
+return true
+/**
+* assigns the meta region.
+* <p>
+* assumes that meta is currently closed and is not being actively served by
+* any regionserver.
+* <p>
+* forcibly unsets the current meta region location in zookeeper and assigns
+* meta to a random regionserver.
+* @throws keeperexception
+*/
+public void assignmeta   throws keeperexception
+metaregiontracker deletemetalocation this watcher
+assign hregioninfo first_meta_regioninfo  true
+/**
+* assigns specified regions retaining assignments, if any.
+* <p>
+* this is a synchronous call and will return once every region has been
+* assigned.  if anything fails, an exception is thrown
+* @throws interruptedexception
+* @throws ioexception
+*/
+public void assign map<hregioninfo  servername> regions
+throws ioexception  interruptedexception
+if  regions    null    regions isempty
+return
+list<servername> servers   servermanager createdestinationserverslist
+if  servers    null    servers isempty
+throw new ioexception
+// reuse existing assignment info
+map<servername  list<hregioninfo>> bulkplan
+balancer retainassignment regions  servers
+assign regions size    servers size
+bulkplan
+/**
+* assigns specified regions round robin, if any.
+* <p>
+* this is a synchronous call and will return once every region has been
+* assigned.  if anything fails, an exception is thrown
+* @throws interruptedexception
+* @throws ioexception
+*/
+public void assign list<hregioninfo> regions
+throws ioexception  interruptedexception
+if  regions    null    regions isempty
+return
+list<servername> servers   servermanager createdestinationserverslist
+if  servers    null    servers isempty
+throw new ioexception
+// generate a round-robin bulk assignment plan
+map<servername  list<hregioninfo>> bulkplan
+balancer roundrobinassignment regions  servers
+assign regions size    servers size
+bulkplan
+private void assign int regions  int totalservers
+string message  map<servername  list<hregioninfo>> bulkplan
+throws interruptedexception  ioexception
+int servers   bulkplan size
+if  servers    1     regions < bulkassignthresholdregions
+servers < bulkassignthresholdservers
+// not use bulk assignment.  this could be more efficient in small
+// cluster, especially mini cluster for testing, so that tests won't time out
+log info
+regions       servers
+for  map entry<servername  list<hregioninfo>> plan  bulkplan entryset
+assign plan getkey    plan getvalue
+else
+log info     regions
+totalservers       message
+// use fixed count thread pool assigning.
+bulkassigner ba   new generalbulkassigner
+this server  bulkplan  this  bulkassignwaittillallassigned
+ba bulkassign
+log info
+/**
+* assigns all user regions, if any exist.  used during cluster startup.
+* <p>
+* this is a synchronous call and will return once every region has been
+* assigned.  if anything fails, an exception is thrown and the cluster
+* should be shutdown.
+* @throws interruptedexception
+* @throws ioexception
+* @throws keeperexception
+*/
+private void assignalluserregions
+throws ioexception  interruptedexception  keeperexception
+// cleanup any existing zk nodes and start watching
+zkassign deleteallnodes watcher
+zkutil listchildrenandwatchfornewchildren this watcher
+this watcher assignmentznode
+failovercleanupdone
+// skip assignment for regions of tables in disabling state because during clean cluster startup
+// no rs is alive and regions map also doesn't have any information about the regions.
+// see hbase-6281.
+set<string> disabledordisablingorenabling   zktable getdisabledordisablingtables watcher
+disabledordisablingorenabling addall zktable getenablingtables watcher
+// scan meta for all user regions, skipping any disabled tables
+map<hregioninfo  servername> allregions   metareader fullscan
+catalogtracker  disabledordisablingorenabling  true
+if  allregions    null    allregions isempty    return
+// determine what type of assignment to do on startup
+boolean retainassignment   server getconfiguration
+getboolean    true
+if  retainassignment
+assign allregions
+else
+list<hregioninfo> regions   new arraylist<hregioninfo> allregions keyset
+assign regions
+for  hregioninfo hri   allregions keyset
+string tablename   hri gettablenameasstring
+if   zktable isenabledtable tablename
+setenabledtable tablename
+/**
+* wait until no regions in transition.
+* @param timeout how long to wait.
+* @return true if nothing in regions in transition.
+* @throws interruptedexception
+*/
+boolean waituntilnoregionsintransition final long timeout
+throws interruptedexception
+// blocks until there are no regions in transition. it is possible that
+// there
+// are regions in transition immediately after this returns but guarantees
+// that if it returns without an exception that there was a period of time
+// with no regions in transition from the point-of-view of the in-memory
+// state of the master.
+final long endtime   system currenttimemillis     timeout
+while   this server isstopped      regionstates isregionsintransition
+endtime > system currenttimemillis
+regionstates waitforupdate 100
+return  regionstates isregionsintransition
+/**
+* rebuild the list of user regions and assignment information.
+* <p>
+* returns a map of servers that are not found to be online and the regions
+* they were hosting.
+* @return map of servers not online to their assigned regions, as stored
+*         in meta
+* @throws ioexception
+*/
+map<servername  list<hregioninfo>> rebuilduserregions   throws ioexception  keeperexception
+set<string> enablingtables   zktable getenablingtables watcher
+set<string> disabledorenablingtables   zktable getdisabledtables watcher
+disabledorenablingtables addall enablingtables
+set<string> disabledordisablingorenabling   zktable getdisablingtables watcher
+disabledordisablingorenabling addall disabledorenablingtables
+// region assignment from meta
+list<result> results   metareader fullscan this catalogtracker
+// get any new but slow to checkin region server that joined the cluster
+set<servername> onlineservers   servermanager getonlineservers   keyset
+// map of offline servers and their regions to be returned
+map<servername  list<hregioninfo>> offlineservers
+new treemap<servername  list<hregioninfo>>
+// iterate regions in meta
+for  result result   results
+pair<hregioninfo  servername> region   hregioninfo gethregioninfoandservername result
+if  region    null  continue
+hregioninfo regioninfo   region getfirst
+servername regionlocation   region getsecond
+if  regioninfo    null  continue
+regionstates createregionstate regioninfo
+string tablename   regioninfo gettablenameasstring
+if  regionlocation    null
+// regionlocation could be null if createtable didn't finish properly.
+// when createtable is in progress, hmaster restarts.
+// some regions have been added to .meta., but have not been assigned.
+// when this happens, the region's table must be in enabling state.
+// it can't be in enabled state as that is set when all regions are
+// assigned.
+// it can't be in disabling state, because disabling state transitions
+// from enabled state when application calls disabletable.
+// it can't be in disabled state, because disabled states transitions
+// from disabling state.
+if   enablingtables contains tablename
+log warn     regioninfo getencodedname
+tablename
+else if   onlineservers contains regionlocation
+// region is located on a server that isn't online
+list<hregioninfo> offlineregions   offlineservers get regionlocation
+if  offlineregions    null
+offlineregions   new arraylist<hregioninfo> 1
+offlineservers put regionlocation  offlineregions
+offlineregions add regioninfo
+// need to enable the table if not disabled or disabling or enabling
+// this will be used in rolling restarts
+if   disabledordisablingorenabling contains tablename
+getzktable   isenabledtable tablename
+setenabledtable tablename
+else
+// if region is in offline and split state check the zknode
+if  regioninfo isoffline      regioninfo issplit
+string node   zkassign getnodename this watcher  regioninfo
+getencodedname
+stat stat   new stat
+byte data   zkutil getdatanowatch this watcher  node  stat
+// if znode does not exist, don't consider this region
+if  data    null
+log debug  	   regioninfo getregionnameasstring
+continue
+// region is being served and on an active server
+// add only if region not in disabled or enabling table
+if   disabledorenablingtables contains tablename
+regionstates regiononline regioninfo  regionlocation
+// need to enable the table if not disabled or disabling or enabling
+// this will be used in rolling restarts
+if   disabledordisablingorenabling contains tablename
+getzktable   isenabledtable tablename
+setenabledtable tablename
+return offlineservers
+/**
+* recover the tables that were not fully moved to disabled state. these
+* tables are in disabling state when the master restarted/switched.
+*
+* @throws keeperexception
+* @throws tablenotfoundexception
+* @throws ioexception
+*/
+private void recovertableindisablingstate
+throws keeperexception  tablenotfoundexception  ioexception
+set<string> disablingtables   zktable getdisablingtables watcher
+if  disablingtables size      0
+for  string tablename   disablingtables
+// recover by calling disabletablehandler
+log info     tablename
+new disabletablehandler this server  tablename getbytes    catalogtracker
+this  tablelockmanager  true  prepare   process
+/**
+* recover the tables that are not fully moved to enabled state. these tables
+* are in enabling state when the master restarted/switched
+*
+* @throws keeperexception
+* @throws org.apache.hadoop.hbase.exceptions.tablenotfoundexception
+* @throws ioexception
+*/
+private void recovertableinenablingstate
+throws keeperexception  tablenotfoundexception  ioexception
+set<string> enablingtables   zktable getenablingtables watcher
+if  enablingtables size      0
+for  string tablename   enablingtables
+// recover by calling enabletablehandler
+log info     tablename
+// enabletable in sync way during master startup,
+// no need to invoke coprocessor
+new enabletablehandler this server  tablename getbytes
+catalogtracker  this  tablelockmanager  true  prepare   process
+/**
+* processes list of dead servers from result of meta scan and regions in rit
+* <p>
+* this is used for failover to recover the lost regions that belonged to
+* regionservers which failed while there was no active master or regions
+* that were in rit.
+* <p>
+*
+*
+* @param deadservers
+*          the list of dead servers which failed while there was no active
+*          master. can be null.
+* @throws ioexception
+* @throws keeperexception
+*/
+private void processdeadserversandrecoverlostregions
+map<servername  list<hregioninfo>> deadservers
+throws ioexception  keeperexception
+if  deadservers    null
+for  map entry<servername  list<hregioninfo>> server  deadservers entryset
+servername servername   server getkey
+if   servermanager isserverdead servername
+servermanager expireserver servername      let ssh do region re assign
+list<string> nodes   zkutil listchildrenandwatchfornewchildren
+this watcher  this watcher assignmentznode
+if   nodes isempty
+for  string encodedregionname   nodes
+processregionintransition encodedregionname  null
+// now we can safely claim failover cleanup completed and enable
+// servershutdownhandler for further processing. the nodes (below)
+// in transition, if any, are for regions not related to those
+// dead servers at all, and can be done in parallel to ssh.
+failovercleanupdone
+/**
+* set regions in transitions metrics.
+* this takes an iterator on the regionintransition map (clsm), and is not synchronized.
+* this iterator is not fail fast, which may lead to stale read; but that's better than
+* creating a copy of the map for metrics computation, as this method will be invoked
+* on a frequent interval.
+*/
+public void updateregionsintransitionmetrics
+long currenttime   system currenttimemillis
+int totalrits   0
+int totalritsoverthreshold   0
+long oldestrittime   0
+int ritthreshold   this server getconfiguration
+getint hconstants metrics_rit_stuck_warning_threshold  60000
+for  regionstate state  regionstates getregionsintransition   values
+totalrits
+long rittime   currenttime   state getstamp
+if  rittime > ritthreshold       more than the threshold
+totalritsoverthreshold
+if  oldestrittime < rittime
+oldestrittime   rittime
+if  this metricsmaster    null
+this metricsmaster updateritoldestage oldestrittime
+this metricsmaster updateritcount totalrits
+this metricsmaster updateritcountoverthreshold totalritsoverthreshold
+/**
+* @param region region whose plan we are to clear.
+*/
+void clearregionplan final hregioninfo region
+synchronized  this regionplans
+this regionplans remove region getencodedname
+/**
+* wait on region to clear regions-in-transition.
+* @param hri region to wait on.
+* @throws ioexception
+*/
+public void waitonregiontoclearregionsintransition final hregioninfo hri
+throws ioexception  interruptedexception
+if   regionstates isregionintransition hri   return
+regionstate rs   null
+// there is already a timeout monitor on regions in transition so i
+// should not have to have one here too?
+while  this server isstopped      regionstates isregionintransition hri
+log info     rs
+regionstates waitforupdate 100
+if  this server isstopped
+log info
+/**
+* update timers for all regions in transition going against the server in the
+* serversinupdatingtimer.
+*/
+public class timerupdater extends chore
+public timerupdater final int period  final stoppable stopper
+super    period  stopper
+@override
+protected void chore
+preconditions checkstate tomactivated
+servername servertoupdatetimer   null
+while   serversinupdatingtimer isempty       stopper isstopped
+if  servertoupdatetimer    null
+servertoupdatetimer   serversinupdatingtimer first
+else
+servertoupdatetimer   serversinupdatingtimer
+higher servertoupdatetimer
+if  servertoupdatetimer    null
+break
+updatetimers servertoupdatetimer
+serversinupdatingtimer remove servertoupdatetimer
+/**
+* monitor to check for time outs on region transition operations
+*/
+public class timeoutmonitor extends chore
+private boolean allregionserversoffline   false
+private servermanager servermanager
+private final int timeout
+/**
+* creates a periodic monitor to check for time outs on region transition
+* operations.  this will deal with retries if for some reason something
+* doesn't happen within the specified timeout.
+* @param period
+* @param stopper when {@link stoppable#isstopped()} is true, this thread will
+* cleanup and exit cleanly.
+* @param timeout
+*/
+public timeoutmonitor final int period  final stoppable stopper
+servermanager servermanager
+final int timeout
+super    period  stopper
+this timeout   timeout
+this servermanager   servermanager
+private synchronized void setallregionserversoffline
+boolean allregionserversoffline
+this allregionserversoffline   allregionserversoffline
+@override
+protected void chore
+preconditions checkstate tomactivated
+boolean norsavailable   this servermanager createdestinationserverslist   isempty
+// iterate all regions in transition checking for time outs
+long now   system currenttimemillis
+// no lock concurrent access ok: we will be working on a copy, and it's java-valid to do
+//  a copy while another thread is adding/removing items
+for  string regionname   regionstates getregionsintransition   keyset
+regionstate regionstate   regionstates getregiontransitionstate regionname
+if  regionstate    null  continue
+if  regionstate getstamp     timeout <  now
+// decide on action upon timeout
+actontimeout regionstate
+else if  this allregionserversoffline     norsavailable
+regionplan existingplan   regionplans get regionname
+if  existingplan    null
+this servermanager isserveronline existingplan
+getdestination
+// if some rss just came back online, we can start the assignment
+// right away
+actontimeout regionstate
+setallregionserversoffline norsavailable
+private void actontimeout regionstate regionstate
+hregioninfo regioninfo   regionstate getregion
+log info     regionstate
+// expired! do a retry.
+switch  regionstate getstate
+case closed
+log info     regioninfo getencodedname
+// update our timestamp.
+regionstate updatetimestamptonow
+break
+case offline
+log info
+regioninfo getregionnameasstring
+invokeassign regioninfo
+break
+case pending_open
+log info
+regioninfo getregionnameasstring
+invokeassign regioninfo
+break
+case opening
+processopeningstate regioninfo
+break
+case open
+log error
+regionstate updatetimestamptonow
+break
+case pending_close
+log info
+regioninfo getregionnameasstring
+invokeunassign regioninfo
+break
+case closing
+log info
+invokeunassign regioninfo
+break
+case split
+case splitting
+case failed_open
+case failed_close
+break
+default
+throw new illegalstateexception
+private void processopeningstate hregioninfo regioninfo
+log info
+regioninfo getregionnameasstring
+// should have a zk node in opening state
+try
+string node   zkassign getnodename watcher  regioninfo getencodedname
+stat stat   new stat
+byte  data   zkassign getdatanowatch watcher  node  stat
+if  data    null
+log warn     node
+return
+regiontransition rt   regiontransition parsefrom data
+eventtype et   rt geteventtype
+if  et    eventtype rs_zk_region_opened
+log debug
+return
+else if  et    eventtype rs_zk_region_opening    et    eventtype rs_zk_region_failed_open
+log warn     et
+return
+invokeassign regioninfo
+catch  keeperexception ke
+log error    ke
+catch  deserializationexception e
+log error    e
+void invokeassign hregioninfo regioninfo
+threadpoolexecutorservice submit new assigncallable this  regioninfo
+private void invokeunassign hregioninfo regioninfo
+threadpoolexecutorservice submit new unassigncallable this  regioninfo
+public boolean iscarryingmeta servername servername
+return iscarryingregion servername  hregioninfo first_meta_regioninfo
+/**
+* check if the shutdown server carries the specific region.
+* we have a bunch of places that store region location
+* those values aren't consistent. there is a delay of notification.
+* the location from zookeeper unassigned node has the most recent data;
+* but the node could be deleted after the region is opened by am.
+* the am's info could be old when openedregionhandler
+* processing hasn't finished yet when server shutdown occurs.
+* @return whether the servername currently hosts the region
+*/
+private boolean iscarryingregion servername servername  hregioninfo hri
+regiontransition rt   null
+try
+byte  data   zkassign getdata watcher  hri getencodedname
+// this call can legitimately come by null
+rt   data    null? null  regiontransition parsefrom data
+catch  keeperexception e
+server abort     hri getencodedname    e
+catch  deserializationexception e
+server abort     hri getencodedname    e
+servername addressfromzk   rt    null? rt getservername     null
+if  addressfromzk    null
+// if we get something from zk, we will use the data
+boolean matchzk   addressfromzk equals servername
+log debug     hri getregionnameasstring
+addressfromzk
+servername
+return matchzk
+servername addressfromam   regionstates getregionserverofregion hri
+boolean matcham    addressfromam    null
+addressfromam equals servername
+log debug     hri getregionnameasstring
+addressfromam    null ? addressfromam
+servername
+return matcham
+/**
+* process shutdown server removing any assignments.
+* @param sn server that went down.
+* @return list of regions in transition on this server
+*/
+public list<hregioninfo> processservershutdown final servername sn
+// clean out any existing assignment plans for this server
+synchronized  this regionplans
+for  iterator <map entry<string  regionplan>> i
+this regionplans entryset   iterator    i hasnext
+map entry<string  regionplan> e   i next
+servername othersn   e getvalue   getdestination
+// the name will be null if the region is planned for a random assign.
+if  othersn    null    othersn equals sn
+// use iterator's remove else we'll get cme
+i remove
+list<hregioninfo> regions   regionstates serveroffline sn
+for  iterator<hregioninfo> it   regions iterator    it hasnext
+hregioninfo hri   it next
+string encodedname   hri getencodedname
+// we need a lock on the region as we could update it
+lock lock   locker acquirelock encodedname
+try
+regionstate regionstate
+regionstates getregiontransitionstate encodedname
+if  regionstate    null
+regionstate ispendingopenoropeningonserver sn
+log info     hri
+sn
+it remove
+else
+try
+// delete the znode if exists
+zkassign deletenodefailsilent watcher  hri
+catch  keeperexception ke
+server abort     hri  ke
+// mark the region closed and assign it again by ssh
+regionstates updateregionstate hri  regionstate state closed
+finally
+lock unlock
+return regions
+/**
+* update inmemory structures.
+* @param sn server that reported the split
+* @param parent parent region that was split
+* @param a daughter region a
+* @param b daughter region b
+*/
+public void handlesplitreport final servername sn  final hregioninfo parent
+final hregioninfo a  final hregioninfo b
+regionoffline parent
+regiononline a  sn
+regiononline b  sn
+// there's a possibility that the region was splitting while a user asked
+// the master to disable, we need to make sure we close those regions in
+// that case. this is not racing with the region server itself since rs
+// report is done after the split transaction completed.
+if  this zktable isdisablingordisabledtable
+parent gettablenameasstring
+unassign a
+unassign b
+/**
+* update inmemory structures.
+* @param sn server that reported the merge
+* @param merged regioninfo of merged
+* @param a region a
+* @param b region b
+*/
+public void handleregionsmergereport final servername sn
+final hregioninfo merged  final hregioninfo a  final hregioninfo b
+regionoffline a
+regionoffline b
+regiononline merged  sn
+// there's a possibility that the region was merging while a user asked
+// the master to disable, we need to make sure we close those regions in
+// that case. this is not racing with the region server itself since rs
+// report is done after the regions merge transaction completed.
+if  this zktable isdisablingordisabledtable merged gettablenameasstring
+unassign merged
+/**
+* @param plan plan to execute.
+*/
+public void balance final regionplan plan
+synchronized  this regionplans
+this regionplans put plan getregionname    plan
+unassign plan getregioninfo    false  plan getdestination
+public void stop
+if  tomactivated
+this timeoutmonitor interrupt
+this timerupdater interrupt
+/**
+* shutdown the threadpool executor service
+*/
+public void shutdown
+// it's an immediate shutdown, so we're clearing the remaining tasks.
+synchronized  zkeventworkerwaitinglist
+zkeventworkerwaitinglist clear
+threadpoolexecutorservice shutdownnow
+zkeventworkers shutdownnow
+protected void setenabledtable string tablename
+try
+this zktable setenabledtable tablename
+catch  keeperexception e
+// here we can abort as it is the start up flow
+string errormsg       tablename
+log error errormsg
+this server abort errormsg  e
+/**
+* set region as offlined up in zookeeper asynchronously.
+* @param state
+* @return true if we succeeded, false otherwise (state was incorrect or failed
+* updating zk).
+*/
+private boolean asyncsetofflineinzookeeper final regionstate state
+final asynccallback stringcallback cb  final servername destination
+if   state isclosed       state isoffline
+this server abort     state
+new illegalstateexception
+return false
+regionstates updateregionstate
+state getregion    regionstate state offline
+try
+zkassign asynccreatenodeoffline watcher  state getregion
+destination  cb  state
+catch  keeperexception e
+if  e instanceof nodeexistsexception
+log warn     state getregion
+else
+server abort    e
+return false
+return true

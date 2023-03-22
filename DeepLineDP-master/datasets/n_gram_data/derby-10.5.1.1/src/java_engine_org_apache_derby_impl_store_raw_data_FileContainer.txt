@@ -1,0 +1,2868 @@
+/*
+derby - class org.apache.derby.impl.store.raw.data.filecontainer
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store raw data
+import org apache derby iapi reference property
+import org apache derby iapi reference limits
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services cache cacheable
+import org apache derby iapi services cache cachemanager
+import org apache derby iapi services context contextservice
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services io formatidoutputstream
+import org apache derby iapi services io storedformatids
+import org apache derby iapi services io typedformat
+import org apache derby iapi error standardexception
+import org apache derby iapi store raw containerhandle
+import org apache derby iapi store raw containerkey
+import org apache derby iapi store raw page
+import org apache derby iapi store raw pagekey
+import org apache derby iapi store raw recordhandle
+import org apache derby iapi store raw rawstorefactory
+import org apache derby iapi store raw transaction
+import org apache derby iapi store raw log loginstant
+import org apache derby iapi store raw xact rawtransaction
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi store access accessfactory
+import org apache derby iapi store access spaceinfo
+import org apache derby iapi services io arrayinputstream
+import org apache derby iapi services io arrayoutputstream
+import org apache derby iapi services property propertyutil
+import org apache derby iapi util bytearray
+import java io ioexception
+import java io datainput
+import java util properties
+import java util zip crc32
+import org apache derby io storagerandomaccessfile
+/**
+filecontainer is an abstract base class for containers
+which are based on files.
+this class extends basecontainer and implements cacheable and typedformat
+*/
+abstract class filecontainer
+extends basecontainer implements cacheable  typedformat
+{
+/*
+* typed format
+*/
+protected static final int formatidinteger
+storedformatids raw_store_single_container_file
+// format id must fit in 4 bytes
+/**
+return my format identifier.
+*/
+public int gettypeformatid
+{
+return storedformatids raw_store_single_container_file
+}
+/*
+** immutable fields
+*/
+protected final cachemanager          pagecache 		   my page's cache
+protected final cachemanager          containercache       cache i am in
+protected final basedatafilefactory   datafactory          creating factory
+/*
+** fields that are mutable only during identity changes
+*/
+protected int pagesize 		           size of my pages
+protected int sparespace 	           % space kept free on page in inserts
+protected int minimumrecordsize 	   minimum space a record should
+// occupy on the page.
+protected short initialpages 	       initial number of pages preallocated
+// to the container when created
+protected boolean canupdate            can i be written to?
+private int preallocthreshold          how many pages before preallocation
+// kicks in, only stored in memory
+private int preallocsize 	           how many pages to preallocate at once
+// only stored in memory
+private boolean bulkincreasecontainersize    if true  the next addpage will
+// attempt to preallocate a larger
+// than normal number of pages.
+//
+// preallocation parameters
+private static final int pre_alloc_threshold      8
+private static final int min_pre_alloc_size       1
+private static final int default_pre_alloc_size   8
+private static final int max_pre_alloc_size       1000
+/*
+** mutable fields, only valid when the identity is valid.
+*/
+// resolve: if we run out of bytes in the container, we can change
+// containerversion from a long to an int because this number is only
+// bumped when the container is dropped (and rolled back), so it is almost
+// impossible for the containverversion to get beyond a short, let alone
+// and int - someone will have to write an application that attempt to drop
+// the container 2 billion times for that to happen.
+protected long			firstallocpagenumber     first alloc page number
+protected long			firstallocpageoffset     first alloc page offset
+protected long			containerversion         the logged version number
+protected long			estimatedrowcount        value is changed unlogged
+protected loginstant    lastloginstant           last time this container
+// object was touched.
+/**
+* the sequence number for reusable recordids .
+* as long as this number does not change, recordids will be stable within
+* the container.
+**/
+private long reusablerecordidsequencenumber
+/**
+the page that was last inserted into.  use this for getpageforinsert.
+remember the last allocated non-overflow page, and remember it in
+memory only.
+use get/set method to access this field except when we know it is
+being single thread access.
+*/
+private long lastinsertedpage
+private int  lastinsertedpage_index
+/**
+the last unfilled page found.  use this for getpageforinsert.
+remember the last unfilled page found, and remember it in memory only.
+use get/set method to access this field except when we know it is
+being single thread access.
+*/
+private long lastunfilledpage
+/**
+the last allocated page.  this global var is access *without*
+synchronization.  it is used as a hint for page allocation to find the
+next reusable page.
+*/
+private long lastallocatedpage
+/**
+an estimated page count. use this for getestimatedpagecount.
+remember it in memory only.
+*/
+private long estimatedpagecount
+// the isdirty flag indicates if the container has been modified.  the
+// predirty flag indicates that the container is about to be modified.  the
+// reason for these 2 flags instead of just one is to accomodate
+// checkpoint.  after a clean container sends a log record to the log
+// stream but before that conatiner is dirtied by the log operation, a
+// checkpoint could be taken.  if so, then the redolwm will be after the
+// log record but, without predirty, the cache cleaning will not have
+// waited for the change.  so the predirty bit is to stop the cache
+// cleaning from skipping over this container even though it has not really
+// been modified yet.
+protected boolean			predirty
+protected boolean			isdirty
+/*
+allocation information cached by the container object.
+<p>mt -
+access to the allocation cache must be synchronized on the alloccache
+object.  filecontainer manages all mt issue w/r to allocationcache.
+the allocationcache object itself is not mt-safe.
+<p>
+the protocol for accessing both the allocation cache and the alloc page
+is: get the alloc cache semaphore, then get the alloc page.  once both
+are held, they can be released in any order.
+<br>
+it is legal to get one or the other, i.e, it is legal to only get the
+alloc cache semaphore without latching the alloc page, and it is legal
+to get the alloc page latch without the alloc cache semaphore.
+<br>
+it is illegal to hold alloc page latch and then get the allocation
+cache semaphore
+<pre>
+writer to alloc page (to invalidate alloc cache)
+1) synchronized(alloccache)
+2) invalidate cache
+3) get latch on alloc page
+4) release synchonized(alloccache)
+reader:
+1) synchronized(alloccache)
+2) if valid, read value and release synchronized(alloccache)
+3) if cache is invalid, get latch on alloc page
+4) validate cache
+5) release alloc page latch
+6) read value
+7) release synchonized(alloccache)
+</pre>
+*/
+protected allocationcache	alloccache
+/*
+* array to store persistently stored fields
+*/
+byte containerinfo
+private	crc32		checksum 		   holder for the checksum
+/*
+** buffer for encryption/decryption
+*/
+private byte encryptionbuffer
+/*
+* constants
+*/
+/** the container format must fit in this many bytes */
+private static final int container_format_id_size   4
+/* the checksum size */
+protected static final int checksum_size   8
+/**
+the size of the persistently stored container info
+containerheader contains the following information:
+4 bytes int	formatid
+4 bytes	int	status
+4 bytes int	pagesize
+4 bytes int	sparespace
+4 bytes int minimumrecordsize
+2 bytes short initialpages
+2 bytes short spare1
+8 bytes	long	first allocation page number
+8 bytes	long	first allocation page offset
+8 bytes	long	container version
+8 bytes long	estimated number of rows
+8 bytes long	reusable recordid sequence number
+8 bytes long	spare3
+8 bytes	long	checksum
+container info size is 80 bytes, with 10 bytes of spare space
+*/
+protected static final int container_info_size
+container_format_id_size 4 4 4 4 2 2 8 8 8 8 checksum_size 8 8
+/**
+* where the first alloc page is located -
+* the logical page number and the physical page offset
+* note if it is not 0 this is not going to work for stream
+* file which doesn't support seek
+*/
+public static final long first_alloc_page_number   0l
+public static final long first_alloc_page_offset   0l
+// file status for persistent storage
+private static final int file_dropped          0x1
+private static final int file_committed_drop   0x2
+// recordid in this container can be reused when a page is reused.
+private static final int file_reusable_recordid   0x8
+protected static final string space_trace
+sanitymanager debug ?     null
+filecontainer basedatafilefactory factory
+{
+datafactory   factory
+pagecache   factory getpagecache
+containercache   factory getcontainercache
+initcontainerheader true
+}
+/**
+get information about space used by the container.
+**/
+public spaceinfo getspaceinfo basecontainerhandle handle
+throws standardexception
+{
+spaceinformation spaceinfo
+synchronized alloccache
+{
+spaceinfo
+alloccache getallpagecounts handle firstallocpagenumber
+}
+spaceinfo setpagesize pagesize
+return spaceinfo
+}
+/*
+** methods of cacheable
+**
+** getidentity() and clearidentity() are implemented by basecontainer
+*/
+/**
+containers
+*/
+/**
+open the container.
+@return a valid object if the container was successfully opened, null if
+it does not exist.
+@exception standardexception some problem in opening a container.
+@see cacheable#setidentity
+*/
+public cacheable setidentity object key  throws standardexception
+{
+return setident  containerkey  key
+}
+/**
+* open the container.
+* <p>
+* open the container with key "newidentity".
+* <p>
+* should be same name as setidentity but seems to cause method resolution
+* ambiguities
+*
+* @exception standardexception some problem in opening a container.
+*
+* @see cacheable#setidentity
+**/
+protected cacheable setident containerkey newidentity
+throws standardexception
+{
+boolean ok            opencontainer newidentity
+initializelastinsertedpage 1
+lastunfilledpage      containerhandle invalid_page_number
+lastallocatedpage     containerhandle invalid_page_number
+estimatedpagecount     1
+if  ok
+{
+// set up our identity.
+// if we raise an exception after this we must clear our identity.
+fillinidentity newidentity
+return this
+}
+else
+{
+return null
+}
+}
+public cacheable createidentity object key  object createparameter
+throws standardexception
+{
+if  sanitymanager debug
+{
+sanitymanager assert
+key instanceof pagekey
+}
+return createident  containerkey  key  createparameter
+}
+// should be same name as createidentity but seems to cause method
+// resolution ambiguities
+protected cacheable createident
+containerkey    newidentity
+object          createparameter
+throws standardexception
+{
+// createparameter will be this object if this method is being called
+// from itself to re-initialize the container (only for tempraf)
+// if createparameter == this, do not reinitialize the header, this
+// object is not being reused for another container
+if  createparameter    this
+{
+initcontainerheader true    change to different container
+if  createparameter    null
+createparameter instanceof bytearray
+{
+// this is called during load tran, the create container
+// operation has a byte array created by logcreatecontainerinfo
+// which contains all the information necessary to recreate the
+// container.  use that to recreate the container properties.
+createinfofromlog  bytearray createparameter
+}
+else
+{
+if  sanitymanager debug
+{
+if  createparameter    null
+createparameter instanceof properties
+{
+sanitymanager throwassert
+createparameter getclass   getname
+}
+}
+createinfofromprop  properties createparameter
+}
+}
+else
+{
+// we don't need to completely re-initialize the header
+// just re-initialize the relavent fields
+initcontainerheader false
+}
+if  initialpages > 1
+{
+preallocthreshold             0
+preallocsize                  initialpages
+bulkincreasecontainersize     true
+}
+else
+{
+preallocthreshold             pre_alloc_threshold
+}
+createcontainer newidentity
+setdirty true
+// set up our identity.
+// if we raise an exception after this we must clear our identity.
+fillinidentity newidentity
+return this
+}
+public void clearidentity
+{
+closecontainer
+initializelastinsertedpage 1
+lastunfilledpage   containerhandle invalid_page_number
+lastallocatedpage   containerhandle invalid_page_number
+canupdate   false
+super clearidentity
+}
+/**
+we treat this container as dirty if it has the container file open.
+@see cacheable#isdirty
+*/
+public boolean isdirty
+{
+synchronized  this
+{
+return isdirty
+}
+}
+public void predirty boolean predirtyon
+{
+synchronized  this
+{
+if  predirtyon
+{
+// prevent the cleaner from cleaning this container or skipping
+// over it until the operation which predirtied it got a chance
+// to do the change.
+predirty   true
+}
+else
+{
+predirty   false
+// if a cleaner is waiting on the dirty bit, wake it up
+notifyall
+}
+}
+}
+protected void setdirty boolean dirty
+{
+synchronized this
+{
+predirty   false
+isdirty    dirty
+// if a cleaner is waiting on the dirty bit, wake it up
+notifyall
+}
+}
+/*
+** container creation, opening, and closing
+*/
+/**
+* create a new container.
+* <p>
+* create a new container, all references to identity must be through the
+* passed in identity, this object will no identity until after this
+* method returns.
+*
+* @exception standardexception derby standard error policy
+**/
+abstract void createcontainer containerkey newidentity
+throws standardexception
+/**
+* open a container.
+* <p>
+* longer descrption of routine.
+* <p>
+* open a container. open the file that maps to this container, if the
+* file does not exist then we assume the container was never created.
+* if the file exists but we have trouble opening it then we throw some
+* exception.
+*
+* <br> mt - single thread required - enforced by cache manager.
+*
+* @exception  standardexception  standard exception policy.
+**/
+abstract boolean opencontainer containerkey newidentity
+throws standardexception
+abstract void closecontainer
+/**
+* drop container.
+* <p>
+*
+* @see transaction#dropcontainer
+*
+**/
+protected void dropcontainer
+loginstant  instant
+boolean     isdropped
+{
+synchronized this
+{
+setdroppedstate isdropped
+setdirty true
+bumpcontainerversion instant
+}
+}
+/**
+increment the version by one and return the new version.
+<br> mt - caller must synchronized this in the same sync block that
+modifies the container header.
+*/
+protected final void bumpcontainerversion loginstant instant
+{
+lastloginstant   instant
+containerversion
+}
+protected long getcontainerversion
+{
+// it is not really necessary to synchronized this because the only time the
+// container version is looked at is during recovery, which is single
+// threaded at the moment.  put it in an sync block anyway just in case
+// some other people want to look at this for some bizarre reasons
+synchronized this
+{
+return containerversion
+}
+}
+/**
+* request the system properties associated with a container.
+* <p>
+* request the value of properties that are associated with a container.
+* the following properties can be requested:
+*     derby.storage.pagesize
+*     derby.storage.pagereservedspace
+*     derby.storage.minimumrecordsize
+*     derby.storage.reusablerecordid
+*     derby.storage.initialpages
+* <p>
+* to get the value of a particular property add it to the property list,
+* and on return the value of the property will be set to it's current
+* value.  for example:
+*
+* get_prop(conglomeratecontroller cc)
+* {
+*     properties prop = new properties();
+*     prop.put("derby.storage.pagesize", "");
+*     cc.getcontainerproperties(prop);
+*
+*     system.out.println(
+*         "table's page size = " +
+*         prop.getproperty("derby.storage.pagesize");
+* }
+*
+* @param prop   property list to fill in.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void getcontainerproperties properties prop
+throws standardexception
+{
+// derby.storage.pagesize
+if  prop getproperty property page_size_parameter     null
+{
+prop put
+property page_size_parameter
+integer tostring pagesize
+}
+// derby.storage.minimumrecordsize
+if  prop getproperty rawstorefactory minimum_record_size_parameter
+
+{
+prop put
+rawstorefactory minimum_record_size_parameter
+integer tostring minimumrecordsize
+}
+// derby.storage.pagereservedspace
+if  prop getproperty rawstorefactory page_reserved_space_parameter
+
+{
+prop put
+rawstorefactory page_reserved_space_parameter
+integer tostring sparespace
+}
+// derby.storage.reusablerecordid
+if  prop getproperty rawstorefactory page_reusable_record_id     null
+{
+boolean bool   new boolean isreusablerecordid
+prop put rawstorefactory page_reusable_record_id
+bool tostring
+}
+// derby.storage.initialpages
+if  prop getproperty rawstorefactory container_initial_pages     null
+{
+prop put rawstorefactory container_initial_pages
+integer tostring initialpages
+}
+}
+/**
+read the container's header.
+when this method is called, the embryonic page that is passed in must
+have been read directly from the file or the input stream, even if the
+alloc page may still be in cache.  this is because a stubbify operation
+only writes the stub to disk, it does not get rid of any stale page
+from the page cache.  so if it so happens that the stubbified container
+object is aged out of the container cache but the first alloc page
+hasn't, then when any stale page of this container wants to be written
+out, the container needs to be reopened, which is when this routine is
+called.  we must not get the alloc page in cache because it may be
+stale page and it may still say the container has not been dropped.
+<br> mt - single thread required - enforced by caller.
+@param epage the embryonic page to read the header from
+@exception standardexception derby standard error policy
+@exception ioexception error in reading the header from file
+*/
+protected void readheader byte epage
+throws ioexception  standardexception
+{
+// read persistent container header into containerinfo
+allocpage readcontainerinfo containerinfo  epage
+// initialize header from information stored in containerinfo
+readheaderfromarray containerinfo
+}
+// initialize header information so this container object can be safely
+// reused as if this container object has just been new'ed
+private void initcontainerheader boolean changecontainer
+{
+if  containerinfo    null
+containerinfo   new byte
+if  checksum    null
+checksum   new crc32
+else
+checksum reset
+if  alloccache    null
+alloccache   new allocationcache
+else
+alloccache reset
+if  changecontainer
+{
+pagesize   0
+sparespace   0
+minimumrecordsize   0
+}
+initialpages   1
+firstallocpagenumber   containerhandle invalid_page_number
+firstallocpageoffset    1
+containerversion   0
+estimatedrowcount   0
+reusablerecordidsequencenumber   0
+setdroppedstate false
+setcommitteddropstate false
+setreusablerecordidstate false
+// instance variables that are not stored on disk
+lastloginstant   null
+initializelastinsertedpage 1
+lastunfilledpage   containerhandle invalid_page_number
+lastallocatedpage   containerhandle invalid_page_number
+estimatedpagecount    1
+preallocthreshold   pre_alloc_threshold
+preallocsize   default_pre_alloc_size
+bulkincreasecontainersize   false
+}
+/**
+read containerinfo from a byte array
+the container header array must be written by or of
+the same format as put together by writeheaderfromarray.
+@exception standardexception derby standard error policy
+@exception ioexception error in reading the header from file
+*/
+private void readheaderfromarray byte a
+throws standardexception  ioexception
+{
+arrayinputstream instream   new arrayinputstream a
+instream setlimit container_info_size
+int fid   instream readint
+if  fid    formatidinteger
+{
+throw standardexception newexception
+sqlstate data_unknown_container_format  getidentity
+new long fid
+}
+int status   instream readint
+pagesize   instream readint
+sparespace   instream readint
+minimumrecordsize   instream readint
+initialpages   instream readshort
+preallocsize   instream readshort
+firstallocpagenumber   instream readlong
+firstallocpageoffset   instream readlong
+containerversion   instream readlong
+estimatedrowcount   instream readlong
+reusablerecordidsequencenumber   instream readlong
+lastloginstant   null
+if  preallocsize    0 	   pre 2 0  we don't store this
+preallocsize   default_pre_alloc_size
+long spare3   instream readlong   	   read spare long
+// upgrade - if this is a container that was created before
+// initialpages was stored, it will have a zero value.  set it to the
+// default of 1.
+if  initialpages    0
+initialpages   1
+// container read in from disk, reset preallocation values
+preallocthreshold   pre_alloc_threshold
+// validate checksum
+long ondiskchecksum   instream readlong
+checksum reset
+checksum update a  0  container_info_size   checksum_size
+if  ondiskchecksum    checksum getvalue
+{
+pagekey pk   new pagekey identity  first_alloc_page_number
+throw datafactory markcorrupt
+standardexception newexception
+sqlstate file_bad_checksum
+pk
+new long checksum getvalue
+new long ondiskchecksum
+org apache derby iapi util stringutil hexdump a
+}
+alloccache reset
+// set the in memory state
+setdroppedstate  status   file_dropped     0
+setcommitteddropstate  status   file_committed_drop     0
+setreusablerecordidstate  status   file_reusable_recordid     0
+}
+/**
+write the container header to a page array (the first allocation page)
+@exception standardexception derby standard error policy
+@exception ioexception error in writing the header to file
+*/
+protected void writeheader byte pagedata
+throws standardexception  ioexception
+{
+// write out the current containerinfo in the borrowed space to byte
+// array containerinfo
+writeheadertoarray containerinfo
+allocpage writecontainerinfo containerinfo  pagedata  false
+}
+/**
+write the container header directly to file.
+subclasses that can writes the container header is expected to
+manufacture a dataoutput stream which is used here.
+<br> mt - single thread required - enforced by caller
+@exception standardexception derby standard error policy
+@exception ioexception error in writing the header to file
+*/
+protected void writeheader storagerandomaccessfile file
+boolean create  byte epage
+throws ioexception  standardexception
+{
+// write out the current containerinfo in the borrowed space to byte
+// array containerinfo
+writeheadertoarray containerinfo
+// resolve: get no wait on the page cache to see if allocation page is
+// there, if so, use that instead of making a new array and a static
+// function.
+allocpage writecontainerinfo containerinfo  epage  create
+// now epage has the containerinfo written inside it
+// force wal - and check to see if database is corrupt or is frozen.
+datafactory flush lastloginstant
+if  lastloginstant    null
+lastloginstant   null
+// write it out
+datafactory writeinprogress
+try
+{
+writeatoffset file  epage  first_alloc_page_offset
+}
+finally
+{
+datafactory writefinished
+}
+}
+/**
+* write a sequence of bytes at the given offset in a file. this method
+* is not thread safe, so the caller must make sure that no other thread
+* is performing operations that may change current position in the file.
+*
+* @param file the file to write to
+* @param bytes the bytes to write
+* @param offset the offset to start writing at
+* @throws ioexception if an i/o error occurs while writing
+*/
+void writeatoffset storagerandomaccessfile file  byte bytes  long offset
+throws ioexception
+{
+file seek offset
+file write bytes
+}
+/**
+get an embryonic page from the datainput stream.
+the embryonic page will be read
+in from the input stream (filedata), which is assumed to be
+positioned at the beginning of the first allocation page.
+@exception ioexception error in read the embryonic page from file
+*/
+protected byte getembryonicpage datainput filedata  throws ioexception
+{
+byte epage   new byte
+filedata readfully epage
+return epage
+}
+/**
+* read an embryonic page (that is, a section of the first alloc page that
+* is so large that we know all the borrowed space is included in it) from
+* the specified offset in a {@code storagerandomaccessfile}. this method
+* is not thread safe, so the caller must make sure that no other thread
+* is performing operations that may change current position in the file.
+*
+* @param file the file to read from
+* @param offset where to start reading (normally
+* {@code filecontainer.first_alloc_page_offset})
+* @return a byte array containing the embryonic page
+* @throws ioexception if an i/o error occurs while reading
+*/
+byte getembryonicpage storagerandomaccessfile file  long offset
+throws ioexception
+{
+file seek offset
+return getembryonicpage file
+}
+/**
+write containerinfo into a byte array
+the container header thus put together can be read by readheaderfromarray.
+@exception ioexception error in writing the header
+*/
+private void writeheadertoarray byte a  throws ioexception
+{
+if  sanitymanager debug
+sanitymanager assert a length >  container_info_size
+arrayoutputstream a_out   new arrayoutputstream a
+formatidoutputstream outstream   new formatidoutputstream a_out
+int status   0
+if  getdroppedstate    status    file_dropped
+if  getcommitteddropstate    status    file_committed_drop
+if  isreusablerecordid    status    file_reusable_recordid
+a_out setposition 0
+a_out setlimit container_info_size
+outstream writeint formatidinteger
+outstream writeint status
+outstream writeint pagesize
+outstream writeint sparespace
+outstream writeint minimumrecordsize
+outstream writeshort initialpages
+outstream writeshort preallocsize  		   write spare1
+outstream writelong firstallocpagenumber
+outstream writelong firstallocpageoffset
+outstream writelong containerversion
+outstream writelong estimatedrowcount
+outstream writelong reusablerecordidsequencenumber
+outstream writelong 0  		  write spare3
+checksum reset
+checksum update a  0  container_info_size   checksum_size
+// write the checksum to the array
+outstream writelong checksum getvalue
+a_out clearlimit
+}
+/**
+log all information on the container creation necessary to recreate the
+container during a load tran.
+@exception standardexception derby standard error policy
+*/
+protected bytearray logcreatecontainerinfo
+throws  standardexception
+{
+// just write out the whole container header
+byte array   new byte
+try
+{
+writeheadertoarray array
+}
+catch  ioexception ioe
+{
+throw standardexception newexception
+sqlstate data_unexpected_exception  ioe
+}
+return new bytearray array
+}
+/**
+set container properties from the passed in bytearray, which is created
+by logcreatecontainerinfo.  this information is used to recreate the
+container during recovery load tran.
+the following container properties are set:
+pagesize
+sparespace
+minimumrecordsize
+isreusablerecordid
+initialpages
+*/
+private void createinfofromlog bytearray bytearray
+throws standardexception
+{
+if  sanitymanager debug
+{
+sanitymanager assert bytearray    null
+sanitymanager assert bytearray getlength
+container_info_size
+}
+byte array   bytearray getarray
+// now extract the relavent information from array - basically
+// duplicate the code in readheaderfromarray
+arrayinputstream instream   new arrayinputstream array
+int status   0
+try
+{
+instream setlimit container_info_size
+int fid   instream readint
+if  fid    formatidinteger
+{
+// resolve: do something about this when we have > 1 container format
+throw standardexception newexception
+sqlstate data_unknown_container_format
+getidentity    new long fid
+}
+status   instream readint
+pagesize   instream readint
+sparespace   instream readint
+minimumrecordsize   instream readint
+initialpages   instream readshort
+}
+catch  ioexception ioe
+{
+throw standardexception newexception
+sqlstate data_unexpected_exception  ioe
+}
+// set reusable record id property
+setreusablerecordidstate  status   file_reusable_recordid     0
+// sanity check to make sure we are not encoutering any
+// dropped container
+if  sanitymanager debug
+{
+sanitymanager assert  status   file_dropped     0
+status   file_committed_drop     0
+}
+}
+/**
+set container properties from the passed in createargs.
+the following container properties are set:
+pagesize
+sparespace
+minimumrecordsize
+isreusablerecordid
+initialpages
+resolve - in the future setting parameters should be overridable
+by sub-class, e.g. one implementation of container may require a
+minimum page size of 4k.
+*/
+private void createinfofromprop properties createargs
+throws standardexception
+{
+// need a transactioncontroller to get database/service wide properties.
+accessfactory af    accessfactory
+monitor getservicemodule datafactory  accessfactory module
+// resolve: sku defectid 2014
+transactioncontroller tc
+af    null  ?
+
+af gettransaction
+contextservice getfactory   getcurrentcontextmanager
+pagesize
+propertyutil getserviceint tc  createargs
+property page_size_parameter
+limits db2_min_page_size
+limits db2_max_page_size
+rawstorefactory page_size_default
+// rather than throw error, just automatically set page size to
+// default if bad value given.
+if   pagesize    4096
+pagesize    8192
+pagesize    16384
+pagesize    32768
+{
+pagesize  rawstorefactory page_size_default
+}
+sparespace
+propertyutil getserviceint tc  createargs
+rawstorefactory page_reserved_space_parameter
+0  100  20
+preallocsize
+propertyutil getserviceint tc  createargs
+rawstorefactory pre_allocate_page
+min_pre_alloc_size
+max_pre_alloc_size
+default_pre_alloc_size    default
+// resolve - in the future, we will allow user to set minimumrecordsize
+// to be larger than pagesize, when long rows are supported.
+if  createargs    null
+// if the createargs is null, then the following method call
+// will get the system properties from the appropriete places.
+// we want to make sure minimumrecrodsize is set to at least
+// the default value minimum_record_size_default (12)
+// as set in rawstorefactory.
+minimumrecordsize
+propertyutil getserviceint tc
+rawstorefactory minimum_record_size_parameter
+rawstorefactory minimum_record_size_default     this is different from the next call
+// reserving 100 bytes for record/field headers
+pagesize    1   sparespace 100    100
+rawstorefactory minimum_record_size_default
+else
+// if the createargs is not null, then it has already been set
+// by upper layer or create statement, then, we allow the minimum
+// value of this to be minimum_record_size_minimum (1).
+minimumrecordsize
+propertyutil getserviceint tc  createargs
+rawstorefactory minimum_record_size_parameter
+rawstorefactory minimum_record_size_minimum      this is different from the last call
+// reserving 100 bytes for record/field headers
+pagesize    1   sparespace 100    100
+rawstorefactory minimum_record_size_default
+}
+// for the following properties, do not check value set in global
+// properties, we only listen to what access has to say about them.
+//
+// whether or not container's recordids can be reused
+// if container is to be created with a large number of pages
+if  createargs    null
+{
+string reusablerecordidparameter
+createargs getproperty rawstorefactory page_reusable_record_id
+if  reusablerecordidparameter    null
+{
+boolean reusablerecordid   new boolean reusablerecordidparameter
+setreusablerecordidstate reusablerecordid booleanvalue
+}
+string containerinitialpageparameter
+createargs getproperty rawstorefactory container_initial_pages
+if  containerinitialpageparameter    null
+{
+initialpages
+short parseshort containerinitialpageparameter
+if  initialpages > 1
+{
+if  initialpages > rawstorefactory max_container_initial_pages
+initialpages   rawstorefactory max_container_initial_pages
+}
+}
+}
+}
+/**
+*/
+protected boolean canupdate
+return canupdate
+}
+/**
+deallocate a page from the container.
+@param handle the container handle doing the deallocation
+@param page the page to be deallocated.  it is latched upon entry and
+will be unlatched by the caller of this function
+@exception standardexception derby standard error policy
+*/
+protected void deallocatepage basecontainerhandle handle  basepage page
+throws standardexception
+{
+if  sanitymanager debug
+sanitymanager assert page islatched
+sanitymanager assert page getpagenumber      first_alloc_page_number
+}
+long pnum   page getpagenumber
+// dealloc the page from the alloc page
+deallocatepagenum handle  pnum
+// mark the page as deallocated.  page should not be touched after this
+// the page latch is released by the basecontainer upon return of this
+// method.  regardless of whether this operation is successful or not,
+// the page will be unlatched by basecontainer.
+page deallocatepage
+}
+/** deallocate the page from the alloc page */
+private void deallocatepagenum basecontainerhandle handle  long pnum
+throws standardexception
+{
+synchronized alloccache
+{
+long allocpagenum   alloccache getallocpagenumber handle  pnum  firstallocpagenumber
+if  sanitymanager debug
+{
+if  allocpagenum    containerhandle invalid_page_number
+alloccache dumpallocationcache
+if  allocpagenum    containerhandle invalid_page_number
+sanitymanager throwassert
+pnum
+}
+// get the alloc page to deallocate this pnum
+allocpage allocpage    allocpage handle getallocpage allocpagenum
+if  allocpage    null
+{
+pagekey pkey   new pagekey identity  allocpagenum
+throw standardexception newexception
+sqlstate file_no_alloc_page  pkey
+}
+try
+{
+alloccache invalidate allocpage  allocpagenum
+// unlatch alloc page.  the page is protected by the dealloc
+// lock.
+allocpage deallocatepage handle  pnum
+}
+finally
+{
+allocpage unlatch
+}
+}
+// make sure this page gets looked at when someone needs a new page
+if  pnum <  lastallocatedpage
+{
+lastallocatedpage   pnum   1
+}
+}
+/**
+compress free space from container.
+<br> mt - thread aware - it is assumed that our caller (our super class)
+has already arranged a logical lock on page allocation to only allow a
+single thread through here.
+compressing free space is done in allocation page units, working
+it's way from the end of the container to the beginning.  each
+loop operates on the last allocation page in the container.
+freeing space in the container page involves 2 transactions, an
+update to an allocation page, n data pages, and possibly the delete
+of the allocation page.
+the user transaction (ut) initiated the compress call.
+the nested top transaction (ntt) is the transaction started by rawstore
+inside the compress call.  this ntt is committed before compress returns.
+the ntt is used to access high traffic data structures such as the
+allocpage.
+this is outline of the algorithm used in compressing the container.
+until a non free page is found loop, in each loop return to the os
+all space at the end of the container occupied by free pages, including
+the allocation page itself if all of it's pages are free.
+1) find last 2 allocation pages in container (last if there is only one).
+2) invalidate the allocation information cached by the container.
+without the cache no page can be gotten from the container.  pages
+already in the page cache are not affected.  thus by latching the
+allocpage and invalidating the allocation cache, this ntt blocks out
+all page gets from this container until it commits.
+3) the allocpage determines which pages can be released to the os,
+mark that in its data structure (the alloc extent).  mark the
+contiguous block of nallocated/free pages at the end of the file
+as unallocated.  this change is associated with the ntt.
+4) the ntt calls the os to deallocate the space from the file.  note
+that the system can handle being booted and asked to get an allocated
+page which is past end of file, it just extends the file automatically.
+5) if freeing all space on the alloc page, and there is more than one
+alloc page, then free the alloc page - this requires an update to the
+previous alloc page which the loop has kept latched also.
+6) if the last alloc page was deleted, restart loop at #1
+all ntt latches are released before this routine returns.
+if we use an ntt, the caller has to commit the ntt to release the
+allocpage latch.  if we don't use an ntt, the allocpage latch is released
+as this routine returns.
+@param ntt - the nested top transaction for the purpose of freeing space.
+if ntt is null, use the user transaction for allocation.
+#param allochandle - the container handle opened by the ntt,
+use this to latch the alloc page
+@exception standardexception standard derby error policy
+*/
+protected void compresscontainer
+rawtransaction      ntt
+basecontainerhandle allochandle
+throws standardexception
+{
+allocpage alloc_page        null
+allocpage prev_alloc_page   null
+if  firstallocpagenumber    containerhandle invalid_page_number
+{
+// no allocation pages in container, no work to do!
+return
+}
+// make sure we don't execute redo recovery on any page
+// which is getting truncated.  at this point we have an exclusive
+// table lock on the table, so after checkpoint no page change
+// can happen between checkpoint log record and compress of space.
+datafactory getrawstorefactory   checkpoint
+// block the backup, if backup is already in progress wait
+// for the backup to finish. otherwise restore from the backup
+// can start recovery at different checkpoint and possibly
+// do redo on pages that are going to get truncated.
+ntt blockbackup true
+try
+{
+synchronized alloccache
+{
+// loop until last 2 alloc pages are reached.
+alloc_page    allocpage
+allochandle getallocpage firstallocpagenumber
+while   alloc_page islast
+{
+if  prev_alloc_page    null
+{
+// there are more than 2 alloc pages, unlatch the
+// earliest one.
+prev_alloc_page unlatch
+}
+prev_alloc_page   alloc_page
+alloc_page        null
+long nextallocpagenumber
+prev_alloc_page getnextallocpagenumber
+long nextallocpageoffset
+prev_alloc_page getnextallocpageoffset
+alloc_page    allocpage
+allochandle getallocpage nextallocpagenumber
+}
+// invalidate cache before compress changes cached information,
+// while holding synchronization on cache and latch on
+// allocation page.  this should guarantee that only new info
+// is seen after this operation completes.
+alloccache invalidate
+// reset, as pages may not exist after compress
+lastunfilledpage      containerhandle invalid_page_number
+lastallocatedpage     containerhandle invalid_page_number
+alloc_page compress ntt  this
+}
+}
+finally
+{
+if  alloc_page    null
+{
+alloc_page unlatch
+alloc_page   null
+}
+if  prev_alloc_page    null
+{
+prev_alloc_page unlatch
+prev_alloc_page   null
+}
+// flush all changes to this file from cache.
+flushall
+// make sure all truncated pages are removed from the cache,
+// as it will get confused in the future if we allocate the same
+// page again, but find an existing copy of it in the cache -
+// it expects to not find new pages in the cache.  could just
+// get rid of truncated pages, iterface allows one page or
+// all pages.
+pagecache discard identity
+}
+}
+/**
+* get the reusable recordid sequence number for the container.
+* @see basecontainer#getreusablerecordidsequencenumber
+* @return reusable recordid sequence number for the container.
+*/
+public final long getreusablerecordidsequencenumber
+synchronized this
+return reusablerecordidsequencenumber
+}
+}
+/**
+* increment the reusable recordid version sequence number.
+*/
+protected final void incrementreusablerecordidsequencenumber
+{
+final boolean readonly   datafactory isreadonly
+synchronized  this
+reusablerecordidsequencenumber
+if   readonly
+{
+isdirty   true
+}
+}
+}
+/**
+create a new page in the container.
+<br> mt - thread aware - it is assumed that our caller (our super class)
+has already arranged a logical lock on page allocation to only allow a
+single thread through here.
+adding a new page involves 2 transactions and 2 pages.
+the user transaction (ut) initiated the addpage call and expects a
+latched page (owns by the ut) to be returned.
+the nested top transaction (ntt) is the transaction started by rawstore
+inside an addpage call.  this ntt is committed before the page is
+returned.  the ntt is used to accessed high traffic data structure such
+as the allocpage.
+this is outline of the algorithm used in adding a page:
+1) find or make an allocpage which can handle the addding of a new page.
+latch the allocpage with the ntt.
+2) invalidate the allocation information cached by the container.
+without the cache no page can be gotten from the container.  pages
+already in the page cache is not affected.  thus by latching the
+allocpage and invalidating the allocation cache, this ntt blocks out
+all page gets from this container until it commits.
+3) the allocpage determines which page can be allocated, mark that in its
+data structure (the alloc extent) and returns the page number of the
+new page.  this change is associated with the ntt.
+4) the ntt gets or creates the new page in the page cache (bypassing the
+lookup of the allocpage since that is already latched by the ntt and
+will deadlock).
+5) the ntt initializes the page (mark it is being a valid page).
+6) the page latch is transfered to the ut from the ntt.
+7) the new page is returned, latched by ut
+if we use an ntt, the caller has to commit the ntt to release the
+allocpage latch.  if we don't use an ntt, the allocpage latch is released
+as this routine returns.
+@param userhandle - the container handle opened by the user transaction,
+use this to latch the new user page
+@param ntt - the nested top transaction for the purpose of allocating the new page
+if ntt is null, use the user transaction for allocation.
+#param allochandle - the container handle opened by the ntt,
+use this to latch the alloc page
+@exception standardexception standard derby error policy
+*/
+protected basepage newpage basecontainerhandle userhandle
+rawtransaction ntt
+basecontainerhandle allochandle
+boolean isoverflow
+throws standardexception
+{
+// note: we are single threaded thru this method, see mt comment
+boolean usentt    ntt    null
+// if ntt is null, use user transaction
+if   usentt
+ntt   userhandle gettransaction
+long lastpage 			   last allocated page
+long lastpreallocpage 	   last pre allcated page
+long pagenumber 		   the page number of the new page
+pagekey pkey 			   the identity of the new page
+boolean reuse 			   if true  we are trying to reuse a page
+/* in case the page recommeded by allocpage is not committed yet, may
+/* need to retry a couple of times */
+boolean retry
+int numtries   0
+long startsearch   lastallocatedpage
+allocpage allocpage   null 	   the alloc page
+basepage page   null 	   the new page
+try
+{
+do
+{
+retry   false 		   we don't expect we need to retry
+synchronized alloccache
+{
+if  sanitymanager debug
+{
+sanitymanager assert
+ntt getid   equals
+allochandle gettransaction   getid
+if  usentt
+sanitymanager assert
+ntt getid   equals
+userhandle gettransaction   getid
+}
+/* find an allocation page that can handle adding a new
+* page.
+*
+* allocpage is unlatched when the ntt commits. the new
+* page is initialized by the ntt but the latch is
+* transfered to the user transaction before the allocpage
+* is unlatched.  the allocpage latch prevents almost any
+* other reader or writer from finding the new page until
+* the ntt is committed and the new page is latched by the
+* user transaction.
+*
+* (if the page is being reused, it is possible for another
+* xact which kept a handle on the reused page to find the
+* page during the transfer ut -> ntt. if this unlikely
+* even occurs and the transfer fails [see code relating
+* to transfer below], we retry from the beginning.)
+*
+* after the ntt commits a reader (getnextpagenumber) may
+* get the page number of the newly allocated page and it
+* will wait for the new page and latch it when the user
+* transaction commits, aborts or unlatches the new page.
+* whether the user transaction commits or aborts, the new
+* page stay allocated.
+*
+* resolve: before ntt rolls back (or commits) the latch is
+* released.  to repopulate the allocation cache, need to
+* get either the container lock on add page, or get a per
+* allocation page lock.
+*
+* this blocks all page read (getpage) from accessing this
+* alloc page in this container until the alloc page is
+* unlatched.  those who already have a page handle into
+* this container are unaffected.
+*
+* in other words, allocation blocks out reader (of any
+* page that is managed by this alloc page) by the latch
+* on the allocation page.
+*
+* note that write page can proceed as usual.
+*/
+allocpage
+findallocpageforadd allochandle  ntt  startsearch
+alloccache invalidate allocpage  allocpage getpagenumber
+}
+if  sanitymanager debug
+{
+if  allocpage    null
+alloccache dumpallocationcache
+sanitymanager assert allocpage    null
+}
+//
+// get the next free page's number.
+// for case 1, page number > lastpreallocpage
+// for case 2, page number <= lastpage
+// for case 3, lastpage < page number <= lastpreallocpage
+//
+pagenumber   allocpage nextfreepagenumber startsearch
+// need to distinguish between the following 3 cases:
+// 1) the page has not been allocate or initalized.
+//		create it in the page cache and sync it to disk.
+// 2) the page is being re-allocated.
+//		we need to read it in to re-initialize it
+// 3) the page has been preallocated.
+//		create it in the page cache and don't sync it to disk
+//
+// first find out the current last initialized page and
+// preallocated page before the new page is added
+lastpage           allocpage getlastpagenum
+lastpreallocpage   allocpage getlastpreallocpagenum
+reuse   pagenumber <  lastpage
+// no address translation necessary
+pkey   new pagekey identity  pagenumber
+if  reuse
+{
+// if re-useing a page, make sure the dealloclock on the new
+// page is not held.  we only need a zero duration lock on
+// the new page because the allocpage is latched and this
+// is the only thread which can be looking at this
+// pagenumber.
+recordhandle dealloclock   basepage makerecordhandle pkey
+recordhandle deallocate_protection_handle
+if   getdealloclock allochandle  dealloclock
+false    nowait
+true    zeroduration
+{
+// the transaction which deallocated this page has not
+// committed yet. try going to some other page.  if
+// this is the first time we fail to get the dealloc
+// lock, try from the beginning of the allocated page.
+// if we already did that and still fail, keep going
+// until we get a brand new page.
+if  numtries    0
+{
+startsearch   containerhandle invalid_page_number
+lastallocatedpage   pagenumber
+}
+else	   continue from where we were
+startsearch   pagenumber
+numtries
+// we have to unlatch the allocpage so that if that
+// transaction rolls back, it won't deadlock with this
+// transaction.
+allocpage unlatch
+allocpage   null
+retry   true
+}
+else
+{
+// we got the lock, next time start from there
+lastallocatedpage   pagenumber
+}
+}
+else
+{
+// we got a new page, next time, start from beginning of
+// the bit map again if we suspect there are some some
+// deallocated pages
+if  numtries > 0
+lastallocatedpage   containerhandle invalid_page_number
+else
+lastallocatedpage   pagenumber
+}
+// retry from the beginning if necessary.
+if  retry
+continue
+// if we get past here must have (retry == false)
+if  sanitymanager debug
+{
+sanitymanager assert retry    false
+}
+// now we have verified that the allocpage is latched and we
+// can get the zeroduration dealloclock nowait.  this means the
+// transaction which freed the page has committed.  had that
+// transaction aborted, we would have retried.
+if  sanitymanager debug
+{
+// assert lastpage <= lastpreallocpage
+if  lastpage > lastpreallocpage
+{
+sanitymanager throwassert
+lastpage
+lastpreallocpage
+}
+}
+// no i/o at all if this new page is requested as part of a
+// create and load statement or this new page is in a temporary
+// container.
+//
+// in the former case, basecontainer will allow the
+// mode_unlogged bit to go thru to the nested top transaction
+// alloc handle.  in the later case, there is no nested top
+// transaction and the alloc handle is the user handle, which
+// is unlogged.
+boolean noio
+allochandle getmode     containerhandle mode_unlogged
+containerhandle mode_unlogged
+// if we do not need the i/o (either because we are in a
+// create_unlogged mode or we are dealing with a temp table),
+// don't do any preallocation.  otherwise, see if we should be
+// pre-allocating page by now.  we don't call it before
+// nextfreepagenumber because finding a reusable page may be
+// expensive and we don't want to start preallocation unless
+// there is no more reusable page.  unless we are called
+// explicitly to bulk increase the container size in a preload
+// or in a create container.
+if   noio
+bulkincreasecontainersize
+pagenumber > lastpreallocpage
+pagenumber > preallocthreshold
+{
+allocpage preallocatepage
+this  preallocthreshold  preallocsize
+}
+// update last preallocated page, it may have been changed by
+// the preallocatepage call.  we don't want to do the sync if
+// preallocatepage already took care of it.
+lastpreallocpage   allocpage getlastpreallocpagenum
+boolean prealloced   pagenumber <  lastpreallocpage
+// argument to the create is an array of ints.
+// the array is only used for new page creation or for creating
+// a preallocated page, not for reuse.
+// 0'th element is the page format
+// 1'st element is whether or not to sync the page to disk
+// 2'nd element is pagesize
+// 3'rd element is sparespace
+pagecreationargs createpageargs   new pagecreationargs
+storedpage format_number
+prealloced ? 0    noio ? 0   cachedpage write_sync
+pagesize
+sparespace
+minimumrecordsize
+0    containerinfosize   unused for storedpage
+// resolve: right now, there is no re-mapping of pages, so
+// pageoffset = pagenumber*pagesize
+long pageoffset   pagenumber   pagesize
+// initialize a new user page
+// we first use the ntt to initialize the new page - in case the
+// allocation failed, it is rolled back with the ntt.
+// later, we transfer the latch to the userhandle so it won't be
+// released when the ntt commits
+try
+{
+page   initpage allochandle  pkey  createpageargs  pageoffset
+reuse  isoverflow
+}
+catch  standardexception se
+{
+if  sanitymanager debug
+sanitymanager debug_print
+reuse
+createpageargs syncflag
+allocpage
+}
+alloccache dumpallocationcache
+throw se
+}
+if  sanitymanager debug
+{
+sanitymanager assert
+page    null
+sanitymanager assert
+page islatched
+}
+// allocate the page in the allocation page bit map
+allocpage addpage this  pagenumber  ntt  userhandle
+if  usentt
+{
+// transfer the page latch from ntt to ut.
+//
+// after the page is unlatched by ntt, it is still
+// protected from being found by almost everybody else
+// because the alloc page is still latched and the alloc
+// cache is invalidated.
+//
+// however it is possible for the page to be
+// found by threads who specifically ask for this
+// pagenumber (e.g. heappostcommit).
+// we may find that such a thread has latched the page.
+// we shouldn't wait for it because we have the alloc page
+// latch, and this could cause deadlock (e.g.
+// heappostcommit might call removepage and this would wait
+// on the alloc page).
+//
+// we may instead find that we can latch the page, but that
+// another thread has managed to get hold of it during the
+// transfer and either deallocated it or otherwise change it
+// (add rows, delete rows etc.)
+//
+// since this doesn't happen very often, we retry in these
+// 2 cases (we give up the alloc page and page and we start
+// this method from scratch).
+//
+// if the lock manager were changed to allow latches to be
+// transferred between transactions, wouldn't need to
+// unlatch to do the transfer, and would avoid having to
+// retry in these cases (derby-2337).
+page unlatch
+page   null
+// need to find it in the cache again since unlatch also
+// unkept the page from the cache
+page    basepage pagecache find pkey
+page   latchpage
+userhandle  page
+false    don't wait  it might deadlock
+if  page    null
+// recordcount will only return true if there are no
+// rows (including deleted rows)
+page recordcount      0
+page getpagestatus      basepage valid_page
+{
+retry   true
+if  page    null
+{
+page unlatch
+page   null
+}
+allocpage unlatch
+allocpage   null
+}
+}
+// if ntt is null, no need to transfer.  page is latched by user
+// transaction already.  will be no need to retry.
+// the alloc page is unlatched in the finally block.
+}
+while  retry    true
+// at this point, should have a page suitable for returning
+if  sanitymanager debug
+sanitymanager assert page islatched
+}
+catch  standardexception se
+{
+if  page    null
+page unlatch
+page   null
+throw se 			   rethrow error
+}
+finally
+{
+if   usentt    allocpage    null
+{
+allocpage unlatch
+allocpage   null
+}
+// ntt is committed by the caller
+}
+if  sanitymanager debug
+sanitymanager assert page islatched
+// if bulkincreasecontainersize is set, that means this newpage call
+// may have greatly expanded the container size due to preallocation.
+// regardless of how many page it actually created, reset preallocsize
+// to the default so we won't attempt to always preallocate 1000 pages
+// at a time in the future.
+if  bulkincreasecontainersize
+{
+bulkincreasecontainersize   false
+preallocsize   default_pre_alloc_size
+}
+if   isoverflow    page    null
+setlastinsertedpage pagenumber
+// increase estimated page count - without any synchronization or
+// logging, this is an estimate only
+if  estimatedpagecount >  0
+estimatedpagecount
+if   this identity equals page getpageid   getcontainerid
+if  sanitymanager debug
+sanitymanager throwassert
+this identity
+page getpageid   getcontainerid
+userhandle
+allochandle
+this
+}
+throw standardexception newexception
+sqlstate data_different_container
+this identity  page getpageid   getcontainerid
+}
+return page 			   return the newly added page
+}
+protected void clearpreallocthreshold
+{
+// start life with preallocated page if possible
+preallocthreshold   0
+}
+protected void prepareforbulkload basecontainerhandle handle  int numpage
+{
+clearpreallocthreshold
+rawtransaction tran   handle gettransaction
+// find the last allocation page - do not invalidate the alloc cache,
+// we don't want to prevent other people from reading or writing
+// pages.
+allocpage allocpage   findlastallocpage handle  tran
+// preallocate numpages.  do whatever this allocpage can handle, if it
+// is full, too bad.  we don't guarentee that we will preallocate this
+// many pages, we only promise to try.
+if  allocpage    null
+{
+allocpage preallocatepage this  0  numpage
+allocpage unlatch
+}
+}
+private boolean pagevalid basecontainerhandle handle  long pagenum
+throws standardexception
+{
+boolean retval   false
+synchronized alloccache
+{
+if  pagenum <  alloccache getlastpagenumber handle  firstallocpagenumber
+alloccache getpagestatus handle  pagenum  firstallocpagenumber     allocextent allocated_page
+retval   true
+}
+return retval
+}
+protected long getlastpagenumber basecontainerhandle handle
+throws standardexception
+{
+long retval
+synchronized alloccache
+{
+// check if the first alloc page number is valid, it is invalid
+// if some one attempts to access the container info before the
+// first alloc page got created. one such case is online backup.
+// if first alloc page itself is invalid, then there are no pages
+// on the disk yet for this container, just return
+// containerhandle.invalid_page_number, caller can decide what to
+// do.
+if  firstallocpagenumber    containerhandle invalid_page_number
+{
+retval   containerhandle invalid_page_number
+}
+else
+{
+retval
+alloccache getlastpagenumber handle  firstallocpagenumber
+}
+}
+return retval
+}
+/*
+find or allocate an allocation page which can handle adding a new page.
+return a latched allocpage.
+<br> mt - single thread required - called as part of add page
+*/
+private allocpage findallocpageforadd basecontainerhandle allochandle
+rawtransaction ntt  long lastallocatedpage
+throws standardexception
+{
+allocpage allocpage   null
+allocpage oldallocpage   null     in case we need to walk the alloc page chain
+boolean success   false     set this for clean up
+try
+{
+if  firstallocpagenumber    containerhandle invalid_page_number
+{
+// make and return a latched new allocation page
+allocpage   makeallocpage ntt  allochandle  first_alloc_page_number
+first_alloc_page_offset  container_info_size
+if  sanitymanager debug
+{
+sanitymanager assert firstallocpagenumber    first_alloc_page_number
+sanitymanager assert firstallocpageoffset    first_alloc_page_offset
+}
+}
+else
+{
+// an allocation page already exist, go get it
+allocpage    allocpage allochandle getallocpage firstallocpagenumber
+}
+/* allocpage is latched by allochandle */
+if   allocpage canaddfreepage lastallocatedpage
+{
+// allocpage cannot manage the addition of one more page, walk the
+// alloc page chain till we find an allocpage that can
+// resolve: always start with the first page for now...
+boolean found   false     found an alloc page that can handle
+// adding a new page
+while allocpage islast      true
+{
+long nextallocpagenumber   allocpage getnextallocpagenumber
+long nextallocpageoffset   allocpage getnextallocpageoffset
+// resolve (future): chain this info to in memory structure so
+// getallocpage can find this alloc page
+allocpage unlatch
+allocpage   null
+// the nextallocpage is stable once set - even though it is
+// save to get the next page latch before releasing this
+// allocpage.
+allocpage    allocpage allochandle getallocpage nextallocpagenumber
+if  allocpage canaddfreepage lastallocatedpage
+{
+found   true
+break
+}
+}
+if   found
+{
+// allocpage is last and it is full
+oldallocpage   allocpage
+allocpage   null
+if  sanitymanager debug
+sanitymanager assert oldallocpage getlastpagenum
+oldallocpage getmaxpagenum
+long newallocpagenum   oldallocpage getmaxpagenum     1
+long newallocpageoffset   newallocpagenum     no translation
+allocpage   makeallocpage ntt  allochandle
+newallocpagenum
+newallocpageoffset
+0    no containerinfo
+// this writes out the new alloc page and return a latched page
+// nobody can find the new alloc page until oldallocpage is unlatched.
+// oldallocpage is no longer the last alloc page,
+// it has a pointer to the new last alloc page
+oldallocpage chainnewallocpage allochandle  newallocpagenum  newallocpageoffset
+oldallocpage unlatch
+oldallocpage   null
+}
+}
+/* no error handling necessary */
+success   true
+}
+finally					   unlatch allocation page if any error happened
+{
+if   success
+{
+if  oldallocpage    null
+oldallocpage unlatch
+if  allocpage    null
+allocpage unlatch
+allocpage   null
+}
+// if success drop out of finally block
+}
+return allocpage
+}
+/**
+find the last alloc page, returns null if no alloc page is found
+*/
+private allocpage findlastallocpage basecontainerhandle handle
+rawtransaction tran
+{
+allocpage allocpage   null
+allocpage oldallocpage   null
+if  firstallocpagenumber    containerhandle invalid_page_number
+return null
+try
+{
+allocpage    allocpage handle getallocpage firstallocpagenumber
+while  allocpage islast
+{
+long nextallocpagenumber   allocpage getnextallocpagenumber
+long nextallocpageoffset   allocpage getnextallocpageoffset
+allocpage unlatch
+allocpage   null
+allocpage    allocpage handle getallocpage nextallocpagenumber
+}
+}
+catch  standardexception se
+{
+if  allocpage    null
+allocpage unlatch
+allocpage   null
+}
+return allocpage
+}
+/*
+make a new alloc page, latch it with the passed in container handle.
+*/
+private allocpage makeallocpage rawtransaction ntt
+basecontainerhandle handle
+long pagenumber
+long pageoffset
+int containerinfosize
+throws standardexception
+{
+if  sanitymanager debug
+{
+if  containerinfosize    0
+containerinfosize    container_info_size
+sanitymanager throwassert
+container_info_size
+containerinfosize
+if  pagenumber    first_alloc_page_number
+containerinfosize    0
+sanitymanager throwassert
+containerinfosize
+}
+// argument to the create is an array of ints
+// 0'th element is the page format
+// 1'st element is whether or not to sync the page to disk
+// 2'nd element is the pagesize
+// 3'rd element is sparespace
+// 4'th element is number of bytes to reserve for the container header
+// 5'th element is the minimumrecordsize
+// note: the arg list here must match the one in allocpage
+// no i/o at all if this new page is requested as part of a create
+// and load statement or this new alloc page is in a temporary
+// container.
+// in the former case, basecontainer will allow the mode_unlogged
+// bit to go thru to the nested top transaction alloc handle.
+// in the later case, there is no nested top transaction and the
+// alloc handle is the user handle, which is unlogged.
+boolean noio    handle getmode     containerhandle mode_unlogged
+containerhandle mode_unlogged
+pagecreationargs createallocpageargs   new pagecreationargs
+allocpage format_number
+noio ? 0   cachedpage write_sync
+pagesize
+0            allocation page has no need for spare
+minimumrecordsize
+containerinfosize
+if  sanitymanager debug
+{
+if  sanitymanager debug_on space_trace
+{
+sanitymanager debug
+space_trace      pagenumber
+}
+}
+if  pagenumber    first_alloc_page_number
+{
+// resolve: make sure the following is true
+//
+// firstallocpagenumber and offset can be set and access without
+// synchronization since the first allocation page is
+// created as part of the container create, this value is set
+// before any other transaction has a chance to open the container.
+// once set, the first allocation page does not move or change
+// position
+firstallocpagenumber   pagenumber
+firstallocpageoffset   pageoffset
+}
+pagekey pkey   new pagekey identity  pagenumber
+// return a latched new alloc page
+return  allocpage initpage handle  pkey  createallocpageargs
+pageoffset
+false     not reuse
+false    not overflow
+}
+/**
+initialize a page
+@return a latched page that has been initialized.
+@param allochandle the contianer handle to initialize the page with - the ntt
+@param pkey the page number of the page to be initialized
+@param createargs the arguments for page creation
+@param reuse is true if we are reusing a page that has
+already been initialized once
+@exception standardexception derby standard error policy
+*/
+protected basepage initpage basecontainerhandle allochandle
+pagekey pkey
+pagecreationargs createargs
+long pageoffset
+boolean reuse
+boolean overflow  throws standardexception
+{
+basepage page   null
+boolean releasepage   true
+try
+{
+if  reuse 				    read the page in first
+{
+// cannot go thru the container handle because all read pages are blocked.
+// do it underneath the handle and directly to the cache.
+// nobody can get thru becuase getpage will block at getting the alloc page.
+if  sanitymanager debug
+{
+if  sanitymanager debug_on space_trace
+{
+sanitymanager debug
+space_trace      pkey
+}
+}
+page    basepage pagecache find pkey
+if  page    null 	   hmmm?
+{
+throw standardexception newexception
+sqlstate file_reuse_page_not_found  pkey
+}
+}
+else
+{
+if  sanitymanager debug
+{
+if  sanitymanager debug_on space_trace
+{
+sanitymanager debug
+space_trace      pkey
+}
+}
+// a brand new page, initialize and a new page in cache
+page    basepage  pagecache create pkey  createargs
+if  sanitymanager debug
+sanitymanager assert page    null
+}
+releasepage   false
+page   latchpage allochandle  page  true    may need to wait  track3822
+if  page    null
+{
+throw standardexception newexception
+sqlstate file_new_page_not_latched  pkey
+}
+// page is either brand new or is read from disk, in either case,
+// it knows how to get itself initialized.
+int initpageflag   0
+if  reuse  initpageflag    basepage init_page_reuse
+if  overflow  initpageflag    basepage init_page_overflow
+if  reuse    isreusablerecordid
+initpageflag    basepage init_page_reuse_recordid
+page initpage initpageflag  pageoffset
+page setcontainerrowcount estimatedrowcount
+}
+finally
+{
+if  releasepage    page    null
+{
+// release the new page from cache if it errors
+// out before the exclusive lock is set
+pagecache release  cacheable page
+page   null
+}
+}
+return page
+}
+/**
+get a page in the container.
+get user page is the generic base routine for all user (client to raw
+store) getpage.  this routine coordinate with allocation/deallocation
+to ensure that no page can be gotten from the container while page is
+in the middle of being allocated or deallocated.
+this routine latches the page.
+@param handle the container handle
+@param pagenumber the page number of the page to get
+@param overflowok if true then an overflow page is ok,
+if false, then only non-overflow page is ok
+@param wait if true then wait for a latch
+@return the latched page
+<br> mt - thread safe
+@exception standardexception standard derby error policy
+*/
+private basepage getuserpage basecontainerhandle handle  long pagenumber
+boolean overflowok  boolean wait
+throws standardexception
+{
+if  sanitymanager debug
+{
+sanitymanager assert
+pagenumber    first_alloc_page_number
+pagenumber
+if  pagenumber < containerhandle first_page_number
+sanitymanager throwassert     pagenumber
+}
+if  pagenumber < containerhandle first_page_number
+return null
+if  getcommitteddropstate       committed and dropped  cannot get a page
+return null
+if   pagevalid handle  pagenumber
+{
+return null
+}
+// resolve: no translation!
+pagekey pagesearch   new pagekey identity  pagenumber
+basepage page    basepage pagecache find pagesearch
+if  page    null
+{
+return page
+}
+// latch the page
+if  latchpage handle page wait     null
+{
+// page was already released from cache
+return null
+}
+// double check for overflow and deallocated page
+// a page that was valid before maybe invalid by now if it was
+// deallocated in the interum.
+// a page that is invalid can also become valid in the interim, but
+// we do not handle that.  the client must supply other locking
+// mechanism to prevent that (an allocatino happenning where there are
+// readers) if that is needed
+if   page isoverflowpage       overflowok
+page getpagestatus      basepage valid_page
+{
+// unlatch releases page from cache, see storedpage.releaseexclusive()
+page unlatch
+page   null
+}
+return page
+}
+protected void trackunfilledpage long pagenumber  boolean unfilled
+{
+if   datafactory isreadonly
+alloccache trackunfilledpage pagenumber  unfilled
+}
+/**
+get a valid (non-deallocated or free) page in the container.
+overflow page is ok. resulting page is latched.
+<br> mt - thread safe
+@exception standardexception standard derby error policy
+*/
+protected basepage getpage basecontainerhandle handle  long pagenumber
+boolean wait
+throws standardexception
+{
+return getuserpage handle  pagenumber  true    overflow page ok
+wait
+}
+/**
+get any old page - turn off all validation
+@exception standardexception derby standard error policy
+*/
+protected basepage getanypage basecontainerhandle handle  long pagenumber  throws standardexception
+{
+// get allocpage get a page without any validation (exception a
+// committed dropped container)
+if  getcommitteddropstate       committed and dropped  cannot get a page
+return null
+// make sure alloc cache has no stale info
+synchronized alloccache
+{
+alloccache invalidate
+}
+pagekey pagesearch   new pagekey identity  pagenumber
+basepage page    basepage  pagecache find pagesearch
+return page
+}
+/**
+* recreate a page for rollforward recovery.
+* <p>
+* during redo recovery it is possible for the system to try to redo
+* the creation of a page (ie. going from non-existence to version 0).
+* it first trys to read the page from disk, but a few different types
+* of errors can occur:
+*     o the page does not exist at all on disk, this can happen during
+*       rollforward recovery applied to a backup where the file was
+*       copied and the page was added to the file during the time frame
+*       of the backup but after the physical file was copied.
+*     o space in the file exists, but it was never initalized.  this
+*       can happen if you happen to crash at just the right moment during
+*       the allocation process.  also
+*       on some os's it is possible to read from a part of the file that
+*       was not ever written - resulting in garbage from the store's
+*       point of view (often the result is all 0's).
+*
+* all these errors are easy to recover from as the system can easily
+* create a version 0 from scratch and write it to disk.
+*
+* because the system does not sync allocation of data pages, it is also
+* possible at this point that whlie writing the version 0 to disk to
+* create it we may encounter an out of disk space error (caught in this
+* routine as a standardexception from the create() call.  we can't
+* recovery from this without help from outside, so the caught exception
+* is nested and a new exception thrown which the recovery system will
+* output to the user asking them to check their disk for space/errors.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected basepage recreatepageforredorecovery
+basecontainerhandle handle
+int                 pageformat
+long                pagenumber
+long                pageoffset
+throws standardexception
+{
+// recreating a page should be done only if are in the middle of
+// rollforward recovery or if derby.storage.patchinitpagerecovererror
+// is set to true.
+//check if we are in rollforward recovery
+boolean rollforwardrecovery
+rawtransaction handle gettransaction    inrollforwardrecovery
+if   rollforwardrecovery      propertyutil getsystemboolean
+rawstorefactory patch_initpage_recover_error
+{
+return null
+}
+// resolve: first need to verify that the page is really not in the
+// container!
+// no address translation necessary
+pagekey pkey   new pagekey identity  pagenumber
+pagecreationargs recreatepageargs
+if  pageformat    storedpage format_number
+{
+recreatepageargs   new pagecreationargs
+pageformat
+cachedpage write_sync
+pagesize
+sparespace
+minimumrecordsize
+0    containerinfosize   unused for storedpage
+}
+else if  pageformat    allocpage format_number
+{
+// only the first allocation page have borrowed space for the
+// container info
+int containerinfosize   0
+if  pagenumber    first_alloc_page_number
+{
+containerinfosize   container_info_size
+firstallocpagenumber   pagenumber
+firstallocpageoffset   pageoffset
+}
+recreatepageargs   new pagecreationargs
+pageformat
+cachedpage write_sync
+pagesize
+0     allocation page has no need for spare
+minimumrecordsize
+containerinfosize
+}
+else
+{
+throw standardexception newexception
+sqlstate data_unknown_page_format  pkey
+}
+if  sanitymanager debug
+{
+if  sanitymanager debug_on
+sanitymanager debug_print
+pkey
+}
+// can't just call initpage because that wants to log an initpage
+// operation, whereas we are here because of an initpage operation in
+// the log already.
+basepage page   null
+boolean releasepage   true
+try
+{
+try
+{
+// a brand new page, initialize a new page in cache
+page    basepage  pagecache create pkey  recreatepageargs
+}
+catch  standardexception se
+{
+throw standardexception newexception
+sqlstate file_new_page_during_recovery  se  pkey
+}
+if  page    null
+{
+releasepage   false
+page   latchpage handle  page  false    never need to wait
+if  page    null
+{
+throw standardexception newexception
+sqlstate file_new_page_not_latched  pkey
+}
+}
+else
+{
+throw standardexception newexception
+sqlstate file_new_page_during_recovery  pkey
+}
+}
+finally
+{
+if  releasepage    page    null
+{
+// release the new page from cache if it errors out before
+// the exclusive lock is set error in roll forward recovery.
+// , we are doomed anyway
+pagecache release  cacheable page
+page   null
+}
+}
+return page
+}
+/**
+get an alloc page - only accessible to the raw store
+(container and recovery)
+@exception standardexception derby standard error policy
+*/
+protected basepage getallocpage long pagenumber  throws standardexception
+{
+if  getcommitteddropstate       committed and dropped  cannot get a page
+return null
+pagekey pagesearch   new pagekey identity  pagenumber
+basepage page    basepage  pagecache find pagesearch
+if  sanitymanager debug
+{
+if  page    null
+sanitymanager throwassert
+getidentity     pagenumber
+if      page instanceof allocpage
+sanitymanager throwassert
+getidentity     pagenumber
+}
+// assuming that allocation page lives in the page cache...
+return page
+}
+/**
+get only a valid, non-overflow page.  if page number is either invalid
+or overflow, returns null
+@exception standardexception derby standard error policy
+*/
+protected basepage getheadpage basecontainerhandle handle  long pagenumber
+boolean wait
+throws standardexception
+{
+return getuserpage handle  pagenumber  false    overflow not ok
+wait
+}
+/**
+get the first valid page in the container
+@exception standardexception derby standard error policy
+*/
+protected basepage getfirstheadpage basecontainerhandle handle  boolean wait
+throws standardexception
+{
+return getnextheadpage handle  containerhandle first_page_number 1  wait
+}
+/**
+get the next page in the container.
+@exception standardexception standard derby error policy
+*/
+protected basepage getnextheadpage basecontainerhandle handle
+long pagenumber  boolean wait
+throws standardexception
+{
+long nextnumber
+while true
+{
+synchronized alloccache
+{
+// ask the cache for the next pagenumber
+nextnumber   alloccache getnextvalidpage handle  pagenumber  firstallocpagenumber
+}
+if  nextnumber    containerhandle invalid_page_number
+return null
+// optimistically go for the next page
+basepage p   getuserpage handle  nextnumber
+false    no overflow page    wait
+if  p    null
+return p
+pagenumber   nextnumber
+}
+}
+private basepage getinsertablepage basecontainerhandle handle
+long pagenumber
+boolean wait
+boolean overflowok
+throws standardexception
+{
+if  pagenumber    containerhandle invalid_page_number
+return null
+basepage p   getuserpage handle  pagenumber  overflowok  wait
+if  p    null
+{
+// make sure the page is not too full
+if   p allowinsert
+{
+p unlatch
+p   null
+// it is too full, make sure we are tracking it so we won't
+// see it again.
+alloccache.trackunfilledpage(pagenumber, false);
+}
+}
+/*
+resolve track 3757
+need to check if this fix resolves the bug.
+this is commented out because we can't conclude here that this is not
+a user page, it may just be that we failed to get a latch on the page.
+in a high contention scenario this could cause alot of relatively empty
+pages to not be considered for insert.
+todo
+may be a good idea to move the trackunfilledpage call below to some of
+the lines in the getuserpage method.
+else
+{
+// it is not a user page, make sure we are tracking its fillness so
+// we won't consider it as a 1/2 filled page ever
+alloccache.trackunfilledpage(pagenumber, false);
+}
+*/
+return p
+}
+/**
+* get candidate page to move a row for compressing the table.
+* <p>
+* the caller is moving rows from the end of the table toward the beginning,
+* with the goal of freeing up a block of empty pages at the end of the
+* container which can be returned to the os.
+* <p>
+* on entry pageno will be latched by the caller.  only return pages with
+* numbers below pageno.  attempting to return pageno will result in a
+* latch/latch deadlock on the same thread.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected basepage getpageforcompress
+basecontainerhandle handle
+int                 flag
+long                pageno
+throws standardexception
+{
+basepage p   null
+boolean getlastinserted
+flag   containerhandle get_page_unfilled     0
+if  getlastinserted
+{
+// there is nothing protecting lastinsertepage from being changed
+// by another thread.  make a local copy.
+long locallastinsertedpage   getlastinsertedpage
+if   locallastinsertedpage < pageno
+locallastinsertedpage    containerhandle invalid_page_number
+{
+// first try getting last inserted page.
+p   getinsertablepage
+handle
+locallastinsertedpage
+true     wait
+false    no overflow page
+// if locallastinsertedpage is not an insertable page,
+// don't waste time getting it again.
+if  p    null
+{
+// there is a slight possibility that lastunfilledpage and
+// lastinsertedpage will change between the if and the
+// assignment.  the worse that will happen is we lose the
+// optimization.  don't want to slow down allocation by
+// adding more synchronization.
+if  locallastinsertedpage    getlastunfilledpage
+setlastunfilledpage
+containerhandle invalid_page_number
+if  locallastinsertedpage    getlastinsertedpage
+setlastinsertedpage
+containerhandle invalid_page_number
+}
+}
+}
+else
+{
+// get a relatively unfilled page that is not the last inserted page
+long locallastunfilledpage   getlastunfilledpage
+if  locallastunfilledpage    containerhandle invalid_page_number
+locallastunfilledpage >  pageno
+locallastunfilledpage    getlastinsertedpage
+{
+// get an unfilled page, searching from beginning of container.
+locallastunfilledpage
+getunfilledpagenumber handle  0
+}
+if   locallastunfilledpage
+containerhandle invalid_page_number
+locallastunfilledpage < pageno
+{
+p   getinsertablepage
+handle  locallastunfilledpage  true  false
+}
+// return this page for insert
+if  p    null
+{
+setlastunfilledpage locallastunfilledpage
+setlastinsertedpage locallastunfilledpage
+}
+}
+return p
+}
+/**
+get a potentially suitable page for insert and latch it.
+@exception standardexception standard derby error policy
+*/
+protected basepage getpageforinsert basecontainerhandle handle
+int flag
+throws standardexception
+{
+basepage p   null
+boolean getlastinserted    flag   containerhandle get_page_unfilled     0
+if  getlastinserted
+{
+// there is nothing protecting lastinsertepage from being changed
+// by another thread.  make a local copy.
+long locallastinsertedpage   getlastinsertedpage
+if  locallastinsertedpage    containerhandle invalid_page_number
+{
+// first try getting last allocated page, nowait
+p   getinsertablepage handle  locallastinsertedpage
+false     wait
+false    no overflow page
+if  p    null
+{
+// most likely we could not get the latch nowait, try again
+// with a new page, and tell the system to switch to
+// multi-page mode.
+/* switchtomultiinsertpagemode(handle); */
+locallastinsertedpage   getlastinsertedpage
+p   getinsertablepage handle  locallastinsertedpage
+true     wait
+false    no overflow page
+}
+}
+// if lastunfilledpage is not an insertable page, don't waste time
+// getting it again.
+if  p    null
+{
+// there is a slight possibility that lastunfilledpage and
+// lastinsertedpage will change between the if and the
+// assignment.  the worse that will happen is we lose the
+// optimization.  don't want to slow down allocation by adding
+// more synchronization.
+if  locallastinsertedpage    getlastunfilledpage
+setlastunfilledpage containerhandle invalid_page_number
+if  locallastinsertedpage    getlastinsertedpage
+setlastinsertedpage containerhandle invalid_page_number
+}
+}
+else					   get a relatively unfilled page that is not
+the last inserted page
+long locallastunfilledpage   getlastunfilledpage
+if  locallastunfilledpage    containerhandle invalid_page_number
+locallastunfilledpage    getlastinsertedpage
+locallastunfilledpage   getunfilledpagenumber handle  locallastunfilledpage
+if  locallastunfilledpage    containerhandle invalid_page_number
+{
+// try the last unfilled page we found - this could be
+// different from lastinserted if the last unfilled one we
+// found does not have enough space for the insert and the
+// client wants to get a brand new page.
+p   getinsertablepage handle  locallastunfilledpage  true  false
+// try again
+if  p    null
+{
+locallastunfilledpage   getunfilledpagenumber handle  locallastunfilledpage
+if  locallastunfilledpage    containerhandle invalid_page_number
+{
+p   getinsertablepage handle  locallastunfilledpage  true
+false
+}
+}
+}
+// return this page for insert
+if  p    null
+{
+setlastunfilledpage locallastunfilledpage
+setlastinsertedpage locallastunfilledpage
+}
+}
+return p
+}
+/**
+*  get a latched page. incase of backup page latch is necessary to
+*  prevent modification to the page when it is being written to the backup.
+*  backup process relies on latches to get consistent snap
+*  shot of the page , user level table/page/row locks are not
+*  acquired  by the online backup mechanism.
+*
+*  @param handle the container handle used to latch the page
+*  @param pagenumber the page number of the page to get
+*  @return the latched page
+*	@exception standardexception standard derby error policy
+*/
+protected basepage getlatchedpage basecontainerhandle handle
+long pagenumber
+throws standardexception
+{
+pagekey pagekey   new pagekey identity  pagenumber
+basepage page    basepage  pagecache find pagekey
+if  sanitymanager debug
+sanitymanager assert page    null      pagekey
+}
+// latch the page
+page   latchpage handle  page  true
+if  sanitymanager debug
+sanitymanager assert page islatched        pagekey
+}
+return page
+}
+private long getunfilledpagenumber basecontainerhandle handle  long pagenum
+throws standardexception
+{
+synchronized alloccache
+{
+return alloccache
+getunfilledpagenumber handle  firstallocpagenumber  pagenum
+}
+}
+/*
+cost estimates
+*/
+/**
+<br>mt - this routine is not mt-safe and clients don't need to provide
+synchronization.
+@see containerhandle#getestimatedrowcount
+*/
+public long getestimatedrowcount int flag
+{
+return estimatedrowcount
+}
+/**
+@see containerhandle#setestimatedrowcount
+*/
+public void setestimatedrowcount long count  int flag
+{
+boolean readonly   datafactory isreadonly
+synchronized this
+{
+estimatedrowcount   count
+if   readonly
+isdirty   true
+}
+}
+/**
+update estimated row count by page as it leaves the cache.
+the estimated row count is updated without logging!
+*/
+protected void updateestimatedrowcount int delta
+{
+boolean readonly   datafactory isreadonly
+synchronized this
+{
+estimatedrowcount    delta
+if  estimatedrowcount < 0
+estimatedrowcount   0
+// mark the container as dirty without bumping the container
+// version because row count changes are not logged.
+if   readonly
+isdirty   true
+}
+}
+/**
+@see containerhandle#getestimatedpagecount
+@exception standardexception standard derby error policy
+*/
+public long getestimatedpagecount basecontainerhandle handle  int flag
+throws standardexception
+{
+// page count is set once per container materialization in cache
+if  estimatedpagecount < 0
+{
+synchronized alloccache
+{
+estimatedpagecount
+alloccache getestimatedpagecount handle  firstallocpagenumber
+}
+}
+if  sanitymanager debug
+sanitymanager assert estimatedpagecount >  0
+return estimatedpagecount
+}
+/*
+** methods used solely by storedpage
+*/
+/**
+read a page into the supplied array.
+<br> mt - thread safe
+@exception ioexception error reading page
+@exception standardexception standard derby error message
+*/
+protected abstract void readpage long pagenumber  byte pagedata
+throws ioexception  standardexception
+/**
+write a page from the supplied array.
+<br> mt - thread safe
+@exception ioexception error writing page
+@exception standardexception standard derby error policy
+*/
+protected abstract void writepage long pagenumber  byte pagedata  boolean syncpage
+throws ioexception  standardexception
+/*
+* encryption/decryption
+*/
+/**
+decrypts a page
+<br>mt - mt safe.
+@exception standardexception standard derby error policy
+*/
+protected void decryptpage byte pagedata  int pagesize
+throws standardexception
+{
+// because all our page header looks identical, the
+// checksum is moved to the front so that it will hopefully
+// encrypt differently from page to page
+synchronized this
+{
+if  encryptionbuffer    null    encryptionbuffer length < pagesize
+encryptionbuffer   new byte
+int len   datafactory decrypt pagedata  0  pagesize
+encryptionbuffer  0
+if  sanitymanager debug
+sanitymanager assert len    pagesize
+// put the checksum where it belongs
+system arraycopy encryptionbuffer  8  pagedata  0  pagesize 8
+system arraycopy encryptionbuffer  0  pagedata  pagesize 8  8
+}
+}
+/**
+encrypts a page.
+<br> mt - not safe, call within synchronized block and only use the
+returned byte array withing synchronized block.
+@exception standardexception standard derby error policy
+*/
+protected byte encryptpage byte pagedata
+int pagesize
+byte encryptionbuffer
+boolean newengine
+throws standardexception
+{
+// because all our page header looks identical, move the
+// checksum to the front so that it will hopefully encrypt
+// differently from page to page
+system arraycopy pagedata  pagesize 8  encryptionbuffer  0  8
+system arraycopy pagedata  0  encryptionbuffer  8  pagesize 8
+int len   datafactory encrypt encryptionbuffer  0  pagesize
+encryptionbuffer  0  newengine
+if  sanitymanager debug
+sanitymanager assert len    pagesize
+return encryptionbuffer
+}
+/**
+* get encryption buffer.
+*  mt - not safe, call within synchronized block and only use the
+*  returned byte array withing synchronized block.
+* @return byte array to be used for encryping a page.
+*/
+protected byte getencryptionbuffer
+if  encryptionbuffer    null    encryptionbuffer length < pagesize
+encryptionbuffer   new byte
+return encryptionbuffer
+}
+/*
+* page preallocation
+*/
+/**
+preallocate writes out the preallocated pages to disk if necessary.
+<br>make sure the container is large enough and the
+pages are well formatted.  the only reason to do this is to save some
+i/o during page initialization.  once the initpage log record is
+written, it is expected that the page really do exist and is well
+formed or recovery will fail.  however, we can gain some performance by
+writing a bunch of pages at a time rather than one at a time.
+<br>if it doesn't make sense for the the implementation to have
+pre-allocation, just return 0.
+<br>if the container is not being logged, don't actually do anything,
+just return 0.
+@return number of successfully preallocated page, or 0 if
+no page has been preallocated
+@param lastpreallocpagenum the last preallocated page number as known
+by the allocation page
+@param preallocsize try to preallocate this page number of pages.
+since only the container knows how many pages are actually on
+disk, it may determine that certain number of pages that the
+allocation page thinks need to be preallocated is already
+allocated, in those case, act as if the preallocation is
+successful.
+*/
+protected abstract int preallocate long lastpreallocpagenum  int preallocsize
+/**
+preallocate the pages - actually doing it, called by subclass only
+*/
+protected int dopreallocatepages long lastpreallocpagenum
+int preallocsize
+{
+if  sanitymanager debug
+sanitymanager assert  datafactory isreadonly
+// initialize and a new page in cache
+pagecreationargs createargs   new pagecreationargs
+storedpage format_number     default is a stored page
+cachedpage write_no_sync     write it but no sync
+pagesize
+sparespace
+minimumrecordsize
+0    containerinfosize   unused for storedpage
+storedpage page   new storedpage
+page setfactory datafactory
+boolean error   false
+int count   0
+while count < preallocsize
+{
+pagekey pkey   new pagekey identity
+lastpreallocpagenum count 1
+try
+{
+// create identity will do a writepage
+page createidentity pkey  createargs
+// if create identity somehow failed to do a write page
+if  sanitymanager debug
+sanitymanager assert  page isdirty
+page clearidentity       ready the page for the next loop
+}
+catch  standardexception se
+{
+// if something went wrong, stop and return how many we did
+// successfully
+error   true
+}
+if  error
+break
+count
+}
+return count
+}
+protected int getpagesize
+return pagesize
+}
+protected int getsparespace
+return sparespace
+}
+protected int getminimumrecordsize
+return minimumrecordsize
+}
+private synchronized void switchtomultiinsertpagemode
+basecontainerhandle handle
+throws standardexception
+{
+if  lastinsertedpage length    1
+{
+long last   lastinsertedpage
+lastinsertedpage   new long
+lastinsertedpage   last
+for  int i   3  i > 0  i
+{
+page page   addpage handle  false
+lastinsertedpage   page getpagenumber
+page unlatch
+}
+}
+}
+/*
+* setting and getting lastinserted page and lastunfilledpage in a thead
+* safe manner.
+*/
+private synchronized long getlastinsertedpage
+{
+if  lastinsertedpage length    1
+{
+if  sanitymanager debug
+sanitymanager assert lastinsertedpage_index    0
+// optimize the usual case where no concurrent insert has kicked us
+// into multi-page mode - ie. only one last page.
+return lastinsertedpage
+}
+else
+{
+long ret   lastinsertedpage
+if  lastinsertedpage_index >  lastinsertedpage length   1
+{
+lastinsertedpage_index   0
+}
+return ret
+}
+}
+private synchronized long getlastunfilledpage
+{
+return lastunfilledpage
+}
+private synchronized void initializelastinsertedpage int size
+{
+lastinsertedpage   new long
+for  int i   lastinsertedpage length   1  i >  0  i
+lastinsertedpage   containerhandle invalid_page_number
+lastinsertedpage_index   0
+}
+private synchronized void setlastinsertedpage long val
+{
+lastinsertedpage   val
+}
+private synchronized void setlastunfilledpage long val
+{
+lastunfilledpage   val
+}
+/*
+** hide our super-classes methods to ensure that cache management
+** is correct when the container is obtained and release.
+*/
+/**
+the container is kept by the find() in file.opencontainer.
+*/
+protected void letgo basecontainerhandle handle
+super letgo handle
+containercache release this
+}
+protected basepage latchpage basecontainerhandle handle  basepage foundpage  boolean wait
+throws standardexception
+if  foundpage    null
+return null
+basepage ret   super latchpage handle  foundpage  wait
+if  ret    null
+// page is still cached
+pagecache release  cacheable  foundpage
+}
+return ret
+}
+/**
+* backup the container.
+*
+* @param handle the container handle.
+* @param backuplocation location of the backup container.
+* @exception standardexception standard derby error policy
+*/
+protected abstract void backupcontainer basecontainerhandle handle
+string backuplocation
+throws standardexception
+}

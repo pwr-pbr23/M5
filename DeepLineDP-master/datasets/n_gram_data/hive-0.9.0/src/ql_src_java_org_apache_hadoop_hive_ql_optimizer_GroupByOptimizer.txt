@@ -1,0 +1,240 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.you may obtain a copy of the license at
+*
+* http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql optimizer
+import java io serializable
+import java util arraylist
+import java util linkedhashmap
+import java util linkedlist
+import java util list
+import java util map
+import java util set
+import java util stack
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop hive ql exec functionregistry
+import org apache hadoop hive ql exec groupbyoperator
+import org apache hadoop hive ql exec operator
+import org apache hadoop hive ql exec tablescanoperator
+import org apache hadoop hive ql exec utilities
+import org apache hadoop hive ql lib defaultgraphwalker
+import org apache hadoop hive ql lib defaultruledispatcher
+import org apache hadoop hive ql lib dispatcher
+import org apache hadoop hive ql lib graphwalker
+import org apache hadoop hive ql lib node
+import org apache hadoop hive ql lib nodeprocessor
+import org apache hadoop hive ql lib nodeprocessorctx
+import org apache hadoop hive ql lib rule
+import org apache hadoop hive ql lib ruleregexp
+import org apache hadoop hive ql metadata hiveexception
+import org apache hadoop hive ql metadata partition
+import org apache hadoop hive ql metadata table
+import org apache hadoop hive ql optimizer ppr partitionpruner
+import org apache hadoop hive ql parse parsecontext
+import org apache hadoop hive ql parse prunedpartitionlist
+import org apache hadoop hive ql parse semanticexception
+import org apache hadoop hive ql plan exprnodecolumndesc
+import org apache hadoop hive ql plan exprnodeconstantdesc
+import org apache hadoop hive ql plan exprnodedesc
+import org apache hadoop hive ql plan exprnodefielddesc
+import org apache hadoop hive ql plan exprnodegenericfuncdesc
+import org apache hadoop hive ql plan exprnodenulldesc
+import org apache hadoop hive ql plan groupbydesc
+import org apache hadoop hive ql udf generic genericudf
+/**
+*this transformation does bucket group by optimization.
+*/
+public class groupbyoptimizer implements transform
+private static final log log   logfactory getlog groupbyoptimizer class
+getname
+public groupbyoptimizer
+@override
+public parsecontext transform parsecontext pctx  throws semanticexception
+map<rule  nodeprocessor> oprules   new linkedhashmap<rule  nodeprocessor>
+groupbyoptprocctx groupbyoptimizectx   new groupbyoptprocctx
+// process group-by pattern
+oprules put new ruleregexp
+getmapaggresortedgroupbyproc pctx
+// the dispatcher fires the processor corresponding to the closest matching
+// rule and passes the context along
+dispatcher disp   new defaultruledispatcher getdefaultproc    oprules
+groupbyoptimizectx
+graphwalker ogw   new defaultgraphwalker disp
+// create a list of topop nodes
+arraylist<node> topnodes   new arraylist<node>
+topnodes addall pctx gettopops   values
+ogw startwalking topnodes  null
+return pctx
+private nodeprocessor getdefaultproc
+return new nodeprocessor
+@override
+public object process node nd  stack<node> stack
+nodeprocessorctx procctx  object    nodeoutputs  throws semanticexception
+return null
+private nodeprocessor getmapaggresortedgroupbyproc parsecontext pctx
+return new bucketgroupbyprocessor pctx
+/**
+* bucketgroupbyprocessor.
+*
+*/
+public class bucketgroupbyprocessor implements nodeprocessor
+protected parsecontext pgraphcontext
+public bucketgroupbyprocessor parsecontext pgraphcontext
+this pgraphcontext   pgraphcontext
+@override
+public object process node nd  stack<node> stack  nodeprocessorctx procctx
+object    nodeoutputs  throws semanticexception
+// gby,rs,gby... (top to bottom)
+groupbyoperator op    groupbyoperator  stack get stack size     3
+checkbucketgroupby op
+return null
+private void checkbucketgroupby groupbyoperator curr
+throws semanticexception
+// if this is not a hash groupby, return
+if  curr getconf   getmode      groupbydesc mode hash
+return
+set<string> tblnames   pgraphcontext getgroupoptoinputtables   get curr
+if  tblnames    null    tblnames size      0
+return
+boolean bucketgroupby   true
+groupbydesc desc   curr getconf
+list<exprnodedesc> groupbykeys   new linkedlist<exprnodedesc>
+groupbykeys addall desc getkeys
+// compute groupby columns from groupby keys
+list<string> groupbycols   new arraylist<string>
+while  groupbykeys size   > 0
+exprnodedesc node   groupbykeys remove 0
+if  node instanceof exprnodecolumndesc
+groupbycols addall node getcols
+else if   node instanceof exprnodeconstantdesc
+node instanceof exprnodenulldesc
+// nothing
+else if  node instanceof exprnodefielddesc
+groupbykeys add 0    exprnodefielddesc  node  getdesc
+continue
+else if  node instanceof exprnodegenericfuncdesc
+exprnodegenericfuncdesc udfnode     exprnodegenericfuncdesc  node
+genericudf udf   udfnode getgenericudf
+if   functionregistry isdeterministic udf
+return
+groupbykeys addall 0  udfnode getchildexprs
+else
+return
+if  groupbycols size      0
+return
+for  string table   tblnames
+operator<? extends serializable> topop   pgraphcontext gettopops   get
+table
+if  topop    null       topop instanceof tablescanoperator
+// this is in a sub-query.
+// in future, we need to infer subq's columns propery. for example
+// "select key, count(1)
+// from (from clustergroupbyselect key, value where ds='210') group by key, 3;",
+// even though the group by op is in a subquery, it can be changed to
+// bucket groupby.
+return
+tablescanoperator ts    tablescanoperator  topop
+table desttable   pgraphcontext gettoptotable   get ts
+if  desttable    null
+return
+if   desttable ispartitioned
+list<string> bucketcols   desttable getbucketcols
+list<string> sortcols   utilities
+getcolumnnamesfromsortcols desttable getsortcols
+bucketgroupby   matchbucketorsortedcolumns groupbycols  bucketcols
+sortcols
+if   bucketgroupby
+return
+else
+prunedpartitionlist partslist   null
+try
+partslist   pgraphcontext getoptopartlist   get ts
+if  partslist    null
+partslist   partitionpruner prune desttable  pgraphcontext
+getoptopartpruner   get ts   pgraphcontext getconf    table
+pgraphcontext getprunedpartitions
+pgraphcontext getoptopartlist   put ts  partslist
+catch  hiveexception e
+// has to use full name to make sure it does not conflict with
+// org.apache.commons.lang.stringutils
+log error org apache hadoop util stringutils stringifyexception e
+throw new semanticexception e getmessage    e
+list<partition> parts   new arraylist<partition>
+parts addall partslist getconfirmedpartns
+parts addall partslist getunknownpartns
+for  partition part   parts
+list<string> bucketcols   part getbucketcols
+list<string> sortcols   part getsortcolnames
+bucketgroupby   matchbucketorsortedcolumns groupbycols  bucketcols
+sortcols
+if   bucketgroupby
+return
+curr getconf   setbucketgroup bucketgroupby
+/**
+* given the group by keys, bucket columns, sort column, this method
+* determines if we can use sorted group by or not.
+*
+* we use bucket columns only when the sorted column set is empty and if all
+* group by columns are contained in bucket columns.
+*
+* if we can can not determine by looking at bucketed columns and the table
+* has sort columns, we resort to sort columns. we can use bucket group by
+* if the groupby column set is an exact prefix match of sort columns.
+*
+* @param groupbycols
+* @param bucketcols
+* @param sortcols
+* @return
+* @throws semanticexception
+*/
+private boolean matchbucketorsortedcolumns list<string> groupbycols
+list<string> bucketcols  list<string> sortcols  throws semanticexception
+boolean ret   false
+if  sortcols    null    sortcols size      0
+ret   matchbucketcolumns groupbycols  bucketcols
+if   ret    sortcols    null    sortcols size   >  groupbycols size
+// check sort columns, if groupbycols is a prefix subset of sort
+// columns, we will use sorted group by. for example, if data is sorted
+// by column a, b, c, and a query wants to group by b,a, we will use
+// sorted group by. but if the query wants to groupby b,c, then sorted
+// group by can not be used.
+int num   groupbycols size
+for  int i   0  i < num  i
+if  sortcols indexof groupbycols get i   >  num   1
+return false
+return true
+return ret
+/*
+* all group by columns should be contained in the bucket column set. and
+* the number of group by columns should be equal to number of bucket
+* columns.
+*/
+private boolean matchbucketcolumns list<string> grpcols
+list<string> tblbucketcols  throws semanticexception
+if  tblbucketcols    null    tblbucketcols size      0
+grpcols size      0    grpcols size      tblbucketcols size
+return false
+for  int i   0  i < grpcols size    i
+string tblcol   grpcols get i
+if   tblbucketcols contains tblcol
+return false
+return true
+/**
+* groupbyoptprocctx.
+*
+*/
+public class groupbyoptprocctx implements nodeprocessorctx

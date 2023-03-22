@@ -1,0 +1,362 @@
+/*
+* copyright 2011 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase io hfile
+import java io dataoutput
+import java io dataoutputstream
+import java io ioexception
+import java util arraylist
+import java util list
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs fsdataoutputstream
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase keyvalue keycomparator
+import org apache hadoop hbase io hfile hfile writer
+import org apache hadoop hbase io hfile hfileblock blockwritable
+import org apache hadoop hbase regionserver metrics schemametrics
+import org apache hadoop hbase util checksumtype
+import org apache hadoop hbase util bloomfilterwriter
+import org apache hadoop hbase util bytes
+import org apache hadoop io writable
+import org apache hadoop io writableutils
+/**
+* writes hfile format version 2.
+*/
+public class hfilewriterv2 extends abstracthfilewriter
+static final log log   logfactory getlog hfilewriterv2 class
+/** max memstore (mvcc) timestamp in fileinfo */
+public static final byte  max_memstore_ts_key
+bytes tobytes
+/** keyvalue version in fileinfo */
+public static final byte  key_value_version
+bytes tobytes
+/** version for keyvalue which includes memstore timestamp */
+public static final int key_value_ver_with_memstore   1
+/** inline block writers for multi-level block index and compound blooms. */
+private list<inlineblockwriter> inlineblockwriters
+new arraylist<inlineblockwriter>
+/** unified version 2 block writer */
+private hfileblock writer fsblockwriter
+private hfileblockindex blockindexwriter datablockindexwriter
+private hfileblockindex blockindexwriter metablockindexwriter
+/** the offset of the first data block or -1 if the file is empty. */
+private long firstdatablockoffset    1
+/** the offset of the last data block or 0 if the file is empty. */
+private long lastdatablockoffset
+/** additional data items to be written to the "load-on-open" section. */
+private list<blockwritable> additionalloadonopendata
+new arraylist<blockwritable>
+/** checksum related settings */
+private checksumtype checksumtype   hfile default_checksum_type
+private int bytesperchecksum   hfile default_bytes_per_checksum
+private final boolean includememstorets   true
+private long maxmemstorets   0
+static class writerfactoryv2 extends hfile writerfactory
+writerfactoryv2 configuration conf  cacheconfig cacheconf
+super conf  cacheconf
+@override
+public writer createwriter filesystem fs  path path
+fsdataoutputstream ostream  int blocksize
+compression algorithm compress  hfiledatablockencoder blockencoder
+final keycomparator comparator  final checksumtype checksumtype
+final int bytesperchecksum  throws ioexception
+return new hfilewriterv2 conf  cacheconf  fs  path  ostream  blocksize
+compress  blockencoder  comparator  checksumtype  bytesperchecksum
+/** constructor that takes a path, creates and closes the output stream. */
+public hfilewriterv2 configuration conf  cacheconfig cacheconf
+filesystem fs  path path  fsdataoutputstream ostream  int blocksize
+compression algorithm compressalgo  hfiledatablockencoder blockencoder
+final keycomparator comparator  final checksumtype checksumtype
+final int bytesperchecksum  throws ioexception
+super cacheconf
+ostream    null ? createoutputstream conf  fs  path    ostream
+path  blocksize  compressalgo  blockencoder  comparator
+schemametrics configureglobally conf
+this checksumtype   checksumtype
+this bytesperchecksum   bytesperchecksum
+finishinit conf
+/** additional initialization steps */
+private void finishinit final configuration conf
+if  fsblockwriter    null
+throw new illegalstateexception
+// hfile filesystem-level (non-caching) block writer
+fsblockwriter   new hfileblock writer compressalgo  blockencoder
+includememstorets  checksumtype  bytesperchecksum
+// data block index writer
+boolean cacheindexesonwrite   cacheconf shouldcacheindexesonwrite
+datablockindexwriter   new hfileblockindex blockindexwriter fsblockwriter
+cacheindexesonwrite ? cacheconf getblockcache    null
+cacheindexesonwrite ? name   null
+datablockindexwriter setmaxchunksize
+hfileblockindex getmaxchunksize conf
+inlineblockwriters add datablockindexwriter
+// meta data block index writer
+metablockindexwriter   new hfileblockindex blockindexwriter
+log debug     cacheconf
+if  isschemaconfigured
+schemaconfigurationchanged
+@override
+protected void schemaconfigurationchanged
+passschemametricsto datablockindexwriter
+passschemametricsto metablockindexwriter
+/**
+* at a block boundary, write all the inline blocks and opens new block.
+*
+* @throws ioexception
+*/
+private void checkblockboundary   throws ioexception
+if  fsblockwriter blocksizewritten   < blocksize
+return
+finishblock
+writeinlineblocks false
+newblock
+/** clean up the current block */
+private void finishblock   throws ioexception
+if   fsblockwriter iswriting      fsblockwriter blocksizewritten      0
+return
+long starttimens   system nanotime
+// update the first data block offset for scanning.
+if  firstdatablockoffset     1
+firstdatablockoffset   outputstream getpos
+// update the last data block offset
+lastdatablockoffset   outputstream getpos
+fsblockwriter writeheaderanddata outputstream
+int ondisksize   fsblockwriter getondisksizewithheader
+datablockindexwriter addentry firstkeyinblock  lastdatablockoffset
+ondisksize
+totaluncompressedbytes    fsblockwriter getuncompressedsizewithheader
+hfile offerwritelatency system nanotime     starttimens
+if  cacheconf shouldcachedataonwrite
+docacheonwrite lastdatablockoffset
+/** gives inline block writers an opportunity to contribute blocks. */
+private void writeinlineblocks boolean closing  throws ioexception
+for  inlineblockwriter ibw   inlineblockwriters
+while  ibw shouldwriteblock closing
+long offset   outputstream getpos
+boolean cachethisblock   ibw cacheonwrite
+ibw writeinlineblock fsblockwriter startwriting
+ibw getinlineblocktype
+fsblockwriter writeheaderanddata outputstream
+ibw blockwritten offset  fsblockwriter getondisksizewithheader
+fsblockwriter getuncompressedsizewithoutheader
+totaluncompressedbytes    fsblockwriter getuncompressedsizewithheader
+if  cachethisblock
+docacheonwrite offset
+/**
+* caches the last written hfile block.
+* @param offset the offset of the block we want to cache. used to determine
+*          the cache key.
+*/
+private void docacheonwrite long offset
+// we don't cache-on-write data blocks on compaction, so assume this is not
+// a compaction.
+final boolean iscompaction   false
+hfileblock cacheformatblock   blockencoder disktocacheformat
+fsblockwriter getblockforcaching    iscompaction
+passschemametricsto cacheformatblock
+cacheconf getblockcache   cacheblock
+new blockcachekey name  offset  blockencoder getencodingincache
+cacheformatblock getblocktype     cacheformatblock
+/**
+* ready a new block for writing.
+*
+* @throws ioexception
+*/
+private void newblock   throws ioexception
+// this is where the next block begins.
+fsblockwriter startwriting blocktype data
+firstkeyinblock   null
+/**
+* add a meta block to the end of the file. call before close(). metadata
+* blocks are expensive. fill one with a bunch of serialized data rather than
+* do a metadata block per metadata instance. if metadata is small, consider
+* adding to file info using {@link #appendfileinfo(byte[], byte[])}
+*
+* @param metablockname
+*          name of the block
+* @param content
+*          will call readfields to get data later (do not reuse)
+*/
+@override
+public void appendmetablock string metablockname  writable content
+byte key   bytes tobytes metablockname
+int i
+for  i   0  i < metanames size      i
+// stop when the current key is greater than our own
+byte cur   metanames get i
+if  bytes bytes_rawcomparator compare cur  0  cur length  key  0
+key length  > 0
+break
+metanames add i  key
+metadata add i  content
+/**
+* add key/value to file. keys must be added in an order that agrees with the
+* comparator passed on construction.
+*
+* @param kv
+*          keyvalue to add. cannot be empty nor null.
+* @throws ioexception
+*/
+@override
+public void append final keyvalue kv  throws ioexception
+append kv getmemstorets    kv getbuffer    kv getkeyoffset    kv getkeylength
+kv getbuffer    kv getvalueoffset    kv getvaluelength
+this maxmemstorets   math max this maxmemstorets  kv getmemstorets
+/**
+* add key/value to file. keys must be added in an order that agrees with the
+* comparator passed on construction.
+*
+* @param key
+*          key to add. cannot be empty nor null.
+* @param value
+*          value to add. cannot be empty nor null.
+* @throws ioexception
+*/
+@override
+public void append final byte key  final byte value  throws ioexception
+append 0  key  0  key length  value  0  value length
+/**
+* add key/value to file. keys must be added in an order that agrees with the
+* comparator passed on construction.
+*
+* @param key
+* @param koffset
+* @param klength
+* @param value
+* @param voffset
+* @param vlength
+* @throws ioexception
+*/
+private void append final long memstorets  final byte key  final int koffset  final int klength
+final byte value  final int voffset  final int vlength
+throws ioexception
+boolean dupkey   checkkey key  koffset  klength
+checkvalue value  voffset  vlength
+if   dupkey
+checkblockboundary
+if   fsblockwriter iswriting
+newblock
+// write length of key and value and then actual key and value bytes.
+// additionally, we may also write down the memstorets.
+dataoutputstream out   fsblockwriter getuserdatastream
+out writeint klength
+totalkeylength    klength
+out writeint vlength
+totalvaluelength    vlength
+out write key  koffset  klength
+out write value  voffset  vlength
+if  this includememstorets
+writableutils writevlong out  memstorets
+// are we the first key in this block?
+if  firstkeyinblock    null
+// copy the key.
+firstkeyinblock   new byte
+system arraycopy key  koffset  firstkeyinblock  0  klength
+lastkeybuffer   key
+lastkeyoffset   koffset
+lastkeylength   klength
+entrycount
+@override
+public void close   throws ioexception
+if  outputstream    null
+return
+// write out the end of the data blocks, then write meta data blocks.
+// followed by fileinfo, data block index and meta block index.
+finishblock
+writeinlineblocks true
+fixedfiletrailer trailer   new fixedfiletrailer 2
+hfilereaderv2 max_minor_version
+// write out the metadata blocks if any.
+if   metanames isempty
+for  int i   0  i < metanames size      i
+// store the beginning offset
+long offset   outputstream getpos
+// write the metadata content
+dataoutputstream dos   fsblockwriter startwriting blocktype meta
+metadata get i  write dos
+fsblockwriter writeheaderanddata outputstream
+totaluncompressedbytes    fsblockwriter getuncompressedsizewithheader
+// add the new meta block to the meta index.
+metablockindexwriter addentry metanames get i   offset
+fsblockwriter getondisksizewithheader
+// load-on-open section.
+// data block index.
+//
+// in version 2, this section of the file starts with the root level data
+// block index. we call a function that writes intermediate-level blocks
+// first, then root level, and returns the offset of the root level block
+// index.
+long rootindexoffset   datablockindexwriter writeindexblocks outputstream
+trailer setloadonopenoffset rootindexoffset
+// meta block index.
+metablockindexwriter writesinglelevelindex fsblockwriter startwriting
+blocktype root_index
+fsblockwriter writeheaderanddata outputstream
+totaluncompressedbytes    fsblockwriter getuncompressedsizewithheader
+if  this includememstorets
+appendfileinfo max_memstore_ts_key  bytes tobytes maxmemstorets
+appendfileinfo key_value_version  bytes tobytes key_value_ver_with_memstore
+// file info
+writefileinfo trailer  fsblockwriter startwriting blocktype file_info
+fsblockwriter writeheaderanddata outputstream
+totaluncompressedbytes    fsblockwriter getuncompressedsizewithheader
+// load-on-open data supplied by higher levels, e.g. bloom filters.
+for  blockwritable w   additionalloadonopendata
+fsblockwriter writeblock w  outputstream
+totaluncompressedbytes    fsblockwriter getuncompressedsizewithheader
+// now finish off the trailer.
+trailer setnumdataindexlevels datablockindexwriter getnumlevels
+trailer setuncompresseddataindexsize
+datablockindexwriter gettotaluncompressedsize
+trailer setfirstdatablockoffset firstdatablockoffset
+trailer setlastdatablockoffset lastdatablockoffset
+trailer setcomparatorclass comparator getclass
+trailer setdataindexcount datablockindexwriter getnumrootentries
+finishclose trailer
+fsblockwriter releasecompressor
+@override
+public void addinlineblockwriter inlineblockwriter ibw
+inlineblockwriters add ibw
+@override
+public void addgeneralbloomfilter final bloomfilterwriter bfw
+this addbloomfilter bfw  blocktype general_bloom_meta
+@override
+public void adddeletefamilybloomfilter final bloomfilterwriter bfw
+this addbloomfilter bfw  blocktype delete_family_bloom_meta
+private void addbloomfilter final bloomfilterwriter bfw
+final blocktype blocktype
+if  bfw getkeycount   <  0
+return
+if  blocktype    blocktype general_bloom_meta
+blocktype    blocktype delete_family_bloom_meta
+throw new runtimeexception     blocktype tostring
+additionalloadonopendata add new blockwritable
+@override
+public blocktype getblocktype
+return blocktype
+@override
+public void writetoblock dataoutput out  throws ioexception
+bfw getmetawriter   write out
+writable datawriter   bfw getdatawriter
+if  datawriter    null
+datawriter write out

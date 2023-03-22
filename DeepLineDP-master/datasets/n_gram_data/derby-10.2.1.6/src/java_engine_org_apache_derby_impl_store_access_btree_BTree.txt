@@ -1,0 +1,533 @@
+/*
+derby - class org.apache.derby.impl.store.access.btree.btree
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store access btree
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services io arrayinputstream
+import org apache derby iapi services io formatablebitset
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services io formatidutil
+import org apache derby iapi services io storable
+import org apache derby iapi services stream infostreams
+import org apache derby iapi error standardexception
+import org apache derby iapi store access conglomerate conglomerate
+import org apache derby iapi store access conglomerate scanmanager
+import org apache derby iapi store access conglomerate transactionmanager
+import org apache derby iapi store access conglomeratecontroller
+import org apache derby iapi store access dynamiccompiledopenconglominfo
+import org apache derby iapi store access qualifier
+import org apache derby iapi store access rowlocationretrowsource
+import org apache derby iapi store access rowutil
+import org apache derby iapi store access scancontroller
+import org apache derby iapi store access staticcompiledopenconglominfo
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi store raw lockingpolicy
+import org apache derby iapi store raw page
+import org apache derby iapi store raw rawstorefactory
+import org apache derby iapi store raw recordhandle
+import org apache derby iapi store raw containerhandle
+import org apache derby iapi store raw transaction
+import org apache derby iapi store raw containerkey
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi types rowlocation
+import org apache derby impl store access conglomerate conglomerateutil
+import org apache derby impl store access conglomerate genericconglomerate
+import org apache derby impl store access conglomerate openconglomeratescratchspace
+import org apache derby impl store access conglomerate templaterow
+import java io ioexception
+import java io objectoutput
+import java io objectinput
+import java util properties
+/**
+a b-tree object corresponds to an instance of a b-tree conglomerate.  it
+contains the static information about a conglomerate which is built at
+create conglomerate time.
+<p>
+this generic implementation is expected to be extended by the concreate
+implementations.
+<p>
+the fields are set when the conglomerate is created and never changed
+thereafter.  when alter table is supported then it will change under the
+control of a table level lock.
+<p>
+they have package scope because they're read by the scans and controllers.
+<p>
+a table of all conglomerates in the system is maintained by the accessmanager.
+a cache of conglomerates is maintained in the accessmanager, and references
+to the read only objects are handed out.  a copy of the conglomerate
+object is kept in the control row of the root page, so that during logical
+undo this information can be read without needing to access the possibly
+corrupt table maintained by the access manager.
+**/
+public abstract class btree extends genericconglomerate
+/**************************************************************************
+* public constants of btree class:
+**************************************************************************
+*/
+/**
+* the page number of the root page is always at the fixed page number:
+* rootpageid.  this means that given an open container, during logical
+* undo one can always find the root page and look up the conglomerate
+* information.
+**/
+public static final long rootpageid   containerhandle first_page_number
+/**
+property name for the maximum number of rows to place in a btree page (leaf
+or branch).  equal to 'derby.access.btreemaxrowperpage'.  used by tests
+and debugging to exactly control split points, and to make it easier to test
+tall trees without needing lots of data.
+*/
+public static final string property_max_rows_per_page_parameter
+sanitymanager debug ?      null
+/* properties of a btree see create(). */
+public static final string property_allowduplicates
+public static final string property_nkeyfields
+public static final string property_nuniquecolumns
+public static final string property_parentlinks
+/**************************************************************************
+* protected fields of btree class:
+**************************************************************************
+*/
+/**
+the id of the container in which this b-tree is stored.
+**/
+protected containerkey id
+/**
+the number of key fields.
+**/
+protected int nkeyfields
+/**
+the number of uniqueness columns.  these are the columns that
+are considered for the purpose of detecting duplicate keys and rows.
+**/
+int nuniquecolumns
+/**
+whether the index allows duplicates or not.
+**/
+boolean allowduplicates
+/**
+whether the parent should maintain links from child pages to their parent.
+these links are only used for consistency checking purposes.  they improve
+consistency checking at the cost of run-time efficiency.
+**/
+boolean maintainparentlinks
+/**
+maximum rows per page to place on a btree leaf or nonleaf page.  used
+by testing to finely control split points.  only changed for debugging
+purposes.
+resolve (mikem) - this should not be static.  need to design a way in
+debugging mode to get btree created with a persistent "maxrowsperpage".
+this hack makes all btrees get created with the "last" maxrowsperpage
+value set.
+**/
+static int maxrowsperpage   integer max_value
+/**
+format id of the conglomerate.
+**/
+protected int conglom_format_id
+/**
+the array of format id's, one for each column in the template.
+**/
+int    format_ids
+//columns sorting order information
+// true - ascending order ; false -descending order
+protected boolean	ascdescinfo
+/*
+** private methods of btree.
+*/
+/*
+** public methods of btree.
+*/
+/**************************************************************************
+* abstract protected locking methods of btree:
+*     getbtreelockingpolicy
+*     lockscan
+*     unlockscan
+*     lockpreviousrow
+*     lockrowonpage
+*     lockrow
+*     locktable
+**************************************************************************
+*/
+/**
+* create a new btree locking policy from scratch.
+*
+* @exception  standardexception  standard exception policy.
+**/
+abstract protected btreelockingpolicy getbtreelockingpolicy
+transaction             rawtran
+int                     lock_level
+int                     mode
+int                     isolation_level
+conglomeratecontroller  base_cc
+openbtree               open_btree
+throws standardexception
+/**
+* lock the base table.
+* <p>
+* assumes that segment of the base container is the same as the segment
+* of the btree segment.
+* <p>
+* resolve - we really want to get the lock without opening the container.
+* raw store will be providing this.
+*
+* @param xact_manager transaction to associate the lock with.
+*
+* @exception  standardexception  standard exception policy.
+**/
+abstract public conglomeratecontroller locktable
+transactionmanager  xact_manager
+int                 open_mode
+int                 lock_level
+int                 isolation_level
+throws standardexception
+/**************************************************************************
+* private/protected methods of btree:
+**************************************************************************
+*/
+/**
+* create a branch row template for this conglomerate.
+* <p>
+* reads the format id's of each of the columns and manufactures object of
+* the given type for each.  it then uses these "empty" objects to create
+* a template row.  the object passed in is then added to the last column
+* of the row.
+*
+* @return the new template.
+*
+* @exception  standardexception  standard exception policy.
+**/
+final datavaluedescriptor createbranchtemplate
+datavaluedescriptor page_ptr
+throws standardexception
+return templaterow newbranchrow format_ids  page_ptr
+/**************************************************************************
+* public methods of btree:
+**************************************************************************
+*/
+/**
+* create a template for this conglomerate.
+* <p>
+* reads the format id's of each of the columns and manufactures object of
+* the given type for each.  it then uses these "empty" objects to create
+* a template row.
+* <p>
+* this method is public so that b2iundo() can call it.
+*
+* @return the new template.
+*
+* @exception  standardexception  standard exception policy.
+**/
+final public datavaluedescriptor createtemplate
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert format_ids    null
+return templaterow newrow  formatablebitset  null  format_ids
+/**
+* is this a "unique" index?
+**/
+final public boolean isunique
+return nkeyfields    nuniquecolumns
+/**************************************************************************
+* public methods of conglomerate interface:
+**************************************************************************
+*/
+/**
+* add a column to the conglomerate.
+* <p>
+* currently b2i does not support this operation.
+* input template column.
+*
+* @param xact_manager      transaction to associate the lock with.
+* @param column_id        the column number to add this column at.
+* @param template_column  an instance of the column to be added to table.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void addcolumn
+transactionmanager  xact_manager
+int                 column_id
+storable            template_column
+throws standardexception
+throw standardexception newexception
+sqlstate btree_unimplemented_feature
+/**
+* get the id of the container of the conglomerate.
+* <p>
+* will have to change when a conglomerate could have more than one
+* container.  the containerkey is a combination of the container id
+* and segment id.
+*
+* @return the containerkey.
+**/
+public final containerkey getid
+return id
+/**
+do the generic part of creating a b-tree conglomerate.  this method
+is called from the concrete subclass (which may also read some properties).
+<p>
+this method processes all properties which are generic to all btree's.  it
+creates the container for the btree.
+<p>
+the following properties are generic to a b-tree conglomerate.  :
+<ul>
+<li>"allowduplicates" (boolean).  if set to true the table will allow
+rows which are duplicate in key column's 0 through (nuniquecolumns - 1).
+currently only supports "false".
+this property is optional, defaults to false.
+<li>"nkeyfields"  (integer) columns 0 through (nkeyfields - 1) will be
+included in key of the conglomerate.
+this implementation requires that "nkeyfields" must be the same as the
+number of fields in the conglomerate, including the rowlocationcolumn.
+other implementations may relax this restriction to allow non-key fields
+in the index.
+this property is required.
+<li>"nuniquecolumns" (integer) columns 0 through "nuniquecolumns" will be
+used to check for uniqueness.  so for a standard sql non-unique index
+implementation set "nuniquecolumns" to the same value as "nkeyfields"; and
+for a unique index set "nuniquecolumns" to "nkeyfields" - 1 (ie. don't
+include the rowlocationcolumn in the uniqueness check).
+this property is required.
+<li>"maintainparentlinks" (boolean)
+whether the b-tree pages maintain the page number of their parent.  only
+used for consistency checking.  it takes a certain amount more effort to
+maintain these links, but they're really handy for ensuring that the index
+is consistent.
+this property is optional, defaults to true.
+</ul>
+@exception standardexception thrown by underlying raw store, or thrown by
+this routine on an invalid containerid.
+**/
+public void create
+transaction             rawtran
+int                     segmentid
+long                    input_containerid
+datavaluedescriptor   template
+properties              properties
+int                     conglom_format_id
+int                     tmpflag
+throws standardexception
+string result_string
+if  properties    null
+throw
+standardexception newexception
+sqlstate btree_property_not_found  property_nkeyfields
+// check input arguments
+allowduplicates    boolean valueof
+properties getproperty property_allowduplicates       booleanvalue
+result_string   properties getproperty property_nkeyfields
+if  result_string    null
+throw
+standardexception newexception
+sqlstate btree_property_not_found  property_nkeyfields
+else
+nkeyfields   integer parseint result_string
+result_string   properties getproperty property_nuniquecolumns
+if  result_string    null
+throw standardexception newexception
+sqlstate btree_property_not_found  property_nuniquecolumns
+else
+nuniquecolumns   integer parseint result_string
+if  sanitymanager debug
+result_string
+properties getproperty property_max_rows_per_page_parameter
+if  result_string    null
+maxrowsperpage   integer parseint result_string
+maintainparentlinks    boolean valueof
+properties getproperty property_parentlinks       booleanvalue
+// resolve (mikem) - true for now, if we want to support non-key
+// fields eventually this assert may be wrong.
+if  sanitymanager debug
+if  template length    nkeyfields
+sanitymanager throwassert
+template length
+nkeyfields
+sanitymanager assert  nuniquecolumns    nkeyfields
+nuniquecolumns     nkeyfields   1
+// get format id's from each column in template and store it in the
+// conglomerate state.
+format_ids   conglomerateutil createformatids template
+// copy the format id of the conglomerate.
+this conglom_format_id   conglom_format_id
+// create a container for the b-tree with default page size and
+// fill up pages.
+properties put rawstorefactory page_reserved_space_parameter
+properties put rawstorefactory minimum_record_size_parameter
+properties put rawstorefactory page_reusable_record_id
+long containerid
+rawtran addcontainer
+segmentid  input_containerid
+containerhandle mode_default  properties  tmpflag
+// make sure the container was actually created.
+// open segment will get cleaned up when transaction is.
+if  containerid <  0
+throw standardexception newexception
+sqlstate btree_cant_create_container
+if  sanitymanager debug
+if  input_containerid    containerhandle default_assign_id
+sanitymanager assert containerid    input_containerid
+id   new containerkey segmentid  containerid
+/**
+drop this btree.
+this must be done by a concrete implementation.
+@see conglomerate#drop
+@exception standardexception standard exception policy.
+**/
+public abstract void drop transactionmanager xact_manager
+throws standardexception
+/**
+load a b-tree.  this must be done by a concrete implementation.
+@see conglomerate#load
+@exception standardexception standard exception policy.
+**/
+public abstract long load
+transactionmanager      xact_manager
+boolean                 createconglom
+rowlocationretrowsource rowsource
+throws standardexception
+public long getcontainerid
+return this id getcontainerid
+/**
+* return dynamic information about the conglomerate to be dynamically
+* reused in repeated execution of a statement.
+* <p>
+* the dynamic info is a set of variables to be used in a given
+* scancontroller or conglomeratecontroller.  it can only be used in one
+* controller at a time.  it is up to the caller to insure the correct
+* thread access to this info.  the type of info in this is a scratch
+* template for btree traversal, other scratch variables for qualifier
+* evaluation, ...
+* <p>
+*
+* @return the dynamic information.
+*
+* @param conglomid the identifier of the conglomerate to open.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public dynamiccompiledopenconglominfo getdynamiccompiledconglominfo
+long        conglomid
+throws standardexception
+return new openconglomeratescratchspace format_ids
+/**
+* is this conglomerate temporary?
+* <p>
+*
+* @return whether conglomerate is temporary or not.
+**/
+public boolean istemporary
+return  id getsegmentid      containerhandle temporary_segment
+/**
+open a b-tree controller.
+this must be done by a concrete implementation.
+@see conglomerate#open
+@exception standardexception standard exception policy.
+**/
+public abstract conglomeratecontroller open
+transactionmanager              xact_manager
+transaction                     rawtran
+boolean                         hold
+int                             open_mode
+int                             lock_level
+lockingpolicy                   locking_policy
+staticcompiledopenconglominfo   static_info
+dynamiccompiledopenconglominfo  dynamic_info
+throws standardexception
+/**************************************************************************
+* public methods of storable interface (via conglomerate):
+*     this class is responsible for re/storing its own state.
+**************************************************************************
+*/
+/**
+return whether the value is null or not.
+the containerid being zero is what determines nullness;  subclasses
+are not expected to override this method.
+@see org.apache.derby.iapi.services.io.storable#isnull
+**/
+public boolean isnull
+return id    null
+/**
+restore the in-memory representation to the null value.
+the containerid being zero is what determines nullness;  subclasses
+are not expected to override this method.
+@see org.apache.derby.iapi.services.io.storable#restoretonull
+**/
+public void restoretonull
+id   null
+/**
+restore the in-memory representation from the stream.
+@exception classnotfoundexception thrown if the stored representation is
+serialized and a class named in the stream could not be found.
+@exception ioexception thrown by readobject()
+@see java.io.externalizable#readexternal
+*/
+public void readexternal objectinput in
+throws ioexception  classnotfoundexception
+// read in the conglomerate format id.
+conglom_format_id   formatidutil readformatidinteger in
+// xxx (nat) need to improve error handling
+long containerid           in readlong
+int segmentid			  in readint
+nkeyfields            in readint
+nuniquecolumns        in readint
+allowduplicates       in readboolean
+maintainparentlinks   in readboolean
+// read in the array of format id's
+format_ids   conglomerateutil readformatidarray this nkeyfields  in
+id   new containerkey segmentid  containerid
+public void readexternalfromarray arrayinputstream in
+throws ioexception  classnotfoundexception
+// read in the conglomerate format id.
+conglom_format_id   formatidutil readformatidinteger in
+// xxx (nat) need to improve error handling
+long containerid           in readlong
+int segmentid			  in readint
+nkeyfields            in readint
+nuniquecolumns        in readint
+allowduplicates       in readboolean
+maintainparentlinks   in readboolean
+// read in the array of format id's
+format_ids   conglomerateutil readformatidarray this nkeyfields  in
+id   new containerkey segmentid  containerid
+/**
+store the stored representation of the column value in the stream.
+it might be easier to simply store the properties - which would certainly
+make upgrading easier.
+@exception ioexception thrown by writeobject()
+*/
+public void writeexternal objectoutput out
+throws ioexception
+formatidutil writeformatidinteger out  conglom_format_id
+out writelong id getcontainerid
+out writeint  int  id getsegmentid
+out writeint  nkeyfields
+out writeint  nuniquecolumns
+out writeboolean  allowduplicates
+out writeboolean  maintainparentlinks
+conglomerateutil writeformatidarray format_ids  out
+/**************************************************************************
+* public tostring() method:
+**************************************************************************
+*/
+public string tostring
+if  sanitymanager debug
+return
+this id    null ?     this id tostring
+nkeyfields
+nuniquecolumns
+allowduplicates
+else
+return super tostring

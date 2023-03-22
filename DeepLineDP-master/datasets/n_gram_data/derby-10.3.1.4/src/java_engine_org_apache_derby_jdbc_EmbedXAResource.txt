@@ -1,0 +1,686 @@
+/*
+derby - class org.apache.derby.jdbc.embedxaresource
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby jdbc
+import java sql sqlexception
+import javax transaction xa xaresource
+import javax transaction xa xid
+import javax transaction xa xaexception
+import org apache derby iapi error standardexception
+import org apache derby iapi jdbc brokeredconnection
+import org apache derby iapi jdbc resourceadapter
+import org apache derby iapi reference sqlstate
+import org apache derby iapi reference jdbc30translation
+import org apache derby iapi services context contextmanager
+import org apache derby iapi services context contextservice
+import org apache derby iapi services info jvminfo
+import org apache derby iapi sql conn languageconnectioncontext
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi store access xatransactioncontroller
+import org apache derby iapi store access xa xaresourcemanager
+import org apache derby iapi store access xa xaxactid
+import org apache derby impl jdbc embedconnection
+import org apache derby impl jdbc transactionresourceimpl
+import org apache derby shared common sanity sanitymanager
+import org apache derby iapi services property propertyutil
+import org apache derby iapi reference property
+/**
+* implements xaresource
+*/
+class embedxaresource implements xaresource
+private embedpooledconnection con
+private resourceadapter ra
+private xaxactid currentxid
+/** the value of the transaction timeout on this resource. */
+private int timeoutseconds
+embedxaresource  embedpooledconnection con  resourceadapter ra
+this con   con
+this ra   ra
+// setup the default value for the transaction timeout.
+this timeoutseconds   0
+/**
+* commit the global transaction specified by xid.
+* @param xid a global transaction identifier
+* @param onephase if true, the resource manager should use a one-phase
+* commit protocol to commit the work done on behalf of xid.
+*
+* @exception xaexception an error has occurred. possible xaexceptions are
+* xa_heurhaz, xa_heurcom, xa_heurrb, xa_heurmix, xaer_rmerr,
+* xaer_rmfail, xaer_nota, xaer_inval, or xaer_proto.
+* <p>if the resource manager did not commit the transaction and
+* the paramether onephase is set to true, the resource manager
+* may throw one of the xa_rb* exceptions. upon return, the
+* resource manager has rolled back the branch's work and has
+* released all held resources.
+*/
+public final synchronized void commit xid xid  boolean onephase
+throws xaexception
+checkxaactive
+// ensure immtable and correct equals method.
+xaxactid xid_im   new xaxactid xid
+xatransactionstate transtate   gettransactionstate xid_im
+if  transtate    null
+xaresourcemanager rm   ra getxaresourcemanager
+contextmanager indoubtcm   rm find xid
+// rm also does not know about this xid.
+if  indoubtcm    null
+throw new xaexception xaexception xaer_nota
+contextservice csf   contextservice getfactory
+csf setcurrentcontextmanager indoubtcm
+try
+rm commit indoubtcm  xid_im  onephase
+// close the connection/transaction since it can never
+// be used again.
+indoubtcm cleanuponerror standardexception closeexception
+return
+catch  standardexception se
+// the rm threw an exception, clean it up in the approprate
+// context.  there is no transactionresource to handle the
+// exception for us.
+indoubtcm cleanuponerror se
+throw wrapinxaexception se
+finally
+csf resetcurrentcontextmanager indoubtcm
+synchronized  transtate
+checkusercredentials transtate creatingresource
+// check the transaction is no associated with
+// any xaresource.
+switch  transtate associationstate
+case xatransactionstate t0_not_associated
+break
+case xatransactionstate tro_fail
+throw new xaexception transtate rollbackonlycode
+default
+throw new xaexception xaexception xaer_proto
+if  transtate suspendedlist    null    transtate suspendedlist size      0
+throw new xaexception xaexception xaer_proto
+if  transtate isprepared    onephase
+throw new xaexception xaexception xaer_proto
+try
+transtate xa_commit onephase
+catch  sqlexception sqle
+throw wrapinxaexception sqle
+finally
+returnconnectiontoresource transtate  xid_im
+/**
+* ends the work performed on behalf of a transaction branch. the resource
+* manager disassociates the xa resource from the transaction branch
+* specified and let the transaction be completed.
+*
+* <p> if tmsuspend is specified in flags, the transaction branch is
+* temporarily suspended in incomplete state. the transaction context
+* is in suspened state and must be resumed via start with tmresume
+* specified.
+*
+* <p> if tmfail is specified, the portion of work has failed. the
+* resource manager may mark the transaction as rollback-only
+*
+* <p> if tmsuccess is specified, the portion of work has completed
+* successfully.
+*
+* @param xid a global transaction identifier that is the same as what was
+* used previously in the start method.
+* @param flags one of tmsuccess, tmfail, or tmsuspend
+*
+* @exception xaexception an error has occurred.
+* possible xaexception values are xaer_rmerr, xaer_rmfailed, xaer_nota,
+* xaer_inval, xaer_proto, or xa_rb*.
+*/
+public final synchronized void end xid xid  int flags  throws xaexception
+checkxaactive
+try
+// it is possible that the isolation level state in connection
+// handle has gotten out of sync with the real isolation level.
+// this can happen if slq instead of jdbc api has been used to
+// set the isolation level. the code below will check if isolation
+// was set using jdbc or sql and if yes, then it will update the
+// isolation state in brokeredconnection with embedconnection's
+// isolation level.
+if  con currentconnectionhandle    null
+con currentconnectionhandle getisolationuptodate
+catch  sqlexception sqle
+throw wrapinxaexception sqle
+// ensure immtable and correct equals method.
+xaxactid xid_im   new xaxactid xid
+boolean endingcurrentxid   false
+// must match the xid from start()
+if  currentxid    null
+if   currentxid equals xid_im
+throw new xaexception xaexception xaer_proto
+endingcurrentxid   true
+xatransactionstate transtate   gettransactionstate xid_im
+if  transtate    null
+throw new xaexception xaexception xaer_nota
+boolean rollbackonly   transtate end this  flags  endingcurrentxid
+// resolve - what happens to the connection on a fail
+// where we are not ending the current xid.
+if  endingcurrentxid
+currentxid   null
+con realconnection   null
+if  rollbackonly
+throw new xaexception transtate rollbackonlycode
+/**
+* ask the resource manager to prepare for a transaction commit of the
+* transaction specified in xid.
+*
+* @param xid a global transaction identifier
+*
+* @return a value indicating the resource manager's vote on the outcome
+* of the transaction. the possible values are: xa_rdonly or xa_ok. if the
+* resource manager wants to roll back the transaction, it should do so by
+* raising an appropriate xaexception in the prepare method.
+*
+* @exception xaexception an error has occurred. possible exception values
+* are: xa_rb*, xaer_rmerr, xaer_rmfail, xaer_nota, xaer_inval, or
+* xaer_proto.
+*
+*/
+public final synchronized int prepare xid xid  throws xaexception
+checkxaactive
+// ensure immtable and correct equals method.
+xaxactid xid_im   new xaxactid xid
+xatransactionstate transtate   gettransactionstate xid_im
+if  transtate    null
+xaresourcemanager rm   ra getxaresourcemanager
+contextmanager indoubtcm   rm find xid
+// rm also does not know about this xid.
+if  indoubtcm    null
+throw new xaexception xaexception xaer_nota
+// cannot prepare in doubt transactions
+throw new xaexception xaexception xaer_proto
+synchronized  transtate
+checkusercredentials transtate creatingresource
+// check the transaction is no associated with
+// any xaresource.
+switch  transtate associationstate
+case xatransactionstate t0_not_associated
+break
+case xatransactionstate tro_fail
+throw new xaexception transtate rollbackonlycode
+default
+throw new xaexception xaexception xaer_proto
+if  transtate suspendedlist    null
+transtate suspendedlist size      0
+throw new xaexception xaexception xaer_proto
+if  transtate isprepared
+throw new xaexception xaexception xaer_proto
+try
+int ret   transtate xa_prepare
+if  ret    xatransactioncontroller xa_ok
+transtate isprepared   true
+return xaresource xa_ok
+else
+returnconnectiontoresource transtate  xid_im
+if  sanitymanager debug
+if  con realconnection    null
+sanitymanager assert con realconnection transactionisidle
+return xaresource xa_rdonly
+catch  sqlexception sqle
+throw wrapinxaexception sqle
+/**
+* obtain the current transaction timeout value set for this xaresource
+* instance. if xaresource.settransactiontimeout was not use prior to
+* invoking this method, the return value is 0; otherwise, the value
+* used in the previous settransactiontimeout call is returned.
+*
+* @return the transaction timeout value in seconds. if the returned value
+* is equal to integer.max_value it means no timeout.
+*/
+public synchronized int gettransactiontimeout
+return timeoutseconds
+/**
+* this method is called to determine if the resource manager instance
+* represented by the target object is the same as the resouce manager
+* instance represented by the parameter xares.
+*
+* @param xares an xaresource object whose resource manager instance is to
+* be compared with the resource manager instance of the target object.
+*
+* @return true if it's the same rm instance; otherwise false.
+* @exception xaexception an error has occurred. possible exception values
+* are xaer_rmerr, xaer_rmfail.
+*/
+public final synchronized boolean issamerm xaresource xares
+throws xaexception
+checkxaactive
+if  xares instanceof embedxaresource
+return ra      embedxaresource  xares  ra
+return false
+/**
+* obtain a list of prepared transaction branches from a resource
+* manager. the transaction manager calls this method during recovery to
+* obtain the list of transaction branches that are currently in prepared
+* or heuristically completed states.
+*
+* @param flag one of tmstartrscan, tmendrscan, tmnoflags. tmnoflags must
+* be used when no other flags are set in flags.
+*
+* @return the resource manager returns zero or more xids for the
+* transaction branches that are currently in a prepared or heuristically
+* completed state. if an error occurs during the operation, the resource
+* manager should throw the appropriate xaexception.
+*
+* @exception xaexception an error has occurred. possible values are
+* xaer_rmerr, xaer_rmfail, xaer_inval, and xaer_proto.
+*
+*/
+public final synchronized xid recover int flag  throws xaexception
+checkxaactive
+try
+return ra getxaresourcemanager   recover flag
+catch  standardexception se
+throw wrapinxaexception se
+/**
+* tell the resource manager to forget about a heuristically completed
+* transaction branch.
+*
+* @param xid a global transaction identifier
+* @exception xaexception an error has occurred. possible exception values
+* are xaer_rmerr, xaer_rmfail, xaer_nota, xaer_inval, or xaer_proto.
+*/
+public final synchronized void forget xid xid  throws xaexception
+checkxaactive
+// ensure immtable and correct equals method.
+xaxactid xid_im   new xaxactid xid
+xatransactionstate transtate   gettransactionstate xid_im
+if  transtate    null
+xaresourcemanager rm   ra getxaresourcemanager
+contextmanager indoubtcm   rm find xid
+// rm also does not know about this xid.
+if  indoubtcm    null
+throw new xaexception xaexception xaer_nota
+contextservice csf   contextservice getfactory
+csf setcurrentcontextmanager indoubtcm
+try
+rm forget indoubtcm  xid_im
+// close the connection/transaction since it can never be used again.
+indoubtcm cleanuponerror standardexception closeexception
+return
+catch  standardexception se
+// the rm threw an exception, clean it up in the approprate
+// context.  there is no transactionresource to handle the
+// exception for us.
+indoubtcm cleanuponerror se
+throw wrapinxaexception se
+finally
+csf resetcurrentcontextmanager indoubtcm
+throw new xaexception transtate isprepared
+? xaexception xaer_nota
+xaexception xaer_proto
+/**
+* inform the resource manager to roll back work done on behalf of a
+* transaction branch
+*
+* @param xid a global transaction identifier
+* @exception xaexception - an error has occurred
+*/
+public final synchronized void rollback xid xid  throws xaexception
+checkxaactive
+// ensure immtable and correct equals method.
+xaxactid xid_im   new xaxactid xid
+xatransactionstate transtate   gettransactionstate xid_im
+if  transtate    null
+xaresourcemanager rm   ra getxaresourcemanager
+contextmanager indoubtcm   rm find xid
+// rm also does not know about this xid.
+if  indoubtcm    null
+throw new xaexception xaexception xaer_nota
+contextservice csf   contextservice getfactory
+csf setcurrentcontextmanager indoubtcm
+try
+rm rollback indoubtcm  xid_im
+// close the connection/transaction since it can never be used again.
+indoubtcm cleanuponerror standardexception closeexception
+return
+catch  standardexception se
+// the rm threw an exception, clean it up in the approprate
+// context.  there is no transactionresource to handle the
+// exception for us.
+indoubtcm cleanuponerror se
+throw wrapinxaexception se
+finally
+csf resetcurrentcontextmanager indoubtcm
+synchronized  transtate
+// check the transaction is no associated with
+// any xaresource.
+switch  transtate associationstate
+case xatransactionstate t0_not_associated
+case xatransactionstate tro_fail
+break
+default
+throw new xaexception xaexception xaer_proto
+if  transtate suspendedlist    null
+transtate suspendedlist size      0
+throw new xaexception xaexception xaer_proto
+checkusercredentials transtate creatingresource
+try
+transtate xa_rollback
+catch  sqlexception sqle
+throw wrapinxaexception sqle
+finally
+returnconnectiontoresource transtate  xid_im
+/**
+* set the current transaction timeout value for this xaresource
+* instance. once set, this timeout value is effective until
+* settransactiontimeout is invoked again with a different value. to reset
+* the timeout value to the default value used by the resource manager,
+* set the value to zero. if the timeout operation is performed
+* successfully, the method returns true; otherwise false. if a resource
+* manager does not support transaction timeout value to be set
+* explicitly, this method returns false.
+*
+* @param seconds the transaction timeout value in seconds.
+*                value of 0 means the reasource manager's default value.
+*                value of integer.max_value means no timeout.
+* @return true if transaction timeout value is set successfully;
+* otherwise false.
+*
+* @exception xaexception - an error has occurred. possible exception
+* values are xaer_rmerr, xaer_rmfail, or xaer_inval.
+*/
+public synchronized boolean settransactiontimeout int seconds
+throws xaexception
+if  seconds < 0
+// throw an exception if invalid value was specified
+throw new xaexception xaexception xaer_inval
+timeoutseconds   seconds
+return true
+/** returns the default value for the transaction timeout in milliseconds
+*  setted up by the system properties.
+*/
+private long getdefaultxatransactiontimeout   throws xaexception
+try
+languageconnectioncontext lcc   con getlanguageconnection
+transactioncontroller tc   lcc gettransactionexecute
+long timeoutmillis   1000    long  propertyutil getserviceint
+tc
+property prop_xa_transaction_timeout
+0
+integer max_value
+property default_xa_transaction_timeout
+return timeoutmillis
+catch  sqlexception sqle
+throw wrapinxaexception sqle
+catch  standardexception se
+throw wrapinxaexception se
+/**
+* start work on behalf of a transaction branch specified in xid if tmjoin
+* is specified, the start is for joining a transaction previously seen by
+* the resource manager. if tmresume is specified, the start is to resume
+* a suspended transaction specified in the parameter xid. if neither
+* tmjoin nor tmresume is specified and the transaction specified by xid
+* has previously been seen by the resource manager, the resource manager
+* throws the xaexception exception with xaer_dupid error code.
+*
+* @param xid a global transaction identifier to be associated with the
+* resource
+* @param flags one of tmnoflags, tmjoin, or tmresume
+*
+* @exception xaexception an error has occurred. possible exceptions are
+* xa_rb*, xaer_rmerr, xaer_rmfail, xaer_dupid, xaer_outside, xaer_nota,
+* xaer_inval, or xaer_proto.
+*/
+public final synchronized void start xid xid
+int flags  throws xaexception
+checkxaactive
+// jdbc 3.0 section 12.3 - one transaction associated with a xaconnection
+if  currentxid    null
+throw new xaexception xaexception xaer_proto
+// ensure immtable and correct equals method.
+xaxactid xid_im   new xaxactid xid
+xatransactionstate transtate   gettransactionstate xid_im
+switch  flags
+case xaresource tmnoflags
+if  transtate    null
+throw new xaexception xaexception xaer_dupid
+try
+if  con realconnection    null
+con openrealconnection
+if  con currentconnectionhandle    null
+// since this is a new connection, set its complete
+// state according to the application's connection
+// handle view of the world.
+con currentconnectionhandle setstate true
+con realconnection setapplicationconnection
+con currentconnectionhandle
+else
+// xaresource.start() auto commits in db2 when in
+// auto commit mode.
+if  con currentconnectionhandle    null
+if  con currentconnectionhandle getautocommit
+con currentconnectionhandle rollback
+if   con realconnection transactionisidle
+throw new xaexception xaexception xaer_outside
+if  con currentconnectionhandle    null
+// it is possible that the isolation level state
+// in connection handle has gotten out of sync
+// with the real isolation level. this can happen
+// if slq instead of jdbc api has been used to set
+// the isolation level. the code below will check
+// if isolation was set using jdbc or sql and if
+// yes, then it will update the isolation state
+// in brokeredconnection with embedconnection's
+// isolation level.
+con currentconnectionhandle getisolationuptodate
+// we have a current handle so we need to keep
+// the connection state of the current connection.
+con currentconnectionhandle setstate true
+// at the local to global transition we need
+// to discard and close any open held result
+// sets, a rollback will do this.
+con realconnection rollback
+else
+con resetrealconnection
+// global connections are always in auto commit false mode.
+con realconnection setautocommit false
+// and holdability false (cannot hold cursors across
+// xa transactions.
+con realconnection setholdability
+jdbc30translation close_cursors_at_commit
+con realconnection getlanguageconnection
+gettransactionexecute
+createxatransactionfromlocaltransaction
+xid_im getformatid
+xid_im getglobaltransactionid
+xid_im getbranchqualifier
+catch  standardexception se
+throw wrapinxaexception se
+catch  sqlexception sqle
+throw wrapinxaexception sqle
+transtate   new xatransactionstate
+con realconnection getcontextmanager
+con realconnection  this  xid_im
+if   ra addconnection xid_im  transtate
+throw new xaexception xaexception xaer_dupid
+currentxid   xid_im
+// if the the timeout specified is equal to integer.max_value
+// it means that transaction timeout is disabled.
+if  timeoutseconds    integer max_value
+// find out the value of the transaction timeout
+long timeoutmillis
+if  timeoutseconds > 0
+timeoutmillis   1000 timeoutseconds
+else
+timeoutmillis   getdefaultxatransactiontimeout
+// if we have non-zero transaction timeout schedule a timeout task.
+// the only way how timeoutmillis might be equeal to 0 is that
+// it was specified as a default transaction timeout
+if  timeoutmillis > 0
+transtate scheduletimeouttask timeoutmillis
+break
+case xaresource tmresume
+case xaresource tmjoin
+if  transtate    null
+throw new xaexception xaexception xaer_nota
+transtate start this  flags
+if  transtate conn    con realconnection
+if  con realconnection    null
+if   con realconnection transactionisidle
+throw new xaexception xaexception xaer_outside
+// we need to get the isolation level up to date same
+// way as it is done at start of a transaction. before
+// joining the transaction, it is possible that the
+// isolation level was updated using sql. we need to
+// get this state and store in the connection handle so
+// that we can restore the isolation when we are in the
+// local mode.
+try
+if  con currentconnectionhandle    null
+con currentconnectionhandle getisolationuptodate
+catch  sqlexception sqle
+throw wrapinxaexception sqle
+closeunusedconnection con realconnection
+con realconnection   transtate conn
+if  con currentconnectionhandle    null
+try
+// only reset the non-transaction specific
+// connection state.
+con currentconnectionhandle setstate false
+con realconnection setapplicationconnection
+con currentconnectionhandle
+catch  sqlexception sqle
+throw wrapinxaexception sqle
+break
+default
+throw new xaexception xaexception xaer_inval
+currentxid   xid_im
+/**
+* resturns currently active xid
+* @return xid
+*/
+xid getcurrentxid
+return currentxid
+/**
+* returns the xatransactionstate of the the transaction
+* @param xid_im
+* @return xatransactionstate
+*/
+private xatransactionstate gettransactionstate xaxactid xid_im
+return  xatransactionstate  ra findconnection xid_im
+/**
+* compares the user name and password of the xaresource with
+* user name and password of this and throws xaexception if there is
+* a mismatch
+* @param original embedxaresource
+*/
+private void checkusercredentials embedxaresource original
+throws xaexception
+if  original    this
+return
+if  original con getpassword   equals con getpassword
+original con getusername   equals con getusername
+return
+throw new xaexception xaexception xa_rbintegrity
+/**
+* checks if currently associated connection is active
+* throws exception if not
+*/
+private void checkxaactive   throws xaexception
+try
+con checkactive
+catch  sqlexception sqle
+throw wrapinxaexception sqle
+/**
+* map a sql exception to appropriate xaexception.
+* return the mapped xaexception.
+*/
+private static xaexception wrapinxaexception sqlexception se
+// map interesting exceptions to xaexception
+string sqlstate   se getsqlstate
+string message   se getmessage
+xaexception xae
+if  sqlstate    null
+// no idea what was wrong, throw non-descript error.
+if  message    null
+xae   new xaexception message
+else
+xae   new xaexception xaexception xaer_rmerr
+else if  sqlstate equals standardexception getsqlstatefromidentifier
+sqlstate store_xa_xaer_dupid
+xae   new xaexception xaexception xaer_dupid
+else if  sqlstate equals standardexception getsqlstatefromidentifier
+sqlstate store_xa_protocol_violation
+xae   new xaexception xaexception xa_rbproto
+else if  sqlstate equals sqlstate deadlock
+xae   new xaexception xaexception xa_rbdeadlock
+else if  sqlstate equals sqlstate lock_timeout
+xae   new xaexception xaexception xa_rbtimeout
+else if  message    null
+xae   new xaexception message
+else
+xae   new xaexception xaexception xaer_rmerr
+if  jvminfo jdk_id >  jvminfo j2se_14
+xae initcause se
+return xae
+/**
+* map a standard exception to appropriate xaexception.
+* return the mapped xaexception.
+*/
+private static xaexception wrapinxaexception standardexception se
+return wrapinxaexception
+transactionresourceimpl wrapinsqlexception se
+/**
+* return an underlying connection object back to its xaresource
+* if possible. if not close the connection.
+* @param transtate
+* @param xid_im
+*/
+void returnconnectiontoresource xatransactionstate transtate
+xaxactid xid_im
+removexatransaction xid_im
+synchronized  transtate
+// global transaction is over.
+transtate associationstate   xatransactionstate tc_completed
+transtate notifyall
+embedconnection conn   transtate conn
+// already set in its own resource
+// or can it be returned to its original resource?
+if   transtate creatingresource con realconnection    conn
+transtate creatingresource con realconnection    null
+transtate creatingresource con realconnection   conn
+brokeredconnection handle
+transtate creatingresource con currentconnectionhandle
+conn setapplicationconnection handle
+if  handle    null
+try
+handle setstate true
+catch  sqlexception sqle
+// couldn't reset the connection
+closeunusedconnection transtate conn
+transtate creatingresource con realconnection   null
+return
+// nowhere to place it, close it.
+closeunusedconnection transtate conn
+/**
+* close  an underlying connection object when there is
+* no active xaresource to hand it to.
+* @param conn
+*/
+private static void closeunusedconnection embedconnection conn
+if  conn    null
+try
+conn close
+catch  sqlexception sqle
+/**
+* removes the xid from currently active transactions
+* @param xid_im
+*/
+void removexatransaction xaxactid xid_im
+xatransactionstate transtate
+xatransactionstate  ra removeconnection xid_im
+if  transtate    null
+transtate popme
+void setcurrentxid xaxactid acurrentxid
+currentxid   acurrentxid

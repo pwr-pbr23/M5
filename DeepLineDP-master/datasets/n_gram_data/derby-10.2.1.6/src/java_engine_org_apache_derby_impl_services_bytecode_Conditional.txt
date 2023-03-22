@@ -1,0 +1,309 @@
+/*
+derby - class org.apache.derby.impl.services.bytecode.conditional
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl services bytecode
+import org apache derby iapi services classfile vmopcode
+import org apache derby iapi services sanity sanitymanager
+/**
+a conditional represents an if/then/else block.
+when this is created the code  will already have
+the conditional check code. the code is optimized for branch
+offsets that fit in 2 bytes, though will handle 4 byte offsets.
+<code>
+if condition
+then code
+else code
+</code>
+what actually gets built is
+<code>
+if !condition branch to eb:
+then code
+goto end:  // skip else
+eb:
+else code
+end:
+</code>
+if no else condition was provided then the code is:
+<code>
+if !condition branch to end:
+then code
+end:
+</code>
+note all branches here are using relative offsets, not absolute program counters.
+if the then code leads to the conditional branch offset being too big (>32k)
+because the then code is larger than 32767 bytes then this is built:
+<code>
+// when else code is present
+if condition branch to tb: (relative offset +8)
+goto_w eb: // indirect for else block (5 bytes)
+tb:
+then code (> 32767 bytes)
+goto end:
+eb:
+else code
+end:
+</code>
+<code>
+// when only then code is present
+if condition branch to tb: (relative offset +8)
+goto_w end: // indirect for else block (5 bytes)
+tb:
+then code (> 32767 bytes)
+end:
+</code>
+if there is an else branch and only it is larger than 32767 bytes then
+the code is:
+<code>
+if !condition branch to eb: (offset increased by two over previous value)
+then code
+goto_w end:  // skip else
+eb:
+else code (> 32767 bytes)
+end:
+</code>
+this has one special case where the size of conditional branch to eb:
+now must change from a 16bit value to a 32 bit value. the generated code
+for this is the same as when both the then code and the else code require
+32bit offsets for the branches. this code is:
+<code>
+if condition branch to tb: (relative offset +8)
+goto_w eb: // indirect for else block (5 bytes)
+tb:
+then code (> 32767 bytes)
+goto_w end:
+eb:
+else code (> 32767 bytes)
+end:
+</code>
+in theory, at the moment this should not happen as this would mean a total
+code size that exceeds the limit on the code size for a method (64k). this
+code handles this case as it does occur if the limit for a branch is lowered
+for testing purposes, to ensure the complete set of branch re-write code works.
+this lowering of the limit can be done by changing the constant branch16limit.
+*/
+class conditional
+/**
+* limit of a 16 bit branch.
+* <p>
+* if broad testing of the switch from 16bit to 32bit
+* offsets is required then this constant can be reduced
+* to a lower value, say 50 and run complete tests. this
+* will cover all the combinations. this works because the
+* goto_w instruction works with any offset value.
+*/
+private static final int branch16limit   32767
+private final conditional parent
+/**
+* pc of the 'if' opcode.
+*/
+private final int   if_pc
+private type	stack
+/**
+* pc of the goto added at the end of the then block
+* to transfer control to the end of this conditional.
+* that is at the end of the else block.
+*/
+private int thengoto_pc
+/**
+* start a conditional block.
+* @param parent current conditional block, null if no nesting is going on.
+* @param chunk codechunk this conditional lives in
+* @param ifopcode opcode for the if check.
+* @param entrystack type stack on entering the conditional then block.
+*/
+conditional conditional parent  codechunk chunk  short ifopcode  type entrystack
+this parent   parent
+if_pc   chunk getpc
+this stack   entrystack
+// reserve the space for the branch, will overwrite later
+// with the correct branch offset.
+chunk addinstru2 ifopcode  0
+/**
+* complete the 'then' block and start the 'else' block for this conditional
+* @param chunk codechunk this conditional lives in
+* @param thenstack type stack on completing the conditional then block.
+* @return the type stack on entering the then block
+*/
+type startelse bcmethod mb  codechunk chunk  type thenstack
+// reserve space for the goto end we will be adding
+chunk addinstru2 vmopcode goto  0
+// fill in the branch opcode to branch to
+// the code after the goto, which is the current pc.
+fillin mb  chunk  if_pc  chunk getpc
+// cannot use the pc before adding the goto above
+// as the fillin may insert bytes that move the goto,
+// thus calculate at the end, and subtract the number of
+// instructions in a goto to get its pc.
+thengoto_pc   chunk getpc     3
+type entrystack   stack
+stack   thenstack
+return entrystack
+/**
+* complete the conditional and patch up any jump instructions.
+* @param chunk codechunk this conditional lives in
+* @param elsestack current stack, which is the stack at the end of the else
+* @param stacknumber current number of valid elements in elsestack
+* @return the conditional this conditional was nested in, if any.
+*/
+conditional end bcmethod mb  codechunk chunk  type elsestack  int stacknumber
+int branch_pc
+if  thengoto_pc    0
+// no else condition, make the conditional branch to the end
+branch_pc   if_pc
+else
+// otherwise make the goto branch to the end
+branch_pc   thengoto_pc
+fillin mb  chunk  branch_pc  chunk getpc
+if  sanitymanager debug
+if  stacknumber    stack length
+sanitymanager throwassert
+stack length       stacknumber
+for  int i   0  i < stacknumber  i
+if   stack vmname   equals elsestack vmname
+sanitymanager throwassert
+stack vmname
+elsestack vmname
+return parent
+/**
+* fill in the offsets for a conditional or goto instruction that
+* were dummied up as zero during code generation. handles modifying
+* branch logic when the offset for the branch is greater than can
+* fit in 16 bits. in this case a goto_w with a 32 bit offset will
+* be used, see details within the method for how this is acheived
+* in all situations. this method might insert instructions in the
+* already generated byte code, thus increasing the program counter.
+*
+* @param mb method this conditional is for
+* @param chunk our code chunk
+* @param branch_pc pc of the branch or goto opcode in the code stream
+* @param target_pc pc where we want to jump to.
+*/
+private void fillin bcmethod mb  codechunk chunk
+int branch_pc  int target_pc
+int offset   target_pc   branch_pc
+// following code assumes that this class only
+// generates forward jumps. jump of zero is
+// wrong as well, would be infinite loop or stack problems.
+if  sanitymanager debug
+if  offset <  0
+sanitymanager throwassert     offset
+// original opcode written.
+short branchopcode   chunk getopcode branch_pc
+// handle 16bit offsets, two byte.
+if  offset <  branch16limit
+// code was already setup for two byte offsets,
+// branch or goto instruction was written with
+// offset zero, ready to be overwritten by this code.
+codechunk mod   chunk insertcodespace branch_pc  0
+mod addinstru2 branchopcode  offset
+return
+if  branchopcode    vmopcode goto
+// the goto could be beyond the code length
+// supported by the virtual machine: vmopcode.max_code_length
+// we allow this because later splits may bring the goto
+// offset to within the required limits. if the goto
+// still points outside the limits of the jvm then
+// building the class will fail anyway since the code
+// size will be too large. so no need to flag an error here.
+// change the goto to a goto_w, which means
+// inserting 2 bytes into the stream.
+codechunk mod   chunk insertcodespace branch_pc  2
+// offset we are jumping to is now two bytes futher away
+offset    2
+// replace the original goto with a goto_w
+mod addinstru4 vmopcode goto_w  offset
+// now need to patch up the original conditional
+// as the else code it was branching to is now
+// another two bytes away.
+// there are three cases, given the original branch_offset:
+//
+// 1) branch_offset 16bit, branch_offset+2 16 bit
+// 2) branch_offset 16bit, branch_offset+2 32 bit
+// 3) branch_offset 32bit, branch_offset+2 32 bit
+//
+int startelse_pc   mod getpc
+int branchoffset   startelse_pc   if_pc
+if  branchoffset <  branch16limit   2
+// case 1) branch_offset 16bit, branch_offset+2 16 bit
+// case 2) branch_offset 16bit, branch_offset+2 32 bit
+//
+// branch to the else code is on the original conditional
+// both handled by the standard fillin method.
+fillin mb  chunk  if_pc  mod getpc
+return
+// branch to the else code was changed from the conditional
+// to a goto_w as the branch was out of the range of the
+// conditional.
+// overwrite the offset of the existing goto_w, the instruction
+// after the conditional instruction, which is three bytes long
+mod   chunk insertcodespace if_pc   3  0
+// above branchoffset was calculated from the conditional
+// but we need to branch from the goto_w that was inserted
+// which is three bytes after the conditional.
+branchoffset    3
+mod addinstru4 vmopcode goto_w  branchoffset
+return
+else
+// ensure the pc we are jumping to (the current pc)
+// is within bounds of a valid method *after*
+// we have added the extra bytes.
+if   target_pc   5  >  vmopcode max_code_length
+mb cb addlimitexceeded mb
+vmopcode max_code_length  target_pc   5
+// even if we fail continue to generate the correct code
+// so that the assumptions in the patch up code are not broken.
+// conditional branch
+// branch on the conditional, need to add
+// indirection. basically changing
+// (actual conditional might be different)
+// note branch inverting.
+//
+// ifnonnull branch offset (to else code)
+//   <then code>
+// goto end:
+//   <else code>
+// end:
+// to
+//
+// ifnull branch +8  (to then code, 3 bytes in stream)
+// goto_w offset* (to else code, 5 new bytes in stream)
+//    <then code>
+// goto end:
+//    <else code>
+// invert branch.
+switch  branchopcode
+case vmopcode ifnonnull
+branchopcode   vmopcode ifnull
+break
+case vmopcode ifeq
+branchopcode   vmopcode ifne
+break
+default
+if  sanitymanager debug
+sanitymanager throwassert     branchopcode
+// thus we need to insert 5 bytes
+//
+codechunk mod   chunk insertcodespace branch_pc  5
+// mod is positioned at the current branch.
+mod addinstru2 branchopcode  8
+// indirect goto for the conditional else block or end.
+// offset was from the comparision instruction to the
+// start of the real code. now the branch location
+// is an additional two bytes away, because this
+// goto_w instruction occupies 5 bytes, and the original
+// branch 3.
+offset    2
+mod addinstru4 vmopcode goto_w  offset
+return

@@ -1,0 +1,281 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase procedure
+import java io ioexception
+import java util arrays
+import java util list
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop classification interfacestability
+import org apache hadoop hbase errorhandling foreignexception
+import org apache hadoop hbase protobuf protobufutil
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase zookeeper zkutil
+import org apache hadoop hbase zookeeper zookeeperwatcher
+import org apache zookeeper keeperexception
+import com google protobuf invalidprotocolbufferexception
+/**
+* zookeeper based controller for a procedure member.
+* <p>
+* there can only be one {@link zkprocedurememberrpcs} per procedure type per member,
+* since each procedure type is bound to a single set of znodes. you can have multiple
+* {@link zkprocedurememberrpcs} on the same server, each serving a different member
+* name, but each individual rpcs is still bound to a single member name (and since they are
+* used to determine global progress, its important to not get this wrong).
+* <p>
+* to make this slightly more confusing, you can run multiple, concurrent procedures at the same
+* time (as long as they have different types), from the same controller, but the same node name
+* must be used for each procedure (though there is no conflict between the two procedure as long
+* as they have distinct names).
+* <p>
+* there is no real error recovery with this mechanism currently -- if any the coordinator fails,
+* its re-initialization will delete the znodes and require all in progress subprocedures to start
+* anew.
+*/
+@interfaceaudience public
+@interfacestability evolving
+public class zkprocedurememberrpcs implements procedurememberrpcs
+private static final log log   logfactory getlog zkprocedurememberrpcs class
+private final zkprocedureutil zkcontroller
+protected proceduremember member
+private string membername
+/**
+* must call {@link #start(string, proceduremember)} before this can be used.
+* @param watcher {@link zookeeperwatcher} to be owned by <tt>this</tt>. closed via
+*          {@link #close()}.
+* @param proctype name of the znode describing the procedure type
+* @throws keeperexception if we can't reach zookeeper
+*/
+public zkprocedurememberrpcs final zookeeperwatcher watcher  final string proctype
+throws keeperexception
+this zkcontroller   new zkprocedureutil watcher  proctype
+@override
+public void nodecreated string path
+if   isinprocedurepath path
+return
+log info     path
+// if it is a simple start/end/abort then we just rewatch the node
+if  isacquirednode path
+waitfornewprocedures
+return
+else if  isabortnode path
+watchforabortedprocedures
+return
+string parent   zkutil getparent path
+// if its the end barrier, the procedure can be completed
+if  isreachednode parent
+receivedreachedglobalbarrier path
+return
+else if  isabortnode parent
+abort path
+return
+else if  isacquirednode parent
+startnewsubprocedure path
+else
+log debug     path
+@override
+public void nodechildrenchanged string path
+if  path equals this acquiredznode
+log info     path
+waitfornewprocedures
+else if  path equals this abortznode
+log info     path
+watchforabortedprocedures
+public zkprocedureutil getzkcontroller
+return zkcontroller
+@override
+public string getmembername
+return membername
+/**
+* pass along the procedure global barrier notification to any listeners
+* @param path full znode path that cause the notification
+*/
+private void receivedreachedglobalbarrier string path
+log debug     path
+string procname   zkutil getnodename path
+this member receivedreachedglobalbarrier procname
+private void watchforabortedprocedures
+log debug     zkcontroller getabortznode
+try
+// this is the list of the currently aborted procedues
+for  string node   zkutil listchildrenandwatchfornewchildren zkcontroller getwatcher
+zkcontroller getabortznode
+string abortnode   zkutil joinznode zkcontroller getabortznode    node
+abort abortnode
+catch  keeperexception e
+member controllerconnectionfailure
+zkcontroller getabortznode    new ioexception e
+private void waitfornewprocedures
+// watch for new procedues that we need to start subprocedures for
+log debug     zkcontroller getacquiredbarrier
+list<string> runningprocedures   null
+try
+runningprocedures   zkutil listchildrenandwatchfornewchildren zkcontroller getwatcher
+zkcontroller getacquiredbarrier
+if  runningprocedures    null
+log debug
+return
+catch  keeperexception e
+member controllerconnectionfailure
+new ioexception e
+if  runningprocedures    null
+log debug
+return
+for  string procname   runningprocedures
+// then read in the procedure information
+string path   zkutil joinznode zkcontroller getacquiredbarrier    procname
+startnewsubprocedure path
+/**
+* kick off a new sub-procedure on the listener with the data stored in the passed znode.
+* <p>
+* will attempt to create the same procedure multiple times if an procedure znode with the same
+* name is created. it is left up the coordinator to ensure this doesn't occur.
+* @param path full path to the znode for the procedure to start
+*/
+private synchronized void startnewsubprocedure string path
+log debug     path
+string opname   zkutil getnodename path
+// start watching for an abort notification for the procedure
+string abortznode   zkcontroller getabortznode opname
+try
+if  zkutil watchandcheckexists zkcontroller getwatcher    abortznode
+log debug     opname
+return
+catch  keeperexception e
+member controllerconnectionfailure     abortznode
+opname  new ioexception e
+return
+// get the data for the procedure
+subprocedure subproc   null
+try
+byte data   zkutil getdata zkcontroller getwatcher    path
+log debug     data length
+if   protobufutil ispbmagicprefix data
+string msg       opname
+bytes tostring data
+log error msg
+throw new illegalargumentexception msg
+data   arrays copyofrange data  protobufutil lengthofpbmagic    data length
+log debug     path
+subproc   member createsubprocedure opname  data
+member submitsubprocedure subproc
+catch  illegalargumentexception iae
+log error    iae
+sendmemberaborted subproc  new foreignexception getmembername    iae
+catch  illegalstateexception ise
+log error    ise
+sendmemberaborted subproc  new foreignexception getmembername    ise
+catch  keeperexception e
+member controllerconnectionfailure     opname
+new ioexception e
+/**
+* this attempts to create an acquired state znode for the procedure (snapshot name).
+*
+* it then looks for the reached znode to trigger in-barrier execution.  if not present we
+* have a watcher, if present then trigger the in-barrier action.
+*/
+@override
+public void sendmemberacquired subprocedure sub  throws ioexception
+string procname   sub getname
+try
+log debug     membername       procname
+string acquiredznode   zkutil joinznode zkprocedureutil getacquirebarriernode
+zkcontroller  procname   membername
+zkutil createandfailsilent zkcontroller getwatcher    acquiredznode
+// watch for the complete node for this snapshot
+string reachedbarrier   zkcontroller getreachedbarriernode procname
+log debug     reachedbarrier
+if  zkutil watchandcheckexists zkcontroller getwatcher    reachedbarrier
+receivedreachedglobalbarrier reachedbarrier
+catch  keeperexception e
+member controllerconnectionfailure
+procname       membername  new ioexception e
+/**
+* this acts as the ack for a completed snapshot
+*/
+@override
+public void sendmembercompleted subprocedure sub  throws ioexception
+string procname   sub getname
+log debug     procname       membername
+string joinpath   zkutil joinznode zkcontroller getreachedbarriernode procname   membername
+try
+zkutil createandfailsilent zkcontroller getwatcher    joinpath
+catch  keeperexception e
+member controllerconnectionfailure     joinpath
+new ioexception e
+/**
+* this should be called by the member and should write a serialized root cause exception as
+* to the abort znode.
+*/
+@override
+public void sendmemberaborted subprocedure sub  foreignexception ee
+if  sub    null
+log error    ee
+return
+string procname   sub getname
+log debug     procname
+string procabortznode   zkcontroller getabortznode procname
+try
+string source    ee getsource      null  ? membername  ee getsource
+byte errorinfo   protobufutil prependpbmagic foreignexception serialize source  ee
+zkutil createandfailsilent zkcontroller getwatcher    procabortznode  errorinfo
+log debug     procabortznode
+catch  keeperexception e
+// possible that we get this error for the procedure if we already reset the zk state, but in
+// that case we should still get an error for that procedure anyways
+zkcontroller logzktree zkcontroller getbaseznode
+member controllerconnectionfailure     procabortznode
+new ioexception e
+/**
+* pass along the found abort notification to the listener
+* @param abortznode full znode path to the failed procedure information
+*/
+protected void abort string abortznode
+log debug     abortznode
+string opname   zkutil getnodename abortznode
+try
+byte data   zkutil getdata zkcontroller getwatcher    abortznode
+// figure out the data we need to pass
+foreignexception ee
+try
+if   protobufutil ispbmagicprefix data
+string msg       opname
+log error msg
+// we got a remote exception, but we can't describe it so just return exn from here
+ee   new foreignexception getmembername    new illegalargumentexception msg
+else
+data   arrays copyofrange data  protobufutil lengthofpbmagic    data length
+ee   foreignexception deserialize data
+catch  invalidprotocolbufferexception e
+log warn     opname
+// we got a remote exception, but we can't describe it so just return exn from here
+ee   new foreignexception getmembername    e
+this member receiveabortprocedure opname  ee
+catch  keeperexception e
+member controllerconnectionfailure     abortznode
+zkcontroller getabortznode    new ioexception e
+public void start final string membername  final proceduremember listener
+log debug     membername
+this member   listener
+this membername   membername
+watchforabortedprocedures
+waitfornewprocedures
+@override
+public void close   throws ioexception
+zkcontroller close

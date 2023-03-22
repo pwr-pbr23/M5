@@ -1,0 +1,335 @@
+/**
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase util
+import java io ioexception
+import java util arraylist
+import java util collections
+import java util list
+import java util map
+import java util treemap
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase hbaseconfiguration
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase client delete
+import org apache hadoop hbase client get
+import org apache hadoop hbase client htable
+import org apache hadoop hbase client put
+import org apache hadoop hbase client result
+import org apache hadoop hbase client scan
+import org apache hadoop hbase regionserver hregion
+import org apache hadoop hbase regionserver internalscanner
+import org apache hadoop hbase regionserver wal hlog
+/**
+* contains utility methods for manipulating hbase meta tables.
+* be sure to call {@link #shutdown()} when done with this class so it closes
+* resources opened during meta processing (root, meta, etc.).  be careful
+* how you use this class.  if used during migrations, be careful when using
+* this class to check whether migration is needed.
+*/
+public class metautils
+private static final log log   logfactory getlog metautils class
+private final configuration conf
+private filesystem fs
+private hlog log
+private hregion rootregion
+private map<byte   hregion> metaregions   collections synchronizedsortedmap
+new treemap<byte   hregion> bytes bytes_comparator
+/** default constructor
+* @throws ioexception e
+*/
+public metautils   throws ioexception
+this hbaseconfiguration create
+/**
+* @param conf configuration
+* @throws ioexception e
+*/
+public metautils configuration conf  throws ioexception
+this conf   conf
+conf setint    1
+this rootregion   null
+initialize
+/**
+* verifies that dfs is available and that hbase is off-line.
+* @throws ioexception e
+*/
+private void initialize   throws ioexception
+this fs   filesystem get this conf
+/**
+* @return the hlog
+* @throws ioexception e
+*/
+public synchronized hlog getlog   throws ioexception
+if  this log    null
+path logdir   new path this fs gethomedirectory
+hconstants hregion_logdir_name       system currenttimemillis
+path oldlogdir   new path this fs gethomedirectory
+hconstants hregion_oldlogdir_name
+this log   new hlog this fs  logdir  oldlogdir  this conf
+return this log
+/**
+* @return hregion for root region
+* @throws ioexception e
+*/
+public hregion getrootregion   throws ioexception
+if  this rootregion    null
+openrootregion
+return this rootregion
+/**
+* open or return cached opened meta region
+*
+* @param metainfo hregioninfo for meta region
+* @return meta hregion
+* @throws ioexception e
+*/
+public hregion getmetaregion hregioninfo metainfo  throws ioexception
+hregion meta   metaregions get metainfo getregionname
+if  meta    null
+meta   openmetaregion metainfo
+log info     meta tostring
+this metaregions put metainfo getregionname    meta
+return meta
+/**
+* closes catalog regions if open. also closes and deletes the hlog. you
+* must call this method if you want to persist changes made during a
+* metautils edit session.
+*/
+public void shutdown
+if  this rootregion    null
+try
+this rootregion close
+catch  ioexception e
+log error    e
+finally
+this rootregion   null
+try
+for  hregion r  metaregions values
+log info     r tostring
+r close
+catch  ioexception e
+log error    e
+finally
+metaregions clear
+try
+if  this log    null
+this log rollwriter
+this log closeanddelete
+catch  ioexception e
+log error    e
+finally
+this log   null
+/**
+* used by scanrootregion and scanmetaregion to call back the caller so it
+* can process the data for a row.
+*/
+public interface scannerlistener
+/**
+* callback so client of scanner can process row contents
+*
+* @param info hregioninfo for row
+* @return false to terminate the scan
+* @throws ioexception e
+*/
+public boolean processrow hregioninfo info  throws ioexception
+/**
+* scans the root region. for every meta region found, calls the listener with
+* the hregioninfo of the meta region.
+*
+* @param listener method to be called for each meta region found
+* @throws ioexception e
+*/
+public void scanrootregion scannerlistener listener  throws ioexception
+// open root region so we can scan it
+if  this rootregion    null
+openrootregion
+scanmetaregion this rootregion  listener
+/**
+* scan the passed in metaregion <code>m</code> invoking the passed
+* <code>listener</code> per row found.
+* @param r region
+* @param listener scanner listener
+* @throws ioexception e
+*/
+public void scanmetaregion final hregion r  final scannerlistener listener
+throws ioexception
+scan scan   new scan
+scan addcolumn hconstants catalog_family  hconstants regioninfo_qualifier
+internalscanner s   r getscanner scan
+try
+list<keyvalue> results   new arraylist<keyvalue>
+boolean hasnext   true
+do
+hasnext   s next results
+hregioninfo info   null
+for  keyvalue kv  results
+info   writables gethregioninfoornull kv getvalue
+if  info    null
+log warn
+bytes tostringbinary kv getrow
+r gettabledesc   getnameasstring
+continue
+if   listener processrow info
+break
+results clear
+while  hasnext
+finally
+s close
+/**
+* scans a meta region. for every region found, calls the listener with
+* the hregioninfo of the region.
+* todo: use visitor rather than listener pattern.  allow multiple visitors.
+* use this everywhere we scan meta regions: e.g. in metascanners, in close
+* handling, etc.  have it pass in the whole row, not just hregioninfo.
+* <p>use for reading meta only.  does not close region when done.
+* use {@link #getmetaregion(hregioninfo)} instead if writing.  adds
+* meta region to list that will get a close on {@link #shutdown()}.
+*
+* @param metaregioninfo hregioninfo for meta region
+* @param listener method to be called for each meta region found
+* @throws ioexception e
+*/
+public void scanmetaregion hregioninfo metaregioninfo
+scannerlistener listener
+throws ioexception
+// open meta region so we can scan it
+hregion metaregion   openmetaregion metaregioninfo
+scanmetaregion metaregion  listener
+private synchronized hregion openrootregion   throws ioexception
+if  this rootregion    null
+return this rootregion
+this rootregion   hregion openhregion hregioninfo root_regioninfo
+htabledescriptor root_tabledesc  getlog
+this conf
+this rootregion compactstores
+return this rootregion
+private hregion openmetaregion hregioninfo metainfo  throws ioexception
+hregion meta   hregion openhregion metainfo  htabledescriptor meta_tabledesc
+getlog    this conf
+meta compactstores
+return meta
+/**
+* set a single region on/offline.
+* this is a tool to repair tables that have offlined tables in their midst.
+* can happen on occasion.  use at your own risk.  call from a bit of java
+* or jython script.  this method is 'expensive' in that it creates a
+* {@link htable} instance per invocation to go against <code>.meta.</code>
+* @param c a configuration that has its <code>hbase.master</code>
+* properly set.
+* @param row row in the catalog .meta. table whose hregioninfo's offline
+* status we want to change.
+* @param onlineoffline pass <code>true</code> to offline the region.
+* @throws ioexception e
+*/
+public static void changeonlinestatus  final configuration c
+final byte  row  final boolean onlineoffline
+throws ioexception
+htable t   new htable c  hconstants meta_table_name
+get get   new get row
+get addcolumn hconstants catalog_family  hconstants regioninfo_qualifier
+result res   t get get
+keyvalue  kvs   res raw
+if kvs length <  0
+throw new ioexception     bytes tostring row
+byte  value   kvs getvalue
+if  value    null
+throw new ioexception     bytes tostring row
+hregioninfo info   writables gethregioninfo value
+put put   new put row
+info setoffline onlineoffline
+put add hconstants catalog_family  hconstants regioninfo_qualifier
+writables getbytes info
+t put put
+delete delete   new delete row
+delete deletecolumns hconstants catalog_family  hconstants server_qualifier
+delete deletecolumns hconstants catalog_family
+hconstants startcode_qualifier
+t delete delete
+/**
+* update col_regioninfo in meta region r with hregioninfo hri
+*
+* @param r region
+* @param hri region info
+* @throws ioexception e
+*/
+public void updatemetaregioninfo hregion r  final hregioninfo hri
+throws ioexception
+if  log isdebugenabled
+get get   new get hri getregionname
+get addcolumn hconstants catalog_family  hconstants regioninfo_qualifier
+result res   r get get  null
+keyvalue  kvs   res raw
+if kvs length <  0
+return
+byte  value   kvs getvalue
+if  value    null
+return
+hregioninfo h   writables gethregioninfoornull value
+log debug     bytes tostring hconstants catalog_family
+bytes tostring hconstants regioninfo_qualifier
+hri tostring         r tostring         h tostring
+put put   new put hri getregionname
+put add hconstants catalog_family  hconstants regioninfo_qualifier
+writables getbytes hri
+r put put
+if  log isdebugenabled
+get get   new get hri getregionname
+get addcolumn hconstants catalog_family  hconstants regioninfo_qualifier
+result res   r get get  null
+keyvalue  kvs   res raw
+if kvs length <  0
+return
+byte  value   kvs getvalue
+if  value    null
+return
+hregioninfo h   writables gethregioninfoornull value
+log debug     bytes tostring hconstants catalog_family
+bytes tostring hconstants regioninfo_qualifier
+hri tostring         r tostring          h tostring
+/**
+* @return list of {@link hregioninfo} rows found in the root or meta
+* catalog table.
+* @param tablename name of table to go looking for.
+* @throws ioexception e
+* @see #getmetaregion(hregioninfo)
+*/
+public list<hregioninfo> getmetarows final byte  tablename
+throws ioexception
+final list<hregioninfo> result   new arraylist<hregioninfo>
+// if passed table name is meta, then  return the root region.
+if  bytes equals hconstants meta_table_name  tablename
+result add openrootregion   getregioninfo
+return result
+// return all meta regions that contain the passed tablename.
+scanrootregion new scannerlistener
+private final log sl_log   logfactory getlog this getclass
+public boolean processrow hregioninfo info  throws ioexception
+sl_log debug     info
+if  bytes equals info gettablename
+hconstants meta_table_name
+result add info
+return false
+return true
+return result

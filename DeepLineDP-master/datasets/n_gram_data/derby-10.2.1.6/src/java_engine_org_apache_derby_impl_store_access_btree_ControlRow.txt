@@ -1,0 +1,1597 @@
+/*
+derby - class org.apache.derby.impl.store.access.btree.controlrow
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store access btree
+import java io printstream
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services io formatidutil
+import org apache derby iapi services io storable
+import org apache derby iapi services io typedformat
+import org apache derby iapi error standardexception
+import org apache derby iapi store access conglomerate logicalundo
+import org apache derby iapi store access qualifier
+import org apache derby iapi store access rowutil
+import org apache derby iapi store raw auxobject
+import org apache derby iapi store raw fetchdescriptor
+import org apache derby iapi store raw page
+import org apache derby iapi store raw containerhandle
+import org apache derby iapi store raw recordhandle
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi types sqllongint
+import org apache derby impl store access storableformatid
+import org apache derby iapi services io formatablebitset
+import org apache derby impl store access conglomerate conglomerateutil
+/**
+base class for leaf and branch control rows.
+<p>
+<b>concurrency notes</b>
+<p>
+all access through control rows is serialized by an exclusive latch on
+the page the control row is for.  the page is latched when the control
+row is "gotten" (controlrow#get), and unlatched when the control row
+is released (controlrow#release).
+<p>
+<b>to do list</b>
+<ul>
+<li> <i>[note1]</i>
+the code is arranged to fault in fields from the row as necessary.
+many of the fields of a control row are rarely used (left sibling, parent).
+the accessors fault in the underlying column only when
+requested by allocating the appropriate object and calling fetchfromslot and
+only fetching the requested field.
+<li> <i>[note2]</i>
+currently, all the fields of the control row are stored as storableu8s
+for simplicity.  this is too few bits to hold the long page numbers, and
+too many to hold the version, level, and isroot flag.  some consideration
+will have to be given to the appropriate storage format for these values.
+<li> <i>[note3]</i>
+the implementation relies on the existance of page "auxiliary" pointers
+which keep object versions of the control row.
+<p>
+@see controlrow#get
+@see controlrow#release
+**/
+public abstract class controlrow implements auxobject  typedformat
+/**
+* version indentifier of the control row within the page.
+* <p>
+* this is the format id of the control row.  the format id is currently
+* one of either storedformatids.access_btree_leafcontrolrow_id or
+* storedformatids.access_btree_branchcontrolrow_id.
+**/
+private storableformatid    version   null
+/**
+* pointer to page which is "left" at the current level.
+* <p>
+* currently all pages at a level are doubly linked.  the leftmost page
+* in a level has a leftsiblingpagenumber ==
+* containerhandle.invalid_page_number.  all key values on the page which
+* is left must precede the first key value on the current page.
+**/
+private sqllongint leftsiblingpagenumber
+/**
+* pointer to page which is "right" at the current level.
+* <p>
+* currently all pages at a level are doubly linked.  the rightmost page
+* in a level has a rightsiblingpagenumber ==
+* containerhandle.invalid_page_number.  all key values on the page which
+* is right of the current page must follow the last key value on the
+* current page.
+**/
+private sqllongint rightsiblingpagenumber
+/**
+* the parent page of the current page.
+* <p>
+* for consistency checking it is useful to maintain the parentpagenumber
+* field of the current page.  the root page has a value of
+* containerhandle.invalid_page_number in it's parentpagenumber field.
+* <p>
+* resolve (mikem) - we need to come up with some way to not maintain these,
+* maybe by providing a property on secondary index or a different 2nd
+* index.
+*
+**/
+private sqllongint parentpagenumber     for consistency checking
+/**
+* the level of the btree.
+* <p>
+* the leaf level of the btree is 0.  the first branch level (parent level
+* of the leaf), is level 1.  the height of the btree is (level + 1).
+* <p>
+* the smallest btree is a one page btree with only a leaf, and no branch
+* pages.
+**/
+private sqllongint level
+/**
+* is this page the root of the btree?
+* <p>
+* currently "1" if the page is the root page, else "0".
+* <p>
+* resolve (mikem) when real datatype come about, this value should
+* probably be just a bit in some status word.
+**/
+private sqllongint isroot   null
+/**
+* a copy of the conglomerate that describes the owning conglom.
+* <p>
+* this information is used during logical undo to get the type information
+* so that rows can be compared and searched for.  we may be able to get
+* away with a subset of the information stored in the conglomerate.
+* <p>
+* resolve (mikem) - change this to only store the info on the root page.
+**/
+private btree    btree   null
+/**
+* the page that this control row describes.
+**/
+protected page page
+/**
+* the page that this control row describes.
+**/
+protected datavaluedescriptor row
+/**
+* row used to replace fetchfieldfromslot() calls.
+**/
+protected datavaluedescriptor scratch_row
+/**
+* fetchdescriptor used to replace fetchfieldfromslot() calls.
+**/
+protected fetchdescriptor   fetchdesc
+/**
+* in memory hint about whether to use the last_search_result hint during
+* search.
+**/
+transient protected boolean use_last_search_result_hint   false
+/**
+* in memory hint about where to begin the binary search to find a key
+* on the the current control page.
+**/
+transient protected int last_search_result   0
+/**
+* column number assignments for columns of the control row.
+* <p>
+* the control row is stored as the first row in a btree page.  the row
+* is an array of columns.  the control row columns are the columns numbered
+* from controlrow.cr_colid_first through controlrow.cr_colid_last.  the
+* classes which implement the concrete derived classes of controlrow may
+* add columns to the control row, but they must be added after the
+* controlrow columns.
+**/
+protected static final int cr_colid_first		  0
+protected static final int cr_version_colid		  cr_colid_first   0
+protected static final int cr_leftsib_colid		  cr_colid_first   1
+protected static final int cr_rightsib_colid	  cr_colid_first   2
+protected static final int cr_parent_colid		  cr_colid_first   3
+protected static final int cr_level_colid		  cr_colid_first   4
+protected static final int cr_isroot_colid		  cr_colid_first   5
+protected static final int cr_conglom_colid	      cr_colid_first   6
+protected static final int cr_colid_last		  cr_conglom_colid
+protected static final int cr_ncolumns			  cr_colid_last   1
+/**
+* bit sets used to fetch single columns at a time.
+**/
+protected static final formatablebitset   cr_version_bitset
+new formatablebitset cr_version_colid   1
+protected static final formatablebitset   cr_leftsib_bitset
+new formatablebitset cr_leftsib_colid   1
+protected static final formatablebitset   cr_rightsib_bitset
+new formatablebitset cr_rightsib_colid   1
+protected static final formatablebitset   cr_parent_bitset
+new formatablebitset cr_parent_colid   1
+protected static final formatablebitset   cr_level_bitset
+new formatablebitset cr_level_colid   1
+protected static final formatablebitset   cr_isroot_bitset
+new formatablebitset cr_isroot_colid   1
+protected static final formatablebitset   cr_conglom_bitset
+new formatablebitset cr_conglom_colid   1
+/**
+* values passed in the flag argument to splitfor.
+**/
+/* row causing split would be last row on leaf page */
+public static final int split_flag_last_on_page        0x000000001
+/* row causing split would be last row in table */
+public static final int split_flag_last_in_table       0x000000002
+/* row causing split would be first row on page */
+public static final int split_flag_first_on_page       0x000000004
+/* row causing split would be first row in table */
+public static final int split_flag_first_in_table      0x000000008
+/**
+* the slot at which all control rows reside.
+**/
+protected static final int cr_slot   0
+/*
+** constructors of controlrow
+*/
+static
+cr_version_bitset set cr_version_colid
+cr_leftsib_bitset set cr_leftsib_colid
+cr_rightsib_bitset set cr_rightsib_colid
+cr_parent_bitset set cr_parent_colid
+cr_level_bitset set cr_level_colid
+cr_isroot_bitset set cr_isroot_colid
+cr_conglom_bitset set cr_conglom_colid
+/**
+* no arg constructor.
+* <p>
+* getcontrolrowforpage() will call this constructor when it uses the
+* monitor to create a control row dynamically given a given format id.
+**/
+protected controlrow
+this scratch_row
+new datavaluedescriptor
+this fetchdesc
+new fetchdescriptor
+this scratch_row length   formatablebitset  null   qualifier  null
+/**
+* constructor for making a new control row as part of allocating a new
+* page.  fills in all the fields but does not write them anywhere.
+* <p>
+* <p>
+* changes to this constructor will probably require changes to the
+* corresponding accessor(s).
+*
+* @param btree      static information about the btree.
+* @param page       the page described by this control row.
+* @param parent     the parent page of this page, "null" if this page is
+*                   root or if not maintaining parent links.
+* @param isroot     is this page the root of the tree?
+*
+*
+* @exception standardexception standard exception policy.
+**/
+protected controlrow
+openbtree         btree
+page		      page
+int			      level
+controlrow	      parent
+boolean           isroot
+throws standardexception
+// the caller is expected to have latched the pages.
+if  sanitymanager debug
+sanitymanager assert page islatched
+sanitymanager assert parent    null    parent page islatched
+// maintain which page this control row describes.
+this page   page
+// page numbers start out "invalid".  presumably the caller will
+// link the page into a page chain as one of its next steps.
+leftsiblingpagenumber
+new sqllongint btree container invalid_page_number
+rightsiblingpagenumber
+new sqllongint btree container invalid_page_number
+// remember the parent if there is one and we're remembering parents.
+parentpagenumber   new sqllongint
+parent    null ?
+btree container invalid_page_number
+parent page getpagenumber
+// all pages start out not being root pages.  the caller will setisroot
+// if this is going to be a root page. zero means false - see
+// getisroot/setisroot.
+this isroot   new sqllongint isroot ? 1   0
+// set the rest of the state, as passed in.
+this level     new sqllongint level
+this version   new storableformatid gettypeformatid
+// if it is a root page then store the real btree conglomerate, if it
+// is not a root page then set up an "empty" btree conglomerate which
+// will be stored as "null".
+this btree
+isroot ?
+btree getconglomerate
+btree  monitor newinstancefromidentifier
+btree getconglomerate   gettypeformatid
+// initialize the object array to be used for interacting with raw
+// store to insert, fetch, and update the control row.
+this row   new datavaluedescriptor
+this row	  this version
+this row	  this leftsiblingpagenumber
+this row	  this rightsiblingpagenumber
+this row	  this parentpagenumber
+this row	  this level
+this row	  this isroot
+this row    this btree
+// make the control row the aux object for the page so control row
+// getters end up with the same row.
+page setauxobject this
+/**
+* constructor for making a control row for an existing page.
+* <p>
+* not all the fields are filled in; their values will get faulted in from
+* the page as necessary.
+* <p>
+* classes which extend controlrow must delegate to this constructor
+* and may want to override it as well.
+* changes to this constructor will probably require changes to the
+* corresponding accessor(s).
+*
+* @param container  open container
+* @param page       the page described by this control row.
+*
+* @exception standardexception standard exception policy.
+**/
+protected controlrow containerhandle container  page page
+throws standardexception
+system out println
+// the caller is expected to have latched the pages.
+if  sanitymanager debug
+sanitymanager assert page islatched
+// remember the page.
+this page   page
+// the rest of the fields are left null; they'll get faulted
+// in if/when necessary.  see the accessors.
+/* private/protected methods of controlrow: */
+/**
+* get version of the control row.
+* <p>
+* returns the version of the control row, faulting it in from the page
+* if necessary.
+*
+* @return version of the control row.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected int getversion
+throws standardexception
+if  this version    null
+// fault in the version.
+this version   new storableformatid
+scratch_row   this version
+fetchdesc setvalidcolumns cr_version_bitset
+this page fetchfromslot
+recordhandle  null  cr_slot  scratch_row  fetchdesc  false
+return this version getvalue
+/**
+* set version of the control row.
+* <p>
+* sets the version of the control row.  updates both the in-memory
+* control row and the disk copy.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected void setversion int version
+throws standardexception
+// store the field.
+if  this version    null
+this version   new storableformatid
+this version setvalue version
+// write the field through to the underlying row.
+this page updatefieldatslot
+cr_slot  cr_version_colid  this version  null
+/**
+* get the control row for this page's left sibling, or null if there is no
+* left sibling (which probably means it's the leftmost page at its level).
+* since right-to-left traversal of an index level	is deadlock-prone, this
+* method will only get get the left sibling if it can latch it without
+* waiting.
+*
+* @exception waiterror if the latch request would have had to wait.
+*
+* @exception standardexception standard exception policy.
+**/
+public controlrow getleftsibling openbtree btree
+throws standardexception  waiterror
+controlrow cr
+long pageno   this getleftsiblingpagenumber
+// is there a left sibling?
+if  pageno    containerhandle invalid_page_number
+return null
+// try to get the control row without waiting
+cr   controlrow getnowait btree  pageno
+if  cr    null
+throw new waiterror
+return cr
+protected void setleftsibling controlrow leftsib
+throws standardexception
+long left_sib_pageno
+leftsib    null ? containerhandle invalid_page_number
+leftsib page getpagenumber
+// store the field.
+if  leftsiblingpagenumber    null
+leftsiblingpagenumber   new sqllongint left_sib_pageno
+else
+this leftsiblingpagenumber setvalue left_sib_pageno
+// write the field through to the underlying row
+try
+this page updatefieldatslot
+cr_slot  cr_leftsib_colid  this leftsiblingpagenumber  null
+catch  standardexception se
+// since this is an update of a fixed length field it should
+// never fail, but it has happened enough that an assert helps
+// with debugging.
+if  sanitymanager debug
+sanitymanager throwassert
+se
+this
+cr_leftsib_colid
+this leftsiblingpagenumber
+throw se
+/**
+return the control row for this page's right sibling.  unlike getting
+the left sibling, it's ok to wait for the right sibling latch since
+left-to-right is the deadlock-free ordering.
+@exception standardexception standard exception policy.
+**/
+protected controlrow getrightsibling openbtree open_btree
+throws standardexception
+long pageno   this getrightsiblingpagenumber
+// return the control row for the page.
+if  pageno    containerhandle invalid_page_number
+return null
+else
+return controlrow get open_btree  pageno
+// this method will have to update the row.
+protected void setrightsibling controlrow rightsib
+throws standardexception
+long right_sib_pageno
+rightsib    null ? containerhandle invalid_page_number
+rightsib page getpagenumber
+// store the field.
+if  rightsiblingpagenumber    null
+rightsiblingpagenumber   new sqllongint right_sib_pageno
+else
+this rightsiblingpagenumber setvalue right_sib_pageno
+// write the field through to the underlying row
+try
+this page updatefieldatslot
+cr_slot  cr_rightsib_colid  this rightsiblingpagenumber  null
+catch  standardexception se
+// since this is an update of a fixed length field it should
+// never fail, but it has happened enough that an assert helps
+// with debugging.
+if  sanitymanager debug
+sanitymanager throwassert
+se
+this
+cr_rightsib_colid
+this rightsiblingpagenumber
+throw se
+/**
+get the page number of the left sibling. fault it's value in if it
+hasn't been yet.
+@exception standardexception standard exception policy.
+**/
+public long getleftsiblingpagenumber
+throws standardexception
+if  this leftsiblingpagenumber    null
+// fault in the page number.
+this leftsiblingpagenumber   new sqllongint
+if  sanitymanager debug
+sanitymanager assert scratch_row    null
+scratch_row   this leftsiblingpagenumber
+fetchdesc setvalidcolumns cr_leftsib_bitset
+this page fetchfromslot
+recordhandle  null  cr_slot  scratch_row  fetchdesc  false
+return leftsiblingpagenumber getlong
+/**
+get the page number of the right sibling. fault it's value in if it
+hasn't been yet.
+@exception standardexception standard exception policy.
+**/
+protected long getrightsiblingpagenumber
+throws standardexception
+if  this rightsiblingpagenumber    null
+// fault in the page number.
+this rightsiblingpagenumber   new sqllongint
+scratch_row   this rightsiblingpagenumber
+fetchdesc setvalidcolumns cr_rightsib_bitset
+this page fetchfromslot
+recordhandle  null  cr_slot  scratch_row  fetchdesc  false
+return rightsiblingpagenumber getlong
+/**
+get the page number of the parent, if it's being maintained.
+note that there is intentionally no way to get the control
+row for the parent page - the b-tree code never traverses
+up the tree, even in consistency checks.
+@exception standardexception standard exception policy.
+**/
+protected long getparentpagenumber
+throws standardexception
+if  this parentpagenumber    null
+// fault in the page number.
+this parentpagenumber   new sqllongint
+scratch_row   this parentpagenumber
+fetchdesc setvalidcolumns cr_parent_bitset
+this page fetchfromslot
+recordhandle  null  cr_slot  scratch_row  fetchdesc  false
+// see note3 about converting from int to long.
+long pageno   parentpagenumber getlong
+return pageno
+void setparent long parent
+throws standardexception
+// store the field.
+if  parentpagenumber    null
+parentpagenumber   new sqllongint
+this parentpagenumber setvalue parent
+// write the field through to the underlying row
+try
+this page updatefieldatslot
+cr_slot  cr_parent_colid  this parentpagenumber  null
+catch  standardexception se
+// since this is an update of a fixed length field it should
+// never fail, but it has happened enough that an assert helps
+// with debugging.
+if  sanitymanager debug
+sanitymanager throwassert
+se
+this
+cr_parent_colid
+this parentpagenumber
+throw se
+return
+protected int getlevel
+throws standardexception
+if  this level    null
+// fault in the level
+this level   new sqllongint
+scratch_row   this level
+fetchdesc setvalidcolumns cr_level_bitset
+this page fetchfromslot
+recordhandle  null  cr_slot  scratch_row  fetchdesc  false
+return  int  this level getlong
+protected void setlevel int newlevel
+throws standardexception
+// store the field.
+if  this level    null
+this level   new sqllongint
+this level setvalue  long  newlevel
+// write the field through to the underlying row.
+this page updatefieldatslot cr_slot  cr_level_colid  this level  null
+protected boolean getisroot
+throws standardexception
+// convert 1 to true, 0 to false;
+if  this isroot    null
+// fault in the level
+this isroot   new sqllongint
+scratch_row   this isroot
+fetchdesc setvalidcolumns cr_isroot_bitset
+this page fetchfromslot
+recordhandle  null  cr_slot  scratch_row  fetchdesc  false
+return  this isroot getlong      1
+protected void setisroot boolean isroot
+throws standardexception
+// resolve (mmm) - need to store more efficiently //
+// store the field.
+if  this isroot    null
+this isroot   new sqllongint
+this isroot setvalue  isroot  ? 1   0
+// write the field through to the underlying row.
+this page updatefieldatslot
+cr_slot  cr_isroot_colid  this isroot  null
+/**
+* get format id information for row on page.
+* <p>
+* returns the format id information for a row on the page. faulting it
+* in from the page if necessary.
+*
+* @return format id of a row on the page.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public btree getconglom int format_id
+throws standardexception
+if  sanitymanager debug
+// this call is only valid on root pages.  if called on non
+// root pages it will return a "null" conglom object.
+sanitymanager assert
+this page getpagenumber      btree rootpageid     getisroot
+if  this btree    null
+// use format id to create empty instance of conglomerate class
+this btree    btree  monitor newinstancefromidentifier format_id
+scratch_row   this btree
+fetchdesc setvalidcolumns cr_conglom_bitset
+this page fetchfromslot
+recordhandle  null  cr_slot  scratch_row  fetchdesc  false
+return this btree
+/**
+* set the conglomerate field in the btree.
+* <p>
+* sets the btree field of the control row.  updates just the disk copy.
+*
+* @exception  standardexception  standard exception policy.
+**/
+private void setconglom btree btree
+throws standardexception
+// store the field.  delay faulting value into object until getconlgom()
+// call, which in general only happens during recovery.
+// write the field through to the underlying row.
+this page updatefieldatslot cr_slot  cr_conglom_colid  btree  null
+/*
+** methods for getting control rows from pages.
+*/
+/**
+get the control row from the given page in the b-tree.
+the returned control row will be of the correct type
+for the page (i.e., either a leafcontrolrow or a
+branchcontrolrow).
+@exception standardexception standard exception policy.
+**/
+public static controlrow get openbtree open_btree  long pagenumber
+throws standardexception
+return controlrow get open_btree container  pagenumber
+public static controlrow get containerhandle container  long pagenumber
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert container    null
+// get the page, waiting if necessary.  the page is returned latched.
+page page   container getpage pagenumber
+if  sanitymanager debug
+if  page    null
+sanitymanager throwassert
+pagenumber
+container
+// return the corresponding control row.
+return getcontrolrowforpage container  page
+/**
+get the control row for the given page if the latch on the
+page can be obtained without waiting, else return null.
+@exception standardexception standard exception policy.
+**/
+public static controlrow getnowait
+openbtree       open_btree
+long            pagenumber
+throws standardexception
+// try to get the page without waiting.  if we would have
+// to wait, return null.
+page page   open_btree container getuserpagenowait pagenumber
+if  page    null
+return null
+// got the page without waiting.  return the corresponding
+// control row.
+return getcontrolrowforpage open_btree container  page
+protected static controlrow getcontrolrowforpage
+containerhandle container
+page            page
+throws standardexception
+controlrow cr   null
+// see if the control row is still cached with the page
+// if so, just use the cached control row.
+auxobject auxobject   page getauxobject
+if  auxobject    null
+return  controlrow  auxobject
+if  sanitymanager debug
+sanitymanager assert page recordcount   >  1
+// no cached control row, so create a new one.
+// use the version field to determine the type of the row to
+// create.  this routine depends on the version field being the same
+// number column in all control rows.
+storableformatid version   new storableformatid
+datavaluedescriptor version_ret   new datavaluedescriptor
+version_ret   version
+// todo (mikem) - get rid of this new.
+page fetchfromslot
+recordhandle  null  cr_slot  version_ret
+new fetchdescriptor 1  cr_version_bitset   qualifier  null
+false
+// use format id to create empty instance of right conglomerate class
+cr    controlrow  monitor newinstancefromidentifier version getvalue
+cr page   page
+// call page specific initialization.
+cr controlrowinit
+// cache this control row with the page in the cache.
+page setauxobject cr
+return cr
+/**
+release this control row's resources.
+**/
+public void release
+if  sanitymanager debug
+sanitymanager assert page    null
+if  page    null
+page unlatch
+// it might be nice to set the page object to null, but
+// since there might be multiple control rows on this
+// page, we'd have to maintain a use count.  rather than
+// doing that we'll let the garbage collector earn its
+// keep.  we are also expecting that the raw store will
+// throw errors if we attempt to use an unlatched page.
+/**
+search this index page.
+<p>
+this method is very performance sensitive.  it is the intention that no
+object allocations occur during the execution of this method.
+<p>
+this method performs a binary search on the page and finds the entry i on
+the page such that entry[i] <= key < entry[i+1].  the result of the search
+is filled into the passed in params structure.
+@param params the parameters of the search
+@exception standardexception could be thrown by underlying raw store
+operations.
+@see searchparameters
+**/
+protected void searchforentry searchparameters params
+throws standardexception
+if  sanitymanager debug
+// system.out.println("searchforentry() enter: params:" + params);
+// system.out.println("searchforentry() enter: this:"   + this);
+// system.out.println("searchforentry() enter: this page:"   + debugpage(params.btree));
+// leftrange and rightrange indicates the range of slots to search.
+// the range starts as all the slots on the page not including slot
+// 0 which is the control row.
+int leftrange    1
+int rightrange   page recordcount     1
+// leftslot and rightslot if non-zero, mean that the key has been
+// compared to the row at that slot.  if non-zero the key must be
+// greater than the key at leftslot and the key must be lest than
+// the key at rightslot.
+int leftslot    0
+int rightslot   rightrange   1
+int midslot
+int compare_ret
+// search until you either exactly find the key, or you have
+// compared 2 adjacent rows and found the value must exist between
+// the 2.
+if  this use_last_search_result_hint
+// make sure to set midslot to point to somwhere in the legal range.
+midslot
+this last_search_result    0  ? 1   this last_search_result
+if  midslot > rightrange
+midslot   rightrange
+else
+// if we don't think we have a good hint where to start the search
+// just go to the middle.
+midslot    leftrange   rightrange    2
+if  sanitymanager debug
+if   leftslot     rightslot   1
+midslot >  leftrange    midslot <  rightrange
+sanitymanager throwassert
+midslot
+leftrange
+rightrange
+while  leftslot     rightslot   1
+// compare the index row to the key.
+compare_ret
+compareindexrowfrompagetokey
+this
+midslot
+params template  params searchkey
+params btree getconglomerate   nuniquecolumns
+params partial_key_match_op
+params btree getconglomerate   ascdescinfo
+if  compare_ret    0
+// found exact match
+params resultslot   midslot
+params resultexact   true
+// update the hints based on result of the search.
+use_last_search_result_hint
+midslot    this last_search_result  ? true   false
+this last_search_result   midslot
+return
+else if  compare_ret > 0
+// key falls to the left of midslot
+rightslot    midslot
+rightrange   midslot   1
+else
+// key falls to the right of midslot
+leftslot     midslot
+leftrange    midslot   1
+midslot    leftrange   rightrange    2
+//midslot = (leftrange + rightrange) >> 1;
+// update the hints based on result of the search.
+this use_last_search_result_hint
+leftslot    this last_search_result
+this last_search_result   leftslot
+// no exact match found, leftslot will point at the slot on the
+// page just before where the row should be inserted.  in the case
+// where the key is before rows on the page then leftslot will be
+// 0 (an empty page is a special case of this).
+if  sanitymanager debug
+if  leftslot    rightslot   1
+sanitymanager throwassert
+leftslot       rightslot
+params resultslot    leftslot
+params resultexact   false
+if  sanitymanager debug
+// system.out.println("searchforentry() exit: params:" + params);
+return
+protected void searchforentrybackward searchparameters params
+throws standardexception
+if  sanitymanager debug
+// system.out.println("searchforentry() enter: params:" + params);
+// system.out.println("searchforentry() enter: this:"   + this);
+// system.out.println("searchforentry() enter: this page:"   + debugpage(params.btree));
+// leftrange and rightrange indicates the range of slots to search.
+// the range starts as all the slots on the page not including slot
+// 0 which is the control row.
+int leftrange    1
+int rightrange   page recordcount     1
+// leftslot and rightslot if non-zero, mean that the key has been
+// compared to the row at that slot.  if non-zero the key must be
+// greater than the key at leftslot and the key must be lest than
+// the key at rightslot.
+int leftslot    0
+int rightslot   rightrange   1
+int midslot
+int compare_ret
+// search until you either exactly find the key, or you have
+// compared 2 adjacent rows and found the value must exist between
+// the 2.
+if  this use_last_search_result_hint
+// make sure to set midslot to point to somwhere in the legal range.
+midslot
+this last_search_result    0  ? 1   this last_search_result
+if  midslot > rightrange
+midslot   rightrange
+else
+// if we don't think we have a good hint where to start the search
+// just go to the middle.
+midslot    leftrange   rightrange    2
+if  sanitymanager debug
+if   leftslot     rightslot   1
+midslot >  leftrange    midslot <  rightrange
+sanitymanager throwassert
+midslot
+leftrange
+rightrange
+while  leftslot     rightslot   1
+// compare the index row to the key.
+compare_ret
+compareindexrowfrompagetokey
+this
+midslot
+params template  params searchkey
+params btree getconglomerate   nuniquecolumns
+params partial_key_match_op
+params btree getconglomerate   ascdescinfo
+if  compare_ret    0
+// found exact match
+params resultslot   midslot
+params resultexact   true
+// update the hints based on result of the search.
+use_last_search_result_hint
+midslot    this last_search_result  ? true   false
+this last_search_result   midslot
+return
+else if  compare_ret > 0
+// key falls to the left of midslot
+rightslot    midslot
+rightrange   midslot   1
+else
+// key falls to the right of midslot
+leftslot     midslot
+leftrange    midslot   1
+midslot    leftrange   rightrange    2
+//midslot = (leftrange + rightrange) >> 1;
+// update the hints based on result of the search.
+this use_last_search_result_hint
+leftslot    this last_search_result
+this last_search_result   leftslot
+// no exact match found, leftslot will point at the slot on the
+// page just before where the row should be inserted.  in the case
+// where the key is before rows on the page then leftslot will be
+// 0 (an empty page is a special case of this).
+if  sanitymanager debug
+if  leftslot    rightslot   1
+sanitymanager throwassert
+leftslot       rightslot
+params resultslot    leftslot
+params resultexact   false
+if  sanitymanager debug
+// system.out.println("searchforentry() exit: params:" + params);
+return
+/**
+compare two orderable rows, considering ncomparecols, and return -1, 0, or 1
+depending on whether the first row (indexrow) is less than, equal to, or
+greater than the second (key).  the key may have fewer columns present
+than ncomparecols.
+in such a case, if all the columns of the partial key match all of the
+corresponding columns in the index row, then the value passed in in
+partialkeyorder is returned.  the caller should pass in partialkeyorder=1
+if the index rows which match a partial key should be considered to be
+greater than the partial key, and -1 if they should be considered to be
+less.
+this routine only reads objects off the page if it needs them, so if a
+multi-part key differs in the first column the subsequent columns are not
+read.
+@param indexpage controlrow of page to get target row from.
+@param slot      slot to get control row from.
+@param indexrow template of the target row (the row in the index).
+@param key the (possibly partial) search key.
+@param ncomparecols the number of columns to compare.
+@param partialkeyorder what to return on a partial key match.
+@param ascordesc column sort order information
+@throws standardexception if lower levels have a problem.
+@exception standardexception standard exception policy.
+**/
+public static int compareindexrowfrompagetokey
+controlrow              indexpage
+int                     slot
+datavaluedescriptor   indexrow
+datavaluedescriptor	key
+int                     ncomparecols
+int                     partialkeyorder
+boolean               ascordesc
+throws standardexception
+int compare_result
+// get the actual number of key columns present
+// in the partial key.
+int partialkeycols   key length
+// fetch entire index row from page.
+// resolve (mikem) - it may be more efficient to fetch just the
+// columns you need, but there is overhead currently in raw
+// store, since to get to the n'th column you have to walk
+// through the preceding n-1 columns.
+indexpage page fetchfromslot
+recordhandle  null  slot  indexrow
+fetchdescriptor  null
+true
+// compare corresponding columns in the index row and the key.
+for  int i   0  i < ncomparecols  i
+// see if we have run out of partial key columns.
+if  i >  partialkeycols
+// all the columns of the partial key match, and
+// there are more columns in the index row.  we
+// want to return -1 or 1, depending on whether the
+// caller wants to direct the search to the beginning
+// of this key range or the beginning of the next
+// one.  if the caller passes in -1, the index row
+// will appear less than the partial key, sending the
+// search to the next range ("to the right").  if the
+// caller passes in 1, the index row will appear
+// to be greater than the search key, sending the search
+// to the beginning of the range ("to the left").
+return partialkeyorder
+// get the corresponding columns to compare
+// orderable indexcol = (orderable) indexrow[i];
+// orderable keycol = (orderable) key[i];
+// compare them.
+// int r = indexcol.compare(keycol);
+int r   indexrow compare key
+// if the columns don't compare equal, we're done.
+// return the sense of the comparison.
+if  r    0
+//coulmns could have been sorted in ascending or descending
+//order. depending on ascending/descending order search
+//direction will change.
+if  ascordesc      true   ascending order
+return r
+else
+return  r
+// we made it through all the columns, and they must have
+// all compared equal.  so return that the rows compare equal.
+return 0
+public static int compareindexrowtokey
+datavaluedescriptor   indexrow
+datavaluedescriptor   key
+int                     ncomparecols
+int                     partialkeyorder
+boolean               ascordesc
+throws standardexception
+// get the actual number of key columns present
+// in the partial key.
+int partialkeycols   key length
+// compare corresponding columns in the index row and the key.
+for  int i   0  i < ncomparecols  i
+// see if we have run out of partial key columns.
+if  i >  partialkeycols
+// all the columns of the partial key match, and
+// there are more columns in the index row.  we
+// want to return -1 or 1, depending on whether the
+// caller wants to direct the search to the beginning
+// of this key range or the beginning of the next
+// one.  if the caller passes in -1, the index row
+// will appear less than the partial key, sending the
+// search to the next range ("to the right").  if the
+// caller passes in 1, the index row will appear
+// to be greater than the search key, sending the search
+// to the beginning of the range ("to the left").
+return partialkeyorder
+// get the corresponding columns to compare
+datavaluedescriptor indexcol   indexrow
+datavaluedescriptor keycol   key
+// compare them.
+int r   indexcol compare keycol
+// if the columns don't compare equal, we're done.
+// return the sense of the comparison.
+if  r    0
+if  ascordesc      true   column in ascending order
+return r
+else
+return  r
+// we made it through all the columns, and they must have
+// all compared equal.  so return that the rows compare equal.
+return 0
+/**
+** perform consistency checks which are common to all
+** pages that derive from controlrow (both leaf and
+** branch pages).  the checks are:
+** <menu>
+** <li> this page thinks the parent argument is actually
+**      its parent.
+** <li> the level of this page is 1 less than the level of
+**      the parent.
+** <li> all the rows on the page are in order.
+** <li> both left and right siblings, if they exist, are at
+**      the same level of this page.
+** <li> this page is the left sibling of its right sibling,
+**      and it's the right sibling of its left sibling.
+** <li> the last row on the left sibling is < the first
+**      row on this page.
+** <li> the first row on the right sibling is > than the
+**      the last row on this page.
+** </menu>
+** note that these last two are really only true if there
+** are never duplicate keys.
+@exception standardexception standard exception policy.
+**/
+protected void checkgeneric
+openbtree  btree
+controlrow parent
+boolean    check_other_pages
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert this page recordcount   >  1
+sanitymanager assert  this page isdeletedatslot 0
+// make sure that we think we're a child of the parent.
+if    parent    null
+parent page getpagenumber      this getparentpagenumber
+sanitymanager throwassert this       parent
+// check this page's level.
+if    parent    null
+parent getlevel      this getlevel     1
+sanitymanager throwassert this
+parent
+// check rows are in order.
+checkroworder btree  parent
+// check siblings.
+if  check_other_pages
+checksiblings btree
+/**
+** check that all rows on the page are in order.  this
+** means that each key is > than the previous key.
+@exception standardexception standard exception policy.
+**/
+protected boolean checkroworder openbtree btree  controlrow parent
+throws standardexception
+if  sanitymanager debug
+recordhandle            lesser_handle     null
+recordhandle            greater_handle    null
+datavaluedescriptor   lesser            getrowtemplate btree
+datavaluedescriptor   greater           getrowtemplate btree
+boolean                 is_consistent     true
+int numslots   page recordcount
+for  int i   controlrow cr_slot   1   i   1  < numslots  i
+lesser_handle
+page fetchfromslot
+recordhandle  null  i  lesser
+fetchdescriptor  null  true
+greater_handle
+page fetchfromslot
+recordhandle  null  i   1  greater
+fetchdescriptor  null  true
+sanitymanager assert btree getconglomerate   nuniquecolumns <
+btree getconglomerate   nkeyfields
+int compare_result
+compareindexrowtokey
+lesser  greater
+btree getconglomerate   nuniquecolumns  0
+btree getconglomerate   ascdescinfo
+// >= 0 means that lesser >= greater
+if  compare_result >  0
+sanitymanager throwassert
+btree
+compare_result
+btree getconglomerate   nkeyfields
+this        i         i   1
+i        rowutil tostring lesser
+i   1         rowutil tostring greater
+debugpage btree
+parent    null  ?
+parent debugpage btree
+this page
+is_consistent   false
+return is_consistent
+else
+return true
+protected boolean comparerowsonsiblings
+openbtree   btree
+controlrow  left_sib
+controlrow  right_sib
+throws standardexception
+if  sanitymanager debug
+boolean is_consistent   true
+// check that left last row is < right page's first row.
+if  left_sib page recordcount    > 1
+right_sib page recordcount   > 1
+datavaluedescriptor left_lastrow     getrowtemplate btree
+datavaluedescriptor right_firstrow   getrowtemplate btree
+recordhandle    left_lastrow_handle
+left_sib page fetchfromslot
+recordhandle  null  left_sib page recordcount     1
+left_lastrow
+fetchdescriptor  null  true
+recordhandle    right_firstrow_handle
+right_sib page fetchfromslot
+recordhandle  null  1  right_firstrow
+fetchdescriptor  null  true
+int r
+compareindexrowtokey
+left_lastrow  right_firstrow
+btree getconglomerate   nuniquecolumns
+0  btree getconglomerate   ascdescinfo
+if  r >  0
+sanitymanager throwassert
+left_sib page getpagenumber
+right_sib page getpagenumber
+rowutil tostring left_lastrow
+rowutil tostring right_firstrow
+left_sib       right_sib
+is_consistent   false
+return is_consistent
+else
+return true
+/**
+** perform checks on the siblings of this page: make sure
+** that they're at the same level as this page, that they're
+** mutually linked together, and that the first/last keys
+** on sibling pages are in order.
+@exception standardexception standard exception policy.
+**/
+protected void checksiblings openbtree btree
+throws standardexception
+if  sanitymanager debug
+// get this page's left sibling.
+controlrow leftsib    null
+controlrow rightsib   null
+try
+try
+leftsib   this getleftsibling btree
+catch  waiterror e
+// in a normal system it may be possible to not get
+// the left sibling (some other thread either user
+// or daemon cache cleaner thread) may already have
+// the latch on the page, and waiting on it could cause
+// a latch/latch deadlock.  so for now just give up
+// doing the consistency check in this case.
+//
+// resolve (mikem) - we could do fancier things than
+// ignore this error, but the only safe way to wait for
+// a right to left latch is to release current latch which
+// will complicate all the code, and this is only a sanity
+// check.
+// sanitymanager.debug_print(
+//   "controlrow.checksiblings",
+//   this + " left sibling deadlock");
+// give up on checking the left sibling.
+leftsib   null
+// there may not be a left sibling; if there is, check it out.
+if  leftsib    null
+// check that it's at the same level as this page.
+if  leftsib getlevel      this getlevel
+sanitymanager throwassert
+leftsib       this
+// check that its right sibling is this page.
+long hopefullythis_pageno
+leftsib getrightsiblingpagenumber
+if  hopefullythis_pageno    this page getpagenumber
+sanitymanager throwassert
+leftsib        this
+// check that its last row is < this page's first row.
+comparerowsonsiblings btree  leftsib  this
+// done looking at the left sibling.
+leftsib release
+leftsib   null
+// get the right sibling page.
+rightsib   this getrightsibling btree
+// there may not be a right sibling; if there is, check it out.
+if  rightsib    null
+// check that it's at the same level as this page.
+if  rightsib getlevel      this getlevel
+sanitymanager throwassert
+rightsib       this
+// check that its left sibling is this page.
+long hopefullythis_pageno
+rightsib getleftsiblingpagenumber
+if  hopefullythis_pageno    this page getpagenumber
+sanitymanager throwassert
+rightsib        this
+// check that its first row is > this page's last row.
+comparerowsonsiblings btree  this  rightsib
+// done looking at it.
+rightsib release
+rightsib   null
+finally
+if  leftsib    null
+leftsib release
+if  rightsib    null
+rightsib release
+/**
+** link this page to the right of the target page.
+** <p>
+** upon entry, this page and the target must be
+** latched.  upon exit, this page and the target
+** remain latched.
+** <p>
+** this method carefully acquires pages from left
+** to right in order to avoid deadlocks.
+@exception standardexception standard exception policy.
+*/
+void linkright openbtree btree  controlrow target
+throws standardexception
+controlrow rightsibling   null
+try
+rightsibling   target getrightsibling btree
+this setrightsibling rightsibling
+this setleftsibling target
+if  rightsibling    null
+rightsibling setleftsibling this
+target setrightsibling this
+finally
+if  rightsibling    null
+rightsibling release
+/**
+** unlink this page from its siblings.  this method
+** will give up and return false rather than run the
+** risk of a deadlock.
+** <p>
+** on entry this page must be latched.  the siblings
+** are latched and unlatched during the operation.  upon
+** exit, this page will remain latched, but unlinked from
+** its siblings and deallocated from the container.
+** <p>
+** the seemingly odd situation that this page will be
+** returned latched but deallocated is intentional.
+** the container will not be able to reuse this page
+** until the latch is released, and the caller may still
+** need to read information out of it.
+@exception standardexception standard exception policy.
+**/
+boolean unlink openbtree btree
+throws standardexception
+controlrow leftsib    null
+controlrow rightsib   null
+try
+// try to get the left sibling, and give up if
+// it can't be obtained without waiting.
+try
+leftsib   this getleftsibling btree
+catch  waiterror e
+return false
+// we can wait for the right sibling since it's
+// in the deadlock-free direction.
+rightsib   this getrightsibling btree
+// change the links that pointed to this page to
+// point to the appropriate sibling.
+if  leftsib    null
+leftsib setrightsibling rightsib
+if  rightsib    null
+rightsib setleftsibling leftsib
+// deallocate the page.
+// would need to clear out aux object here.
+//
+// resolve (mikem) - how to deallocate a page. //
+btree container removepage this page
+// after removepage call the current page is unlatched, and should
+// not be referenced anymore.
+if  sanitymanager debug
+sanitymanager assert  this page islatched
+return true
+finally
+// unlatch the siblings.
+if  leftsib    null
+leftsib release
+if  rightsib    null
+rightsib release
+public page getpage
+return page
+/**
+* get the row.
+* <p>
+* return the object array that represents the control row for use
+* in raw store fetch, insert, and/or update.
+*
+* @return the row.
+*
+**/
+protected final datavaluedescriptor getrow
+return row
+/*
+* the following methods must be implemented by all
+* control rows.
+*/
+/**
+* check consistency of the page and its children, returning the number of
+* pages seen, and throwing errors if inconsistencies are found.
+* <p>
+*
+* @return the identifier to be used to open the conglomerate later.
+*
+* @param btree  the open btree to associate latches/locks with.
+* @param parent the parent page of this page, "null" if this page is
+*               root or if not maintaining parent links.
+* @param check_other_pages
+*               should the consistency check go to other pages (this
+*               option breaks the latch protocol).
+*
+* @exception  standardexception  standard exception policy.
+**/
+abstract protected int checkconsistency
+openbtree  btree
+controlrow parent
+boolean    check_other_pages
+throws standardexception
+/**
+* return the left child pointer for the page.
+* <p>
+* leaf pages don't have children, so they override this and return null.
+*
+* @return the page which is the leftmost child of this page.
+*
+* @param btree  the open btree to associate latches/locks with.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected abstract controlrow getleftchild openbtree btree
+throws standardexception
+/**
+* return the right child pointer for the page.
+* <p>
+* leaf pages don't have children, so they override this and return null.
+*
+* @return the page which is the rightmost child of this page.
+*
+* @param btree  the open btree to associate latches/locks with.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected abstract controlrow getrightchild openbtree btree
+throws standardexception
+/**
+* perform page specific initialization.
+* <p>
+*
+**/
+protected abstract void controlrowinit
+/**
+* is the current page the leftmost leaf of tree?
+* <p>
+*
+* @return true if the current page is the leftmost leaf of the tree,
+*              else return false.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public abstract boolean isleftmostleaf
+throws standardexception
+/**
+* is the current page the rightmost leaf of tree?
+* <p>
+*
+* @return true if the current page is the rightmost leaf of the tree,
+*              else return false.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public abstract boolean isrightmostleaf
+throws standardexception
+/**
+** perform a recursive search, ultimately returning the latched
+** leaf page and row slot after which the given key belongs.
+** the slot is returned in the result structure.  if the key
+** exists on the page, the resultexact field will be true.  otherwise,
+** resultexact field will be false, and the row slot returned will be
+** the one immediately preceding the position at which the key
+** belongs.
+@exception standardexception standard exception policy.
+**/
+public abstract controlrow search
+searchparameters    search_params
+throws standardexception
+/**
+* get the number of columns in the control row.
+* <p>
+* control rows all share the first columns as defined by this class and
+* then add columns to the end of the control row.  for instance a branch
+* control row add a child page pointer field.
+* <p>
+*
+* @return the total number of columns in the control row.
+**/
+protected abstract int getnumberofcontrolrowcolumns
+/**
+* search and return the left most leaf page.
+* <p>
+* perform a recursive search, ultimately returning the
+* leftmost leaf page which is the first leaf page in the
+* leaf sibling chain.  (this method might better be called
+* getfirstleafpage()).
+*
+* @return the leftmost leaf page.
+*
+* @param btree  the open btree to associate latches/locks with.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected abstract controlrow searchleft openbtree btree
+throws standardexception
+/**
+* search and return the right most leaf page.
+* <p>
+* perform a recursive search, ultimately returning the
+* rightmost leaf page which is the last leaf page in the
+* leaf sibling chain.  (this method might better be called
+* getlastleafpage()).
+*
+* @return the rightmost leaf page.
+*
+* @param btree  the open btree to associate latches/locks with.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected abstract controlrow searchright openbtree btree
+throws standardexception
+/**
+**	perform a recursive shrink operation for the key.
+** if this method returns true, the caller should
+** remove the corresponding entry for the page.
+** this routine is not guaranteed to successfully
+** shrink anything.  the page lead to by the key might
+** turn out not to be empty by the time shrink gets
+** there, and shrinks will give up if there is a deadlock.
+** <p>
+** as currently implemented shrinkfor must be executed while holding
+** an exclusive container lock on the entire table.  it is expected that
+** this call is made within an internal transaction which has been called
+** by a post commit thread.  latches are released by the code.  the raw
+** store guarantees that deallocated pages are not seen by other xacts
+** until the transaction has been committed.
+** <p>
+** note that a non-table level lock implementation must hold latches on
+** pages affected until end transaction.
+** <p>
+** on entry, the current page is latched.  on exit, all pages will have
+** been unlatched.
+**
+** @exception standardexception standard exception policy.
+**/
+protected abstract boolean shrinkfor
+openbtree               btree
+datavaluedescriptor   key
+throws standardexception
+/**
+* perform a top down split pass making room for the the key in "row".
+* <p>
+* perform a split such that a subsequent call to insert
+* given the argument index row will likely find room for it.  since
+* latches are released the client must code for the case where another
+* user has grabbed the space made available by the split pass and be
+* ready to do another split.
+* <p>
+*
+* @return page number of the newly allocated leaf page created by split.
+*
+* @param open_btree the open btree to associate latches with.
+* @param template   a scratch area to use while searching for split pass.
+* @param parentpage the parent page of the current page in the split pass.
+*                   starts at null for root.
+* @param row        the key to make room for during the split pass.
+* @param flag       a flag used to direct where point of split should be
+*                   chosen.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected abstract long splitfor
+openbtree               open_btree
+datavaluedescriptor   template
+branchcontrolrow        parentpage
+datavaluedescriptor   row
+int                     flag
+throws standardexception
+/**
+** recursively print the tree starting at current node in tree.
+@exception standardexception standard exception policy.
+**/
+public abstract void printtree
+openbtree  btree
+throws standardexception
+/*
+** methods of auxobject
+*/
+/**
+called when the page is being evicted from cache or when a rollback
+happened on the page and may possibly have changed the control row's
+value
+@see auxobject#auxobjectinvalidated
+**/
+public void auxobjectinvalidated
+version   null
+leftsiblingpagenumber   null
+rightsiblingpagenumber   null
+parentpagenumber   null
+level   null
+isroot   null
+page   null
+/**
+* return a new template for reading a data row from the current page.
+* <p>
+* default implementation for rows which are the same as the conglomerates
+* template, sub-classes can alter if underlying template is different
+* (for instance branch rows add an extra field at the end).
+*
+* @return newly allocated template.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public datavaluedescriptor getrowtemplate openbtree    open_btree
+throws standardexception
+return open_btree getconglomerate   createtemplate
+/**
+** debug tostring() method's.
+**/
+/**
+* dump complete information about control row and rows on the page.
+* <p>
+*
+* @return string with all info.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public string debugpage
+openbtree   open_btree
+throws standardexception
+string ret_str
+if  sanitymanager debug
+stringbuffer string   new stringbuffer 4096
+string append this tostring
+string append
+datavaluedescriptor row   getrowtemplate open_btree
+string append
+conglomerateutil debugpage
+page  controlrow cr_slot   1  false  row
+ret_str   string tostring
+else
+ret_str   null
+return ret_str
+/**
+* the standard tostring().
+* <p>
+* this is a concise print out of the info in the control row, does not
+* include anything the page.
+* <p>
+*
+**/
+public string tostring
+if  sanitymanager debug
+stringbuffer string   new stringbuffer 4096
+try
+// leaf, branch, leaf-root, branch-root
+string append  getlevel      0  ?
+string append  getisroot        ?
+// (page number)(level):num recs
+//     example: (107)(lev=2):num recs = 16
+string append
+string append this page getpagenumber
+string append
+string append level
+string append
+string append this page recordcount
+string append
+// rest of info
+string append
+string append
+string append getleftsiblingpagenumber
+string append
+string append
+string append getrightsiblingpagenumber
+string append
+string append
+string append getparentpagenumber
+string append
+string append
+string append getisroot
+string append
+catch  throwable t
+string append
+return string tostring
+else
+return null

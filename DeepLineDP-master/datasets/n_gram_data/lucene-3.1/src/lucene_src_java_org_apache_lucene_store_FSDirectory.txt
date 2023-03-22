@@ -1,0 +1,431 @@
+package org apache lucene store
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+import java io file
+import java io filenotfoundexception
+import java io filenamefilter
+import java io ioexception
+import java io randomaccessfile
+import java security messagedigest
+import java security nosuchalgorithmexception
+import java util collection
+import static java util collections synchronizedset
+import java util collections
+import java util hashset
+import java util set
+import java util concurrent future
+import org apache lucene util threadinterruptedexception
+import org apache lucene util constants
+/**
+* <a name="subclasses"/>
+* base class for directory implementations that store index
+* files in the file system.  there are currently three core
+* subclasses:
+*
+* <ul>
+*
+*  <li> {@link simplefsdirectory} is a straightforward
+*       implementation using java.io.randomaccessfile.
+*       however, it has poor concurrent performance
+*       (multiple threads will bottleneck) as it
+*       synchronizes when multiple threads read from the
+*       same file.
+*
+*  <li> {@link niofsdirectory} uses java.nio's
+*       filechannel's positional io when reading to avoid
+*       synchronization when reading from the same file.
+*       unfortunately, due to a windows-only <a
+*       href="http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=6265734">sun
+*       jre bug</a> this is a poor choice for windows, but
+*       on all other platforms this is the preferred
+*       choice. applications using {@link thread#interrupt()} or
+*       {@link future#cancel(boolean)} should use
+*       {@link simplefsdirectory} instead. see {@link niofsdirectory} java doc
+*       for details.
+*
+*
+*
+*  <li> {@link mmapdirectory} uses memory-mapped io when
+*       reading. this is a good choice if you have plenty
+*       of virtual memory relative to your index size, eg
+*       if you are running on a 64 bit jre, or you are
+*       running on a 32 bit jre but your index sizes are
+*       small enough to fit into the virtual memory space.
+*       java has currently the limitation of not being able to
+*       unmap files from user code. the files are unmapped, when gc
+*       releases the byte buffers. due to
+*       <a href="http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=4724038">
+*       this bug</a> in sun's jre, mmapdirectory's {@link indexinput#close}
+*       is unable to close the underlying os file handle. only when
+*       gc finally collects the underlying objects, which could be
+*       quite some time later, will the file handle be closed.
+*       this will consume additional transient disk usage: on windows,
+*       attempts to delete or overwrite the files will result in an
+*       exception; on other platforms, which typically have a &quot;delete on
+*       last close&quot; semantics, while such operations will succeed, the bytes
+*       are still consuming space on disk.  for many applications this
+*       limitation is not a problem (e.g. if you have plenty of disk space,
+*       and you don't rely on overwriting files on windows) but it's still
+*       an important limitation to be aware of. this class supplies a
+*       (possibly dangerous) workaround mentioned in the bug report,
+*       which may fail on non-sun jvms.
+*
+*       applications using {@link thread#interrupt()} or
+*       {@link future#cancel(boolean)} should use
+*       {@link simplefsdirectory} instead. see {@link mmapdirectory}
+*       java doc for details.
+* </ul>
+*
+* unfortunately, because of system peculiarities, there is
+* no single overall best implementation.  therefore, we've
+* added the {@link #open} method, to allow lucene to choose
+* the best fsdirectory implementation given your
+* environment, and the known limitations of each
+* implementation.  for users who have no reason to prefer a
+* specific implementation, it's best to simply use {@link
+* #open}.  for all others, you should instantiate the
+* desired implementation directly.
+*
+* <p>the locking implementation is by default {@link
+* nativefslockfactory}, but can be changed by
+* passing in a custom {@link lockfactory} instance.
+*
+* @see directory
+*/
+public abstract class fsdirectory extends directory
+private final static messagedigest digester
+static
+try
+digester   messagedigest getinstance
+catch  nosuchalgorithmexception e
+throw new runtimeexception e tostring    e
+/**
+* default read chunk size.  this is a conditional default: on 32bit jvms, it defaults to 100 mb.  on 64bit jvms, it's
+* <code>integer.max_value</code>.
+*
+* @see #setreadchunksize
+*/
+public static final int default_read_chunk_size   constants jre_is_64bit ? integer max_value   100   1024   1024
+protected final file directory     the underlying filesystem directory
+protected final set<string> stalefiles   synchronizedset new hashset<string>        files written  but not yet sync'ed
+private int chunksize   default_read_chunk_size     lucene 1566
+// returns the canonical version of the directory, creating it if it doesn't exist.
+private static file getcanonicalpath file file  throws ioexception
+return new file file getcanonicalpath
+/** create a new fsdirectory for the named location (ctor for subclasses).
+* @param path the path of the directory
+* @param lockfactory the lock factory to use, or null for the default
+* ({@link nativefslockfactory});
+* @throws ioexception
+*/
+protected fsdirectory file path  lockfactory lockfactory  throws ioexception
+// new ctors use always nativefslockfactory as default:
+if  lockfactory    null
+lockfactory   new nativefslockfactory
+directory   getcanonicalpath path
+if  directory exists       directory isdirectory
+throw new nosuchdirectoryexception     directory
+setlockfactory lockfactory
+/** creates an fsdirectory instance, trying to pick the
+*  best implementation given the current environment.
+*  the directory returned uses the {@link nativefslockfactory}.
+*
+*  <p>currently this returns {@link mmapdirectory} for most solaris
+*  and windows 64-bit jres, {@link niofsdirectory} for other
+*  non-windows jres, and {@link simplefsdirectory} for other
+*  jres on windows. it is highly recommended that you consult the
+*  implementation's documentation for your platform before
+*  using this method.
+*
+* <p><b>note</b>: this method may suddenly change which
+* implementation is returned from release to release, in
+* the event that higher performance defaults become
+* possible; if the precise implementation is important to
+* your application, please instantiate it directly,
+* instead. for optimal performance you should consider using
+* {@link mmapdirectory} on 64 bit jvms.
+*
+* <p>see <a href="#subclasses">above</a> */
+public static fsdirectory open file path  throws ioexception
+return open path  null
+/** just like {@link #open(file)}, but allows you to
+*  also specify a custom {@link lockfactory}. */
+public static fsdirectory open file path  lockfactory lockfactory  throws ioexception
+if   constants windows    constants sun_os
+constants jre_is_64bit    mmapdirectory unmap_supported
+return new mmapdirectory path  lockfactory
+else if  constants windows
+return new simplefsdirectory path  lockfactory
+else
+return new niofsdirectory path  lockfactory
+@override
+public void setlockfactory lockfactory lockfactory  throws ioexception
+super setlockfactory lockfactory
+// for filesystem based lockfactory, delete the lockprefix, if the locks are placed
+// in index dir. if no index dir is given, set ourselves
+if  lockfactory instanceof fslockfactory
+final fslockfactory lf    fslockfactory  lockfactory
+final file dir   lf getlockdir
+// if the lock factory has no lockdir set, use the this directory as lockdir
+if  dir    null
+lf setlockdir directory
+lf setlockprefix null
+else if  dir getcanonicalpath   equals directory getcanonicalpath
+lf setlockprefix null
+/** lists all files (not subdirectories) in the
+*  directory.  this method never returns null (throws
+*  {@link ioexception} instead).
+*
+*  @throws nosuchdirectoryexception if the directory
+*   does not exist, or does exist but is not a
+*   directory.
+*  @throws ioexception if list() returns null */
+public static string listall file dir  throws ioexception
+if   dir exists
+throw new nosuchdirectoryexception     dir
+else if   dir isdirectory
+throw new nosuchdirectoryexception     dir
+// exclude subdirs
+string result   dir list new filenamefilter
+public boolean accept file dir  string file
+return  new file dir  file  isdirectory
+if  result    null
+throw new ioexception     dir
+return result
+/** lists all files (not subdirectories) in the
+* directory.
+* @see #listall(file) */
+@override
+public string listall   throws ioexception
+ensureopen
+return listall directory
+/** returns true iff a file with the given name exists. */
+@override
+public boolean fileexists string name
+ensureopen
+file file   new file directory  name
+return file exists
+/** returns the time the named file was last modified. */
+@override
+public long filemodified string name
+ensureopen
+file file   new file directory  name
+return file lastmodified
+/** returns the time the named file was last modified. */
+public static long filemodified file directory  string name
+file file   new file directory  name
+return file lastmodified
+/** set the modified time of an existing file to now. */
+@override
+public void touchfile string name
+ensureopen
+file file   new file directory  name
+file setlastmodified system currenttimemillis
+/** returns the length in bytes of a file in the directory. */
+@override
+public long filelength string name  throws ioexception
+ensureopen
+file file   new file directory  name
+final long len   file length
+if  len    0     file exists
+throw new filenotfoundexception name
+else
+return len
+/** removes an existing file in the directory. */
+@override
+public void deletefile string name  throws ioexception
+ensureopen
+file file   new file directory  name
+if   file delete
+throw new ioexception     file
+stalefiles remove name
+/** creates an indexoutput for the file with the given name. */
+@override
+public indexoutput createoutput string name  throws ioexception
+ensureopen
+ensurecanwrite name
+return new fsindexoutput this  name
+protected void ensurecanwrite string name  throws ioexception
+if   directory exists
+if   directory mkdirs
+throw new ioexception     directory
+file file   new file directory  name
+if  file exists       file delete                delete existing  if any
+throw new ioexception     file
+protected void onindexoutputclosed fsindexoutput io
+stalefiles add io name
+@deprecated
+@override
+public void sync string name  throws ioexception
+sync collections singleton name
+@override
+public void sync collection<string> names  throws ioexception
+ensureopen
+set<string> tosync   new hashset<string> names
+tosync retainall stalefiles
+for  string name   tosync
+fsync name
+stalefiles removeall tosync
+// inherit javadoc
+@override
+public indexinput openinput string name  throws ioexception
+ensureopen
+return openinput name  bufferedindexinput buffer_size
+/**
+* so we can do some byte-to-hexchar conversion below
+*/
+private static final char hex_digits
+@override
+public string getlockid
+ensureopen
+string dirname                                   name to be hashed
+try
+dirname   directory getcanonicalpath
+catch  ioexception e
+throw new runtimeexception e tostring    e
+byte digest
+synchronized  digester
+digest   digester digest dirname getbytes
+stringbuilder buf   new stringbuilder
+buf append
+for  int i   0  i < digest length  i
+int b   digest
+buf append hex_digits
+buf append hex_digits
+return buf tostring
+/** closes the store to future operations. */
+@override
+public synchronized void close
+isopen   false
+/** @deprecated use {@link #getdirectory} instead. */
+@deprecated
+public file getfile
+return getdirectory
+/** @return the underlying filesystem directory */
+public file getdirectory
+ensureopen
+return directory
+/** for debug output. */
+@override
+public string tostring
+return this getclass   getname         directory       getlockfactory
+/**
+* sets the maximum number of bytes read at once from the
+* underlying file during {@link indexinput#readbytes}.
+* the default value is {@link #default_read_chunk_size};
+*
+* <p> this was introduced due to <a
+* href="http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=6478546">sun
+* jvm bug 6478546</a>, which throws an incorrect
+* outofmemoryerror when attempting to read too many bytes
+* at once.  it only happens on 32bit jvms with a large
+* maximum heap size.</p>
+*
+* <p>changes to this value will not impact any
+* already-opened {@link indexinput}s.  you should call
+* this before attempting to open an index on the
+* directory.</p>
+*
+* <p> <b>note</b>: this value should be as large as
+* possible to reduce any possible performance impact.  if
+* you still encounter an incorrect outofmemoryerror,
+* trying lowering the chunk size.</p>
+*/
+public final void setreadchunksize int chunksize
+// lucene-1566
+if  chunksize <  0
+throw new illegalargumentexception
+if   constants jre_is_64bit
+this chunksize   chunksize
+/**
+* the maximum number of bytes to read at once from the
+* underlying file during {@link indexinput#readbytes}.
+* @see #setreadchunksize
+*/
+public final int getreadchunksize
+// lucene-1566
+return chunksize
+protected static class fsindexoutput extends bufferedindexoutput
+private final fsdirectory parent
+private final string name
+private final randomaccessfile file
+private volatile boolean isopen     remember if the file is open  so that we don't try to close it more than once
+public fsindexoutput fsdirectory parent  string name  throws ioexception
+this parent   parent
+this name   name
+file   new randomaccessfile new file parent directory  name
+isopen   true
+/** output methods: */
+@override
+public void flushbuffer byte b  int offset  int size  throws ioexception
+file write b  offset  size
+@override
+public void close   throws ioexception
+// only close the file if it has not been closed yet
+if  isopen
+boolean success   false
+try
+super close
+success   true
+finally
+isopen   false
+if   success
+try
+file close
+parent onindexoutputclosed this
+catch  throwable t
+// suppress so we don't mask original exception
+else
+file close
+/** random-access methods */
+@override
+public void seek long pos  throws ioexception
+super seek pos
+file seek pos
+@override
+public long length   throws ioexception
+return file length
+@override
+public void setlength long length  throws ioexception
+file setlength length
+protected void fsync string name  throws ioexception
+file fullfile   new file directory  name
+boolean success   false
+int retrycount   0
+ioexception exc   null
+while   success    retrycount < 5
+retrycount
+randomaccessfile file   null
+try
+try
+file   new randomaccessfile fullfile
+file getfd   sync
+success   true
+finally
+if  file    null
+file close
+catch  ioexception ioe
+if  exc    null
+exc   ioe
+try
+// pause 5 msec
+thread sleep 5
+catch  interruptedexception ie
+throw new threadinterruptedexception ie
+if   success
+// throw original exception
+throw exc

@@ -1,0 +1,857 @@
+/*
+* copyright 2003-2007 the original author or authors.
+*
+* licensed under the apache license, version 2.0 (the "license");
+* you may not use this file except in compliance with the license.
+* you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org codehaus groovy control
+import groovy lang groovyclassloader
+import org codehaus groovy ast
+import org codehaus groovy ast expr
+import org codehaus groovy ast stmt blockstatement
+import org codehaus groovy ast stmt catchstatement
+import org codehaus groovy ast stmt forstatement
+import org codehaus groovy ast stmt statement
+import org codehaus groovy classgen verifier
+import org codehaus groovy control messages exceptionmessage
+import org codehaus groovy syntax types
+import org codehaus groovy groovybugerror
+import org objectweb asm opcodes
+import java io file
+import java io ioexception
+import java net malformedurlexception
+import java net url
+import java net urlconnection
+import java util
+/**
+* visitor to resolve types and convert variableexpression to
+* classexpressions if needed. the resolvevisitor will try to
+* find the class for a classexpression and prints an error if
+* it fails to do so. constructions like c[], foo as c, (c) foo
+* will force creation of a classexpression for c
+* <p/>
+* note: the method to start the resolving is  startresolving(classnode, sourceunit).
+*
+* @author jochen theodorou
+*/
+public class resolvevisitor extends classcodeexpressiontransformer
+private classnode currentclass
+// note: biginteger and bigdecimal are also imported by default
+public static final string default_imports
+private compilationunit compilationunit
+private map cachedclasses   new hashmap
+private static final object no_class   new object
+private static final object script   new object
+private sourceunit source
+private variablescope currentscope
+private boolean istoplevelproperty   true
+private boolean inpropertyexpression   false
+private boolean inclosure   false
+private boolean isspecialconstructorcall   false
+private map genericparameternames   new hashmap
+/**
+* we use constructedclasswithpackage to limit the resolving the compiler
+* does when combining package names and class names. the idea
+* that if we use a package, then we do not want to replace the
+* '.' with a '$' for the package part, only for the class name
+* part. there is also the case of a imported class, so this logic
+* can't be done in these cases...
+*/
+private static class constructedclasswithpackage extends classnode
+string prefix
+string classname
+public constructedclasswithpackage string pkg  string name
+super pkg name  opcodes acc_public classhelper object_type
+isprimarynode   false
+this prefix   pkg
+this classname   name
+public string getname
+if  redirect    this  return super getname
+return prefix classname
+public boolean haspackagename
+if  redirect    this  return super haspackagename
+return classname indexof      1
+public string setname string name
+if  redirect    this
+return super setname name
+else
+throw new groovybugerror
+/**
+* we use lowercaseclass to limit the resolving the compiler
+* does for vanilla names starting with a lower case letter. the idea
+* that if we use a vanilla name with a lower case letter, that this
+* is in most cases no class. if it is a class the class needs to be
+* imported explicitly. the efffect is that in an expression like
+* "def foo = bar" we do not have to use a loadclass call to check the
+* name foo and bar for being classes. instead we will ask the module
+* for an alias for this name which is much faster.
+*/
+private static class lowercaseclass extends classnode
+string classname
+public lowercaseclass string name
+super name  opcodes acc_public classhelper object_type
+isprimarynode   false
+this classname   name
+public string getname
+if  redirect    this  return super getname
+return classname
+public boolean haspackagename
+if  redirect    this  return super haspackagename
+return false;
+public string setname string name
+if  redirect    this
+return super setname name
+else
+throw new groovybugerror
+public resolvevisitor compilationunit cu
+compilationunit   cu
+public void startresolving classnode node  sourceunit source
+this source   source
+visitclass node
+protected void visitconstructorormethod methodnode node  boolean isconstructor
+variablescope oldscope   currentscope
+currentscope   node getvariablescope
+map oldpnames   genericparameternames
+genericparameternames   new hashmap genericparameternames
+resolvegenericsheader node getgenericstypes
+parameter paras   node getparameters
+for  int i   0  i < paras length  i
+parameter p   paras
+p setinitialexpression transform p getinitialexpression
+resolveorfail p gettype    p gettype
+visitannotations p
+classnode exceptions   node getexceptions
+for  int i   0  i < exceptions length  i
+classnode t   exceptions
+resolveorfail t  node
+resolveorfail node getreturntype    node
+super visitconstructorormethod node  isconstructor
+genericparameternames   oldpnames
+currentscope   oldscope
+public void visitfield fieldnode node
+classnode t   node gettype
+resolveorfail t  node
+super visitfield node
+public void visitproperty propertynode node
+classnode t   node gettype
+resolveorfail t  node
+super visitproperty node
+private boolean resolvetoinner  classnode type
+// we do not do our name mangling to find an inner class
+// if the type is a constructedclasswithpackage, because in this case we
+// are resolving the name at a different place already
+if  type instanceof constructedclasswithpackage  return false
+string name   type getname
+string saved   name
+while  true
+int len   name lastindexof
+if  len     1  break
+name   name substring 0 len        name substring len 1
+type setname name
+if  resolve type   return true
+type setname saved
+return false;
+private void resolveorfail classnode type  string msg  astnode node
+if  resolve type   return
+if  resolvetoinner type   return
+adderror     type getname         msg  node
+private void resolveorfail classnode type  astnode node  boolean prefereimports
+resolvegenericstypes type getgenericstypes
+if  prefereimports    resolvealiasfrommodule type   return
+resolveorfail type  node
+private void resolveorfail classnode type  astnode node
+resolveorfail type     node
+private boolean resolve classnode type
+return resolve type  true  true  true
+private boolean resolve classnode type  boolean testmoduleimports  boolean testdefaultimports  boolean teststaticinnerclasses
+if  type isresolved      type isprimaryclassnode    return true
+resolvegenericstypes type getgenericstypes
+if  type isarray
+classnode element   type getcomponenttype
+boolean resolved   resolve element  testmoduleimports  testdefaultimports  teststaticinnerclasses
+if  resolved
+classnode cn   element makearray
+type setredirect cn
+return resolved
+// test if vanilla name is current class name
+if  currentclass    type  return true
+if  genericparameternames get type getname       null
+genericstype gt    genericstype  genericparameternames get type getname
+type setredirect gt gettype
+type setgenericstypes new genericstype gt
+type setgenericsplaceholder true
+return true
+if  currentclass getnamewithoutpackage   equals type getname
+type setredirect currentclass
+return true
+return  resolvefrommodule type  testmoduleimports
+resolvefromcompileunit type
+resolvefromdefaultimports type  testdefaultimports
+resolvefromstaticinnerclasses type  teststaticinnerclasses
+resolvefromclasscache type
+resolvetoclass type
+resolvetoscript type
+private boolean resolvefromclasscache classnode type
+string name   type getname
+object val   cachedclasses get name
+if  val    null    val    no_class
+return false;
+else
+setclass type   class  val
+return true
+// note: copied from groovyclassloader
+private long gettimestamp class cls
+return verifier gettimestamp cls
+// note: copied from groovyclassloader
+private boolean issourcenewer url source  class cls
+try
+long lastmod
+// special handling for file:// protocol, as getlastmodified() often reports
+// incorrect results (-1)
+if  source getprotocol   equals
+// coerce the file url to a file
+string path   source getpath   replace    file separatorchar  replace
+file file   new file path
+lastmod   file lastmodified
+else
+urlconnection conn   source openconnection
+lastmod   conn getlastmodified
+conn getinputstream   close
+return lastmod > gettimestamp cls
+catch  ioexception e
+// if the stream can't be opened, let's keep the old reference
+return false;
+private boolean resolvetoscript classnode type
+string name   type getname
+// we do not need to check instances of lowercaseclass
+// to be a script, because unless there was an import for
+// for this we  do not lookup these cases. this was a decision
+// made on the mailing list. to ensure we will not visit this
+// method again we set a no_class for this name
+if  type instanceof lowercaseclass
+cachedclasses put name  no_class
+if  cachedclasses get name     no_class  return false
+if  cachedclasses get name     script  cachedclasses put name  no_class
+if  name startswith     return type isresolved
+//todo: don't ignore inner static classes completely
+if  name indexof        1  return type isresolved
+modulenode module   currentclass getmodule
+if  module haspackagename      name indexof        1  return type isresolved
+// try to find a script from classpath
+groovyclassloader gcl   compilationunit getclassloader
+url url   null
+try
+url   gcl getresourceloader   loadgroovysource name
+catch  malformedurlexception e
+// fall through and let the url be null
+if  url    null
+if  type isresolved
+class cls   type gettypeclass
+// if the file is not newer we don't want to recompile
+if   issourcenewer url  cls   return true
+// since we came to this, we want to recompile
+cachedclasses remove type getname
+type setredirect null
+sourceunit su   compilationunit addsource url
+currentclass getcompileunit   addclassnodetocompile type  su
+return true
+// type may be resolved through the classloader before
+return type isresolved
+private string replacelastpoint string name
+int lastpoint   name lastindexof
+name   new stringbuffer
+append name substring 0  lastpoint
+append
+append name substring lastpoint   1
+tostring
+return name
+private boolean resolvefromstaticinnerclasses classnode type  boolean teststaticinnerclasses
+// a class consisting of a vanilla name can never be
+// a static inner class, because at last one dot is
+// required for this. example: foo.bar -> foo$bar
+if  type instanceof lowercaseclass  return false
+// try to resolve a public static inner class' name
+teststaticinnerclasses    type haspackagename
+if  teststaticinnerclasses
+if  type instanceof constructedclasswithpackage
+// we replace '.' only in the classname part
+// with '$' to find an inner class. the case that
+// the packageis really a class is handled else where
+constructedclasswithpackage tmp    constructedclasswithpackage  type
+string name     constructedclasswithpackage  type  classname
+tmp classname   replacelastpoint name
+if  resolve tmp  false  true  true
+type setredirect tmp redirect
+return true
+tmp classname   name
+else
+string name   type getname
+string replacedpointtype   replacelastpoint name
+type setname replacedpointtype
+if  resolve type  false  true  true   return true
+type setname name
+return false;
+private boolean resolvefromdefaultimports classnode type  boolean testdefaultimports
+// test default imports
+testdefaultimports     type haspackagename
+// we do not resolve a vanilla name starting with a lower case letter
+// try to resolve against adefault import, because we know that the
+// default packages do not contain classes like these
+testdefaultimports      type instanceof lowercaseclass
+if  testdefaultimports
+for  int i   0  size   default_imports length  i < size  i
+string packageprefix   default_imports
+string name   type getname
+// we limit the inner class lookups here by using constructedclasswithpackage.
+// this way only the name will change, the packageprefix will
+// not be included in the lookup. the case where the
+// packageprefix is really a class is handled else where.
+// warning: this code does not expect a class that has an static
+//          inner class in default_imports
+constructedclasswithpackage tmp    new constructedclasswithpackage packageprefix name
+if  resolve tmp  false  false  false
+type setredirect tmp redirect
+return true
+string name   type getname
+if  name equals
+type setredirect classhelper biginteger_type
+return true
+else if  name equals
+type setredirect classhelper bigdecimal_type
+return true
+return false;
+private boolean resolvefromcompileunit classnode type
+// look into the compile unit if there is a class with that name
+compileunit compileunit   currentclass getcompileunit
+if  compileunit    null  return false
+classnode cuclass   compileunit getclass type getname
+if  cuclass    null
+if  type    cuclass  type setredirect cuclass
+return true
+return false;
+private void setclass classnode n  class cls
+classnode cn   classhelper make cls
+n setredirect cn
+private void ambiguousclass classnode type  classnode itype  string name
+if  type getname   equals itype getname
+adderror     name       type getname         itype getname        type
+else
+type setredirect itype
+private boolean resolvealiasfrommodule classnode type
+// in case of getting a constructedclasswithpackage here we do not do checks for partial
+// matches with imported classes. the constructedclasswithpackage is already a constructed
+// node and any subclass resolving will then take elsewhere place
+if  type instanceof constructedclasswithpackage  return false
+modulenode module   currentclass getmodule
+if  module    null  return false
+string name   type getname
+// check module node imports aliases
+// the while loop enables a check for inner classes which are not fully imported,
+// but visible as the surrounding class is imported and the inner class is public/protected static
+string pname   name
+int index   name length
+/*
+* we have a name foo.bar and an import foo.foo. this means foo.bar is possibly
+* foo.foo.bar rather than foo.bar. this means to cut at the dot in foo.bar and
+* foo for import
+*/
+while  true
+pname   name substring 0  index
+classnode aliasednode   module getimport pname
+if  aliasednode    null
+if  pname length      name length
+// full match
+// we can compare here by length, because pname is always
+// a sbustring of name, so same length means they are equal.
+type setredirect aliasednode
+return true
+else
+//partial match
+// at this point we know that we have a match for pname. this may
+// mean, that name[pname.length()..<-1] is a static inner class.
+// for this the rest of the name does not need any dots in its name.
+// it is either completely a inner static class or it is not.
+// since we do not want to have useless lookups we create the name
+// completely and use a constructedclasswithpackage to prevent lookups against the package.
+string classname   aliasednode getnamewithoutpackage
+name substring pname length   1  replace
+constructedclasswithpackage tmp   new constructedclasswithpackage aliasednode getpackagename      classname
+if  resolve tmp  true  true  false
+type setredirect tmp redirect
+return true
+index   pname lastindexof
+if  index     1  break
+return false;
+private boolean resolvefrommodule classnode type  boolean testmoduleimports
+// we decided if we have a vanilla name starting with a lower case
+// letter that we will not try to resolve this name against .*
+// imports. instead a full import is needed for these.
+// resolvealiasfrommodule will do this check for us. this method
+// does also check the module contains a class in the same package
+// of this name. this check is not done for vanilla names starting
+// with a lower case letter anymore
+if  type instanceof lowercaseclass
+return resolvealiasfrommodule type
+string name   type getname
+modulenode module   currentclass getmodule
+if  module    null  return false
+boolean newnameused   false
+// we add a package if there is none yet and the module has one. but we
+// do not add that if the type is a constructedclasswithpackage. the code in constructedclasswithpackage
+// haspackagename() will return true if constructedclasswithpackage#classname has no dots.
+// but since the prefix may have them and the code there does ignore that
+// fact. we check here for constructedclasswithpackage.
+if   type haspackagename      module haspackagename        type instanceof constructedclasswithpackage
+type setname module getpackagename     name
+newnameused   true
+// look into the module node if there is a class with that name
+list moduleclasses   module getclasses
+for  iterator iter   moduleclasses iterator    iter hasnext
+classnode mclass    classnode  iter next
+if  mclass getname   equals type getname
+if  mclass    type  type setredirect mclass
+return true
+if  newnameused  type setname name
+if  testmoduleimports
+if  resolvealiasfrommodule type   return true
+if  module haspackagename
+// check package this class is defined in. the usage of constructedclasswithpackage here
+// means, that the module package will not be involved when the
+// compiler tries to find an inner class.
+constructedclasswithpackage tmp    new constructedclasswithpackage module getpackagename   name
+if  resolve tmp  false  false  false
+type setredirect tmp redirect
+return true
+// check module node imports packages
+list packages   module getimportpackages
+for  iterator iter   packages iterator    iter hasnext
+string packageprefix    string  iter next
+// we limit the inner class lookups here by using constructedclasswithpackage.
+// this way only the name will change, the packageprefix will
+// not be included in the lookup. the case where the
+// packageprefix is really a class is handled else where.
+constructedclasswithpackage tmp    new constructedclasswithpackage packageprefix name
+if  resolve tmp  false  false  true
+ambiguousclass type  tmp  name
+type setredirect tmp redirect
+return true
+return false;
+private boolean resolvetoclass classnode type
+string name   type getname
+// we do not need to check instances of lowercaseclass
+// to be a class, because unless there was an import for
+// for this we  do not lookup these cases. this was a decision
+// made on the mailing list. to ensure we will not visit this
+// method again we set a no_class for this name
+if  type instanceof lowercaseclass
+cachedclasses put name no_class
+// we use here the class cahce cachedclasses to prevent
+// calls to classloader#loadclass. disabling this cache will
+// cause a major performance hit. unlike at the end of this
+// method we do not return true or false depending on if we
+// want to recompile or not. if the class was cached, then
+// we do not want to recompile, recompilation is already
+// scheduled then
+object cached   cachedclasses get name
+if  cached    no_class  return false
+// cached == script should not happen here!
+if  cached    script  throw new groovybugerror   name
+if  cached    null  return true
+if  currentclass getmodule   haspackagename      name indexof        1  return false
+groovyclassloader loader   compilationunit getclassloader
+class cls
+try
+// note: it's important to do no lookup against script files
+// here since the groovyclassloader would create a new compilationunit
+cls   loader loadclass name  false  true
+catch  classnotfoundexception cnfe
+cachedclasses put name  script
+return false;
+catch  compilationfailedexception cfe
+compilationunit geterrorcollector   adderrorandcontinue new exceptionmessage cfe  true  source
+return false;
+//todo: the case of a noclassdeffounderror needs a bit more research
+// a simple recompilation is not possible it seems. the current class
+// we are searching for is there, so we should mark that somehow.
+// basically the missing class needs to be completly compiled before
+// we can again search for the current name.
+/*catch (noclassdeffounderror ncdfe) {
+cachedclasses.put(name,script);
+return false;
+}*/
+if  cls    null  return false
+cachedclasses put name  cls
+setclass type  cls
+//note: we might return false here even if we found a class,
+//      because  we want to give a possible script a chance to
+//      recompile. this can only be done if the loader was not
+//      the instance defining the class.
+return cls getclassloader      loader
+public expression transform expression exp
+if  exp    null  return null
+expression ret   null
+if  exp instanceof variableexpression
+ret   transformvariableexpression  variableexpression  exp
+else if  exp getclass      propertyexpression class
+ret   transformpropertyexpression  propertyexpression  exp
+else if  exp instanceof declarationexpression
+ret   transformdeclarationexpression  declarationexpression  exp
+else if  exp instanceof binaryexpression
+ret   transformbinaryexpression  binaryexpression  exp
+else if  exp instanceof methodcallexpression
+ret   transformmethodcallexpression  methodcallexpression  exp
+else if  exp instanceof closureexpression
+ret   transformclosureexpression  closureexpression  exp
+else if  exp instanceof constructorcallexpression
+ret   transformconstructorcallexpression  constructorcallexpression  exp
+else if  exp instanceof annotationconstantexpression
+ret   transformannotationconstantexpression  annotationconstantexpression  exp
+else
+resolveorfail exp gettype    exp
+ret   exp transformexpression this
+if  ret  null    ret  exp  ret setsourceposition exp
+return ret
+private string lookupclassname propertyexpression pe
+boolean doinitialclasstest true
+string name
+// this loop builds a name from right to left each name part
+// separated by "."
+for  expression it   pe  it    null  it     propertyexpression  it  getobjectexpression
+if  it instanceof variableexpression
+variableexpression ve    variableexpression  it
+// stop at super and this
+if  ve    variableexpression super_expression    ve    variableexpression this_expression
+return null
+string varname   ve getname
+if  doinitialclasstest
+// we are at the first name part. this is the right most part.
+// if this part is in lower case, then we do not need a class
+// check. other parts of the property expression will be tested
+// by a different method call to this method, so foo.bar.bar
+// can still be resolved to the class foo.bar and the static
+// field bar.
+if   testvanillanameforclass varname   return null
+doinitialclasstest  false
+name   varname
+else
+name   varname       name
+break
+// anything other than propertyexpressions, classexpression or
+// variableexpressions will stop resolving
+else if    it getclass      propertyexpression class
+return null
+else
+propertyexpression current    propertyexpression  it
+string propertypart   current getpropertyasstring
+// the class property stops resolving, dynamic property names too
+if  propertypart    null    propertypart equals
+return null
+if  doinitialclasstest
+// we are at the first name part. this is the right most part.
+// if this part is in lower case, then we do not need a class
+// check. other parts of the property expression will be tested
+// by a different method call to this method, so foo.bar.bar
+// can still be resolved to the class foo.bar and the static
+// field bar.
+if   testvanillanameforclass propertypart   return null
+doinitialclasstest  false
+name   propertypart
+else
+name   propertypart       name
+if  name length      0  return null
+return name
+// iterate from the inner most to the outer and check for classes
+// this check will ignore a .class property, for example integer.class will be
+// a propertyexpression with the classexpression of integer as objectexpression
+// and class as property
+private expression correctclassclasschain propertyexpression pe
+linkedlist stack   new linkedlist
+classexpression found   null
+for  expression it   pe  it    null  it     propertyexpression  it  getobjectexpression
+if  it instanceof classexpression
+found    classexpression  it
+break
+else if    it getclass      propertyexpression class
+return pe
+stack addfirst it
+if  found    null  return pe
+if  stack isempty    return pe
+object stackelement   stack removefirst
+if    stackelement getclass      propertyexpression class   return pe
+propertyexpression classpropertyexpression    propertyexpression  stackelement
+string propertynamepart   classpropertyexpression getpropertyasstring
+if  propertynamepart    null     propertynamepart equals     return pe
+if  stack isempty    return found
+stackelement   stack removefirst
+if    stackelement getclass      propertyexpression class   return pe
+propertyexpression classpropertyexpressioncontainer    propertyexpression  stackelement
+classpropertyexpressioncontainer setobjectexpression found
+return pe
+protected expression transformpropertyexpression propertyexpression pe
+boolean itlp   istoplevelproperty
+boolean ipe   inpropertyexpression
+expression objectexpression   pe getobjectexpression
+inpropertyexpression   true
+istoplevelproperty     objectexpression getclass      propertyexpression class
+objectexpression   transform objectexpression
+// we handle the property part as if it where not part of the property
+inpropertyexpression   false
+expression property   transform pe getproperty
+istoplevelproperty   itlp
+inpropertyexpression   ipe
+boolean spreadsafe   pe isspreadsafe
+propertyexpression old   pe
+pe   new propertyexpression objectexpression  property  pe issafe
+pe setspreadsafe spreadsafe
+pe setsourceposition old
+string classname   lookupclassname pe
+if  classname    null
+classnode type   classhelper make classname
+if  resolve type
+expression ret    new classexpression type
+ret setsourceposition pe
+return ret
+if  objectexpression instanceof classexpression    pe getpropertyasstring      null
+// possibly an inner class
+classexpression ce    classexpression  objectexpression
+classnode type   classhelper make ce gettype   getname         pe getpropertyasstring
+if  resolve type  false  false  false
+expression ret   new classexpression type
+ret setsourceposition ce
+return ret
+expression ret   pe
+if  istoplevelproperty  ret   correctclassclasschain pe
+return ret
+protected expression transformvariableexpression variableexpression ve
+if  ve getname   equals     return variableexpression this_expression
+if  ve getname   equals     return variableexpression super_expression
+variable v   ve getaccessedvariable
+if  v instanceof dynamicvariable
+string name   ve getname
+classnode t   classhelper make name
+// asking isresolved here allows to check if a primitive
+// type name like "int" was used to make t. in such a case
+// we have nothing left to do.
+boolean isclass   t isresolved
+if   isclass
+// it was no primitive type, so next we see if the name,
+// which is a vanilla name, starts with a lower case letter.
+// in that case we change t to a lowercaseclass to let the
+// compiler skip the resolving at several places in this class.
+if  character islowercase name charat 0
+t   new lowercaseclass name
+isclass   resolve t
+if  isclass
+// the name is a type so remove it from the scoping
+// as it is only a classvariable, it is only in
+// referencedclassvariables, but must be removed
+// for each parentscope too
+for  variablescope scope   currentscope  scope    null     scope isroot    scope   scope getparent
+if  scope isroot    break
+if  scope removereferencedclassvariable ve getname       null  break
+classexpression ce   new classexpression t
+ce setsourceposition ve
+return ce
+resolveorfail ve gettype    ve
+return ve
+private boolean testvanillanameforclass string name
+if  name  null    name length    0  return false
+return  character islowercase name charat 0
+protected expression transformbinaryexpression binaryexpression be
+expression left   transform be getleftexpression
+int type   be getoperation   gettype
+if   type    types assignment_operator    type    types equal
+left instanceof classexpression
+classexpression ce    classexpression  left
+string error       ce gettype   getname
+if  ce gettype   isscript
+error
+adderror error  be getleftexpression
+return be
+if  left instanceof classexpression    be getrightexpression   instanceof listexpression
+// we have c[] if the list is empty -> should be an array then!
+listexpression list    listexpression  be getrightexpression
+if  list getexpressions   isempty
+return new classexpression left gettype   makearray
+expression right   transform be getrightexpression
+be setleftexpression left
+be setrightexpression right
+return be
+protected expression transformclosureexpression closureexpression ce
+boolean oldinclosure   inclosure
+inclosure   true
+parameter paras   ce getparameters
+if  paras    null
+for  int i   0  i < paras length  i
+classnode t   paras gettype
+resolveorfail t  ce
+statement code   ce getcode
+if  code    null  code visit this
+inclosure   oldinclosure
+return ce
+protected expression transformconstructorcallexpression constructorcallexpression cce
+classnode type   cce gettype
+resolveorfail type  cce
+isspecialconstructorcall   cce isspecialcall
+expression ret   cce transformexpression this
+isspecialconstructorcall   false
+return ret
+protected expression transformmethodcallexpression methodcallexpression mce
+expression args   transform mce getarguments
+expression method   transform mce getmethod
+expression object   transform mce getobjectexpression
+methodcallexpression result   new methodcallexpression object  method  args
+result setsafe mce issafe
+result setimplicitthis mce isimplicitthis
+result setspreadsafe mce isspreadsafe
+result setsourceposition mce
+return result
+protected expression transformdeclarationexpression declarationexpression de
+expression oldleft   de getleftexpression
+expression left   transform oldleft
+if  left    oldleft
+classexpression ce    classexpression  left
+adderror     ce gettype   getname    oldleft
+return de
+expression right   transform de getrightexpression
+if  right    de getrightexpression    return de
+declarationexpression newdeclexpr   new declarationexpression  variableexpression  left  de getoperation    right
+newdeclexpr setsourceposition de
+return newdeclexpr
+protected expression transformannotationconstantexpression annotationconstantexpression ace
+annotationnode an    annotationnode  ace getvalue
+classnode type   an getclassnode
+resolveorfail type     an
+for  iterator iter   an getmembers   entryset   iterator    iter hasnext
+map entry member    map entry  iter next
+expression membervalue    expression  member getvalue
+member setvalue transform membervalue
+return ace
+public void visitannotations annotatednode node
+map annotionmap   node getannotations
+if  annotionmap isempty    return
+iterator it   annotionmap values   iterator
+while  it hasnext
+annotationnode an    annotationnode  it next
+//skip builtin properties
+if  an isbuiltin    continue
+classnode type   an getclassnode
+resolveorfail type     an
+for  iterator iter   an getmembers   entryset   iterator    iter hasnext
+map entry member    map entry  iter next
+expression membervalue    expression  member getvalue
+expression newvalue   transform membervalue
+member setvalue newvalue
+if  newvalue instanceof propertyexpression
+propertyexpression pe    propertyexpression  newvalue
+if    pe getobjectexpression   instanceof classexpression
+adderror   pe getobjectexpression
+public void visitclass classnode node
+classnode oldnode   currentclass
+currentclass   node
+resolvegenericsheader node getgenericstypes
+modulenode module   node getmodule
+if   module hasimportsresolved
+list l   module getimports
+for  iterator iter   l iterator    iter hasnext
+importnode element    importnode  iter next
+classnode type   element gettype
+if  resolve type  false  false  true   continue
+adderror     type getname    type
+map importpackages   module getstaticimportclasses
+for  iterator iter   importpackages values   iterator    iter hasnext
+classnode type    classnode  iter next
+if  resolve type  false  false  true   continue
+adderror     type getname    type
+for  iterator iter   module getstaticimportaliases   values   iterator    iter hasnext
+classnode type    classnode  iter next
+if  resolve type  true  true  true   continue
+adderror     type getname    type
+for  iterator iter   module getstaticimportclasses   values   iterator    iter hasnext
+classnode type    classnode  iter next
+if  resolve type  true  true  true   continue
+adderror     type getname    type
+module setimportsresolved true
+classnode sn   node getunresolvedsuperclass
+if  sn    null  resolveorfail sn  node  true
+classnode interfaces   node getinterfaces
+for  int i   0  i < interfaces length  i
+resolveorfail interfaces  node  true
+super visitclass node
+currentclass   oldnode
+public void visitcatchstatement catchstatement cs
+resolveorfail cs getexceptiontype    cs
+if  cs getexceptiontype      classhelper dynamic_type
+cs getvariable   settype classhelper make exception class
+super visitcatchstatement cs
+public void visitforloop forstatement forloop
+resolveorfail forloop getvariabletype    forloop
+super visitforloop forloop
+public void visitblockstatement blockstatement block
+variablescope oldscope   currentscope
+currentscope   block getvariablescope
+super visitblockstatement block
+currentscope   oldscope
+protected sourceunit getsourceunit
+return source
+private void resolvegenericstypes genericstype types
+if  types    null  return
+currentclass setusinggenerics true
+for  int i   0  i < types length  i
+resolvegenericstype types
+private void resolvegenericsheader genericstype types
+if  types    null  return
+currentclass setusinggenerics true
+for  int i   0  i < types length  i
+classnode type   types gettype
+string name   type getname
+classnode bounds   types getupperbounds
+if  bounds    null
+boolean nameadded   false
+for  int j   0  j < bounds length  j
+classnode upperbound   bounds
+if   nameadded    upperbound    null     resolve type
+genericparameternames put name  types
+types setplaceholder true
+type setredirect upperbound
+nameadded   true
+resolveorfail upperbound  type
+else
+genericparameternames put name  types
+type setredirect classhelper object_type
+types setplaceholder true
+private void resolvegenericstype genericstype genericstype
+if  genericstype isresolved    return
+currentclass setusinggenerics true
+classnode type   genericstype gettype
+// save name before redirect
+string name   type getname
+classnode bounds   genericstype getupperbounds
+if   genericparameternames containskey name
+if  bounds    null
+for  int j   0  j < bounds length  j
+classnode upperbound   bounds
+resolveorfail upperbound  genericstype
+type setredirect upperbound
+resolvegenericstypes upperbound getgenericstypes
+else if  genericstype iswildcard
+type setredirect classhelper object_type
+else
+resolveorfail type  genericstype
+else
+genericstype gt    genericstype  genericparameternames get name
+type setredirect gt gettype
+genericstype setplaceholder true
+if  genericstype getlowerbound      null
+resolveorfail genericstype getlowerbound    genericstype
+resolvegenericstypes type getgenericstypes
+genericstype setresolved true

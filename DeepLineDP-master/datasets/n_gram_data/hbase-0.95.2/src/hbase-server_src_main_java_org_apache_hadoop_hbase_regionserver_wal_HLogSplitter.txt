@@ -1,0 +1,1420 @@
+/**
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver wal
+import java io eofexception
+import java io filenotfoundexception
+import java io ioexception
+import java io interruptedioexception
+import java lang reflect constructor
+import java lang reflect invocationtargetexception
+import java text parseexception
+import java util arraylist
+import java util collections
+import java util hashset
+import java util linkedlist
+import java util list
+import java util map
+import java util set
+import java util treemap
+import java util treeset
+import java util concurrent callable
+import java util concurrent completionservice
+import java util concurrent concurrenthashmap
+import java util concurrent countdownlatch
+import java util concurrent executionexception
+import java util concurrent executorcompletionservice
+import java util concurrent future
+import java util concurrent threadfactory
+import java util concurrent threadpoolexecutor
+import java util concurrent timeunit
+import java util concurrent atomic atomicboolean
+import java util concurrent atomic atomiclong
+import java util concurrent atomic atomicreference
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase tablename
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase hregionlocation
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase remoteexceptionhandler
+import org apache hadoop hbase servername
+import org apache hadoop hbase tablenotfoundexception
+import org apache hadoop hbase client connectionutils
+import org apache hadoop hbase client delete
+import org apache hadoop hbase client hconnection
+import org apache hadoop hbase client hconnectionmanager
+import org apache hadoop hbase client put
+import org apache hadoop hbase client row
+import org apache hadoop hbase exceptions regionopeningexception
+import org apache hadoop hbase io heapsize
+import org apache hadoop hbase master splitlogmanager
+import org apache hadoop hbase monitoring monitoredtask
+import org apache hadoop hbase monitoring taskmonitor
+import org apache hadoop hbase protobuf protobufutil
+import org apache hadoop hbase protobuf requestconverter
+import org apache hadoop hbase protobuf generated adminprotos getregioninforequest
+import org apache hadoop hbase protobuf generated adminprotos getregioninforesponse
+import org apache hadoop hbase protobuf generated adminprotos adminservice blockinginterface
+import org apache hadoop hbase protobuf generated zookeeperprotos regionstoresequenceids
+import org apache hadoop hbase protobuf generated zookeeperprotos storesequenceid
+import org apache hadoop hbase regionserver hregion
+import org apache hadoop hbase regionserver lastsequenceid
+import org apache hadoop hbase regionserver wal hlog entry
+import org apache hadoop hbase regionserver wal hlog reader
+import org apache hadoop hbase regionserver wal hlog writer
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util cancelableprogressable
+import org apache hadoop hbase util classsize
+import org apache hadoop hbase util environmentedgemanager
+import org apache hadoop hbase util fsutils
+import org apache hadoop hbase util pair
+import org apache hadoop hbase util threads
+import org apache hadoop hbase zookeeper zksplitlog
+import org apache hadoop hbase zookeeper zktable
+import org apache hadoop hbase zookeeper zookeeperwatcher
+import org apache hadoop io multipleioexception
+import org apache zookeeper keeperexception
+import com google common base preconditions
+import com google common collect lists
+import com google protobuf serviceexception
+/**
+* this class is responsible for splitting up a bunch of regionserver commit log
+* files that are no longer being written to, into new files, one per region for
+* region to replay on startup. delete the old log files when finished.
+*/
+@interfaceaudience private
+public class hlogsplitter
+static final log log   logfactory getlog hlogsplitter class
+// parameters for split process
+protected final path rootdir
+protected final filesystem fs
+protected final configuration conf
+// major subcomponents of the split process.
+// these are separated into inner classes to make testing easier.
+outputsink outputsink
+entrybuffers entrybuffers
+private set<tablename> disablingordisabledtables
+new hashset<tablename>
+private zookeeperwatcher watcher
+// if an exception is thrown by one of the other threads, it will be
+// stored here.
+protected atomicreference<throwable> thrown   new atomicreference<throwable>
+// wait/notify for when data has been produced by the reader thread,
+// consumed by the reader thread, or an exception occurred
+final object dataavailable   new object
+private monitoredtask status
+// for checking the latest flushed sequence id
+protected final lastsequenceid sequenceidchecker
+protected boolean distributedlogreplay
+// map encodedregionname -> lastflushedsequenceid
+protected map<string  long> lastflushedsequenceids   new concurrenthashmap<string  long>
+// map encodedregionname -> maxseqidinstores
+protected map<string  map<byte  long>> regionmaxseqidinstores
+new concurrenthashmap<string  map<byte  long>>
+// failed region server that the wal file being split belongs to
+protected string failedservername
+// number of writer threads
+private final int numwriterthreads
+// min batch size when replay wal edits
+private final int minbatchsize
+hlogsplitter configuration conf  path rootdir
+filesystem fs  lastsequenceid idchecker  zookeeperwatcher zkw
+this conf   conf
+this rootdir   rootdir
+this fs   fs
+this sequenceidchecker   idchecker
+this watcher   zkw
+entrybuffers   new entrybuffers
+conf getint
+128 1024 1024
+this minbatchsize   conf getint    512
+this distributedlogreplay   this conf getboolean hconstants distributed_log_replay_key
+hconstants default_distributed_log_replay_config
+this numwriterthreads   conf getint    3
+if  zkw    null    this distributedlogreplay
+outputsink   new logreplayoutputsink numwriterthreads
+else
+if  this distributedlogreplay
+log info
+this distributedlogreplay   false
+outputsink   new logrecoverededitsoutputsink numwriterthreads
+/**
+* splits a hlog file into region's recovered-edits directory.
+* this is the main entry point for distributed log splitting from splitlogworker.
+* <p>
+* if the log file has n regions then n recovered.edits files will be produced.
+* <p>
+* @param rootdir
+* @param logfile
+* @param fs
+* @param conf
+* @param reporter
+* @param idchecker
+* @param zkw zookeeperwatcher if it's null, we will back to the old-style log splitting where we
+*          dump out recoved.edits files for regions to replay on.
+* @return false if it is interrupted by the progress-able.
+* @throws ioexception
+*/
+public static boolean splitlogfile path rootdir  filestatus logfile  filesystem fs
+configuration conf  cancelableprogressable reporter  lastsequenceid idchecker
+zookeeperwatcher zkw  throws ioexception
+hlogsplitter s   new hlogsplitter conf  rootdir  fs  idchecker  zkw
+return s splitlogfile logfile  reporter
+// a wrapper to split one log folder using the method used by distributed
+// log splitting. used by tools and unit tests. it should be package private.
+// it is public only because testwalobserver is in a different package,
+// which uses this method to to log splitting.
+public static list<path> split path rootdir  path logdir  path oldlogdir
+filesystem fs  configuration conf  throws ioexception
+filestatus logfiles   fs liststatus logdir
+list<path> splits   new arraylist<path>
+if  logfiles    null    logfiles length > 0
+for  filestatus logfile  logfiles
+hlogsplitter s   new hlogsplitter conf  rootdir  fs  null  null
+if  s splitlogfile logfile  null
+finishsplitlogfile rootdir  oldlogdir  logfile getpath    conf
+if  s outputsink splits    null
+splits addall s outputsink splits
+if   fs delete logdir  true
+throw new ioexception     logdir
+return splits
+// the real log splitter. it just splits one log file.
+boolean splitlogfile filestatus logfile
+cancelableprogressable reporter  throws ioexception
+boolean iscorrupted   false
+preconditions checkstate status    null
+boolean skiperrors   conf getboolean
+hlog split_skip_errors_default
+int interval   conf getint    1024
+path logpath   logfile getpath
+boolean outputsinkstarted   false
+boolean progress_failed   false
+int editscount   0
+int editsskipped   0
+try
+status   taskmonitor get   createstatus
+logfile getpath
+long loglength   logfile getlen
+log info     logpath       loglength
+log info     this distributedlogreplay
+status setstatus
+if  reporter    null     reporter progress
+progress_failed   true
+return false
+reader in   null
+try
+in   getreader fs  logfile  conf  skiperrors  reporter
+catch  corruptedlogfileexception e
+log warn     logpath  e
+zksplitlog markcorrupted rootdir  logfile getpath   getname    fs
+iscorrupted   true
+if  in    null
+status markcomplete
+log warn     logpath
+return true
+if watcher    null
+try
+disablingordisabledtables   zktable getdisabledordisablingtables watcher
+catch  keeperexception e
+throw new ioexception    e
+int numopenedfilesbeforereporting   conf getint    3
+int numopenedfileslastcheck   0
+outputsink setreporter reporter
+outputsink startwriterthreads
+outputsinkstarted   true
+entry entry
+long lastflushedsequenceid    1l
+servername servername   hlogutil getservernamefromhlogdirectoryname logpath
+failedservername    servername    null  ?     servername getservername
+while   entry   getnextlogline in  logpath  skiperrors      null
+byte region   entry getkey   getencodedregionname
+string key   bytes tostring region
+lastflushedsequenceid   lastflushedsequenceids get key
+if  lastflushedsequenceid    null
+if  this distributedlogreplay
+regionstoresequenceids ids
+splitlogmanager getregionflushedsequenceid this watcher  failedservername  key
+if  ids    null
+lastflushedsequenceid   ids getlastflushedsequenceid
+else if  sequenceidchecker    null
+lastflushedsequenceid   sequenceidchecker getlastsequenceid region
+if  lastflushedsequenceid    null
+lastflushedsequenceid    1l
+lastflushedsequenceids put key  lastflushedsequenceid
+if  lastflushedsequenceid >  entry getkey   getlogseqnum
+editsskipped
+continue
+entrybuffers appendentry entry
+editscount
+int morewritersfromlastcheck   this getnumopenwriters     numopenedfileslastcheck
+// if sufficient edits have passed, check if we should report progress.
+if  editscount % interval    0
+morewritersfromlastcheck > numopenedfilesbeforereporting
+numopenedfileslastcheck   this getnumopenwriters
+string countsstr    editscount    editsskipped   outputsink getskippededits
+editsskipped
+status setstatus     countsstr
+if  reporter    null     reporter progress
+progress_failed   true
+return false
+catch  interruptedexception ie
+ioexception iie   new interruptedioexception
+iie initcause ie
+throw iie
+catch  corruptedlogfileexception e
+log warn     logpath  e
+zksplitlog markcorrupted rootdir  logfile getpath   getname    fs
+iscorrupted   true
+catch  ioexception e
+e   remoteexceptionhandler checkioexception e
+throw e
+finally
+log info
+if  outputsinkstarted
+progress_failed   outputsink finishwritingandclose      null
+string msg       editscount
+outputsink getnumberofrecoveredregions         logpath
+iscorrupted       progress_failed
+log info msg
+status markcomplete msg
+return  progress_failed
+/**
+* completes the work done by splitlogfile by archiving logs
+* <p>
+* it is invoked by splitlogmanager once it knows that one of the
+* splitlogworkers have completed the splitlogfile() part. if the master
+* crashes then this function might get called multiple times.
+* <p>
+* @param logfile
+* @param conf
+* @throws ioexception
+*/
+public static void finishsplitlogfile string logfile
+configuration conf   throws ioexception
+path rootdir   fsutils getrootdir conf
+path oldlogdir   new path rootdir  hconstants hregion_oldlogdir_name
+path logpath
+if  fsutils isstartingwithpath rootdir  logfile
+logpath   new path logfile
+else
+logpath   new path rootdir  logfile
+finishsplitlogfile rootdir  oldlogdir  logpath  conf
+static void finishsplitlogfile path rootdir  path oldlogdir
+path logpath  configuration conf  throws ioexception
+list<path> processedlogs   new arraylist<path>
+list<path> corruptedlogs   new arraylist<path>
+filesystem fs
+fs   rootdir getfilesystem conf
+if  zksplitlog iscorrupted rootdir  logpath getname    fs
+corruptedlogs add logpath
+else
+processedlogs add logpath
+archivelogs corruptedlogs  processedlogs  oldlogdir  fs  conf
+path stagingdir   zksplitlog getsplitlogdir rootdir  logpath getname
+fs delete stagingdir  true
+/**
+* moves processed logs to a oldlogdir after successful processing moves
+* corrupted logs (any log that couldn't be successfully parsed to corruptdir
+* (.corrupt) for later investigation
+*
+* @param corruptedlogs
+* @param processedlogs
+* @param oldlogdir
+* @param fs
+* @param conf
+* @throws ioexception
+*/
+private static void archivelogs
+final list<path> corruptedlogs
+final list<path> processedlogs  final path oldlogdir
+final filesystem fs  final configuration conf  throws ioexception
+final path corruptdir   new path fsutils getrootdir conf   conf get
+hconstants corrupt_dir_name
+if   fs mkdirs corruptdir
+log info     corruptdir
+fs mkdirs oldlogdir
+// this method can get restarted or called multiple times for archiving
+// the same log files.
+for  path corrupted   corruptedlogs
+path p   new path corruptdir  corrupted getname
+if  fs exists corrupted
+if   fs rename corrupted  p
+log warn     corrupted       p
+else
+log warn     corrupted       p
+for  path p   processedlogs
+path newpath   fshlog gethlogarchivepath oldlogdir  p
+if  fs exists p
+if   fsutils renameandsetmodifytime fs  p  newpath
+log warn     p       newpath
+else
+log debug     p       newpath
+/**
+* path to a file under recovered_edits_dir directory of the region found in
+* <code>logentry</code> named for the sequenceid in the passed
+* <code>logentry</code>: e.g. /hbase/some_table/2323432434/recovered.edits/2332.
+* this method also ensures existence of recovered_edits_dir under the region
+* creating it if necessary.
+* @param fs
+* @param logentry
+* @param rootdir hbase root dir.
+* @return path to file into which to dump split log edits.
+* @throws ioexception
+*/
+@suppresswarnings
+static path getregionspliteditspath final filesystem fs
+final entry logentry  final path rootdir  boolean iscreate
+throws ioexception
+path tabledir   fsutils gettabledir rootdir  logentry getkey   gettablename
+string encodedregionname   bytes tostring logentry getkey   getencodedregionname
+path regiondir   hregion getregiondir tabledir  encodedregionname
+path dir   hlogutil getregiondirrecoverededitsdir regiondir
+if   fs exists regiondir
+log info
+regiondir tostring
+return null
+if  fs exists dir     fs isfile dir
+path tmp   new path
+if   fs exists tmp
+fs mkdirs tmp
+tmp   new path tmp
+hconstants recovered_edits_dir       encodedregionname
+log warn     dir
+tmp
+if   fs rename dir  tmp
+log warn     dir
+if  iscreate     fs exists dir
+if   fs mkdirs dir   log warn     dir
+// append file name ends with recovered_log_tmpfile_suffix to ensure
+// region's replayrecoverededits will not delete it
+string filename   formatrecoverededitsfilename logentry getkey   getlogseqnum
+filename   gettmprecoverededitsfilename filename
+return new path dir  filename
+static string gettmprecoverededitsfilename string filename
+return filename   hlog recovered_log_tmpfile_suffix
+/**
+* get the completed recovered edits file path, renaming it to be by last edit
+* in the file from its first edit. then we could use the name to skip
+* recovered edits when doing {@link hregion#replayrecoverededitsifany}.
+* @param srcpath
+* @param maximumeditlogseqnum
+* @return dstpath take file's last edit log seq num as the name
+*/
+static path getcompletedrecoverededitsfilepath path srcpath
+long maximumeditlogseqnum
+string filename   formatrecoverededitsfilename maximumeditlogseqnum
+return new path srcpath getparent    filename
+static string formatrecoverededitsfilename final long seqid
+return string format    seqid
+/**
+* create a new {@link reader} for reading logs to split.
+*
+* @param fs
+* @param file
+* @param conf
+* @return a new reader instance
+* @throws ioexception
+* @throws corruptedlogfileexception
+*/
+protected reader getreader filesystem fs  filestatus file  configuration conf
+boolean skiperrors  cancelableprogressable reporter
+throws ioexception  corruptedlogfileexception
+path path   file getpath
+long length   file getlen
+reader in
+// check for possibly empty file. with appends, currently hadoop reports a
+// zero length even if the file has been sync'd. revisit if hdfs-376 or
+// hdfs-878 is committed.
+if  length <  0
+log warn     path
+try
+fsutils getinstance fs  conf  recoverfilelease fs  path  conf  reporter
+try
+in   getreader fs  path  conf  reporter
+catch  eofexception e
+if  length <  0
+// todo should we ignore an empty, not-last log file if skip.errors
+// is false? either way, the caller should decide what to do. e.g.
+// ignore if this is the last log in sequence.
+// todo is this scenario still possible if the log has been
+// recovered (i.e. closed)
+log warn     path      e
+return null
+else
+// eofexception being ignored
+return null
+catch  ioexception e
+if  e instanceof filenotfoundexception
+// a wal file may not exist anymore. nothing can be recovered so move on
+log warn     path      e
+return null
+if   skiperrors    e instanceof interruptedioexception
+throw e     don't mark the file corrupted if interrupted  or not skiperrors
+corruptedlogfileexception t
+new corruptedlogfileexception
+path
+t initcause e
+throw t
+return in
+static private entry getnextlogline reader in  path path  boolean skiperrors
+throws corruptedlogfileexception  ioexception
+try
+return in next
+catch  eofexception eof
+// truncated files are expected if a rs crashes (see hbase-2643)
+log info     path
+return null
+catch  ioexception e
+// if the ioe resulted from bad file format,
+// then this problem is idempotent and retrying won't help
+if  e getcause      null
+e getcause   instanceof parseexception
+e getcause   instanceof org apache hadoop fs checksumexception
+log warn     e getcause   tostring
+path
+return null
+if   skiperrors
+throw e
+corruptedlogfileexception t
+new corruptedlogfileexception
+path
+t initcause e
+throw t
+private void writerthreaderror throwable t
+thrown compareandset null  t
+/**
+* check for errors in the writer threads. if any is found, rethrow it.
+*/
+private void checkforerrors   throws ioexception
+throwable thrown   this thrown get
+if  thrown    null  return
+if  thrown instanceof ioexception
+throw new ioexception thrown
+else
+throw new runtimeexception thrown
+/**
+* create a new {@link writer} for writing log splits.
+*/
+protected writer createwriter filesystem fs  path logfile  configuration conf
+throws ioexception
+return hlogfactory createwriter fs  logfile  conf
+/**
+* create a new {@link reader} for reading logs to split.
+*/
+protected reader getreader filesystem fs  path curlogfile
+configuration conf  cancelableprogressable reporter  throws ioexception
+return hlogfactory createreader fs  curlogfile  conf  reporter
+/**
+* get current open writers
+* @return
+*/
+private int getnumopenwriters
+int result   0
+if  this outputsink    null
+result    this outputsink getnumopenwriters
+return result
+/**
+* class which accumulates edits and separates them into a buffer per region
+* while simultaneously accounting ram usage. blocks if the ram usage crosses
+* a predefined threshold.
+*
+* writer threads then pull region-specific buffers from this class.
+*/
+class entrybuffers
+map<byte  regionentrybuffer> buffers
+new treemap<byte  regionentrybuffer> bytes bytes_comparator
+/* track which regions are currently in the middle of writing. we don't allow
+an io thread to pick up bytes from a region if we're already writing
+data for that region in a different io thread. */
+set<byte> currentlywriting   new treeset<byte> bytes bytes_comparator
+long totalbuffered   0
+long maxheapusage
+entrybuffers long maxheapusage
+this maxheapusage   maxheapusage
+/**
+* append a log entry into the corresponding region buffer.
+* blocks if the total heap usage has crossed the specified threshold.
+*
+* @throws interruptedexception
+* @throws ioexception
+*/
+void appendentry entry entry  throws interruptedexception  ioexception
+hlogkey key   entry getkey
+regionentrybuffer buffer
+long incrheap
+synchronized  this
+buffer   buffers get key getencodedregionname
+if  buffer    null
+buffer   new regionentrybuffer key gettablename    key getencodedregionname
+buffers put key getencodedregionname    buffer
+incrheap  buffer appendentry entry
+// if we crossed the chunk threshold, wait for more space to be available
+synchronized  dataavailable
+totalbuffered    incrheap
+while  totalbuffered > maxheapusage    thrown get      null
+log debug     totalbuffered
+dataavailable wait 2000
+dataavailable notifyall
+checkforerrors
+/**
+* @return regionentrybuffer a buffer of edits to be written or replayed.
+*/
+synchronized regionentrybuffer getchunktowrite
+long biggestsize   0
+byte biggestbufferkey   null
+for  map entry<byte  regionentrybuffer> entry   buffers entryset
+long size   entry getvalue   heapsize
+if  size > biggestsize      currentlywriting contains entry getkey
+biggestsize   size
+biggestbufferkey   entry getkey
+if  biggestbufferkey    null
+return null
+regionentrybuffer buffer   buffers remove biggestbufferkey
+currentlywriting add biggestbufferkey
+return buffer
+void donewriting regionentrybuffer buffer
+synchronized  this
+boolean removed   currentlywriting remove buffer encodedregionname
+assert removed
+long size   buffer heapsize
+synchronized  dataavailable
+totalbuffered    size
+// we may unblock writers
+dataavailable notifyall
+synchronized boolean isregioncurrentlywriting byte region
+return currentlywriting contains region
+/**
+* a buffer of some number of edits for a given region.
+* this accumulates edits and also provides a memory optimization in order to
+* share a single byte array instance for the table and region name.
+* also tracks memory usage of the accumulated edits.
+*/
+static class regionentrybuffer implements heapsize
+long heapinbuffer   0
+list<entry> entrybuffer
+tablename tablename
+byte encodedregionname
+regionentrybuffer tablename tablename  byte region
+this tablename   tablename
+this encodedregionname   region
+this entrybuffer   new linkedlist<entry>
+long appendentry entry entry
+internify entry
+entrybuffer add entry
+long incrheap   entry getedit   heapsize
+classsize align 2   classsize reference       hlogkey pointers
+0     todo linkedlist entry
+heapinbuffer    incrheap
+return incrheap
+private void internify entry entry
+hlogkey k   entry getkey
+k interntablename this tablename
+k internencodedregionname this encodedregionname
+public long heapsize
+return heapinbuffer
+class writerthread extends thread
+private volatile boolean shouldstop   false
+private outputsink outputsink   null
+writerthread outputsink sink  int i
+super     i
+outputsink   sink
+public void run
+try
+dorun
+catch  throwable t
+log error    t
+writerthreaderror t
+private void dorun   throws ioexception
+log debug     this
+while  true
+regionentrybuffer buffer   entrybuffers getchunktowrite
+if  buffer    null
+// no data currently available, wait on some more to show up
+synchronized  dataavailable
+if  shouldstop     this outputsink flush
+return
+try
+dataavailable wait 500
+catch  interruptedexception ie
+if   shouldstop
+throw new runtimeexception ie
+continue
+assert buffer    null
+try
+writebuffer buffer
+finally
+entrybuffers donewriting buffer
+private void writebuffer regionentrybuffer buffer  throws ioexception
+outputsink append buffer
+void finish
+synchronized  dataavailable
+shouldstop   true
+dataavailable notifyall
+/**
+* the following class is an abstraction class to provide a common interface to support both
+* existing recovered edits file sink and region server wal edits replay sink
+*/
+abstract class outputsink
+protected map<byte  sinkwriter> writers   collections
+synchronizedmap new treemap<byte  sinkwriter> bytes bytes_comparator
+protected final map<byte  long> regionmaximumeditlogseqnum   collections
+synchronizedmap new treemap<byte  long> bytes bytes_comparator
+protected final list<writerthread> writerthreads   lists newarraylist
+/* set of regions which we've decided should not output edits */
+protected final set<byte> blacklistedregions   collections
+synchronizedset new treeset<byte> bytes bytes_comparator
+protected boolean closeandcleancompleted   false
+protected boolean writersclosed   false
+protected final int numthreads
+protected cancelableprogressable reporter   null
+protected atomiclong skippededits   new atomiclong
+protected list<path> splits   null
+public outputsink int numwriters
+numthreads   numwriters
+void setreporter cancelableprogressable reporter
+this reporter   reporter
+/**
+* start the threads that will pump data from the entrybuffers to the output files.
+*/
+synchronized void startwriterthreads
+for  int i   0  i < numthreads  i
+writerthread t   new writerthread this  i
+t start
+writerthreads add t
+/**
+*
+* update region's maximum edit log seqnum.
+*/
+void updateregionmaximumeditlogseqnum entry entry
+synchronized  regionmaximumeditlogseqnum
+long currentmaxseqnum   regionmaximumeditlogseqnum get entry getkey
+getencodedregionname
+if  currentmaxseqnum    null    entry getkey   getlogseqnum   > currentmaxseqnum
+regionmaximumeditlogseqnum put entry getkey   getencodedregionname    entry getkey
+getlogseqnum
+long getregionmaximumeditlogseqnum byte region
+return regionmaximumeditlogseqnum get region
+/**
+* @return the number of currently opened writers
+*/
+int getnumopenwriters
+return this writers size
+long getskippededits
+return this skippededits get
+/**
+* wait for writer threads to dump all info to the sink
+* @return true when there is no error
+* @throws ioexception
+*/
+protected boolean finishwriting   throws ioexception
+log info
+boolean progress_failed   false
+for  writerthread t   writerthreads
+t finish
+for  writerthread t   writerthreads
+if   progress_failed    reporter    null     reporter progress
+progress_failed   true
+try
+t join
+catch  interruptedexception ie
+ioexception iie   new interruptedioexception
+iie initcause ie
+throw iie
+checkforerrors
+log info
+return   progress_failed
+abstract list<path> finishwritingandclose   throws ioexception
+/**
+* @return a map from encoded region id to the number of edits written out for that region.
+*/
+abstract map<byte  long> getoutputcounts
+/**
+* @return number of regions we've recovered
+*/
+abstract int getnumberofrecoveredregions
+/**
+* @param buffer a wal edit entry
+* @throws ioexception
+*/
+abstract void append regionentrybuffer buffer  throws ioexception
+/**
+* writerthread call this function to help flush internal remaining edits in buffer before close
+* @return true when underlying sink has something to flush
+*/
+protected boolean flush   throws ioexception
+return false
+/**
+* class that manages the output streams from the log splitting process.
+*/
+class logrecoverededitsoutputsink extends outputsink
+public logrecoverededitsoutputsink int numwriters
+// more threads could potentially write faster at the expense
+// of causing more disk seeks as the logs are split.
+// 3. after a certain setting (probably around 3) the
+// process will be bound on the reader in the current
+// implementation anyway.
+super numwriters
+/**
+* @return null if failed to report progress
+* @throws ioexception
+*/
+@override
+list<path> finishwritingandclose   throws ioexception
+boolean issuccessful   false
+list<path> result   null
+try
+issuccessful   finishwriting
+finally
+result   close
+list<ioexception> thrown   closelogwriters null
+if  thrown    null     thrown isempty
+throw multipleioexception createioexception thrown
+if  issuccessful
+splits   result
+return splits
+/**
+* close all of the output streams.
+* @return the list of paths written.
+*/
+private list<path> close   throws ioexception
+preconditions checkstate  closeandcleancompleted
+final list<path> paths   new arraylist<path>
+final list<ioexception> thrown   lists newarraylist
+threadpoolexecutor closethreadpool   threads getboundedcachedthreadpool numthreads  30l
+timeunit seconds  new threadfactory
+private int count   1
+public thread newthread runnable r
+thread t   new thread r      count
+return t
+completionservice<void> completionservice
+new executorcompletionservice<void> closethreadpool
+for  final map entry<byte  ? extends sinkwriter> writersentry   writers entryset
+log debug       writerandpath writersentry getvalue    p
+completionservice submit new callable<void>
+public void call   throws exception
+writerandpath wap    writerandpath  writersentry getvalue
+log debug     wap p
+try
+wap w close
+catch  ioexception ioe
+log error     wap p  ioe
+thrown add ioe
+return null
+log info     wap p       wap editswritten
+wap nanosspent   1000   1000
+if  wap editswritten    0
+// just remove the empty recovered.edits file
+if  fs exists wap p      fs delete wap p  false
+log warn     wap p
+throw new ioexception     wap p
+return null
+path dst   getcompletedrecoverededitsfilepath wap p
+regionmaximumeditlogseqnum get writersentry getkey
+try
+if   dst equals wap p     fs exists dst
+log warn
+dst
+fs getfilestatus dst  getlen
+if   fs delete dst  false
+log warn     dst
+throw new ioexception     dst
+// skip the unit tests which create a splitter that reads and
+// writes the data without touching disk.
+// testhlogsplit#testthreading is an example.
+if  fs exists wap p
+if   fs rename wap p  dst
+throw new ioexception     wap p       dst
+log debug     wap p       dst
+catch  ioexception ioe
+log error     wap p       dst  ioe
+thrown add ioe
+return null
+paths add dst
+return null
+boolean progress_failed   false
+try
+for  int i   0  n   this writers size    i < n  i
+future<void> future   completionservice take
+future get
+if   progress_failed    reporter    null     reporter progress
+progress_failed   true
+catch  interruptedexception e
+ioexception iie   new interruptedioexception
+iie initcause e
+throw iie
+catch  executionexception e
+throw new ioexception e getcause
+finally
+closethreadpool shutdownnow
+if   thrown isempty
+throw multipleioexception createioexception thrown
+writersclosed   true
+closeandcleancompleted   true
+if  progress_failed
+return null
+return paths
+private list<ioexception> closelogwriters list<ioexception> thrown  throws ioexception
+if  writersclosed
+return thrown
+if  thrown    null
+thrown   lists newarraylist
+try
+for  writerthread t   writerthreads
+while  t isalive
+t shouldstop   true
+t interrupt
+try
+t join 10
+catch  interruptedexception e
+ioexception iie   new interruptedioexception
+iie initcause e
+throw iie
+finally
+synchronized  writers
+writerandpath wap   null
+for  sinkwriter tmpwap   writers values
+try
+wap    writerandpath  tmpwap
+wap w close
+catch  ioexception ioe
+log error     wap p  ioe
+thrown add ioe
+continue
+log info     wap p       wap editswritten
+wap nanosspent   1000   1000
+writersclosed   true
+return thrown
+/**
+* get a writer and path for a log starting at the given entry. this function is threadsafe so
+* long as multiple threads are always acting on different regions.
+* @return null if this region shouldn't output any logs
+*/
+private writerandpath getwriterandpath entry entry  throws ioexception
+byte region   entry getkey   getencodedregionname
+writerandpath ret    writerandpath  writers get region
+if  ret    null
+return ret
+// if we already decided that this region doesn't get any output
+// we don't need to check again.
+if  blacklistedregions contains region
+return null
+ret   createwap region  entry  rootdir  fs  conf
+if  ret    null
+blacklistedregions add region
+return null
+writers put region  ret
+return ret
+private writerandpath createwap byte region  entry entry  path rootdir  filesystem fs
+configuration conf  throws ioexception
+path regionedits   getregionspliteditspath fs  entry  rootdir  true
+if  regionedits    null
+return null
+if  fs exists regionedits
+log warn
+regionedits
+fs getfilestatus regionedits  getlen
+if   fs delete regionedits  false
+log warn     regionedits
+writer w   createwriter fs  regionedits  conf
+log debug     regionedits       bytes tostringbinary region
+return  new writerandpath regionedits  w
+void append regionentrybuffer buffer  throws ioexception
+list<entry> entries   buffer entrybuffer
+if  entries isempty
+log warn
+return
+writerandpath wap   null
+long starttime   system nanotime
+try
+int editscount   0
+for  entry logentry   entries
+if  wap    null
+wap   getwriterandpath logentry
+if  wap    null
+// getwriterandpath decided we don't need to write these edits
+return
+wap w append logentry
+this updateregionmaximumeditlogseqnum logentry
+editscount
+// pass along summary statistics
+wap incrementedits editscount
+wap incrementnanotime system nanotime     starttime
+catch  ioexception e
+e   remoteexceptionhandler checkioexception e
+log fatal    e
+throw e
+/**
+* @return a map from encoded region id to the number of edits written out for that region.
+*/
+map<byte  long> getoutputcounts
+treemap<byte  long> ret   new treemap<byte  long> bytes bytes_comparator
+synchronized  writers
+for  map entry<byte  ? extends sinkwriter> entry   writers entryset
+ret put entry getkey    entry getvalue   editswritten
+return ret
+@override
+int getnumberofrecoveredregions
+return writers size
+/**
+* class wraps the actual writer which writes data out and related statistics
+*/
+private abstract static class sinkwriter
+/* count of edits written to this path */
+long editswritten   0
+/* number of nanos spent writing to this log */
+long nanosspent   0
+void incrementedits int edits
+editswritten    edits
+void incrementnanotime long nanos
+nanosspent    nanos
+/**
+* private data structure that wraps a writer and its path, also collecting statistics about the
+* data written to this output.
+*/
+private final static class writerandpath extends sinkwriter
+final path p
+final writer w
+writerandpath final path p  final writer w
+this p   p
+this w   w
+/**
+* class that manages to replay edits from wal files directly to assigned fail over region servers
+*/
+class logreplayoutputsink extends outputsink
+private static final double buffer_threshold   0 35
+private static final string key_delimiter
+private long waitregiononlinetimeout
+private final set<string> recoveredregions   collections synchronizedset new hashset<string>
+private final map<string  regionserverwriter> writers
+new concurrenthashmap<string  regionserverwriter>
+// online encoded region name -> region location map
+private final map<string  hregionlocation> onlineregions
+new concurrenthashmap<string  hregionlocation>
+private map<tablename  hconnection> tablenametohconnectionmap   collections
+synchronizedmap new treemap<tablename  hconnection>
+/**
+* map key -> value layout
+* <servername>:<table name> -> queue<row>
+*/
+private map<string  list<pair<hregionlocation  row>>> servertobufferqueuemap
+new concurrenthashmap<string  list<pair<hregionlocation  row>>>
+private list<throwable> thrown   new arraylist<throwable>
+// the following sink is used in distrubitedlogreplay mode for entries of regions in a disabling
+// table. it's a limitation of distributedlogreplay. because log replay needs a region is
+// assigned and online before it can replay wal edits while regions of disabling/disabled table
+// won't be assigned by am. we can retire this code after hbase-8234.
+private logrecoverededitsoutputsink logrecoverededitsoutputsink
+private boolean haseditsindisablingordisabledtables   false
+public logreplayoutputsink int numwriters
+super numwriters
+this waitregiononlinetimeout   conf getint
+splitlogmanager default_timeout
+this logrecoverededitsoutputsink   new logrecoverededitsoutputsink numwriters
+this logrecoverededitsoutputsink setreporter reporter
+void append regionentrybuffer buffer  throws ioexception
+list<entry> entries   buffer entrybuffer
+if  entries isempty
+log warn
+return
+// check if current region in a disabling or disabled table
+if  disablingordisabledtables contains buffer tablename
+// need fall back to old way
+logrecoverededitsoutputsink append buffer
+haseditsindisablingordisabledtables   true
+// store regions we have recovered so far
+addtorecoveredregions bytes tostring buffer encodedregionname
+return
+// group entries by region servers
+groupeditsbyserver entries
+// process workitems
+string maxlockey   null
+int maxsize   0
+list<pair<hregionlocation  row>> maxqueue   null
+synchronized  this servertobufferqueuemap
+for  string key   this servertobufferqueuemap keyset
+list<pair<hregionlocation  row>> curqueue   this servertobufferqueuemap get key
+if  curqueue size   > maxsize
+maxsize   curqueue size
+maxqueue   curqueue
+maxlockey   key
+if  maxsize < minbatchsize
+entrybuffers totalbuffered < buffer_threshold   entrybuffers maxheapusage
+// buffer more to process
+return
+else if  maxsize > 0
+this servertobufferqueuemap remove maxlockey
+if  maxsize > 0
+processworkitems maxlockey  maxqueue
+private void addtorecoveredregions string encodedregionname
+if   recoveredregions contains encodedregionname
+recoveredregions add encodedregionname
+/**
+* helper function to group walentries to individual region servers
+* @throws ioexception
+*/
+private void groupeditsbyserver list<entry> entries  throws ioexception
+set<tablename> nonexistenttables   null
+long cachedlastflushedsequenceid    1l
+for  hlog entry entry   entries
+waledit edit   entry getedit
+tablename table   entry getkey   gettablename
+string encoderegionnamestr   bytes tostring entry getkey   getencodedregionname
+// skip edits of non-existent tables
+if  nonexistenttables    null    nonexistenttables contains table
+this skippededits incrementandget
+continue
+map<byte  long> maxstoresequenceids   null
+boolean needskip   false
+put put   null
+delete del   null
+keyvalue lastkv   null
+hregionlocation loc   null
+row prerow   null
+hregionlocation preloc   null
+row lastaddedrow   null     it is not really needed here just be conservative
+string prekey   null
+list<keyvalue> kvs   edit getkeyvalues
+hconnection hconn   this getconnectionbytablename table
+for  keyvalue kv   kvs
+// filtering hlog meta entries
+// we don't handle hbase-2231 because we may or may not replay a compaction event.
+// details at https://issues.apache.org/jira/browse/hbase-2231?focusedcommentid=13647143&
+// page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-13647143
+if  kv matchingfamily waledit metafamily   continue
+if  lastkv    null    lastkv gettype      kv gettype       lastkv matchingrow kv
+if  prerow    null
+synchronized  servertobufferqueuemap
+list<pair<hregionlocation  row>> queue   servertobufferqueuemap get prekey
+if  queue    null
+queue   collections synchronizedlist new arraylist<pair<hregionlocation  row>>
+servertobufferqueuemap put prekey  queue
+queue add new pair<hregionlocation  row> preloc  prerow
+lastaddedrow   prerow
+// store regions we have recovered so far
+addtorecoveredregions preloc getregioninfo   getencodedname
+try
+loc   locateregionandrefreshlastflushedsequenceid hconn  table  kv getrow
+encoderegionnamestr
+catch  tablenotfoundexception ex
+// table has been deleted so skip edits of the table
+log info     table
+encoderegionnamestr
+lastflushedsequenceids put encoderegionnamestr  long max_value
+if  nonexistenttables    null
+nonexistenttables   new treeset<tablename>
+nonexistenttables add table
+this skippededits incrementandget
+needskip   true
+break
+cachedlastflushedsequenceid
+lastflushedsequenceids get loc getregioninfo   getencodedname
+if  cachedlastflushedsequenceid    null
+cachedlastflushedsequenceid >  entry getkey   getlogseqnum
+// skip the whole hlog entry
+this skippededits incrementandget
+needskip   true
+break
+else
+if  maxstoresequenceids    null
+maxstoresequenceids
+regionmaxseqidinstores get loc getregioninfo   getencodedname
+if  maxstoresequenceids    null
+long maxstoreseqid   maxstoresequenceids get kv getfamily
+if  maxstoreseqid    null    maxstoreseqid >  entry getkey   getlogseqnum
+// skip current kv if column family doesn't exist anymore or already flushed
+continue
+if  kv isdelete
+del   new delete kv getrow
+del setclusterid entry getkey   getclusterid
+prerow   del
+else
+put   new put kv getrow
+put setclusterid entry getkey   getclusterid
+prerow   put
+prekey   loc gethostnameport     key_delimiter   table
+preloc   loc
+if  kv isdelete
+del adddeletemarker kv
+else
+put add kv
+lastkv   kv
+// skip the edit
+if needskip  continue
+// add the last row
+if  prerow    null    lastaddedrow    prerow
+synchronized  servertobufferqueuemap
+list<pair<hregionlocation  row>> queue   servertobufferqueuemap get prekey
+if  queue    null
+queue   collections synchronizedlist new arraylist<pair<hregionlocation  row>>
+servertobufferqueuemap put prekey  queue
+queue add new pair<hregionlocation  row> preloc  prerow
+// store regions we have recovered so far
+addtorecoveredregions preloc getregioninfo   getencodedname
+/**
+* locate destination region based on table name & row. this function also makes sure the
+* destination region is online for replay.
+* @throws ioexception
+*/
+private hregionlocation locateregionandrefreshlastflushedsequenceid hconnection hconn
+tablename table  byte row  string originalencodedregionname  throws ioexception
+// fetch location from cache
+hregionlocation loc   onlineregions get originalencodedregionname
+if loc    null  return loc
+// fetch location from .meta. directly without using cache to avoid hit old dead server
+loc   hconn getregionlocation table  row  true
+if  loc    null
+throw new ioexception     bytes tostring row
+table
+// check if current row moves to a different region due to region merge/split
+if   originalencodedregionname equalsignorecase loc getregioninfo   getencodedname
+// originalencodedregionname should have already flushed
+lastflushedsequenceids put originalencodedregionname  long max_value
+hregionlocation tmploc   onlineregions get loc getregioninfo   getencodedname
+if  tmploc    null  return tmploc
+long lastflushedsequenceid    1l
+atomicboolean isrecovering   new atomicboolean true
+loc   waituntilregiononline loc  row  this waitregiononlinetimeout  isrecovering
+if   isrecovering get
+// region isn't in recovering at all because wal file may contain a region that has
+// been moved to somewhere before hosting rs fails
+lastflushedsequenceids put loc getregioninfo   getencodedname    long max_value
+log info     loc getregioninfo   getencodedname
+else
+long cachedlastflushedsequenceid
+lastflushedsequenceids get loc getregioninfo   getencodedname
+// retrieve last flushed sequence id from zk. because region postopendeploytasks will
+// update the value for the region
+regionstoresequenceids ids
+splitlogmanager getregionflushedsequenceid watcher  failedservername  loc
+getregioninfo   getencodedname
+if  ids    null
+lastflushedsequenceid   ids getlastflushedsequenceid
+map<byte  long> storeids   new treemap<byte  long> bytes bytes_comparator
+list<storesequenceid> maxseqidinstores   ids getstoresequenceidlist
+for  storesequenceid id   maxseqidinstores
+storeids put id getfamilyname   tobytearray    id getsequenceid
+regionmaxseqidinstores put loc getregioninfo   getencodedname    storeids
+if  cachedlastflushedsequenceid    null
+lastflushedsequenceid > cachedlastflushedsequenceid
+lastflushedsequenceids put loc getregioninfo   getencodedname    lastflushedsequenceid
+onlineregions put loc getregioninfo   getencodedname    loc
+return loc
+private void processworkitems string key  list<pair<hregionlocation  row>> actions
+throws ioexception
+regionserverwriter rsw   null
+long starttime   system nanotime
+try
+rsw   getregionserverwriter key
+rsw sink replayentries actions
+// pass along summary statistics
+rsw incrementedits actions size
+rsw incrementnanotime system nanotime     starttime
+catch  ioexception e
+e   remoteexceptionhandler checkioexception e
+log fatal    e
+throw e
+/**
+* wait until region is online on the destination region server
+* @param loc
+* @param row
+* @param timeout how long to wait
+* @param isrecovering recovering state of the region interested on destination region server.
+* @return true when region is online on the destination region server
+* @throws interruptedexception
+*/
+private hregionlocation waituntilregiononline hregionlocation loc  byte row
+final long timeout  atomicboolean isrecovering
+throws ioexception
+final long endtime   environmentedgemanager currenttimemillis     timeout
+final long pause   conf getlong hconstants hbase_client_pause
+hconstants default_hbase_client_pause
+boolean reloadlocation   false
+tablename tablename   loc getregioninfo   gettablename
+int tries   0
+throwable cause   null
+while  endtime > environmentedgemanager currenttimemillis
+try
+// try and get regioninfo from the hosting server.
+hconnection hconn   getconnectionbytablename tablename
+if reloadlocation
+loc   hconn getregionlocation tablename  row  true
+blockinginterface remotesvr   hconn getadmin loc getservername
+hregioninfo region   loc getregioninfo
+try
+getregioninforequest request
+requestconverter buildgetregioninforequest region getregionname
+getregioninforesponse response   remotesvr getregioninfo null  request
+if  hregioninfo convert response getregioninfo       null
+isrecovering set  response hasisrecovering    ? response getisrecovering     true
+return loc
+catch  serviceexception se
+throw protobufutil getremoteexception se
+catch  ioexception e
+cause   e getcause
+if   cause instanceof regionopeningexception
+reloadlocation   true
+long expectedsleep   connectionutils getpausetime pause  tries
+try
+thread sleep expectedsleep
+catch  interruptedexception e
+thread currentthread   interrupt
+throw new ioexception
+loc getregioninfo   getencodedname        e
+tries
+throw new ioexception     loc getregioninfo   getencodedname
+timeout      cause
+@override
+protected boolean flush   throws ioexception
+string curloc   null
+int cursize   0
+list<pair<hregionlocation  row>> curqueue   null
+synchronized  this servertobufferqueuemap
+for  string locationkey   this servertobufferqueuemap keyset
+curqueue   this servertobufferqueuemap get locationkey
+if   curqueue isempty
+cursize   curqueue size
+curloc   locationkey
+break
+if  cursize > 0
+this servertobufferqueuemap remove curloc
+if  cursize > 0
+this processworkitems curloc  curqueue
+dataavailable notifyall
+return true
+return false
+void addwritererror throwable t
+thrown add t
+@override
+list<path> finishwritingandclose   throws ioexception
+try
+if   finishwriting
+return null
+if  haseditsindisablingordisabledtables
+splits   logrecoverededitsoutputsink finishwritingandclose
+else
+splits   new arraylist<path>
+// returns an empty array in order to keep interface same as old way
+return splits
+finally
+list<ioexception> thrown   closeregionserverwriters
+if  thrown    null     thrown isempty
+throw multipleioexception createioexception thrown
+@override
+int getnumopenwriters
+return this writers size     this logrecoverededitsoutputsink getnumopenwriters
+private list<ioexception> closeregionserverwriters   throws ioexception
+list<ioexception> result   null
+if   writersclosed
+result   lists newarraylist
+try
+for  writerthread t   writerthreads
+while  t isalive
+t shouldstop   true
+t interrupt
+try
+t join 10
+catch  interruptedexception e
+ioexception iie   new interruptedioexception
+iie initcause e
+throw iie
+finally
+synchronized  writers
+for  string locationkey   writers keyset
+regionserverwriter tmpw   writers get locationkey
+try
+tmpw close
+catch  ioexception ioe
+log error     locationkey  ioe
+result add ioe
+// close connections
+synchronized  this tablenametohconnectionmap
+for  tablename tablename   this tablenametohconnectionmap keyset
+hconnection hconn   this tablenametohconnectionmap get tablename
+try
+hconn clearregioncache
+hconn close
+catch  ioexception ioe
+result add ioe
+writersclosed   true
+return result
+map<byte  long> getoutputcounts
+treemap<byte  long> ret   new treemap<byte  long> bytes bytes_comparator
+synchronized  writers
+for  map entry<string  regionserverwriter> entry   writers entryset
+ret put bytes tobytes entry getkey     entry getvalue   editswritten
+return ret
+@override
+int getnumberofrecoveredregions
+return this recoveredregions size
+/**
+* get a writer and path for a log starting at the given entry. this function is threadsafe so
+* long as multiple threads are always acting on different regions.
+* @return null if this region shouldn't output any logs
+*/
+private regionserverwriter getregionserverwriter string loc  throws ioexception
+regionserverwriter ret   writers get loc
+if  ret    null
+return ret
+tablename tablename   gettablefromlocationstr loc
+if tablename    null
+log warn     loc
+hconnection hconn   getconnectionbytablename tablename
+synchronized  writers
+ret   writers get loc
+if  ret    null
+ret   new regionserverwriter conf  tablename  hconn
+writers put loc  ret
+return ret
+private hconnection getconnectionbytablename final tablename tablename  throws ioexception
+hconnection hconn   this tablenametohconnectionmap get tablename
+if  hconn    null
+synchronized  this tablenametohconnectionmap
+hconn   this tablenametohconnectionmap get tablename
+if  hconn    null
+hconn   hconnectionmanager getconnection conf
+this tablenametohconnectionmap put tablename  hconn
+return hconn
+private tablename gettablefromlocationstr string loc
+/**
+* location key is in format <server name:port>#<table name>
+*/
+string splits   loc split key_delimiter
+if  splits length    2
+return null
+return tablename valueof splits
+/**
+* private data structure that wraps a receiving rs and collecting statistics about the data
+* written to this newly assigned rs.
+*/
+private final static class regionserverwriter extends sinkwriter
+final waleditsreplaysink sink
+regionserverwriter final configuration conf  final tablename tablename  final hconnection conn
+throws ioexception
+this sink   new waleditsreplaysink conf  tablename  conn
+void close   throws ioexception
+static class corruptedlogfileexception extends exception
+private static final long serialversionuid   1l
+corruptedlogfileexception string s
+super s

@@ -1,0 +1,3307 @@
+/*
+derby - class org.apache.derby.impl.sql.compile.frombasetable
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package	org apache derby impl sql compile
+import org apache derby catalog indexdescriptor
+import org apache derby iapi util stringutil
+import org apache derby iapi reference classname
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services io formatablebitset
+import org apache derby iapi services io formatablearrayholder
+import org apache derby iapi services io formatableintholder
+import org apache derby iapi util jbitset
+import org apache derby iapi util reusefactory
+import org apache derby iapi services classfile vmopcode
+import org apache derby iapi services compiler methodbuilder
+import org apache derby iapi services property propertyutil
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby iapi sql compile compilercontext
+import org apache derby iapi sql compile optimizablepredicatelist
+import org apache derby iapi sql compile optimizer
+import org apache derby iapi sql compile optimizablepredicate
+import org apache derby iapi sql compile optimizable
+import org apache derby iapi sql compile costestimate
+import org apache derby iapi sql compile accesspath
+import org apache derby iapi sql compile joinstrategy
+import org apache derby iapi sql compile rowordering
+import org apache derby iapi sql compile c_nodetypes
+import org apache derby iapi sql compile visitable
+import org apache derby iapi sql compile visitor
+import org apache derby iapi sql dictionary datadictionary
+import org apache derby iapi sql dictionary columndescriptor
+import org apache derby iapi sql dictionary columndescriptorlist
+import org apache derby iapi sql dictionary constraintdescriptor
+import org apache derby iapi sql dictionary conglomeratedescriptor
+import org apache derby iapi sql dictionary indexrowgenerator
+import org apache derby iapi sql dictionary schemadescriptor
+import org apache derby iapi sql dictionary tabledescriptor
+import org apache derby iapi sql dictionary viewdescriptor
+import org apache derby iapi sql execute execrow
+import org apache derby iapi sql execute executioncontext
+import org apache derby iapi sql languageproperties
+import org apache derby iapi store access staticcompiledopenconglominfo
+import org apache derby iapi store access storecostcontroller
+import org apache derby iapi store access scancontroller
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi types datavaluedescriptor
+import org apache derby impl sql compile expressionclassbuilder
+import org apache derby impl sql compile activationclassbuilder
+import java util enumeration
+import java util properties
+import java util vector
+import java util hashset
+import java util set
+/**
+* a frombasetable represents a table in the from list of a dml statement,
+* as distinguished from a fromsubquery, which represents a subquery in the
+* from list. a frombasetable may actually represent a view.  during parsing,
+* we can't distinguish views from base tables. during binding, when we
+* find frombasetables that represent views, we replace them with fromsubqueries.
+* by the time we get to code generation, all fromsubqueries have been eliminated,
+* and all frombasetables will represent only true base tables.
+* <p>
+* <b>positioned update</b>: currently, all columns of an updatable cursor
+* are selected to deal with a positioned update.  this is because we don't
+* know what columns will ultimately be needed from the updatenode above
+* us.  for example, consider:<pre><i>
+*
+* 	get c as 'select cint from t for update of ctinyint'
+*  update t set ctinyint = csmallint
+*
+* </pre></i> ideally, the cursor only selects cint.  then,
+* something akin to an indexrowtobaserow is generated to
+* take the cursorresultset and get the appropriate columns
+* out of the base table from the rowlocation retunrned by the
+* cursor.  then the update node can generate the appropriate
+* normalizeresultset (or whatever else it might need) to
+* get things into the correct format for the updateresultset.
+* see currentofnode for more information.
+*
+*/
+public class frombasetable extends fromtable
+static final int unset    1
+tablename		tablename
+tabledescriptor	tabledescriptor
+conglomeratedescriptor		baseconglomeratedescriptor
+conglomeratedescriptor	conglomdescs
+int				updateordelete
+/*
+** the number of rows to bulkfetch.
+** initially it is unset.  if the user
+** uses the bulkfetch table property,
+** it is set to that.  otherwise, it
+** may be turned on if it isn't an updatable
+** cursor and it is the right type of
+** result set (more than 1 row expected to
+** be returned, and not hash, which does its
+** own bulk fetch, and subquery).
+*/
+int 			bulkfetch   unset
+/* we may turn off bulk fetch for a variety of reasons,
+* including because of the min optimization.
+* bulkfetchturnedoff is set to true in those cases.
+*/
+boolean			bulkfetchturnedoff
+/* whether or not we are going to do execution time "multi-probing"
+* on the table scan for this frombasetable.
+*/
+boolean			multiprobing   false
+private double	singlescanrowcount
+private formatablebitset referencedcols
+private resultcolumnlist templatecolumns
+/* a 0-based array of column names for this table used
+* for optimizer trace.
+*/
+private string columnnames
+// true if we are to do a special scan to retrieve the last value
+// in the index
+private boolean specialmaxscan
+// true if we are to do a distinct scan
+private boolean distinctscan
+/**
+*information for dependent table scan for referential actions
+*/
+private boolean radependentscan
+private string raparentresultsetid
+private long fkindexconglomid
+private int fkcolarray
+/**
+* restriction as a predicatelist
+*/
+predicatelist basetablerestrictionlist
+predicatelist nonbasetablerestrictionlist
+predicatelist restrictionlist
+predicatelist storerestrictionlist
+predicatelist nonstorerestrictionlist
+predicatelist requalificationrestrictionlist
+public static final int update   1
+public static final int delete   2
+/* variables for exists fbts */
+private boolean	existsbasetable
+private boolean	isnotexists     is a not exists base table
+private jbitset dependencymap
+private boolean getupdatelocks
+/**
+* initializer for a table in a from list. parameters are as follows:
+*
+* <ul>
+* <li>tablename			the name of the table</li>
+* <li>correlationname	the correlation name</li>
+* <li>derivedrcl		the derived column list</li>
+* <li>tableproperties	the properties list associated with the table.</li>
+* </ul>
+*
+* <p>
+*  - or -
+* </p>
+*
+* <ul>
+* <li>tablename			the name of the table</li>
+* <li>correlationname	the correlation name</li>
+* <li>updateordelete	table is being updated/deleted from. </li>
+* <li>derivedrcl		the derived column list</li>
+* </ul>
+*/
+public void init
+object arg1
+object arg2
+object arg3
+object arg4
+if  arg3 instanceof integer
+init arg2  null
+this tablename    tablename  arg1
+this updateordelete     integer  arg3  intvalue
+resultcolumns    resultcolumnlist  arg4
+else
+init arg2  arg4
+this tablename    tablename  arg1
+resultcolumns    resultcolumnlist  arg3
+setorigtablename this tablename
+templatecolumns   resultcolumns
+/**
+* no loj reordering for base table.
+*/
+public boolean loj_reorderable int numtables
+throws standardexception
+return false
+public jbitset lojgetreferencedtables int numtables
+throws standardexception
+jbitset map   new jbitset numtables
+fillinreferencedtablemap map
+return map
+/*
+* optimizable interface.
+*/
+/**
+* @see optimizable#nextaccesspath
+*
+* @exception standardexception		thrown on error
+*/
+public boolean nextaccesspath optimizer optimizer
+optimizablepredicatelist predlist
+rowordering rowordering
+throws standardexception
+string userspecifiedindexname   getuserspecifiedindexname
+accesspath ap   getcurrentaccesspath
+conglomeratedescriptor currentconglomeratedescriptor
+ap getconglomeratedescriptor
+optimizer trace optimizer calling_next_access_path
+predlist    null  ? 0   predlist size
+0  0 0  getexposedname
+/*
+** remove the ordering of the current conglomerate descriptor,
+** if any.
+*/
+rowordering removeoptimizable gettablenumber
+// resolve: this will have to be modified to step through the
+// join strategies as well as the conglomerates.
+if  userspecifiedindexname    null
+/*
+** user specified an index name, so we should look at only one
+** index.  if there is a current conglomerate descriptor, and there
+** are no more join strategies, we've already looked at the index,
+** so go back to null.
+*/
+if  currentconglomeratedescriptor    null
+if     super nextaccesspath optimizer
+predlist
+rowordering
+currentconglomeratedescriptor   null
+else
+optimizer trace optimizer looking_for_specified_index
+tablenumber  0  0 0  userspecifiedindexname
+if  stringutil sqltouppercase userspecifiedindexname  equals
+/* special case - user-specified table scan */
+currentconglomeratedescriptor
+tabledescriptor getconglomeratedescriptor
+tabledescriptor getheapconglomerateid
+else
+/* user-specified index name */
+getconglomdescs
+for  int index   0  index < conglomdescs length  index
+currentconglomeratedescriptor   conglomdescs
+string conglomeratename
+currentconglomeratedescriptor getconglomeratename
+if  conglomeratename    null
+/* have we found the desired index? */
+if  conglomeratename equals userspecifiedindexname
+break
+/* we should always find a match */
+if  sanitymanager debug
+if  currentconglomeratedescriptor    null
+sanitymanager throwassert
+userspecifiedindexname
+if     super nextaccesspath optimizer
+predlist
+rowordering
+if  sanitymanager debug
+sanitymanager throwassert
+else
+if  currentconglomeratedescriptor    null
+/*
+** once we have a conglomerate descriptor, cycle through
+** the join strategies (done in parent).
+*/
+if     super nextaccesspath optimizer
+predlist
+rowordering
+/*
+** when we're out of join strategies, go to the next
+** conglomerate descriptor.
+*/
+currentconglomeratedescriptor   getnextconglom currentconglomeratedescriptor
+/*
+** new conglomerate, so step through join strategies
+** again.
+*/
+resetjoinstrategies optimizer
+if     super nextaccesspath optimizer
+predlist
+rowordering
+if  sanitymanager debug
+sanitymanager throwassert
+else
+/* get the first conglomerate descriptor */
+currentconglomeratedescriptor   getfirstconglom
+if     super nextaccesspath optimizer
+predlist
+rowordering
+if  sanitymanager debug
+sanitymanager throwassert
+if  currentconglomeratedescriptor    null
+optimizer trace optimizer no_more_conglomerates  tablenumber  0  0 0  null
+else
+currentconglomeratedescriptor setcolumnnames columnnames
+optimizer trace optimizer considering_conglomerate  tablenumber  0  0 0
+currentconglomeratedescriptor
+/*
+** tell the rowordering that what the ordering of this conglomerate is
+*/
+if  currentconglomeratedescriptor    null
+if     currentconglomeratedescriptor isindex
+/* if we are scanning the heap, but there
+* is a full match on a unique key, then
+* we can say that the table is not unordered.
+* (we can't currently say what the ordering is
+* though.)
+*/
+if    isonerowresultset predlist
+optimizer trace optimizer adding_unordered_optimizable
+predlist    null  ? 0   predlist size
+0  0 0  null
+rowordering addunorderedoptimizable this
+else
+optimizer trace optimizer scanning_heap_full_match_on_unique_key
+0  0  0 0  null
+else
+indexrowgenerator irg
+currentconglomeratedescriptor getindexdescriptor
+int basecolumnpositions   irg basecolumnpositions
+boolean isascending   irg isascending
+for  int i   0  i < basecolumnpositions length  i
+/*
+** don't add the column to the ordering if it's already
+** an ordered column.  this can happen in the following
+** case:
+**
+**		create index ti on t(x, y);
+**		select * from t where x = 1 order by y;
+**
+** column x is always ordered, so we want to avoid the
+** sort when using index ti.  this is accomplished by
+** making column y appear as the first ordered column
+** in the list.
+*/
+if     rowordering orderedoncolumn isascending ?
+rowordering ascending
+rowordering descending
+gettablenumber
+basecolumnpositions
+rowordering nextorderposition isascending ?
+rowordering ascending
+rowordering descending
+rowordering addorderedcolumn isascending ?
+rowordering ascending
+rowordering descending
+gettablenumber
+basecolumnpositions
+ap setconglomeratedescriptor currentconglomeratedescriptor
+return currentconglomeratedescriptor    null
+/** tell super-class that this optimizable can be ordered */
+protected boolean canbeordered
+return true
+/**
+* @see org.apache.derby.iapi.sql.compile.optimizable#optimizeit
+*
+* @exception standardexception		thrown on error
+*/
+public costestimate optimizeit
+optimizer optimizer
+optimizablepredicatelist predlist
+costestimate outercost
+rowordering rowordering
+throws standardexception
+optimizer costoptimizable
+this
+tabledescriptor
+getcurrentaccesspath   getconglomeratedescriptor
+predlist
+outercost
+// the cost that we found from the above call is now stored in the
+// cost field of this fbt's current access path.  so that's the
+// cost we want to return here.
+return getcurrentaccesspath   getcostestimate
+/** @see optimizable#gettabledescriptor */
+public tabledescriptor gettabledescriptor
+return tabledescriptor
+/** @see optimizable#ismaterializable
+*
+* @exception standardexception		thrown on error
+*/
+public boolean ismaterializable
+throws standardexception
+/* base tables are always materializable */
+return true
+/**
+* @see optimizable#pushoptpredicate
+*
+* @exception standardexception		thrown on error
+*/
+public boolean pushoptpredicate optimizablepredicate optimizablepredicate
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert optimizablepredicate instanceof predicate
+/* add the matching predicate to the restrictionlist */
+restrictionlist addpredicate  predicate  optimizablepredicate
+return true
+/**
+* @see optimizable#pulloptpredicates
+*
+* @exception standardexception		thrown on error
+*/
+public void pulloptpredicates
+optimizablepredicatelist optimizablepredicates
+throws standardexception
+for  int i   restrictionlist size     1  i >  0  i
+optimizablepredicates addoptpredicate
+restrictionlist getoptpredicate i
+restrictionlist removeoptpredicate i
+/**
+* @see optimizable#iscoveringindex
+* @exception standardexception		thrown on error
+*/
+public boolean iscoveringindex conglomeratedescriptor cd  throws standardexception
+boolean coveringindex   true
+indexrowgenerator	irg
+int				basecols
+int					colpos
+/* you can only be a covering index if you're an index */
+if     cd isindex
+return false
+irg   cd getindexdescriptor
+basecols   irg basecolumnpositions
+/* first we check to see if this is a covering index */
+int rclsize   resultcolumns size
+for  int index   0  index < rclsize  index
+resultcolumn rc    resultcolumn  resultcolumns elementat index
+/* ignore unreferenced columns */
+if    rc isreferenced
+continue
+/* ignore constants - this can happen if all of the columns
+* were projected out and we ended up just generating
+* a "1" in rcl.doproject().
+*/
+if  rc getexpression   instanceof constantnode
+continue
+coveringindex   false
+colpos   rc getcolumnposition
+/* is this column in the index? */
+for  int i   0  i < basecols length  i
+if  colpos    basecols
+coveringindex   true
+break
+/* no need to continue if the column was not in the index */
+if    coveringindex
+break
+return coveringindex
+/** @see optimizable#verifyproperties
+* @exception standardexception		thrown on error
+*/
+public void verifyproperties datadictionary ddictionary
+throws standardexception
+if  tableproperties    null
+return
+/* check here for:
+*		invalid properties key
+*		index and constraint properties
+*		non-existent index
+*		non-existent constraint
+*		invalid joinstrategy
+*		invalid value for hashinitialcapacity
+*		invalid value for hashloadfactor
+*		invalid value for hashmaxcapacity
+*/
+boolean indexspecified   false
+boolean constraintspecified   false
+constraintdescriptor consdesc   null
+enumeration e   tableproperties keys
+stringutil sqlequalsignorecase tabledescriptor getschemaname
+while  e hasmoreelements
+string key    string  e nextelement
+string value    string  tableproperties get key
+if  key equals
+// user only allowed to specify 1 of index and constraint, not both
+if  constraintspecified
+throw standardexception newexception sqlstate lang_both_force_index_and_constraint_specified
+getbasetablename
+indexspecified   true
+/* validate index name - null means table scan */
+if    stringutil sqltouppercase value  equals
+conglomeratedescriptor cd   null
+conglomeratedescriptor cds   tabledescriptor getconglomeratedescriptors
+for  int index   0  index < cds length  index
+cd   cds
+string conglomeratename   cd getconglomeratename
+if  conglomeratename    null
+if  conglomeratename equals value
+break
+// not a match, clear cd
+cd   null
+// throw exception if user specified index not found
+if  cd    null
+throw standardexception newexception sqlstate lang_invalid_forced_index1
+value  getbasetablename
+/* query is dependent on the conglomeratedescriptor */
+getcompilercontext   createdependency cd
+else if  key equals
+// user only allowed to specify 1 of index and constraint, not both
+if  indexspecified
+throw standardexception newexception sqlstate lang_both_force_index_and_constraint_specified
+getbasetablename
+constraintspecified   true
+if    stringutil sqltouppercase value  equals
+consdesc
+ddictionary getconstraintdescriptorbyname
+tabledescriptor   schemadescriptor null  value
+false
+/* throw exception if user specified constraint not found
+* or if it does not have a backing index.
+*/
+if   consdesc    null       consdesc hasbackingindex
+throw standardexception newexception sqlstate lang_invalid_forced_index2
+value  getbasetablename
+/* query is dependent on the constraintdescriptor */
+getcompilercontext   createdependency consdesc
+else if  key equals
+userspecifiedjoinstrategy   stringutil sqltouppercase value
+else if  key equals
+initialcapacity   getintproperty value  key
+// verify that the specified value is valid
+if  initialcapacity <  0
+throw standardexception newexception sqlstate lang_invalid_hash_initial_capacity
+string valueof initialcapacity
+else if  key equals
+try
+loadfactor   float valueof value  floatvalue
+catch  numberformatexception nfe
+throw standardexception newexception sqlstate lang_invalid_number_format_for_override
+value  key
+// verify that the specified value is valid
+if  loadfactor <  0 0    loadfactor > 1 0
+throw standardexception newexception sqlstate lang_invalid_hash_load_factor
+value
+else if  key equals
+maxcapacity   getintproperty value  key
+// verify that the specified value is valid
+if  maxcapacity <  0
+throw standardexception newexception sqlstate lang_invalid_hash_max_capacity
+string valueof maxcapacity
+else if  key equals
+bulkfetch   getintproperty value  key
+// verify that the specified value is valid
+if  bulkfetch <  0
+throw standardexception newexception sqlstate lang_invalid_bulk_fetch_value
+string valueof bulkfetch
+// no bulk fetch on updatable scans
+if  forupdate
+throw standardexception newexception sqlstate lang_invalid_bulk_fetch_updateable
+else
+// no other "legal" values at this time
+throw standardexception newexception sqlstate lang_invalid_from_table_property  key
+/* if user specified a non-null constraint name(derby-1707), then
+* replace it in the properties list with the underlying index name to
+* simplify the code in the optimizer.
+* note: the code to get from the constraint name, for a constraint
+* with a backing index, to the index name is convoluted.  given
+* the constraint name, we can get the conglomerate id from the
+* constraintdescriptor.  we then use the conglomerate id to get
+* the conglomeratedescriptor from the datadictionary and, finally,
+* we get the index name (conglomerate name) from the conglomeratedescriptor.
+*/
+if  constraintspecified    consdesc    null
+conglomeratedescriptor cd
+ddictionary getconglomeratedescriptor
+consdesc getconglomerateid
+string indexname   cd getconglomeratename
+tableproperties remove
+tableproperties put    indexname
+/** @see optimizable#getbasetablename */
+public string getbasetablename
+return tablename gettablename
+/** @see optimizable#startoptimizing */
+public void startoptimizing optimizer optimizer  rowordering rowordering
+accesspath ap   getcurrentaccesspath
+accesspath bestap   getbestaccesspath
+accesspath bestsortap   getbestsortavoidancepath
+ap setconglomeratedescriptor  conglomeratedescriptor  null
+bestap setconglomeratedescriptor  conglomeratedescriptor  null
+bestsortap setconglomeratedescriptor  conglomeratedescriptor  null
+ap setcoveringindexscan false
+bestap setcoveringindexscan false
+bestsortap setcoveringindexscan false
+ap setlockmode 0
+bestap setlockmode 0
+bestsortap setlockmode 0
+/*
+** only need to do this for current access path, because the
+** costestimate will be copied to the best access paths as
+** necessary.
+*/
+costestimate costestimate   getcostestimate optimizer
+ap setcostestimate costestimate
+/*
+** this is the initial cost of this optimizable.  initialize it
+** to the maximum cost so that the optimizer will think that
+** any access path is better than none.
+*/
+costestimate setcost double max_value  double max_value  double max_value
+super startoptimizing optimizer  rowordering
+/** @see optimizable#convertabsolutetorelativecolumnposition */
+public int convertabsolutetorelativecolumnposition int absoluteposition
+return mapabsolutetorelativecolumnposition absoluteposition
+/**
+* @see optimizable#estimatecost
+*
+* @exception standardexception		thrown on error
+*/
+public costestimate estimatecost optimizablepredicatelist predlist
+conglomeratedescriptor cd
+costestimate outercost
+optimizer optimizer
+rowordering rowordering
+throws standardexception
+double cost
+boolean statisticsfortable   false
+boolean statisticsforconglomerate   false
+/* unknownpredicatelist contains all predicates whose effect on
+* cost/selectivity can't be calculated by the store.
+*/
+predicatelist unknownpredicatelist   null
+if  optimizer usestatistics      predlist    null
+/* if user has specified that we don't use statistics,
+pretend that statistics don't exist.
+*/
+statisticsforconglomerate   tabledescriptor statisticsexist cd
+statisticsfortable   tabledescriptor statisticsexist null
+unknownpredicatelist   new predicatelist
+predlist copypredicatestootherlist unknownpredicatelist
+accesspath currentaccesspath   getcurrentaccesspath
+joinstrategy currentjoinstrategy
+currentaccesspath getjoinstrategy
+optimizer trace optimizer estimating_cost_of_conglomerate
+tablenumber  0  0 0  cd
+/* get the uniqueness factory for later use (see below) */
+double tableuniquenessfactor
+optimizer uniquejoinwithoutertable predlist
+boolean onerowresultsetforsomeconglom   isonerowresultset predlist
+/* get the predicates that can be used for scanning the base table */
+basetablerestrictionlist removeallelements
+currentjoinstrategy getbasepredicates predlist
+basetablerestrictionlist
+this
+/* resolve: need to figure out how to cache the storecostcontroller */
+storecostcontroller scc   getstorecostcontroller cd
+costestimate costestimate   getscratchcostestimate optimizer
+/* first, get the cost for one scan */
+/* does the conglomerate match at most one row? */
+if  isonerowresultset cd  basetablerestrictionlist
+/*
+** tell the rowordering that this optimizable is always ordered.
+** it will figure out whether it is really always ordered in the
+** context of the outer tables and their orderings.
+*/
+rowordering optimizablealwaysordered this
+singlescanrowcount   1 0
+/* yes, the cost is to fetch exactly one row */
+// resolve: need to figure out how to get referenced column list,
+// field states, and access type
+cost   scc getfetchfromfullkeycost
+formatablebitset  null
+0
+optimizer trace optimizer match_single_row_cost
+tablenumber  0  cost  null
+costestimate setcost cost  1 0d  1 0d
+/*
+** let the join strategy decide whether the cost of the base
+** scan is a single scan, or a scan per outer row.
+** note: the multiplication should only be done against the
+** total row count, not the singlescanrowcount.
+*/
+double newcost   costestimate getestimatedcost
+if  currentjoinstrategy multiplybasecostbyouterrows
+newcost    outercost rowcount
+costestimate setcost
+newcost
+costestimate rowcount     outercost rowcount
+costestimate singlescanrowcount
+/*
+** choose the lock mode.  if the start/stop conditions are
+** constant, choose row locking, because we will always match
+** the same row.  if they are not constant (i.e. they include
+** a join), we decide whether to do row locking based on
+** the total number of rows for the life of the query.
+*/
+boolean constantstartstop   true
+for  int i   0  i < predlist size    i
+optimizablepredicate pred   predlist getoptpredicate i
+/*
+** the predicates are in index order, so the start and
+** stop keys should be first.
+*/
+if      pred isstartkey      pred isstopkey
+break
+/* stop when we've found a join */
+if     pred getreferencedmap   hassinglebitset
+constantstartstop   false
+break
+if  constantstartstop
+currentaccesspath setlockmode
+transactioncontroller mode_record
+optimizer trace optimizer row_lock_all_constant_start_stop
+0  0  0 0  null
+else
+setlockingbasedonthreshold optimizer  costestimate rowcount
+optimizer trace optimizer cost_of_n_scans
+tablenumber  0  outercost rowcount    costestimate
+/* add in cost of fetching base row for non-covering index */
+if  cd isindex          iscoveringindex cd
+double singlefetchcost
+getbasecostcontroller   getfetchfromrowlocationcost
+formatablebitset  null
+0
+cost   singlefetchcost   costestimate rowcount
+costestimate setestimatedcost
+costestimate getestimatedcost     cost
+optimizer trace optimizer non_covering_index_cost
+tablenumber  0  cost  null
+else
+/* conglomerate might match more than one row */
+/*
+** some predicates are good for start/stop, but we don't know
+** the values they are being compared to at this time, so we
+** estimate their selectivity in language rather than ask the
+** store about them .  the predicates on the first column of
+** the conglomerate reduce the number of pages and rows scanned.
+** the predicates on columns after the first reduce the number
+** of rows scanned, but have a much smaller effect on the number
+** of pages scanned, so we keep track of these selectivities in
+** two separate variables: extrafirstcolumnselectivity and
+** extrastartstopselectivity. (theoretically, we could try to
+** figure out the effect of predicates after the first column
+** on the number of pages scanned, but it's too hard, so we
+** use these predicates only to reduce the estimated number of
+** rows.  for comparisons with known values, though, the store
+** can figure out exactly how many rows and pages are scanned.)
+**
+** other predicates are not good for start/stop.  we keep track
+** of their selectvities separately, because these limit the
+** number of rows, but not the number of pages, and so need to
+** be factored into the row count but not into the cost.
+** these selectivities are factored into extraqualifierselectivity.
+**
+** statstartstopselectivity (using statistics) represents the
+** selectivity of start/stop predicates that can be used to scan
+** the index. if no statistics exist for the conglomerate then
+** the value of this variable remains at 1.0
+**
+** statcompositeselectivity (using statistics) represents the
+** selectivity of all the predicates (including nonbasetable
+** predicates). this represents the most educated guess [among
+** all the wild surmises in this routine] as to the number
+** of rows that will be returned from this joinnode.
+** if no statistics exist on the table or no statistics at all
+** can be found to satisfy the predicates at this join opertor,
+** then statcompositeselectivity is left initialized at 1.0
+*/
+double extrafirstcolumnselectivity   1 0d
+double extrastartstopselectivity   1 0d
+double extraqualifierselectivity   1 0d
+double extranonqualifierselectivity   1 0d
+double statstartstopselectivity   1 0d
+double statcompositeselectivity   1 0d
+int	   numextrafirstcolumnpreds   0
+int	   numextrastartstoppreds   0
+int	   numextraqualifiers   0
+int	   numextranonqualifiers   0
+/*
+** it is possible for something to be a start or stop predicate
+** without it being possible to use it as a key for cost estimation.
+** for example, with an index on (c1, c2), and the predicate
+** c1 = othertable.c3 and c2 = 1, the comparison on c1 is with
+** an unknown value, so we can't pass it to the store.  this means
+** we can't pass the comparison on c2 to the store, either.
+**
+** the following booleans keep track of whether we have seen
+** gaps in the keys we can pass to the store.
+*/
+boolean startgap   false
+boolean stopgap   false
+boolean seenfirstcolumn   false
+/*
+** we need to figure out the number of rows touched to decide
+** whether to use row locking or table locking.  if the start/stop
+** conditions are constant (i.e. no joins), the number of rows
+** touched is the number of rows per scan.  but if the start/stop
+** conditions contain a join, the number of rows touched must
+** take the number of outer rows into account.
+*/
+boolean constantstartstop   true
+boolean startstopfound   false
+/* count the number of start and stop keys */
+int startkeynum   0
+int stopkeynum   0
+optimizablepredicate pred
+int predlistsize
+if  predlist    null
+predlistsize   basetablerestrictionlist size
+else
+predlistsize   0
+int startstoppredcount   0
+columnreference firstcolumn   null
+for  int i   0  i < predlistsize  i
+pred   basetablerestrictionlist getoptpredicate i
+boolean startkey   pred isstartkey
+boolean stopkey   pred isstopkey
+if  startkey    stopkey
+startstopfound   true
+if     pred getreferencedmap   hassinglebitset
+constantstartstop   false
+boolean knownconstant
+pred comparewithknownconstant this  true
+if  startkey
+if  knownconstant        startgap
+startkeynum
+if  unknownpredicatelist    null
+unknownpredicatelist removeoptpredicate pred
+else
+startgap   true
+if  stopkey
+if  knownconstant        stopgap
+stopkeynum
+if  unknownpredicatelist    null
+unknownpredicatelist removeoptpredicate pred
+else
+stopgap   true
+/* if either we are seeing startgap or stopgap because start/stop key is
+* comparison with non-constant, we should multiply the selectivity to
+* extrafirstcolumnselectivity.  beetle 4787.
+*/
+if  startgap    stopgap
+// don't include redundant join predicates in selectivity calculations
+if  basetablerestrictionlist isredundantpredicate i
+continue
+if  startkey    stopkey
+startstoppredcount
+if  pred getindexposition      0
+extrafirstcolumnselectivity
+pred selectivity this
+if    seenfirstcolumn
+valuenode relnode     predicate  pred  getandnode   getleftoperand
+if  relnode instanceof binaryrelationaloperatornode
+firstcolumn     binaryrelationaloperatornode  relnode  getcolumnoperand this
+seenfirstcolumn   true
+else
+extrastartstopselectivity    pred selectivity this
+numextrastartstoppreds
+else
+// don't include redundant join predicates in selectivity calculations
+if  basetablerestrictionlist isredundantpredicate i
+continue
+/* if we have "like" predicate on the first index column, it is more likely
+* to have a smaller range than "between", so we apply extra selectivity 0.2
+* here.  beetle 4387, 4787.
+*/
+if  pred instanceof predicate
+valuenode leftopnd     predicate  pred  getandnode   getleftoperand
+if  firstcolumn    null    leftopnd instanceof likeescapeoperatornode
+likeescapeoperatornode likenode    likeescapeoperatornode  leftopnd
+if  likenode getleftoperand   requirestypefromcontext
+valuenode receiver     ternaryoperatornode  likenode  getreceiver
+if  receiver instanceof columnreference
+columnreference cr    columnreference  receiver
+if  cr gettablenumber      firstcolumn gettablenumber
+cr getcolumnnumber      firstcolumn getcolumnnumber
+extrafirstcolumnselectivity    0 2
+if  pred isqualifier
+extraqualifierselectivity    pred selectivity this
+numextraqualifiers
+else
+extranonqualifierselectivity    pred selectivity this
+numextranonqualifiers
+/*
+** strictly speaking, it shouldn't be necessary to
+** indicate a gap here, since there should be no more
+** start/stop predicates, but let's do it, anyway.
+*/
+startgap   true
+stopgap   true
+if  unknownpredicatelist    null
+statcompositeselectivity   unknownpredicatelist selectivity this
+if  statcompositeselectivity     1 0d
+statcompositeselectivity   1 0d
+if  seenfirstcolumn    statisticsforconglomerate
+startstoppredcount > 0
+statstartstopselectivity
+tabledescriptor selectivityforconglomerate cd  startstoppredcount
+/*
+** factor the non-base-table predicates into the extra
+** non-qualifier selectivity, since these will restrict the
+** number of rows, but not the cost.
+*/
+extranonqualifierselectivity
+currentjoinstrategy nonbasepredicateselectivity this  predlist
+/* create the start and stop key arrays, and fill them in */
+datavaluedescriptor startkeys
+datavaluedescriptor stopkeys
+if  startkeynum > 0
+startkeys   new datavaluedescriptor
+else
+startkeys   null
+if  stopkeynum > 0
+stopkeys   new datavaluedescriptor
+else
+stopkeys   null
+startkeynum   0
+stopkeynum   0
+startgap   false
+stopgap   false
+/* if we have a probe predicate that is being used as a start/stop
+* key then sskeysourceinlist will hold the inlistoperatornode
+* from which the probe predicate was built.
+*/
+inlistoperatornode sskeysourceinlist   null
+for  int i   0  i < predlistsize  i
+pred   basetablerestrictionlist getoptpredicate i
+boolean startkey   pred isstartkey
+boolean stopkey   pred isstopkey
+if  startkey    stopkey
+/* a probe predicate is only useful if it can be used as
+* as a start/stop key for _first_ column in an index
+* (i.e. if the column position is 0).  that said, we only
+* allow a single start/stop key per column position in
+* the index (see predicatelist.orderusefulpredicates()).
+* those two facts combined mean that we should never have
+* more than one probe predicate start/stop key for a given
+* conglomerate.
+*/
+if  sanitymanager debug
+if   sskeysourceinlist    null
+predicate pred  isinlistprobepredicate
+sanitymanager throwassert
+cd getconglomeratename
+/* by passing "true" in the next line we indicate that we
+* should only retrieve the underlying inlistopnode *if*
+* the predicate is a "probe predicate".
+*/
+sskeysourceinlist     predicate pred  getsourceinlist true
+boolean knownconstant   pred comparewithknownconstant this  true
+if  startkey
+if  knownconstant        startgap
+startkeys   pred getcomparevalue this
+startkeynum
+else
+startgap   true
+if  stopkey
+if  knownconstant        stopgap
+stopkeys   pred getcomparevalue this
+stopkeynum
+else
+stopgap   true
+else
+startgap   true
+stopgap   true
+int startoperator
+int stopoperator
+if  basetablerestrictionlist    null
+startoperator   basetablerestrictionlist startoperator this
+stopoperator   basetablerestrictionlist stopoperator this
+else
+/*
+** if we're doing a full scan, it doesn't matter what the
+** start and stop operators are.
+*/
+startoperator   scancontroller na
+stopoperator   scancontroller na
+/*
+** get a row template for this conglomerate.  for now, just tell
+** it we are using all the columns in the row.
+*/
+datavaluedescriptor rowtemplate
+getrowtemplate cd  getbasecostcontroller
+/* we prefer index than table scan for concurrency reason, by a small
+* adjustment on estimated row count.  this affects optimizer's decision
+* especially when few rows are in table. beetle 5006. this makes sense
+* since the plan may stay long before we actually check and invalidate it.
+* and new rows may be inserted before we check and invalidate the plan.
+* here we only prefer index that has start/stop key from predicates. non-
+* constant start/stop key case is taken care of by selectivity later.
+*/
+long baserc    startkeys    null    stopkeys    null  ? baserowcount     baserowcount     5
+scc getscancost
+currentjoinstrategy scancosttype
+baserc
+1
+forupdate
+formatablebitset  null
+rowtemplate
+startkeys
+startoperator
+stopkeys
+stopoperator
+false
+0
+costestimate
+/* initialpositioncost is the first part of the index scan cost we get above.
+* it's the cost of initial positioning/fetch of key.  so it's unrelated to
+* row count of how many rows we fetch from index.  we extract it here so that
+* we only multiply selectivity to the other part of index scan cost, which is
+* nearly linear, to make cost calculation more accurate and fair, especially
+* compared to the plan of "one row result set" (unique index). beetle 4787.
+*/
+double initialpositioncost   0 0
+if  cd isindex
+initialpositioncost   scc getfetchfromfullkeycost  formatablebitset  null  0
+/* onerowresultsetforsomeconglom means there's a unique index, but certainly
+* not this one since we are here.  if store knows this non-unique index
+* won't return any row or just returns one row (eg., the predicate is a
+* comparison with constant or almost empty table), we do minor adjustment
+* on cost (affecting decision for covering index) and rc (decision for
+* non-covering). the purpose is favoring unique index. beetle 5006.
+*/
+if  onerowresultsetforsomeconglom    costestimate rowcount   <  1
+costestimate setcost costestimate getestimatedcost     2
+costestimate rowcount     2
+costestimate singlescanrowcount     2
+optimizer trace optimizer cost_of_conglomerate_scan1
+tablenumber  0  0 0  cd
+optimizer trace optimizer cost_of_conglomerate_scan2
+tablenumber  0  0 0  costestimate
+optimizer trace optimizer cost_of_conglomerate_scan3
+numextrafirstcolumnpreds  0
+extrafirstcolumnselectivity  null
+optimizer trace optimizer cost_of_conglomerate_scan4
+numextrastartstoppreds  0
+extrastartstopselectivity  null
+optimizer trace optimizer cost_of_conglomerate_scan7
+startstoppredcount  0
+statstartstopselectivity  null
+optimizer trace optimizer cost_of_conglomerate_scan5
+numextraqualifiers  0
+extraqualifierselectivity  null
+optimizer trace optimizer cost_of_conglomerate_scan6
+numextranonqualifiers  0
+extranonqualifierselectivity  null
+/* initial row count is the row count without applying
+any predicates-- we use this at the end of the routine
+when we use statistics to recompute the row count.
+*/
+double initialrowcount   costestimate rowcount
+if  statstartstopselectivity    1 0d
+/*
+** if statistics exist use the selectivity computed
+** from the statistics to calculate the cost.
+** note: we apply this selectivity to the cost as well
+** as both the row counts. in the absence of statistics
+** we only applied the firstcolumnselectivity to the
+** cost.
+*/
+costestimate setcost
+scancostafterselectivity costestimate getestimatedcost
+initialpositioncost
+statstartstopselectivity
+onerowresultsetforsomeconglom
+costestimate rowcount     statstartstopselectivity
+costestimate singlescanrowcount
+statstartstopselectivity
+optimizer trace optimizer cost_including_stats_for_index
+tablenumber  0  0 0  costestimate
+else
+/*
+** factor in the extra selectivity on the first column
+** of the conglomerate (see comment above).
+** note: in this case we want to apply the selectivity to both
+** the total row count and singlescanrowcount.
+*/
+if  extrafirstcolumnselectivity    1 0d
+costestimate setcost
+scancostafterselectivity costestimate getestimatedcost
+initialpositioncost
+extrafirstcolumnselectivity
+onerowresultsetforsomeconglom
+costestimate rowcount     extrafirstcolumnselectivity
+costestimate singlescanrowcount     extrafirstcolumnselectivity
+optimizer trace optimizer cost_including_extra_1st_col_selectivity
+tablenumber  0  0 0  costestimate
+/* factor in the extra start/stop selectivity (see comment above).
+* note: in this case we want to apply the selectivity to both
+* the row count and singlescanrowcount.
+*/
+if  extrastartstopselectivity    1 0d
+costestimate setcost
+costestimate getestimatedcost
+costestimate rowcount     extrastartstopselectivity
+costestimate singlescanrowcount     extrastartstopselectivity
+optimizer trace optimizer cost_including_extra_start_stop
+tablenumber  0  0 0  costestimate
+/* if the start and stop key came from an in-list "probe predicate"
+* then we need to adjust the cost estimate.  the probe predicate
+* is of the form "col = ?" and we currently have the estimated
+* cost of probing the index a single time for "?".  but with an
+* in-list we don't just probe the index once; we're going to
+* probe it once for every value in the in-list.  and we are going
+* to potentially return an additional row (or set of rows) for
+* each probe.  to account for this "multi-probing" we take the
+* costestimate and multiply each of its fields by the size of
+* the in-list.
+*
+* note: if the in-list has duplicate values then this simple
+* multiplication could give us an elevated cost (because we
+* only probe the index for each *non-duplicate* value in the
+* in-list).  but for now, we're saying that's okay.
+*/
+if  sskeysourceinlist    null
+int listsize   sskeysourceinlist getrightoperandlist   size
+double rc   costestimate rowcount     listsize
+double ssrc   costestimate singlescanrowcount     listsize
+/* if multiplication by listsize returns more rows than are
+* in the scan then just use the number of rows in the scan.
+*/
+costestimate setcost
+costestimate getestimatedcost     listsize
+rc > initialrowcount ? initialrowcount   rc
+ssrc > initialrowcount ? initialrowcount   ssrc
+/*
+** figure out whether to do row locking or table locking.
+**
+** if there are no start/stop predicates, we're doing full
+** conglomerate scans, so do table locking.
+*/
+if    startstopfound
+currentaccesspath setlockmode
+transactioncontroller mode_table
+optimizer trace optimizer table_lock_no_start_stop
+0  0  0 0  null
+else
+/*
+** figure out the number of rows touched.  if all the
+** start/stop predicates are constant, the number of
+** rows touched is the number of rows per scan.
+** this is also true for join strategies that scan the
+** inner table only once (like hash join) - we can
+** tell if we have one of those, because
+** multiplybasecostbyouterrows() will return false.
+*/
+double rowstouched   costestimate rowcount
+if      constantstartstop
+currentjoinstrategy multiplybasecostbyouterrows
+/*
+** this is a join where the inner table is scanned
+** more than once, so we have to take the number
+** of outer rows into account.  the formula for this
+** works out as follows:
+**
+**	total rows in table = r
+**  number of rows touched per scan = s
+**  number of outer rows = o
+**  proportion of rows touched per scan = s / r
+**  proportion of rows not touched per scan =
+**										1 - (s / r)
+**  proportion of rows not touched for all scans =
+**									(1 - (s / r)) ** o
+**  proportion of rows touched for all scans =
+**									1 - ((1 - (s / r)) ** o)
+**  total rows touched for all scans =
+**							r * (1 - ((1 - (s / r)) ** o))
+**
+** in doing these calculations, we must be careful not
+** to divide by zero.  this could happen if there are
+** no rows in the table.  in this case, let's do table
+** locking.
+*/
+double r   baserowcount
+if  r > 0 0
+double s   costestimate rowcount
+double o   outercost rowcount
+double prowsnottouchedperscan   1 0    s   r
+double prowsnottouchedallscans
+math pow prowsnottouchedperscan  o
+double prowstouchedallscans
+1 0   prowsnottouchedallscans
+double rowstouchedallscans
+r   prowstouchedallscans
+rowstouched   rowstouchedallscans
+else
+/* see comments in setlockingbasedonthreshold */
+rowstouched   optimizer tablelockthreshold     1
+setlockingbasedonthreshold optimizer  rowstouched
+/*
+** if the index isn't covering, add the cost of getting the
+** base row.  only apply extrafirstcolumnselectivity and extrastartstopselectivity
+** before we do this, don't apply extraqualifierselectivity etc.  the
+** reason is that the row count here should be the number of index rows
+** (and hence heap rows) we get, and we need to fetch all those rows, even
+** though later on some of them may be filtered out by other predicates.
+** beetle 4787.
+*/
+if  cd isindex          iscoveringindex cd
+double singlefetchcost
+getbasecostcontroller   getfetchfromrowlocationcost
+formatablebitset  null
+0
+cost   singlefetchcost   costestimate rowcount
+costestimate setestimatedcost
+costestimate getestimatedcost     cost
+optimizer trace optimizer cost_of_noncovering_index
+tablenumber  0  0 0  costestimate
+/* factor in the extra qualifier selectivity (see comment above).
+* note: in this case we want to apply the selectivity to both
+* the row count and singlescanrowcount.
+*/
+if  extraqualifierselectivity    1 0d
+costestimate setcost
+costestimate getestimatedcost
+costestimate rowcount     extraqualifierselectivity
+costestimate singlescanrowcount     extraqualifierselectivity
+optimizer trace optimizer cost_including_extra_qualifier_selectivity
+tablenumber  0  0 0  costestimate
+singlescanrowcount   costestimate singlescanrowcount
+/*
+** let the join strategy decide whether the cost of the base
+** scan is a single scan, or a scan per outer row.
+** note: in this case we only want to multiply against the
+** total row count, not the singlescanrowcount.
+** note: do not multiply row count if we determined that
+** conglomerate is a 1 row result set when costing nested
+** loop.  (eg, we will find at most 1 match when probing
+** the hash table.)
+*/
+double newcost   costestimate getestimatedcost
+double rowcount   costestimate rowcount
+/*
+** resolve - if there is a unique index on the joining
+** columns, the number of matching rows will equal the
+** number of outer rows, even if we're not considering the
+** unique index for this access path. to figure that out,
+** however, would require an analysis phase at the beginning
+** of optimization. so, we'll always multiply the number
+** of outer rows by the number of rows per scan. this will
+** give us a higher than actual row count when there is
+** such a unique index, which will bias the optimizer toward
+** using the unique index. this is probably ok most of the
+** time, since the optimizer would probably choose the
+** unique index, anyway. but it would be better if the
+** optimizer set the row count properly in this case.
+*/
+if  currentjoinstrategy multiplybasecostbyouterrows
+newcost    outercost rowcount
+rowcount    outercost rowcount
+initialrowcount    outercost rowcount
+/*
+** if this table can generate at most one row per scan,
+** the maximum row count is the number of outer rows.
+** note: this does not completely take care of the resolve
+** in the above comment, since it will only notice
+** one-row result sets for the current join order.
+*/
+if  onerowresultsetforsomeconglom
+if  outercost rowcount   < rowcount
+rowcount   outercost rowcount
+/*
+** the estimated cost may be too high for indexes, if the
+** estimated row count exceeds the maximum. only do this
+** if we're not doing a full scan, and the start/stop position
+** is not constant (i.e. we're doing a join on the first column
+** of the index) - the reason being that this is when the
+** cost may be inaccurate.
+*/
+if  cd isindex      startstopfound        constantstartstop
+/*
+** does any table outer to this one have a unique key on
+** a subset of the joining columns? if so, the maximum number
+** of rows that this table can return is the number of rows
+** in this table times the number of times the maximum number
+** of times each key can be repeated.
+*/
+double scanuniquenessfactor
+optimizer uniquejoinwithoutertable basetablerestrictionlist
+if  scanuniquenessfactor > 0 0
+/*
+** a positive uniqueness factor means there is a unique
+** outer join key. the value is the reciprocal of the
+** maximum number of duplicates for each unique key
+** (the duplicates can be caused by other joining tables).
+*/
+double maxrows
+double  baserowcount      scanuniquenessfactor
+if  rowcount > maxrows
+/*
+** the estimated row count is too high. adjust the
+** estimated cost downwards proportionately to
+** match the maximum number of rows.
+*/
+newcost     maxrows   rowcount
+/* the estimated total row count may be too high */
+if  tableuniquenessfactor > 0 0
+/*
+** a positive uniqueness factor means there is a unique outer
+** join key. the value is the reciprocal of the maximum number
+** of duplicates for each unique key (the duplicates can be
+** caused by other joining tables).
+*/
+double maxrows
+double  baserowcount      tableuniquenessfactor
+if  rowcount > maxrows
+/*
+** the estimated row count is too high. set it to the
+** maximum row count.
+*/
+rowcount   maxrows
+costestimate setcost
+newcost
+rowcount
+costestimate singlescanrowcount
+optimizer trace optimizer cost_of_n_scans
+tablenumber  0  outercost rowcount    costestimate
+/*
+** now figure in the cost of the non-qualifier predicates.
+** existsbasetables have a row count of 1
+*/
+double rc    1  src    1
+if  existsbasetable
+rc   src   1
+// don't factor in extranonqualifierselectivity in case of onerowresultsetforsomeconglom
+// because "1" is the final result and the effect of other predicates already considered
+// beetle 4787
+else if  extranonqualifierselectivity    1 0d
+rc   onerowresultsetforsomeconglom ? costestimate rowcount
+costestimate rowcount     extranonqualifierselectivity
+src   costestimate singlescanrowcount     extranonqualifierselectivity
+if  rc     1     changed
+costestimate setcost costestimate getestimatedcost    rc  src
+optimizer trace optimizer cost_including_extra_nonqualifier_selectivity
+tablenumber  0  0 0  costestimate
+recomputerowcount
+if  statisticsfortable     onerowresultsetforsomeconglom
+statcompositeselectivity    1 0d
+/* if we have statistics we should use statistics to calculate
+row  count-- if it has been determined that this table
+returns one row for some conglomerate then there is no need
+to do this recalculation
+*/
+double compositestatrc   initialrowcount   statcompositeselectivity
+optimizer trace optimizer composite_sel_from_stats
+0  0  statcompositeselectivity  null
+if  tableuniquenessfactor > 0 0
+/* if the row count from the composite statistics
+comes up more than what the table uniqueness
+factor indicates then lets stick with the current
+row count.
+*/
+if  compositestatrc >  baserowcount
+tableuniquenessfactor
+break recomputerowcount
+/* set the row count and the single scan row count
+to the initialrowcount. initialrowcount is the product
+of the rc from store * rc of the outercost.
+thus rc = initialrowcount * the selectivity from stats.
+singlerc = rc / outercost.rowcount().
+*/
+costestimate setcost costestimate getestimatedcost
+compositestatrc
+existsbasetable  ?
+1
+compositestatrc   outercost rowcount
+optimizer trace optimizer cost_including_composite_sel_from_stats
+tablenumber  0  0 0  costestimate
+/* put the base predicates back in the predicate list */
+currentjoinstrategy putbasepredicates predlist
+basetablerestrictionlist
+return costestimate
+private double scancostafterselectivity double originalscancost
+double initialpositioncost
+double selectivity
+boolean anotherindexunique
+throws standardexception
+/* if there's another paln using unique index, its selectivity is 1/r
+* because we use row count 1.  this plan is not unique index, so we make
+* selectivity at least 2/r, which is more fair, because for unique index
+* we don't use our selectivity estimates.  unique index also more likely
+* locks less rows, hence better concurrency.  beetle 4787.
+*/
+if  anotherindexunique
+double r   baserowcount
+if  r > 0 0
+double minselectivity   2 0   r
+if  minselectivity > selectivity
+selectivity   minselectivity
+/* initialpositioncost is the first part of the index scan cost we get above.
+* it's the cost of initial positioning/fetch of key.  so it's unrelated to
+* row count of how many rows we fetch from index.  we extract it here so that
+* we only multiply selectivity to the other part of index scan cost, which is
+* nearly linear, to make cost calculation more accurate and fair, especially
+* compared to the plan of "one row result set" (unique index). beetle 4787.
+*/
+double afterinitialcost    originalscancost   initialpositioncost
+selectivity
+if  afterinitialcost < 0
+afterinitialcost   0
+return initialpositioncost   afterinitialcost
+private void setlockingbasedonthreshold
+optimizer optimizer  double rowstouched
+/* in optimizer we always set it to row lock (unless there's no
+* start/stop key found to utilize an index, in which case we do table
+* lock), it's up to store to upgrade it to table lock.  this makes
+* sense for the default read committed isolation level and update
+* lock.  for more detail, see beetle 4133.
+*/
+getcurrentaccesspath   setlockmode
+transactioncontroller mode_record
+/** @see optimizable#isbasetable */
+public boolean isbasetable
+return true
+/** @see optimizable#forupdate */
+public boolean forupdate
+/* this table is updatable if it is the
+* target table of an update or delete,
+* or it is (or was) the target table of an
+* updatable cursor.
+*/
+return  updateordelete    0     cursortargettable    getupdatelocks
+/** @see optimizable#initialcapacity */
+public int initialcapacity
+return initialcapacity
+/** @see optimizable#loadfactor */
+public float loadfactor
+return loadfactor
+/**
+* @see optimizable#memoryusageok
+*/
+public boolean memoryusageok double rowcount  int maxmemorypertable
+throws standardexception
+return super memoryusageok singlescanrowcount  maxmemorypertable
+/**
+* @see optimizable#istargettable
+*/
+public boolean istargettable
+return  updateordelete    0
+/**
+* @see optimizable#uniquejoin
+*/
+public double uniquejoin optimizablepredicatelist predlist
+throws standardexception
+double retval    1 0
+predicatelist pl    predicatelist  predlist
+int numcolumns   gettabledescriptor   getnumberofcolumns
+int tablenumber   gettablenumber
+// this is supposed to be an array of table numbers for the current
+// query block. it is used to determine whether a join is with a
+// correlation column, to fill in eqoutercols properly. we don't care
+// about eqoutercols, so just create a zero-length array, pretending
+// that all columns are correlation columns.
+int tablenumbers   new int
+jbitset tablecolmap   new jbitset
+tablecolmap   new jbitset numcolumns   1
+pl checktoppredicatesforequalsconditions tablenumber
+
+tablenumbers
+tablecolmap
+false
+if  supersetofuniqueindex tablecolmap
+retval
+getbestaccesspath   getcostestimate   singlescanrowcount
+return retval
+/**
+* @see optimizable#isonerowscan
+*
+* @exception standardexception		thrown on error
+*/
+public boolean isonerowscan
+throws standardexception
+/* exists fbt will never be a 1 row scan.
+* otherwise call method in super class.
+*/
+if  existsbasetable
+return false
+return super isonerowscan
+/**
+* @see optimizable#legaljoinorder
+*/
+public boolean legaljoinorder jbitset assignedtablemap
+// only an issue for exists fbts
+if  existsbasetable
+/* have all of our dependencies been satisfied? */
+return assignedtablemap contains dependencymap
+return true
+/**
+* convert this object to a string.  see comments in querytreenode.java
+* for how this should be done for tree printing.
+*
+* @return	this object as a string
+*/
+public string tostring
+if  sanitymanager debug
+return
+tablename    null ? tablename tostring
+tabledescriptor
+updateordelete
+tableproperties    null ?
+tableproperties tostring
+existsbasetable
+dependencymap    null
+? dependencymap tostring
+super tostring
+else
+return
+/**
+* does this fbt represent an exists fbt.
+*
+* @return whether or not this fbt represents
+*			an exists fbt.
+*/
+boolean getexistsbasetable
+return existsbasetable
+/**
+* set whether or not this fbt represents an
+* exists fbt.
+*
+* @param existsbasetable whether or not an exists fbt.
+* @param dependencymap	  the dependency map for the exists fbt.
+* @param isnotexists     whether or not for not exists, more specifically.
+*/
+void setexistsbasetable boolean existsbasetable  jbitset dependencymap  boolean isnotexists
+this existsbasetable   existsbasetable
+this isnotexists   isnotexists
+/* set/clear the dependency map as needed */
+if  existsbasetable
+this dependencymap   dependencymap
+else
+this dependencymap   null
+/**
+* clear the bits from the dependency map when join nodes are flattened
+*
+* @param locations	vector of bit numbers to be cleared
+*/
+void cleardependency vector locations
+if  this dependencymap    null
+for  int i   0  i < locations size     i
+this dependencymap clear   integer locations elementat i   intvalue
+/**
+* set the table properties for this table.
+*
+* @param tableproperties	the new table properties.
+*/
+public void settableproperties properties tableproperties
+this tableproperties   tableproperties
+/**
+* bind the table in this frombasetable.
+* this is where view resolution occurs
+*
+* @param datadictionary	the datadictionary to use for binding
+* @param fromlistparam		fromlist to use/append to.
+*
+* @return	resultsetnode	the fromtable for the table or resolved view.
+*
+* @exception standardexception		thrown on error
+*/
+public resultsetnode bindnonvtitables datadictionary datadictionary
+fromlist fromlistparam
+throws standardexception
+tabledescriptor tabledescriptor   bindtabledescriptor
+if  tabledescriptor gettabletype      tabledescriptor vti_type
+resultsetnode vtinode   getnodefactory   maptableasvti
+tabledescriptor
+getcorrelationname
+resultcolumns
+getproperties
+getcontextmanager
+return vtinode bindnonvtitables datadictionary  fromlistparam
+resultcolumnlist	derivedrcl   resultcolumns
+// make sure there's a restriction list
+restrictionlist    predicatelist  getnodefactory   getnode
+c_nodetypes predicate_list
+getcontextmanager
+basetablerestrictionlist    predicatelist  getnodefactory   getnode
+c_nodetypes predicate_list
+getcontextmanager
+compilercontext compilercontext   getcompilercontext
+/* generate the resultcolumnlist */
+resultcolumns   genresultcollist
+templatecolumns   resultcolumns
+/* resolve the view, if this is a view */
+if  tabledescriptor gettabletype      tabledescriptor view_type
+fromtable					fsq
+resultsetnode				rsn
+viewdescriptor				vd
+createviewnode				cvn
+schemadescriptor			compschema
+schemadescriptor			prevcompschema
+/* get the associated viewdescriptor so that we can get
+* the view definition text.
+*/
+vd   datadictionary getviewdescriptor tabledescriptor
+/*
+** set the default compilation schema to be whatever
+** this schema this view was originally compiled against.
+** that way we pick up the same tables no matter what
+** schema we are running against.
+*/
+compschema   datadictionary getschemadescriptor vd getcompschemaid    null
+prevcompschema   compilercontext setcompilationschema compschema
+try
+/* this represents a view - query is dependent on the viewdescriptor */
+compilercontext createdependency vd
+if  sanitymanager debug
+sanitymanager assert vd    null
+tablename
+cvn    createviewnode
+parsestatement vd getviewtext    false
+rsn   cvn getparsedqueryexpression
+/* if the view contains a '*' then we mark the views derived column list
+* so that the view will still work, and return the expected results,
+* if any of the tables referenced in the view have columns added to
+* them via alter table.  the expected results means that the view
+* will always return the same # of columns.
+*/
+if  rsn getresultcolumns   containsallresultcolumn
+resultcolumns setcountmismatchallowed true
+//views execute with definer's privileges and if any one of
+//those privileges' are revoked from the definer, the view gets
+//dropped. so, a view can exist in derby only if it's owner has
+//all the privileges needed to create one. in order to do a
+//select from a view, a user only needs select privilege on the
+//view and doesn't need any privilege for objects accessed by
+//the view. hence, when collecting privilege requirement for a
+//sql accessing a view, we only need to look for select privilege
+//on the actual view and that is what the following code is
+//checking.
+for  int i   0  i < resultcolumns size    i
+resultcolumn rc    resultcolumn  resultcolumns elementat i
+if  rc isprivilegecollectionrequired
+compilercontext addrequiredcolumnpriv  rc gettablecolumndescriptor
+fsq    fromtable  getnodefactory   getnode
+c_nodetypes from_subquery
+rsn
+correlationname    null  ?
+correlationname   getorigtablename   gettablename
+resultcolumns
+tableproperties
+getcontextmanager
+// transfer the nesting level to the new fromsubquery
+fsq setlevel level
+//we are getting ready to bind the query underneath the view. since
+//that query is going to run with definer's privileges, we do not
+//need to collect any privilege requirement for that query.
+//following call is marking the query to run with definer
+//privileges. this marking will make sure that we do not collect
+//any privilege requirement for it.
+fsq disableprivilegecollection
+fsq setorigtablename this getorigtablename
+return fsq bindnonvtitables datadictionary  fromlistparam
+finally
+compilercontext setcompilationschema prevcompschema
+else
+/* this represents a table - query is dependent on the tabledescriptor */
+compilercontext createdependency tabledescriptor
+/* get the base conglomerate descriptor */
+baseconglomeratedescriptor
+tabledescriptor getconglomeratedescriptor
+tabledescriptor getheapconglomerateid
+/* build the 0-based array of base column names. */
+columnnames   resultcolumns getcolumnnames
+/* do error checking on derived column list and update "exposed"
+* column names if valid.
+*/
+if  derivedrcl    null
+resultcolumns propagatedclinfo derivedrcl
+origtablename getfulltablename
+/* assign the tablenumber */
+if  tablenumber     1      allow re bind  in which case use old number
+tablenumber   compilercontext getnexttablenumber
+return this
+/**
+* determine whether or not the specified name is an exposed name in
+* the current query block.
+*
+* @param name	the specified name to search for as an exposed name.
+* @param schemaname	schema name, if non-null.
+* @param exactmatch	whether or not we need an exact match on specified schema and table
+*						names or match on table id.
+*
+* @return the fromtable, if any, with the exposed name.
+*
+* @exception standardexception		thrown on error
+*/
+protected fromtable getfromtablebyname string name  string schemaname  boolean exactmatch
+throws standardexception
+// ourschemaname can be null if correlation name is specified.
+string ourschemaname   getorigtablename   getschemaname
+string fullname    schemaname    null  ?  schemaname       name    name
+/* if an exact string match is required then:
+*	o  if schema name specified on 1 but not both then no match.
+*  o  if schema name not specified on either, compare exposed names.
+*  o  if schema name specified on both, compare schema and exposed names.
+*/
+if  exactmatch
+if   schemaname    null    ourschemaname    null
+schemaname    null    ourschemaname    null
+return null
+if  getexposedname   equals fullname
+return this
+return null
+/* if an exact string match is not required then:
+*  o  if schema name specified on both, compare schema and exposed names.
+*  o  if schema name not specified on either, compare exposed names.
+*	o  if schema name specified on column but not table, then compare
+*	   the column's schema name against the schema name from the tabledescriptor.
+*	   if they agree, then the column's table name must match the exposed name
+*	   from the table, which must also be the base table name, since a correlation
+*	   name does not belong to a schema.
+*  o  if schema name not specified on column then just match the exposed names.
+*/
+// both or neither schema name specified
+if  getexposedname   equals fullname
+return this
+else if   schemaname    null    ourschemaname    null
+schemaname    null    ourschemaname    null
+return null
+// schema name only on column
+// e.g.:  select w1.i from t1 w1 order by test2.w1.i;  (incorrect)
+if  schemaname    null    ourschemaname    null
+// compare column's schema name with table descriptor's if it is
+// not a synonym since a synonym can be declared in a different
+// schema.
+if  tablename equals origtablename
+schemaname equals tabledescriptor getschemadescriptor   getschemaname
+return null
+// compare exposed name with column's table name
+if    getexposedname   equals name
+return null
+// make sure exposed name is not a correlation name
+if    getexposedname   equals getorigtablename   gettablename
+return null
+return this
+/* schema name only specified on table. compare full exposed name
+* against table's schema name || "." || column's table name.
+*/
+if    getexposedname   equals getorigtablename   getschemaname         name
+return null
+return this
+/**
+*	bind the table descriptor for this table.
+*
+* if the tablename is a synonym, it will be resolved here.
+* the original table name is retained in origtablename.
+*
+* @exception standardexception		thrown on error
+*/
+private	tabledescriptor	bindtabledescriptor
+throws standardexception
+string schemaname   tablename getschemaname
+schemadescriptor sd   getschemadescriptor schemaname
+tabledescriptor   gettabledescriptor tablename gettablename    sd
+if  tabledescriptor    null
+// check if the reference is for a synonym.
+tablename synonymtab   resolvetabletosynonym tablename
+if  synonymtab    null
+throw standardexception newexception sqlstate lang_table_not_found  tablename
+tablename   synonymtab
+sd   getschemadescriptor tablename getschemaname
+tabledescriptor   gettabledescriptor synonymtab gettablename    sd
+if  tabledescriptor    null
+throw standardexception newexception sqlstate lang_table_not_found  tablename
+return	tabledescriptor
+/**
+* bind the expressions in this frombasetable.  this means binding the
+* sub-expressions, as well as figuring out what the return type is for
+* each expression.
+*
+* @param fromlistparam		fromlist to use/append to.
+*
+* @exception standardexception		thrown on error
+*/
+public void bindexpressions fromlist fromlistparam
+throws standardexception
+/* no expressions to bind for a frombasetable.
+* note - too involved to optimize so that this method
+* doesn't get called, so just do nothing.
+*/
+/**
+* bind the result columns of this resultsetnode when there is no
+* base table to bind them to.  this is useful for select statements,
+* where the result columns get their types from the expressions that
+* live under them.
+*
+* @param fromlistparam		fromlist to use/append to.
+*
+* @exception standardexception		thrown on error
+*/
+public void bindresultcolumns fromlist fromlistparam
+throws standardexception
+/* nothing to do, since rcl bound in bindnonvtitables() */
+/**
+* try to find a resultcolumn in the table represented by this frombasetable
+* that matches the name in the given columnreference.
+*
+* @param columnreference	the columnreference whose name we're looking
+*				for in the given table.
+*
+* @return	a resultcolumn whose expression is the columnnode
+*			that matches the columnreference.
+*		returns null if there is no match.
+*
+* @exception standardexception		thrown on error
+*/
+public resultcolumn getmatchingcolumn columnreference columnreference  throws standardexception
+resultcolumn	resultcolumn   null
+tablename		columnstablename
+tablename		exposedtablename
+columnstablename   columnreference gettablenamenode
+if columnstablename    null
+if columnstablename getschemaname      null    correlationname    null
+columnstablename bind this getdatadictionary
+/*
+** if there is a correlation name, use that instead of the
+** table name.
+*/
+exposedtablename   getexposedtablename
+if exposedtablename getschemaname      null    correlationname    null
+exposedtablename bind this getdatadictionary
+/*
+** if the column did not specify a name, or the specified name
+** matches the table we're looking at, see whether the column
+** is in this table.
+*/
+if  columnstablename    null    columnstablename equals exposedtablename
+resultcolumn   resultcolumns getresultcolumn columnreference getcolumnname
+/* did we find a match? */
+if  resultcolumn    null
+columnreference settablenumber tablenumber
+if  tabledescriptor    null
+formatablebitset referencedcolumnmap   tabledescriptor getreferencedcolumnmap
+if  referencedcolumnmap    null
+referencedcolumnmap   new formatablebitset
+tabledescriptor getnumberofcolumns     1
+referencedcolumnmap set resultcolumn getcolumnposition
+tabledescriptor setreferencedcolumnmap referencedcolumnmap
+return resultcolumn
+/**
+* preprocess a resultsetnode - this currently means:
+*	o  generating a referenced table map for each resultsetnode.
+*  o  putting the where and having clauses in conjunctive normal form (cnf).
+*  o  converting the where and having clauses into predicatelists and
+*	   classifying them.
+*  o  ensuring that a projectrestrictnode is generated on top of every
+*     frombasetable and generated in place of every fromsubquery.
+*  o  pushing single table predicates down to the new projectrestrictnodes.
+*
+* @param numtables			the number of tables in the dml statement
+* @param gbl				the group by list, if any
+* @param fromlist			the from list, if any
+*
+* @return resultsetnode at top of preprocessed tree.
+*
+* @exception standardexception		thrown on error
+*/
+public resultsetnode preprocess int numtables
+groupbylist gbl
+fromlist fromlist
+throws standardexception
+/* generate the referenced table map */
+referencedtablemap   new jbitset numtables
+referencedtablemap set tablenumber
+return genprojectrestrict numtables
+/**
+* put a projectrestrictnode on top of each fromtable in the fromlist.
+* columnreferences must continue to point to the same resultcolumn, so
+* that resultcolumn must percolate up to the new prn.  however,
+* that resultcolumn will point to a new expression, a virtualcolumnnode,
+* which points to the fromtable and the resultcolumn that is the source for
+* the columnreference.
+* (the new prn will have the original of the resultcolumnlist and
+* the resultcolumns from that list.  the fromtable will get shallow copies
+* of the resultcolumnlist and its resultcolumns.  resultcolumn.expression
+* will remain at the fromtable, with the prn getting a new
+* virtualcolumnnode for each resultcolumn.expression.)
+* we then project out the non-referenced columns.  if there are no referenced
+* columns, then the prn's resultcolumnlist will consist of a single resultcolumn
+* whose expression is 1.
+*
+* @param numtables			number of tables in the dml statement
+*
+* @return the generated projectrestrictnode atop the original fromtable.
+*
+* @exception standardexception		thrown on error
+*/
+protected resultsetnode genprojectrestrict int numtables
+throws standardexception
+/* we get a shallow copy of the resultcolumnlist and its
+* resultcolumns.  (copy maintains resultcolumn.expression for now.)
+*/
+resultcolumnlist prrclist   resultcolumns
+resultcolumns   resultcolumns copylistandobjects
+/* replace resultcolumn.expression with new virtualcolumnnodes
+* in the projectrestrictnode's resultcolumnlist.  (virtualcolumnnodes include
+* pointers to source resultsetnode, this, and source resultcolumn.)
+* note: we don't want to mark the underlying rcs as referenced, otherwise
+* we won't be able to project out any of them.
+*/
+prrclist genvirtualcolumnnodes this  resultcolumns  false
+/* project out any unreferenced columns.  if there are no referenced
+* columns, generate and bind a single resultcolumn whose expression is 1.
+*/
+prrclist doprojection
+/* finally, we create the new projectrestrictnode */
+return  resultsetnode  getnodefactory   getnode
+c_nodetypes project_restrict_node
+this
+prrclist
+null 	   restriction
+null       restriction as predicatelist
+null 	   project subquery list
+null 	   restrict subquery list
+
+getcontextmanager
+/**
+* @see resultsetnode#changeaccesspath
+*
+* @exception standardexception		thrown on error
+*/
+public resultsetnode changeaccesspath   throws standardexception
+resultsetnode	retval
+accesspath ap   gettrulythebestaccesspath
+conglomeratedescriptor trulythebestconglomeratedescriptor
+ap getconglomeratedescriptor
+joinstrategy trulythebestjoinstrategy   ap getjoinstrategy
+optimizer optimizer   ap getoptimizer
+optimizer trace optimizer changing_access_path_for_table
+tablenumber  0  0 0  null
+if  sanitymanager debug
+sanitymanager assert
+trulythebestconglomeratedescriptor    null
+/*
+** make sure user-specified bulk fetch is ok with the chosen join
+** strategy.
+*/
+if  bulkfetch    unset
+if     trulythebestjoinstrategy bulkfetchok
+throw standardexception newexception sqlstate lang_invalid_bulk_fetch_with_join_type
+trulythebestjoinstrategy getname
+// bulkfetch has no meaning for hash join, just ignore it
+else if  trulythebestjoinstrategy ignorebulkfetch
+disablebulkfetch
+// bug 4431 - ignore bulkfetch property if it's 1 row resultset
+else if  isonerowresultset
+disablebulkfetch
+// bulkfetch = 1 is the same as no bulk fetch
+if  bulkfetch    1
+disablebulkfetch
+/* remove any redundant join clauses.  a redundant join clause is one
+* where there are other join clauses in the same equivalence class
+* after it in the predicatelist.
+*/
+restrictionlist removeredundantpredicates
+/*
+** divide up the predicates for different processing phases of the
+** best join strategy.
+*/
+storerestrictionlist    predicatelist  getnodefactory   getnode
+c_nodetypes predicate_list
+getcontextmanager
+nonstorerestrictionlist    predicatelist  getnodefactory   getnode
+c_nodetypes predicate_list
+getcontextmanager
+requalificationrestrictionlist
+predicatelist  getnodefactory   getnode
+c_nodetypes predicate_list
+getcontextmanager
+trulythebestjoinstrategy divideuppredicatelists
+this
+restrictionlist
+storerestrictionlist
+nonstorerestrictionlist
+requalificationrestrictionlist
+getdatadictionary
+/* check to see if we are going to do execution-time probing
+* of an index using in-list values.  we can tell by looking
+* at the restriction list: if there is an in-list probe
+* predicate that is also a start/stop key then we know that
+* we're going to do execution-time probing.  in that case
+* we disable bulk fetching to minimize the number of non-
+* matching rows that we read from disk.  resolve: do we
+* really need to completely disable bulk fetching here,
+* or can we do something else?
+*/
+for  int i   0  i < restrictionlist size    i
+predicate pred    predicate restrictionlist elementat i
+if  pred isinlistprobepredicate      pred isstartkey
+disablebulkfetch
+multiprobing   true
+break
+/*
+** consider turning on bulkfetch if it is turned
+** off.  only turn it on if it is a not an updatable
+** scan and if it isn't a onerowresultset, and
+** not a subquery, and it is ok to use bulk fetch
+** with the chosen join strategy.  note: the subquery logic
+** could be more sophisticated -- we are taking
+** the safe route in avoiding reading extra
+** data for something like:
+**
+**	select x from t where x in (select y from t)
+**
+** in this case we want to stop the subquery
+** evaluation as soon as something matches.
+*/
+if  trulythebestjoinstrategy bulkfetchok
+trulythebestjoinstrategy ignorebulkfetch
+bulkfetchturnedoff
+bulkfetch    unset
+forupdate
+isonerowresultset
+getlevel      0
+bulkfetch   getdefaultbulkfetch
+/* statement is dependent on the chosen conglomerate. */
+getcompilercontext   createdependency
+trulythebestconglomeratedescriptor
+/* no need to modify access path if conglomerate is the heap */
+if     trulythebestconglomeratedescriptor isindex
+/*
+** we need a little special logic for sysstatements
+** here.  sysstatements has a hidden column at the
+** end.  when someone does a select * we don't want
+** to get that column from the store.  so we'll always
+** generate a partial read bitset if we are scanning
+** sysstatements to ensure we don't get the hidden
+** column.
+*/
+boolean issysstatements   tablename equals
+/* template must reflect full row.
+* compact rcl down to partial row.
+*/
+templatecolumns   resultcolumns
+referencedcols   resultcolumns getreferencedformatablebitset cursortargettable  issysstatements  false
+resultcolumns   resultcolumns compactcolumns cursortargettable  issysstatements
+return this
+/* no need to go to the data page if this is a covering index */
+/* derby-1087: use data page when returning an updatable resultset */
+if  ap getcoveringindexscan        cursortargettable
+/* massage resultcolumns so that it matches the index. */
+resultcolumns   newresultcolumns resultcolumns
+trulythebestconglomeratedescriptor
+baseconglomeratedescriptor
+false
+/* we are going against the index.  the template row must be the full index row.
+* the template row will have the rid but the result row will not
+* since there is no need to go to the data page.
+*/
+templatecolumns   newresultcolumns resultcolumns
+trulythebestconglomeratedescriptor
+baseconglomeratedescriptor
+false
+templatecolumns addrcforrid
+// if this is for update then we need to get the rid in the result row
+if  forupdate
+resultcolumns addrcforrid
+/* compact rcl down to the partial row.  we always want a new
+* rcl and formatablebitset because this is a covering index.  (this is
+* because we don't want the rid in the partial row returned
+* by the store.)
+*/
+referencedcols   resultcolumns getreferencedformatablebitset cursortargettable true  false
+resultcolumns   resultcolumns compactcolumns cursortargettable true
+resultcolumns setindexrow
+baseconglomeratedescriptor getconglomeratenumber
+forupdate
+return this
+/* statement is dependent on the base conglomerate if this is
+* a non-covering index.
+*/
+getcompilercontext   createdependency baseconglomeratedescriptor
+/*
+** on bulkfetch, we need to add the restrictions from
+** the tablescan and reapply them  here.
+*/
+if  bulkfetch    unset
+restrictionlist copypredicatestootherlist
+requalificationrestrictionlist
+/*
+** we know the chosen conglomerate is an index.  we need to allocate
+** an indextobaserownode above us, and to change the result column
+** list for this frombasetable to reflect the columns in the index.
+** we also need to shift "cursor target table" status from this
+** frombasetable to the new indextobaserownow (because that's where
+** a cursor can fetch the current row).
+*/
+resultcolumnlist newresultcolumns
+newresultcolumns resultcolumns
+trulythebestconglomeratedescriptor
+baseconglomeratedescriptor
+true
+/* compact the rcl for the indextobaserownode down to
+* the partial row for the heap.  the referenced bitset
+* will reflect only those columns coming from the heap.
+* (ie, it won't reflect columns coming from the index.)
+* note: we need to re-get all of the columns from the heap
+* when doing a bulk fetch because we will be requalifying
+* the row in the indexrowtobaserow.
+*/
+// get the bitset for all of the referenced columns
+formatablebitset indexreferencedcols   null
+formatablebitset heapreferencedcols   null
+if   bulkfetch    unset
+requalificationrestrictionlist    null
+requalificationrestrictionlist size      0
+/* no bulk fetch or requalification, xor off the columns coming from the heap
+* to get the columns coming from the index.
+*/
+indexreferencedcols   resultcolumns getreferencedformatablebitset cursortargettable  true  false
+heapreferencedcols   resultcolumns getreferencedformatablebitset cursortargettable  true  true
+if  heapreferencedcols    null
+indexreferencedcols xor heapreferencedcols
+else
+// bulk fetch or requalification - re-get all referenced columns from the heap
+heapreferencedcols   resultcolumns getreferencedformatablebitset cursortargettable  true  false
+resultcolumnlist heaprcl   resultcolumns compactcolumns cursortargettable  false
+retval    resultsetnode  getnodefactory   getnode
+c_nodetypes index_to_base_row_node
+this
+baseconglomeratedescriptor
+heaprcl
+new boolean cursortargettable
+heapreferencedcols
+indexreferencedcols
+requalificationrestrictionlist
+new boolean forupdate
+tableproperties
+getcontextmanager
+/*
+** the template row is all the columns.  the
+** result set is the compacted column list.
+*/
+resultcolumns   newresultcolumns
+templatecolumns   newresultcolumns resultcolumns
+trulythebestconglomeratedescriptor
+baseconglomeratedescriptor
+false
+/* since we are doing a non-covered index scan, if bulkfetch is on, then
+* the only columns that we need to get are those columns referenced in the start and stop positions
+* and the qualifiers (and the rid) because we will need to re-get all of the other
+* columns from the heap anyway.
+* at this point in time, columns referenced anywhere in the column tree are
+* marked as being referenced.  so, we clear all of the references, walk the
+* predicate list and remark the columns referenced from there and then add
+* the rid before compacting the columns.
+*/
+if  bulkfetch    unset
+resultcolumns markallunreferenced
+storerestrictionlist markreferencedcolumns
+if  nonstorerestrictionlist    null
+nonstorerestrictionlist markreferencedcolumns
+resultcolumns addrcforrid
+templatecolumns addrcforrid
+// compact the rcl for the index scan down to the partial row.
+referencedcols   resultcolumns getreferencedformatablebitset cursortargettable  false  false
+resultcolumns   resultcolumns compactcolumns cursortargettable  false
+resultcolumns setindexrow
+baseconglomeratedescriptor getconglomeratenumber
+forupdate
+/* we must remember if this was the cursortargettable
+* in order to get the right locking on the scan.
+*/
+getupdatelocks   cursortargettable
+cursortargettable   false
+return retval
+/**
+* create a new resultcolumnlist to reflect the columns in the
+* index described by the given conglomeratedescriptor.  the columns
+* in the new resultcolumnlist are based on the columns in the given
+* resultcolumnlist, which reflects the columns in the base table.
+*
+* @param oldcolumns	the original list of columns, which reflects
+*						the columns in the base table.
+* @param idxcd			the conglomeratedescriptor, which describes
+*						the index that the new resultcolumnlist will
+*						reflect.
+* @param heapcd		the conglomeratedescriptor for the base heap
+* @param clonercs		whether or not to clone the rcs
+*
+* @return	a new resultcolumnlist that reflects the columns in the index.
+*
+* @exception standardexception		thrown on error
+*/
+private resultcolumnlist newresultcolumns
+resultcolumnlist oldcolumns
+conglomeratedescriptor idxcd
+conglomeratedescriptor heapcd
+boolean clonercs
+throws standardexception
+indexrowgenerator	irg   idxcd getindexdescriptor
+int				basecols   irg basecolumnpositions
+resultcolumnlist	newcols
+resultcolumnlist  getnodefactory   getnode
+c_nodetypes result_column_list
+getcontextmanager
+for  int i   0  i < basecols length  i
+int	baseposition   basecols
+resultcolumn oldcol   oldcolumns getresultcolumn baseposition
+resultcolumn newcol
+if  sanitymanager debug
+sanitymanager assert oldcol    null
+baseposition
+oldcolumns
+/* if we're cloning the rcs its because we are
+* building an rcl for the index when doing
+* a non-covering index scan.  set the expression
+* for the old rc to be a vcn pointing to the
+* new rc.
+*/
+if  clonercs
+newcol   oldcol cloneme
+oldcol setexpression
+valuenode  getnodefactory   getnode
+c_nodetypes virtual_column_node
+this
+newcol
+reusefactory getinteger oldcol getvirtualcolumnid
+getcontextmanager
+else
+newcol   oldcol
+newcols addresultcolumn newcol
+/*
+** the conglomerate is an index, so we need to generate a rowlocation
+** as the last column of the result set.  notify the resultcolumnlist
+** that it needs to do this.  also tell the rcl whether this is
+** the target of an update, so it can tell the conglomerate controller
+** when it is getting the rowlocation template.
+*/
+newcols setindexrow heapcd getconglomeratenumber    forupdate
+return newcols
+/**
+* generation on a frombasetable creates a scan on the
+* optimizer-selected conglomerate.
+*
+* @param acb	the activationclassbuilder for the class being built
+* @param mb	the execute() method to be built
+*
+* @exception standardexception		thrown on error
+*/
+public void generate activationclassbuilder acb
+methodbuilder mb
+throws standardexception
+generateresultset  acb  mb
+/*
+** remember if this base table is the cursor target table, so we can
+** know which table to use when doing positioned update and delete
+*/
+if  cursortargettable
+acb remembercursortarget mb
+/**
+* generation on a frombasetable for a select. this logic was separated
+* out so that it could be shared with prepare select filter.
+*
+* @param acb	the expressionclassbuilder for the class being built
+* @param mb	the execute() method to be built
+*
+* @exception standardexception		thrown on error
+*/
+public void generateresultset expressionclassbuilder acb
+methodbuilder mb
+throws standardexception
+/* we must have been a best conglomerate descriptor here */
+if  sanitymanager debug
+sanitymanager assert
+gettrulythebestaccesspath   getconglomeratedescriptor      null
+/* get the next resultset #, so that we can number this resultsetnode, its
+* resultcolumnlist and resultset.
+*/
+assignresultsetnumber
+/*
+** if we are doing a special scan to get the last row
+** of an index, generate it separately.
+*/
+if  specialmaxscan
+generatemaxspecialresultset acb  mb
+return
+/*
+** if we are doing a special distinct scan, generate
+** it separately.
+*/
+if  distinctscan
+generatedistinctscan acb  mb
+return
+/*
+* referential action dependent table scan, generate it
+* seperately.
+*/
+if radependentscan
+generaterefactiondependenttablescan acb  mb
+return
+joinstrategy trulythebestjoinstrategy
+gettrulythebestaccesspath   getjoinstrategy
+// the table scan generator is what we return
+acb pushgetresultsetfactoryexpression mb
+int nargs   getscanarguments acb  mb
+mb callmethod vmopcode invokeinterface   string  null
+trulythebestjoinstrategy resultsetmethodname
+bulkfetch    unset   multiprobing
+classname noputresultset  nargs
+/* if this table is the target of an update or a delete, then we must
+* wrap the expression up in an assignment expression before
+* returning.
+* note - scanexpress is a resultset.  we will need to cast it to the
+* appropriate subclass.
+* for example, for a delete, instead of returning a call to the
+* resultsetfactory, we will generate and return:
+*		this.scanresultset = (cast to appropriate resultset type)
+* the outer cast back to resultset is needed so that
+* we invoke the appropriate method.
+*										(call to the resultsetfactory)
+*/
+if   updateordelete    update      updateordelete    delete
+mb cast classname cursorresultset
+mb putfield acb getrowlocationscanresultsetname    classname cursorresultset
+mb cast classname noputresultset
+/**
+* get the final costestimate for this resultsetnode.
+*
+* @return	the final costestimate for this resultsetnode.
+*/
+public costestimate getfinalcostestimate
+return gettrulythebestaccesspath   getcostestimate
+/* helper method used by generatemaxspecialresultset and
+* generatedistinctscan to return the name of the index if the
+* conglomerate is an index.
+* @param cd   conglomerate for which we need to push the index name
+* @param mb   associated methodbuilder
+* @throws standardexception
+*/
+private void pushindexname conglomeratedescriptor cd  methodbuilder mb
+throws standardexception
+if  cd isconstraint
+datadictionary dd   getdatadictionary
+constraintdescriptor constraintdesc
+dd getconstraintdescriptor tabledescriptor  cd getuuid
+mb push constraintdesc getconstraintname
+else if  cd isindex
+mb push cd getconglomeratename
+else
+// if the conglomerate is the base table itself, make sure we push null.
+//  before the fix for derby-578, we would push the base table name
+//  and  this was just plain wrong and would cause statistics information to be incorrect.
+mb pushnull
+private void generatemaxspecialresultset
+expressionclassbuilder	acb
+methodbuilder mb
+throws standardexception
+conglomeratedescriptor cd   gettrulythebestaccesspath   getconglomeratedescriptor
+costestimate costestimate   getfinalcostestimate
+int colrefitem    referencedcols    null  ?
+1
+acb additem referencedcols
+boolean tablelockgranularity   tabledescriptor getlockgranularity      tabledescriptor table_lock_granularity
+/*
+** getlastindexkeyresultset
+** (
+**		activation,
+**		resultsetnumber,
+**		resultrowallocator,
+**		conglomerenumber,
+**		tablename,
+**		optimizeroverride
+**		indexname,
+**		colrefitem,
+**		lockmode,
+**		tablelocked,
+**		isolationlevel,
+**		optimizerestimatedrowcount,
+**		optimizerestimatedrowcost,
+**	);
+*/
+acb pushgetresultsetfactoryexpression mb
+acb pushthisasactivation mb
+mb push getresultsetnumber
+resultcolumns generateholder acb  mb  referencedcols   formatablebitset  null
+mb push cd getconglomeratenumber
+mb push tabledescriptor getname
+//user may have supplied optimizer overrides in the sql
+//pass them onto execute phase so it can be shown in
+//run time statistics.
+if  tableproperties    null
+mb push org apache derby iapi util propertyutil sortproperties tableproperties
+else
+mb pushnull
+pushindexname cd  mb
+mb push colrefitem
+mb push gettrulythebestaccesspath   getlockmode
+mb push tablelockgranularity
+mb push getcompilercontext   getscanisolationlevel
+mb push costestimate singlescanrowcount
+mb push costestimate getestimatedcost
+mb callmethod vmopcode invokeinterface   string  null
+classname noputresultset  13
+private void generatedistinctscan
+expressionclassbuilder	acb
+methodbuilder mb
+throws standardexception
+conglomeratedescriptor cd   gettrulythebestaccesspath   getconglomeratedescriptor
+costestimate costestimate   getfinalcostestimate
+int colrefitem    referencedcols    null  ?
+1
+acb additem referencedcols
+boolean tablelockgranularity   tabledescriptor getlockgranularity      tabledescriptor table_lock_granularity
+/*
+** getdistinctscanresultset
+** (
+**		activation,
+**		resultsetnumber,
+**		resultrowallocator,
+**		conglomerenumber,
+**		tablename,
+**		optimizeroverride
+**		indexname,
+**		colrefitem,
+**		lockmode,
+**		tablelocked,
+**		isolationlevel,
+**		optimizerestimatedrowcount,
+**		optimizerestimatedrowcost,
+**		closecleanupmethod
+**	);
+*/
+/* get the hash key columns and wrap them in a formattable */
+int hashkeycolumns
+hashkeycolumns   new int
+if  referencedcols    null
+for  int index   0  index < hashkeycolumns length  index
+hashkeycolumns   index
+else
+int index   0
+for  int colnum   referencedcols anysetbit
+colnum     1
+colnum   referencedcols anysetbit colnum
+hashkeycolumns   colnum
+formatableintholder fiharray
+formatableintholder getformatableintholders hashkeycolumns
+formatablearrayholder hashkeyholder   new formatablearrayholder fiharray
+int hashkeyitem   acb additem hashkeyholder
+long conglomnumber   cd getconglomeratenumber
+staticcompiledopenconglominfo scoci   getlanguageconnectioncontext
+gettransactioncompile
+getstaticcompiledconglominfo conglomnumber
+acb pushgetresultsetfactoryexpression mb
+acb pushthisasactivation mb
+mb push conglomnumber
+mb push acb additem scoci
+resultcolumns generateholder acb  mb  referencedcols   formatablebitset  null
+mb push getresultsetnumber
+mb push hashkeyitem
+mb push tabledescriptor getname
+//user may have supplied optimizer overrides in the sql
+//pass them onto execute phase so it can be shown in
+//run time statistics.
+if  tableproperties    null
+mb push org apache derby iapi util propertyutil sortproperties tableproperties
+else
+mb pushnull
+pushindexname cd  mb
+mb push cd isconstraint
+mb push colrefitem
+mb push gettrulythebestaccesspath   getlockmode
+mb push tablelockgranularity
+mb push getcompilercontext   getscanisolationlevel
+mb push costestimate singlescanrowcount
+mb push costestimate getestimatedcost
+mb callmethod vmopcode invokeinterface   string  null
+classname noputresultset  16
+/**
+* generation on a frombasetable for a referential action dependent table.
+*
+* @param acb	the expressionclassbuilder for the class being built
+* @param mb	the execute() method to be built
+*
+* @exception standardexception		thrown on error
+*/
+private void generaterefactiondependenttablescan
+expressionclassbuilder	acb
+methodbuilder mb
+throws standardexception
+acb pushgetresultsetfactoryexpression mb
+//get the parameters required to do a table scan
+int nargs   getscanarguments acb  mb
+//extra parameters required to create an dependent table result set.
+mb push raparentresultsetid      id for the parent result set
+mb push fkindexconglomid
+mb push acb additem fkcolarray
+mb push acb additem getdatadictionary   getrowlocationtemplate
+getlanguageconnectioncontext    tabledescriptor
+int argcount   nargs   4
+mb callmethod vmopcode invokeinterface   string  null
+classname noputresultset  argcount
+if   updateordelete    update      updateordelete    delete
+mb cast classname cursorresultset
+mb putfield acb getrowlocationscanresultsetname    classname cursorresultset
+mb cast classname noputresultset
+private int getscanarguments expressionclassbuilder acb
+methodbuilder mb
+throws standardexception
+// get a function to allocate scan rows of the right shape and size
+methodbuilder resultrowallocator
+resultcolumns generateholdermethod acb
+referencedcols
+formatablebitset  null
+// pass in the referenced columns on the saved objects
+// chain
+int colrefitem    1
+if  referencedcols    null
+colrefitem   acb additem referencedcols
+// beetle entry 3865: updateable cursor using index
+int indexcolitem    1
+if  cursortargettable    getupdatelocks
+conglomeratedescriptor cd   gettrulythebestaccesspath   getconglomeratedescriptor
+if  cd isindex
+int basecolpos   cd getindexdescriptor   basecolumnpositions
+boolean isascending   cd getindexdescriptor   isascending
+int indexcols   new int
+for  int i   0  i < indexcols length  i
+indexcols   isascending ? basecolpos    basecolpos
+indexcolitem   acb additem indexcols
+accesspath ap   gettrulythebestaccesspath
+joinstrategy trulythebestjoinstrategy  	ap getjoinstrategy
+/*
+** we can only do bulkfetch on nestedloop
+*/
+if  sanitymanager debug
+if       trulythebestjoinstrategy bulkfetchok
+bulkfetch    unset
+sanitymanager throwassert
+trulythebestjoinstrategy getname
+int nargs   trulythebestjoinstrategy getscanargs
+getlanguageconnectioncontext   gettransactioncompile
+mb
+this
+storerestrictionlist
+nonstorerestrictionlist
+acb
+bulkfetch
+resultrowallocator
+colrefitem
+indexcolitem
+gettrulythebestaccesspath
+getlockmode
+tabledescriptor getlockgranularity      tabledescriptor table_lock_granularity
+getcompilercontext   getscanisolationlevel
+ap getoptimizer   getmaxmemorypertable
+multiprobing
+return nargs
+/**
+* convert an absolute to a relative 0-based column position.
+*
+* @param absoluteposition	the absolute 0-based column position.
+*
+* @return the relative 0-based column position.
+*/
+private int mapabsolutetorelativecolumnposition int absoluteposition
+if  referencedcols    null
+return absoluteposition
+/* setbitctr counts the # of columns in the row,
+* from the leftmost to the absoluteposition, that will be
+* in the partial row returned by the store.  this becomes
+* the new value for column position.
+*/
+int setbitctr   0
+int bitctr   0
+for
+bitctr < referencedcols size      bitctr < absoluteposition
+bitctr
+if  referencedcols get bitctr
+setbitctr
+return setbitctr
+/**
+* get the exposed name for this table, which is the name that can
+* be used to refer to it in the rest of the query.
+*
+* @return	the exposed name of this table.
+*
+*/
+public string getexposedname
+if  correlationname    null
+return correlationname
+else
+return getorigtablename   getfulltablename
+/**
+* get the exposed table name for this table, which is the name that can
+* be used to refer to it in the rest of the query.
+*
+* @return	tablename the exposed name of this table.
+*
+* @exception standardexception  thrown on error
+*/
+private tablename getexposedtablename   throws standardexception
+if  correlationname    null
+return maketablename null  correlationname
+else
+return getorigtablename
+/**
+* return the table name for this table.
+*
+* @return	the table name for this table.
+*/
+public tablename gettablenamefield
+return tablename
+/**
+* return a resultcolumnlist with all of the columns in this table.
+* (used in expanding '*'s.)
+* note: since this method is for expanding a "*" in the select list,
+* resultcolumn.expression will be a columnreference.
+*
+* @param alltablename		the qualifier on the "*"
+*
+* @return resultcolumnlist	list of result columns from this table.
+*
+* @exception standardexception		thrown on error
+*/
+public resultcolumnlist getallresultcolumns tablename alltablename
+throws standardexception
+return getresultcolumnsforlist alltablename  resultcolumns
+getorigtablename
+/**
+* build a resultcolumnlist based on all of the columns in this frombasetable.
+* note - since the resultcolumnlist generated is for the frombasetable,
+* resultcolumn.expression will be a basecolumnnode.
+*
+* @return resultcolumnlist representing all referenced columns
+*
+* @exception standardexception		thrown on error
+*/
+public resultcolumnlist genresultcollist
+throws standardexception
+resultcolumnlist 			rclist   null
+resultcolumn	 			resultcolumn
+valuenode		 			valuenode
+columndescriptor 			coldesc   null
+tablename		 			exposedname
+/* cache exposed name for this table.
+* the exposed name becomes the qualifier for each column
+* in the expanded list.
+*/
+exposedname   getexposedtablename
+/* add all of the columns in the table */
+rclist    resultcolumnlist  getnodefactory   getnode
+c_nodetypes result_column_list
+getcontextmanager
+columndescriptorlist cdl   tabledescriptor getcolumndescriptorlist
+int					 cdlsize   cdl size
+for  int index   0  index < cdlsize  index
+/* build a resultcolumn/basecolumnnode pair for the column */
+coldesc    columndescriptor  cdl elementat index
+//a columndescriptor instantiated through syscolumnsrowfactory only has
+//the uuid set on it and no table descriptor set on it. since we know here
+//that this columndescriptor is tied to tabledescriptor, set it so using
+//settabledescriptor method. columndescriptor's table descriptor is used
+//to get resultsetmetadata.gettablename & resultsetmetadata.getschemaname
+coldesc settabledescriptor tabledescriptor
+valuenode    valuenode  getnodefactory   getnode
+c_nodetypes base_column_node
+coldesc getcolumnname
+exposedname
+coldesc gettype
+getcontextmanager
+resultcolumn    resultcolumn  getnodefactory   getnode
+c_nodetypes result_column
+coldesc
+valuenode
+getcontextmanager
+/* build the resultcolumnlist to return */
+rclist addresultcolumn resultcolumn
+return rclist
+/**
+* augment the rcl to include the columns in the formatablebitset.
+* if the column is already there, don't add it twice.
+* column is added as a resultcolumn pointing to a
+* columnreference.
+*
+* @param inputrcl			the original list
+* @param colswewant		bit set of cols we want
+*
+* @return resultcolumnlist the rcl
+*
+* @exception standardexception		thrown on error
+*/
+public resultcolumnlist addcolstolist
+resultcolumnlist	inputrcl
+formatablebitset				colswewant
+throws standardexception
+resultcolumnlist 			rclist   null
+resultcolumn	 			resultcolumn
+valuenode		 			valuenode
+columndescriptor 			cd   null
+tablename		 			exposedname
+/* cache exposed name for this table.
+* the exposed name becomes the qualifier for each column
+* in the expanded list.
+*/
+exposedname   getexposedtablename
+/* add all of the columns in the table */
+resultcolumnlist newrcl    resultcolumnlist  getnodefactory   getnode
+c_nodetypes result_column_list
+getcontextmanager
+columndescriptorlist cdl   tabledescriptor getcolumndescriptorlist
+int					 cdlsize   cdl size
+for  int index   0  index < cdlsize  index
+/* build a resultcolumn/basecolumnnode pair for the column */
+cd    columndescriptor  cdl elementat index
+int position   cd getposition
+if   colswewant get position
+continue
+if   resultcolumn   inputrcl getresultcolumn position      null
+valuenode    valuenode  getnodefactory   getnode
+c_nodetypes column_reference
+cd getcolumnname
+exposedname
+getcontextmanager
+resultcolumn    resultcolumn  getnodefactory
+getnode
+c_nodetypes result_column
+cd
+valuenode
+getcontextmanager
+/* build the resultcolumnlist to return */
+newrcl addresultcolumn resultcolumn
+return newrcl
+/**
+* return a tablename node representing this fromtable.
+* @return a tablename node representing this fromtable.
+* @exception standardexception		thrown on error
+*/
+public tablename gettablename
+throws standardexception
+tablename tn
+tn   super gettablename
+if tn    null
+if tn getschemaname      null
+correlationname    null
+tn bind this getdatadictionary
+return  tn    null ? tn   tablename
+/**
+mark this resultsetnode as the target table of an updatable
+cursor.
+*/
+public boolean markascursortargettable
+cursortargettable   true
+return true
+/**
+* is this a table that has a for update
+* clause?
+*
+* @return true/false
+*/
+protected boolean cursortargettable
+return cursortargettable
+/**
+* mark as updatable all the columns in the result column list of this
+* frombasetable that match the columns in the given update column list.
+*
+* @param updatecolumns		a resultcolumnlist representing the columns
+*							to be updated.
+*/
+void markupdated resultcolumnlist updatecolumns
+resultcolumns markupdated updatecolumns
+/**
+* search to see if a query references the specifed table name.
+*
+* @param name		table name (string) to search for.
+* @param basetable	whether or not name is for a base table
+*
+* @return	true if found, else false
+*
+* @exception standardexception		thrown on error
+*/
+public boolean referencestarget string name  boolean basetable
+throws standardexception
+return basetable    name equals getbasetablename
+/**
+* return true if the node references session schema tables (temporary or permanent)
+*
+* @return	true if references session schema tables, else false
+*
+* @exception standardexception		thrown on error
+*/
+public boolean referencessessionschema
+throws standardexception
+//if base table is a session schema table, then return true.
+return issessionschema tabledescriptor getschemadescriptor
+/**
+* return whether or not the underlying resultset tree will return
+* a single row, at most.  this method is intended to be used during
+* generation, after the "truly" best conglomerate has been chosen.
+* this is important for join nodes where we can save the extra next
+* on the right side if we know that it will return at most 1 row.
+*
+* @return whether or not the underlying resultset tree will return a single row.
+* @exception standardexception		thrown on error
+*/
+public boolean isonerowresultset  	throws standardexception
+// exists fbt will only return a single row
+if  existsbasetable
+return true
+/* for hash join, we need to consider both the qualification
+* and hash join predicates and we consider them against all
+* conglomerates since we are looking for any uniqueness
+* condition that holds on the columns in the hash table,
+* otherwise we just consider the predicates in the
+* restriction list and the conglomerate being scanned.
+*/
+accesspath ap   gettrulythebestaccesspath
+joinstrategy trulythebestjoinstrategy   ap getjoinstrategy
+predicatelist pl
+if  trulythebestjoinstrategy ishashjoin
+pl    predicatelist  getnodefactory   getnode
+c_nodetypes predicate_list
+getcontextmanager
+if  storerestrictionlist    null
+pl nondestructiveappend storerestrictionlist
+if  nonstorerestrictionlist    null
+pl nondestructiveappend nonstorerestrictionlist
+return isonerowresultset pl
+else
+return isonerowresultset gettrulythebestaccesspath
+getconglomeratedescriptor
+restrictionlist
+/**
+* return whether or not this is actually a ebt for not exists.
+*/
+public boolean isnotexists
+return isnotexists
+public boolean isonerowresultset optimizablepredicatelist predlist 	throws standardexception
+conglomeratedescriptor cds   tabledescriptor getconglomeratedescriptors
+for  int index   0  index < cds length  index
+if  isonerowresultset cds  predlist
+return true
+return false
+/**
+* determine whether or not the columns marked as true in
+* the passed in array are a superset of any unique index
+* on this table.
+* this is useful for subquery flattening and distinct elimination
+* based on a uniqueness condition.
+*
+* @param eqcols	the columns to consider
+*
+* @return whether or not the columns marked as true are a superset
+*/
+protected boolean supersetofuniqueindex boolean eqcols
+throws standardexception
+conglomeratedescriptor cds   tabledescriptor getconglomeratedescriptors
+/* cycle through the conglomeratedescriptors */
+for  int index   0  index < cds length  index
+conglomeratedescriptor cd   cds
+if    cd isindex
+continue
+indexdescriptor id   cd getindexdescriptor
+if    id isunique
+continue
+int keycolumns   id basecolumnpositions
+int inner   0
+for     inner < keycolumns length  inner
+if    eqcols]
+break
+/* did we get a full match? */
+if  inner    keycolumns length
+return true
+return false
+/**
+* determine whether or not the columns marked as true in
+* the passed in join table matrix are a superset of any single column unique index
+* on this table.
+* this is useful for distinct elimination
+* based on a uniqueness condition.
+*
+* @param tablecolmap	the columns to consider
+*
+* @return whether or not the columns marked as true for one at least
+* 	one table are a superset
+*/
+protected boolean supersetofuniqueindex jbitset tablecolmap
+throws standardexception
+conglomeratedescriptor cds   tabledescriptor getconglomeratedescriptors
+/* cycle through the conglomeratedescriptors */
+for  int index   0  index < cds length  index
+conglomeratedescriptor cd   cds
+if    cd isindex
+continue
+indexdescriptor id   cd getindexdescriptor
+if    id isunique
+continue
+int keycolumns   id basecolumnpositions
+int numbits   tablecolmap size
+jbitset keymap   new jbitset numbits
+jbitset resmap   new jbitset numbits
+int inner   0
+for     inner < keycolumns length  inner
+keymap set keycolumns
+int table   0
+for     table < tablecolmap length  table
+resmap setto tablecolmap
+resmap and keymap
+if  keymap equals resmap
+tablecolmap set 0
+return true
+return false
+/**
+* get the lock mode for the target table heap of an update or delete
+* statement.  it is not always mode_record.  we want the lock on the
+* heap to be consistent with optimizer and eventually system's decision.
+* this is to avoid deadlock (beetle 4318).  during update/delete's
+* execution, it will first use this lock mode we return to lock heap to
+* open a rowchanger, then use the lock mode that is the optimizer and
+* system's combined decision to open the actual source conglomerate.
+* we've got to make sure they are consistent.  this is the lock chart (for
+* detail reason, see comments below):
+*		best access path			lock mode on heap
+*   ----------------------		-----------------------------------------
+*			index					  row lock
+*
+*			heap					  row lock if read_committed,
+*			                          repeatble_read, or read_uncommitted &&
+*			                          not specified table lock otherwise,
+*			                          use optimizer decided best acess
+*			                          path's lock mode
+*
+* @return	the lock mode
+*/
+public int updatetargetlockmode
+/* if best access path is index scan, we always use row lock on heap,
+* consistent with indexrowtobaserowresultset's opencore().  we don't
+* need to worry about the correctness of serializable isolation level
+* because index will have previous key locking if it uses row locking
+* as well.
+*/
+if  gettrulythebestaccesspath   getconglomeratedescriptor   isindex
+return transactioncontroller mode_record
+/* we override optimizer's decision of the lock mode on heap, and
+* always use row lock if we are read committed/uncommitted or
+* repeatable read isolation level, and no forced table lock.
+*
+* this is also reflected in tablescanresultset's constructor,
+* keep them consistent!
+*
+* this is to improve concurrency, while maintaining correctness with
+* serializable level.  since the isolation level can change between
+* compilation and execution if the statement is cached or stored, we
+* encode both the serializable lock mode and the non-serializable
+* lock mode in the returned lock mode if they are different.
+*/
+int isolationlevel
+getlanguageconnectioncontext   getcurrentisolationlevel
+if   isolationlevel    executioncontext serializable_isolation_level
+tabledescriptor getlockgranularity
+tabledescriptor table_lock_granularity
+int lockmode   gettrulythebestaccesspath   getlockmode
+if  lockmode    transactioncontroller mode_record
+lockmode    lockmode   0xff  << 16
+else
+lockmode   0
+lockmode    transactioncontroller mode_record
+return lockmode
+/* if above don't apply, use optimizer's decision on heap's lock
+*/
+return gettrulythebestaccesspath   getlockmode
+/**
+* return whether or not the underlying resultset tree
+* is ordered on the specified columns.
+* resolve - this method currently only considers the outermost table
+* of the query block.
+* resolve - we do not currently push method calls down, so we don't
+* worry about whether the equals comparisons can be against a variant method.
+*
+* @param	crs					the specified columnreference[]
+* @param	permuteordering		whether or not the order of the crs in the array can be permuted
+* @param	fbtvector			vector that is to be filled with the frombasetable
+*
+* @return	whether the underlying resultset tree
+* is ordered on the specified column.
+*
+* @exception standardexception		thrown on error
+*/
+boolean isorderedon columnreference crs  boolean permuteordering  vector fbtvector
+throws standardexception
+/* the following conditions must be met, regardless of the value of permuteordering,
+* in order for the table to be ordered on the specified columns:
+*	o  each column is from this table. (resolve - handle joins later)
+*	o  the access path for this table is an index.
+*/
+// verify that all crs are from this table
+for  int index   0  index < crs length  index
+if  crs gettablenumber      tablenumber
+return false
+// verify access path is an index
+conglomeratedescriptor cd   gettrulythebestaccesspath   getconglomeratedescriptor
+if    cd isindex
+return false
+// now consider whether or not the crs can be permuted
+boolean isordered
+if  permuteordering
+isordered   isordered crs  cd
+else
+isordered   isstrictlyordered crs  cd
+if  fbtvector    null
+fbtvector addelement this
+return isordered
+/**
+* turn off bulk fetch
+*/
+void disablebulkfetch
+bulkfetchturnedoff   true
+bulkfetch   unset
+/**
+* do a special scan for max.
+*/
+void dospecialmaxscan
+if  sanitymanager debug
+if   restrictionlist size      0
+storerestrictionlist size      0
+nonstorerestrictionlist size      0
+sanitymanager throwassert
+specialmaxscan   true
+/**
+* is it possible to do a distinct scan on this resultset tree.
+* (see selectnode for the criteria.)
+*
+* @param distinctcolumns the set of distinct columns
+* @return whether or not it is possible to do a distinct scan on this resultset tree.
+*/
+boolean ispossibledistinctscan set distinctcolumns
+if   restrictionlist    null    restrictionlist size      0
+return false
+hashset columns   new hashset
+for  int i   0  i < resultcolumns size    i
+resultcolumn rc    resultcolumn  resultcolumns elementat i
+columns add rc getexpression
+return columns equals distinctcolumns
+/**
+* mark the underlying scan as a distinct scan.
+*/
+void markfordistinctscan
+distinctscan   true
+/**
+* @see resultsetnode#adjustforsortelimination
+*/
+void adjustforsortelimination
+/* note: irtbr will use a different method to tell us that
+* it cannot do a bulk fetch as the ordering issues are
+* specific to a fbt being under an irtbr as opposed to a
+* fbt being under a prn, etc.
+* so, we just ignore this call for now.
+*/
+/**
+* return whether or not this index is ordered on a permutation of the specified columns.
+*
+* @param	crs		the specified columnreference[]
+* @param	cd		the conglomeratedescriptor for the chosen index.
+*
+* @return	whether or not this index is ordered exactly on the specified columns.
+*
+* @exception standardexception		thrown on error
+*/
+private boolean isordered columnreference crs  conglomeratedescriptor cd
+throws standardexception
+/* this table is ordered on a permutation of the specified columns if:
+*  o  for each key column, until a match has been found for all of the
+*	   columnreferences, it is either in the array of columnreferences
+*	   or there is an equality predicate on it.
+*	   (note: it is okay to exhaust the key columns before the columnreferences
+*	   if the index is unique.  in other words if we have crs left over after
+*	   matching all of the columns in the key then the table is considered ordered
+*	   iff the index is unique. for example:
+*		i1 on (c1, c2), unique
+*		select distinct c3 from t1 where c1 = 1 and c2 = ?;
+*	   is ordered on c3 since there will be at most 1 qualifying row.)
+*/
+boolean matchedcrs   new boolean
+int nextkeycolumn   0
+int keycolumns   cd getindexdescriptor   basecolumnpositions
+// walk through the key columns
+for     nextkeycolumn < keycolumns length  nextkeycolumn
+boolean currmatch   false
+// see if the key column is in crs
+for  int nextcr   0  nextcr < crs length  nextcr
+if  crs getcolumnnumber      keycolumns
+matchedcrs   true
+currmatch   true
+break
+// advance to next key column if we found a match on this one
+if  currmatch
+continue
+// stop search if there is no equality predicate on this key column
+if    storerestrictionlist hasoptimizableequalitypredicate this  keycolumns  true
+break
+/* count the number of matched crs. the table is ordered if we matched all of them. */
+int numcrsmatched   0
+for  int nextcr   0  nextcr < matchedcrs length  nextcr
+if  matchedcrs
+numcrsmatched
+if  numcrsmatched    matchedcrs length
+return true
+/* we didn't match all of the crs, but if
+* we matched all of the key columns then
+* we need to check if the index is unique.
+*/
+if  nextkeycolumn    keycolumns length
+if  cd getindexdescriptor   isunique
+return true
+else
+return false
+else
+return false
+/**
+* return whether or not this index is ordered on a permutation of the specified columns.
+*
+* @param	crs		the specified columnreference[]
+* @param	cd		the conglomeratedescriptor for the chosen index.
+*
+* @return	whether or not this index is ordered exactly on the specified columns.
+*
+* @exception standardexception		thrown on error
+*/
+private boolean isstrictlyordered columnreference crs  conglomeratedescriptor cd
+throws standardexception
+/* this table is ordered on the specified columns in the specified order if:
+*  o  for each columnreference, it is either the next key column or there
+*	   is an equality predicate on all key columns prior to the columnreference.
+*	   (note: if the index is unique, then it is okay to have a suffix of
+*	   unmatched columnreferences because the set is known to be ordered. for example:
+*		i1 on (c1, c2), unique
+*		select distinct c3 from t1 where c1 = 1 and c2 = ?;
+*	   is ordered on c3 since there will be at most 1 qualifying row.)
+*/
+int nextcr   0
+int nextkeycolumn   0
+int keycolumns   cd getindexdescriptor   basecolumnpositions
+// walk through the crs
+for     nextcr < crs length  nextcr
+/* if we've walked through all of the key columns then
+* we need to check if the index is unique.
+* beetle 4402
+*/
+if  nextkeycolumn    keycolumns length
+if  cd getindexdescriptor   isunique
+break
+else
+return false
+if  crs getcolumnnumber      keycolumns
+nextkeycolumn
+continue
+else
+while  crs getcolumnnumber      keycolumns
+// stop if there is no equality predicate on this key column
+if    storerestrictionlist hasoptimizableequalitypredicate this  keycolumns  true
+return false
+// advance to the next key column
+nextkeycolumn
+/* if we've walked through all of the key columns then
+* we need to check if the index is unique.
+*/
+if  nextkeycolumn    keycolumns length
+if  cd getindexdescriptor   isunique
+break
+else
+return false
+return true
+/**
+* is this a one-row result set with the given conglomerate descriptor?
+*/
+private boolean isonerowresultset conglomeratedescriptor cd
+optimizablepredicatelist predlist
+throws standardexception
+if  predlist    null
+return false
+if  sanitymanager debug
+if     predlist instanceof predicatelist
+sanitymanager throwassert
+predlist getclass   getname
+predicatelist restrictionlist    predicatelist  predlist
+if    cd isindex
+return false
+indexrowgenerator irg
+cd getindexdescriptor
+// is this a unique index
+if    irg isunique
+return false
+int basecolumnpositions   irg basecolumnpositions
+datadictionary dd   getdatadictionary
+// do we have an exact match on the full key
+for  int index   0  index < basecolumnpositions length  index
+// get the column number at this position
+int curcol   basecolumnpositions
+/* is there a pushable equality predicate on this key column?
+* (is null is also acceptable)
+*/
+if    restrictionlist hasoptimizableequalitypredicate this  curcol  true
+return false
+return true
+private int getdefaultbulkfetch
+throws standardexception
+int valint
+string valstr   propertyutil getserviceproperty
+getlanguageconnectioncontext   gettransactioncompile
+languageproperties bulk_fetch_prop
+languageproperties bulk_fetch_default
+valint   getintproperty valstr  languageproperties bulk_fetch_prop
+// verify that the specified value is valid
+if  valint <  0
+throw standardexception newexception sqlstate lang_invalid_bulk_fetch_value
+string valueof valint
+/*
+** if the value is <= 1, then reset it
+** to unset -- this is how customers can
+** override the bulkfetch default to turn
+** it off.
+*/
+return  valint <  1  ?
+unset   valint
+private string getuserspecifiedindexname
+string retval   null
+if  tableproperties    null
+retval   tableproperties getproperty
+return retval
+/*
+** resolve: this whole thing should probably be moved somewhere else,
+** like the optimizer or the data dictionary.
+*/
+private storecostcontroller getstorecostcontroller
+conglomeratedescriptor cd
+throws standardexception
+return getcompilercontext   getstorecostcontroller cd getconglomeratenumber
+private storecostcontroller getbasecostcontroller
+throws standardexception
+return getstorecostcontroller baseconglomeratedescriptor
+private boolean gotrowcount   false
+private long rowcount   0
+private long baserowcount   throws standardexception
+if    gotrowcount
+storecostcontroller scc   getbasecostcontroller
+rowcount   scc getestimatedrowcount
+gotrowcount   true
+return rowcount
+private datavaluedescriptor getrowtemplate
+conglomeratedescriptor  cd
+storecostcontroller     scc
+throws standardexception
+/*
+** if it's for a heap scan, just get all the columns in the
+** table.
+*/
+if    cd isindex
+return templatecolumns buildemptyrow   getrowarray
+/* it's an index scan, so get all the columns in the index */
+execrow emptyindexrow   templatecolumns buildemptyindexrow
+tabledescriptor
+cd
+scc
+getdatadictionary
+return emptyindexrow getrowarray
+private conglomeratedescriptor getfirstconglom
+throws standardexception
+getconglomdescs
+return conglomdescs
+private conglomeratedescriptor getnextconglom conglomeratedescriptor currcd
+throws standardexception
+int index   0
+for     index < conglomdescs length  index
+if  currcd    conglomdescs
+break
+if  index < conglomdescs length   1
+return conglomdescs
+else
+return null
+private void getconglomdescs
+throws standardexception
+if  conglomdescs    null
+conglomdescs   tabledescriptor getconglomeratedescriptors
+/**
+* set the information gathered from the parent table that is
+* required to peform a referential action on dependent table.
+*/
+public void setrefactioninfo long fkindexconglomid
+intfkcolarray
+string parentresultsetid
+boolean dependentscan
+this fkindexconglomid   fkindexconglomid
+this fkcolarray   fkcolarray
+this raparentresultsetid   parentresultsetid
+this radependentscan   dependentscan
+/**
+* accept a visitor, and call v.visit()
+* on child nodes as necessary.
+*
+* @param v the visitor
+*
+* @exception standardexception on error
+*/
+public visitable accept visitor v
+throws standardexception
+visitable returnnode   super accept v
+if  v skipchildren this
+return returnnode
+if  nonstorerestrictionlist    null     v stoptraversal
+nonstorerestrictionlist accept v
+if  restrictionlist    null    v stoptraversal
+restrictionlist accept v
+if  nonbasetablerestrictionlist    null     v stoptraversal
+nonbasetablerestrictionlist accept v
+if  requalificationrestrictionlist    null     v stoptraversal
+requalificationrestrictionlist accept v
+return returnnode

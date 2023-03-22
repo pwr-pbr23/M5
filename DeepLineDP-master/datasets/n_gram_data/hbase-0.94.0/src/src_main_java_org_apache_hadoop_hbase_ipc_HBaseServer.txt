@@ -1,0 +1,1369 @@
+/**
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase ipc
+import java io bytearrayinputstream
+import java io bytearrayoutputstream
+import java io datainputstream
+import java io dataoutputstream
+import java io ioexception
+import java net bindexception
+import java net inetaddress
+import java net inetsocketaddress
+import java net serversocket
+import java net socket
+import java net socketexception
+import java net unknownhostexception
+import java nio bytebuffer
+import java nio channels cancelledkeyexception
+import java nio channels closedchannelexception
+import java nio channels readablebytechannel
+import java nio channels selectionkey
+import java nio channels selector
+import java nio channels serversocketchannel
+import java nio channels socketchannel
+import java nio channels writablebytechannel
+import java util arraylist
+import java util collections
+import java util iterator
+import java util linkedlist
+import java util list
+import java util map
+import java util random
+import java util concurrent atomic atomicinteger
+import java util concurrent blockingqueue
+import java util concurrent concurrenthashmap
+import java util concurrent executorservice
+import java util concurrent executors
+import java util concurrent linkedblockingqueue
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase io hbaseobjectwritable
+import org apache hadoop hbase io writablewithsize
+import org apache hadoop hbase monitoring monitoredrpchandler
+import org apache hadoop hbase monitoring taskmonitor
+import org apache hadoop hbase security user
+import org apache hadoop hbase util bytebufferoutputstream
+import org apache hadoop hbase util bytes
+import org apache hadoop io writable
+import org apache hadoop io writableutils
+import org apache hadoop ipc rpc versionmismatch
+import org apache hadoop util reflectionutils
+import org apache hadoop util stringutils
+import com google common base function
+import com google common util concurrent threadfactorybuilder
+import org cliffc high_scale_lib counter
+/** an abstract ipc service.  ipc calls take a single {@link writable} as a
+* parameter, and return a {@link writable} as their value.  a service runs on
+* a port and is defined by a parameter class and a value class.
+*
+*
+* <p>copied local so can fix hbase-900.
+*
+* @see hbaseclient
+*/
+public abstract class hbaseserver implements rpcserver
+/**
+* the first four bytes of hadoop rpc connections
+*/
+public static final bytebuffer header   bytebuffer wrap   getbytes
+public static final byte current_version   3
+/**
+* how many calls/handler are allowed in the queue.
+*/
+private static final int default_max_callqueue_length_per_handler   10
+/**
+* the maximum size that we can hold in the ipc queue
+*/
+private static final int default_max_callqueue_size
+1024   1024   1024
+static final int buffer_initial_size   1024
+private static final string warn_delayed_calls
+private static final int default_warn_delayed_calls   1000
+private final int warndelayedcalls
+private atomicinteger delayedcalls
+public static final log log
+logfactory getlog
+protected static final log tracelog
+logfactory getlog
+protected static final threadlocal<rpcserver> server
+new threadlocal<rpcserver>
+private volatile boolean started   false
+private static final map<string  class<? extends versionedprotocol>>
+protocol_cache
+new concurrenthashmap<string  class<? extends versionedprotocol>>
+static class<? extends versionedprotocol> getprotocolclass
+string protocolname  configuration conf
+throws classnotfoundexception
+class<? extends versionedprotocol> protocol
+protocol_cache get protocolname
+if  protocol    null
+protocol    class<? extends versionedprotocol>
+conf getclassbyname protocolname
+protocol_cache put protocolname  protocol
+return protocol
+/** returns the server instance called under or null.  may be called under
+* {@link #call(class, writable, long, monitoredrpchandler)} implementations,
+* and under {@link writable} methods of paramters and return values.
+* permits applications to access the server context.
+* @return hbaseserver
+*/
+public static rpcserver get
+return server get
+/** this is set to call object before handler invokes an rpc and reset
+* after the call returns.
+*/
+protected static final threadlocal<call> curcall   new threadlocal<call>
+/** returns the remote side ip address when invoked inside an rpc
+*  returns null incase of an error.
+*  @return inetaddress
+*/
+public static inetaddress getremoteip
+call call   curcall get
+if  call    null
+return call connection socket getinetaddress
+return null
+/** returns remote address as a string when invoked inside an rpc.
+*  returns null in case of an error.
+*  @return string
+*/
+public static string getremoteaddress
+inetaddress addr   getremoteip
+return  addr    null  ? null   addr gethostaddress
+protected string bindaddress
+protected int port                                 port we listen on
+private int handlercount                           number of handler threads
+private int priorityhandlercount
+private int readthreads                            number of read threads
+protected class<? extends writable> paramclass     class of call parameters
+protected int maxidletime                          the maximum idle time after
+// which a client may be
+// disconnected
+protected int thresholdidleconnections             the number of idle
+// connections after which we
+// will start cleaning up idle
+// connections
+int maxconnectionstonuke                           the max number of
+// connections to nuke
+// during a cleanup
+protected hbaserpcmetrics  rpcmetrics
+protected configuration conf
+private int maxqueuelength
+private int maxqueuesize
+protected int socketsendbuffersize
+protected final boolean tcpnodelay       if t then disable nagle's algorithm
+protected final boolean tcpkeepalive     if t then use keepalives
+protected final long purgetimeout        in milliseconds
+volatile protected boolean running   true             true while server runs
+protected blockingqueue<call> callqueue     queued calls
+protected final counter callqueuesize   new counter
+protected blockingqueue<call> prioritycallqueue
+protected int highprioritylevel      what level a high priority call is at
+protected final list<connection> connectionlist
+collections synchronizedlist new linkedlist<connection>
+//maintain a list
+//of client connections
+private listener listener   null
+protected responder responder   null
+protected int numconnections   0
+private handler handlers   null
+private handler priorityhandlers   null
+protected hbaserpcerrorhandler errorhandler   null
+/**
+* a convenience method to bind to a given address and report
+* better exceptions if the address is not a valid host.
+* @param socket the socket to bind
+* @param address the address to bind to
+* @param backlog the number of connections allowed in the queue
+* @throws bindexception if the address can't be bound
+* @throws unknownhostexception if the address isn't a valid host name
+* @throws ioexception other random errors from bind
+*/
+public static void bind serversocket socket  inetsocketaddress address
+int backlog  throws ioexception
+try
+socket bind address  backlog
+catch  bindexception e
+bindexception bindexception
+new bindexception     address
+e getmessage
+bindexception initcause e
+throw bindexception
+catch  socketexception e
+// if they try to bind to a different host's address, give a better
+// error message.
+if    equals e getmessage
+throw new unknownhostexception
+address gethostname
+throw e
+/** a call queued for handling. */
+protected class call implements delayable
+protected int id                                 the client's call id
+protected writable param                         the parameter passed
+protected connection connection                  connection to client
+protected long timestamp          the time received when response is null
+// the time served when response is not null
+protected bytebuffer response                    the response for this call
+protected boolean delayresponse
+protected responder responder
+protected boolean delayreturnvalue               if the return value should be
+// set at call completion
+protected long size                              size of current call
+protected boolean iserror
+public call int id  writable param  connection connection
+responder responder  long size
+this id   id
+this param   param
+this connection   connection
+this timestamp   system currenttimemillis
+this response   null
+this delayresponse   false
+this responder   responder
+this iserror   false
+this size   size
+@override
+public string tostring
+return param tostring         connection tostring
+protected synchronized void setresponse object value  status status
+string errorclass  string error
+// avoid overwriting an error value in the response.  this can happen if
+// enddelaythrowing is called by another thread before the actual call
+// returning.
+if  this iserror
+return
+if  errorclass    null
+this iserror   true
+writable result   null
+if  value instanceof writable
+result    writable  value
+else
+/* we might have a null value and errors. avoid creating a
+* hbaseobjectwritable, because the constructor fails on null. */
+if  value    null
+result   new hbaseobjectwritable value
+int size   buffer_initial_size
+if  result instanceof writablewithsize
+// get the size hint.
+writablewithsize ohint    writablewithsize  result
+long hint   ohint getwritablesize     bytes sizeof_byte
+2   bytes sizeof_int
+if  hint > integer max_value
+// oops, new problem.
+ioexception ioe
+new ioexception     hint
+errorclass   ioe getclass   getname
+error   stringutils stringifyexception ioe
+else
+size    int hint
+bytebufferoutputstream buf   new bytebufferoutputstream size
+dataoutputstream out   new dataoutputstream buf
+try
+// call id.
+out writeint this id
+// write flag.
+byte flag    error    null ?
+responseflag geterrorandlengthset    responseflag getlengthsetonly
+out writebyte flag
+// place holder for length set later below after we
+// fill the buffer with data.
+out writeint 0xdeadbeef
+out writeint status state
+catch  ioexception e
+errorclass   e getclass   getname
+error   stringutils stringifyexception e
+try
+if  error    null
+result write out
+else
+writableutils writestring out  errorclass
+writableutils writestring out  error
+catch  ioexception e
+log warn    e
+// set the length into the bytebuffer after call id and after
+// byte flag.
+bytebuffer bb   buf getbytebuffer
+int bufsiz   bb remaining
+// move to the size location in our bytebuffer past call.id
+// and past the byte flag.
+bb position bytes sizeof_int   bytes sizeof_byte
+bb putint bufsiz
+bb position 0
+this response   bb
+@override
+public synchronized void enddelay object result  throws ioexception
+assert this delayresponse
+assert this delayreturnvalue    result    null
+this delayresponse   false
+delayedcalls decrementandget
+if  this delayreturnvalue
+this setresponse result  status success  null  null
+this responder dorespond this
+@override
+public synchronized void enddelay   throws ioexception
+this enddelay null
+@override
+public synchronized void startdelay boolean delayreturnvalue
+assert  this delayresponse
+this delayresponse   true
+this delayreturnvalue   delayreturnvalue
+int numdelayed   delayedcalls incrementandget
+if  numdelayed > warndelayedcalls
+log warn     warndelayedcalls
+numdelayed
+@override
+public synchronized void enddelaythrowing throwable t  throws ioexception
+this setresponse null  status error  t getclass   tostring
+stringutils stringifyexception t
+this delayresponse   false
+this sendresponseifready
+@override
+public synchronized boolean isdelayed
+return this delayresponse
+@override
+public synchronized boolean isreturnvaluedelayed
+return this delayreturnvalue
+public long getsize
+return this size
+/**
+* if we have a response, and delay is not set, then respond
+* immediately.  otherwise, do not respond to client.  this is
+* called the by the rpc code in the context of the handler thread.
+*/
+public synchronized void sendresponseifready   throws ioexception
+if   this delayresponse
+this responder dorespond this
+/** listens on the socket. creates jobs for the handler threads*/
+private class listener extends thread
+private serversocketchannel acceptchannel   null    the accept channel
+private selector selector   null    the selector that we use for the server
+private reader readers   null
+private int currentreader   0
+private inetsocketaddress address    the address we bind at
+private random rand   new random
+private long lastcleanupruntime   0    the last time when a cleanup connec
+//-tion (for idle connections) ran
+private long cleanupinterval   10000    the minimum interval between
+//two cleanup runs
+private int backloglength   conf getint    128
+private executorservice readpool
+public listener   throws ioexception
+address   new inetsocketaddress bindaddress  port
+// create a new server socket and set to non blocking mode
+acceptchannel   serversocketchannel open
+acceptchannel configureblocking false
+// bind the server socket to the local host and port
+bind acceptchannel socket    address  backloglength
+port   acceptchannel socket   getlocalport      could be an ephemeral port
+// create a selector;
+selector  selector open
+readers   new reader
+readpool   executors newfixedthreadpool readthreads
+new threadfactorybuilder   setnameformat
+port  setdaemon true  build
+for  int i   0  i < readthreads    i
+reader reader   new reader
+readers   reader
+readpool execute reader
+// register accepts on the server socket with the selector.
+acceptchannel register selector  selectionkey op_accept
+this setname     port
+this setdaemon true
+private class reader implements runnable
+private volatile boolean adding   false
+private final selector readselector
+reader   throws ioexception
+this readselector   selector open
+public void run
+log info     getname
+try
+dorunloop
+finally
+try
+readselector close
+catch  ioexception ioe
+log error     getname    ioe
+private synchronized void dorunloop
+while  running
+selectionkey key   null
+try
+readselector select
+while  adding
+this wait 1000
+iterator<selectionkey> iter   readselector selectedkeys   iterator
+while  iter hasnext
+key   iter next
+iter remove
+if  key isvalid
+if  key isreadable
+doread key
+key   null
+catch  interruptedexception e
+if  running                            unexpected    log it
+log info getname
+stringutils stringifyexception e
+catch  ioexception ex
+log error    ex
+/**
+* this gets reader into the state that waits for the new channel
+* to be registered with readselector. if it was waiting in select()
+* the thread will be woken up, otherwise whenever select() is called
+* it will return even if there is nothing to read and wait
+* in while(adding) for finishadd call
+*/
+public void startadd
+adding   true
+readselector wakeup
+public synchronized selectionkey registerchannel socketchannel channel
+throws ioexception
+return channel register readselector  selectionkey op_read
+public synchronized void finishadd
+adding   false
+this notify
+/** cleanup connections from connectionlist. choose a random range
+* to scan and also have a limit on the number of the connections
+* that will be cleanedup per run. the criteria for cleanup is the time
+* for which the connection was idle. if 'force' is true then all
+* connections will be looked at for the cleanup.
+* @param force all connections will be looked at for cleanup
+*/
+private void cleanupconnections boolean force
+if  force    numconnections > thresholdidleconnections
+long currenttime   system currenttimemillis
+if   force     currenttime   lastcleanupruntime  < cleanupinterval
+return
+int start   0
+int end   numconnections   1
+if   force
+start   rand nextint   % numconnections
+end   rand nextint   % numconnections
+int temp
+if  end < start
+temp   start
+start   end
+end   temp
+int i   start
+int numnuked   0
+while  i <  end
+connection c
+synchronized  connectionlist
+try
+c   connectionlist get i
+catch  exception e   return
+if  c timedout currenttime
+if  log isdebugenabled
+log debug getname         c gethostaddress
+closeconnection c
+numnuked
+end
+//noinspection unusedassignment
+c   null
+if   force    numnuked    maxconnectionstonuke  break
+else i
+lastcleanupruntime   system currenttimemillis
+@override
+public void run
+log info getname
+server set hbaseserver this
+while  running
+selectionkey key   null
+try
+selector select       findbugs is2_inconsistent_sync
+iterator<selectionkey> iter   selector selectedkeys   iterator
+while  iter hasnext
+key   iter next
+iter remove
+try
+if  key isvalid
+if  key isacceptable
+doaccept key
+catch  ioexception ignored
+key   null
+catch  outofmemoryerror e
+if  errorhandler    null
+if  errorhandler checkoome e
+log info getname
+closecurrentconnection key  e
+cleanupconnections true
+return
+else
+// we can run out of memory if we have too many threads
+// log the event and sleep for a minute and give
+// some thread(s) a chance to finish
+log warn    e
+closecurrentconnection key  e
+cleanupconnections true
+try   thread sleep 60000     catch  exception ignored
+catch  exception e
+closecurrentconnection key  e
+cleanupconnections false
+log info     this getname
+synchronized  this
+try
+acceptchannel close
+selector close
+catch  ioexception ignored
+selector  null
+acceptchannel  null
+// clean up all connections
+while   connectionlist isempty
+closeconnection connectionlist remove 0
+private void closecurrentconnection selectionkey key  throwable e
+if  key    null
+connection c    connection key attachment
+if  c    null
+if  log isdebugenabled
+log debug getname         c gethostaddress
+e    null ?     e getmessage
+closeconnection c
+key attach null
+inetsocketaddress getaddress
+return  inetsocketaddress acceptchannel socket   getlocalsocketaddress
+void doaccept selectionkey key  throws ioexception  outofmemoryerror
+connection c
+serversocketchannel server    serversocketchannel  key channel
+socketchannel channel
+while   channel   server accept       null
+channel configureblocking false
+channel socket   settcpnodelay tcpnodelay
+channel socket   setkeepalive tcpkeepalive
+reader reader   getreader
+try
+reader startadd
+selectionkey readkey   reader registerchannel channel
+c   getconnection channel  system currenttimemillis
+readkey attach c
+synchronized  connectionlist
+connectionlist add numconnections  c
+numconnections
+if  log isdebugenabled
+log debug     c tostring
+numconnections
+callqueue size
+finally
+reader finishadd
+rpcmetrics numopenconnections set numconnections
+void doread selectionkey key  throws interruptedexception
+int count   0
+connection c    connection key attachment
+if  c    null
+return
+c setlastcontact system currenttimemillis
+try
+count   c readandprocess
+catch  interruptedexception ieo
+throw ieo
+catch  exception e
+log warn getname         e       count  e
+count    1    so that the  count < 0  block is executed
+if  count < 0
+if  log isdebugenabled
+log debug getname
+c gethostaddress
+numconnections
+closeconnection c
+// c = null;
+else
+c setlastcontact system currenttimemillis
+synchronized void dostop
+if  selector    null
+selector wakeup
+thread yield
+if  acceptchannel    null
+try
+acceptchannel socket   close
+catch  ioexception e
+log info getname         e
+readpool shutdownnow
+// the method that will return the next reader to work with
+// simplistic implementation of round robin for now
+reader getreader
+currentreader    currentreader   1  % readers length
+return readers
+// sends responses of rpc back to clients.
+protected class responder extends thread
+private final selector writeselector
+private int pending             connections waiting to register
+responder   throws ioexception
+this setname
+this setdaemon true
+writeselector   selector open       create a selector
+pending   0
+@override
+public void run
+log info getname
+server set hbaseserver this
+try
+dorunloop
+finally
+log info     this getname
+try
+writeselector close
+catch  ioexception ioe
+log error     this getname    ioe
+private void dorunloop
+long lastpurgetime   0       last check for old calls
+while  running
+try
+waitpending           if a channel is being registered  wait
+writeselector select purgetimeout
+iterator<selectionkey> iter   writeselector selectedkeys   iterator
+while  iter hasnext
+selectionkey key   iter next
+iter remove
+try
+if  key isvalid      key iswritable
+doasyncwrite key
+catch  ioexception e
+log info getname         e
+long now   system currenttimemillis
+if  now < lastpurgetime   purgetimeout
+continue
+lastpurgetime   now
+//
+// if there were some calls that have not been sent out for a
+// long time, discard them.
+//
+log debug
+arraylist<call> calls
+// get the list of channels from list of keys.
+synchronized  writeselector keys
+calls   new arraylist<call> writeselector keys   size
+iter   writeselector keys   iterator
+while  iter hasnext
+selectionkey key   iter next
+call call    call key attachment
+if  call    null    key channel      call connection channel
+calls add call
+for call call   calls
+try
+dopurge call  now
+catch  ioexception e
+log warn     e
+catch  outofmemoryerror e
+if  errorhandler    null
+if  errorhandler checkoome e
+log info getname
+return
+else
+//
+// we can run out of memory if we have too many threads
+// log the event and sleep for a minute and give
+// some thread(s) a chance to finish
+//
+log warn    e
+try   thread sleep 60000     catch  exception ignored
+catch  exception e
+log warn
+stringutils stringifyexception e
+log info     this getname
+private void doasyncwrite selectionkey key  throws ioexception
+call call    call key attachment
+if  call    null
+return
+if  key channel      call connection channel
+throw new ioexception
+synchronized call connection responsequeue
+if  processresponse call connection responsequeue  false
+try
+key interestops 0
+catch  cancelledkeyexception e
+/* the listener/reader might have closed the socket.
+* we don't explicitly cancel the key, so not sure if this will
+* ever fire.
+* this warning could be removed.
+*/
+log warn     e
+//
+// remove calls that have been pending in the responsequeue
+// for a long time.
+//
+private void dopurge call call  long now  throws ioexception
+synchronized  call connection responsequeue
+iterator<call> iter   call connection responsequeue listiterator 0
+while  iter hasnext
+call nextcall   iter next
+if  now > nextcall timestamp   purgetimeout
+closeconnection nextcall connection
+break
+// processes one response. returns true if there are no more pending
+// data for this channel.
+//
+private boolean processresponse final linkedlist<call> responsequeue
+boolean inhandler  throws ioexception
+boolean error   true
+boolean done   false           there is more data for this channel
+int numelements
+call call   null
+try
+//noinspection synchronizationonlocalvariableormethodparameter
+synchronized  responsequeue
+//
+// if there are no items for this channel, then we are done
+//
+numelements   responsequeue size
+if  numelements    0
+error   false
+return true                  no more data for this channel
+//
+// extract the first call
+//
+call   responsequeue removefirst
+socketchannel channel   call connection channel
+if  log isdebugenabled
+log debug getname         call id
+call connection
+//
+// send as much data as we can in the non-blocking fashion
+//
+int numbytes   channelwrite channel  call response
+if  numbytes < 0
+return true
+if   call response hasremaining
+call connection decrpccount
+//noinspection redundantifstatement
+if  numelements    1          last call fully processes
+done   true                 no more data for this channel
+else
+done   false                more calls pending to be sent
+if  log isdebugenabled
+log debug getname         call id
+call connection       numbytes
+else
+//
+// if we were unable to write the entire response out, then
+// insert in selector queue.
+//
+call connection responsequeue addfirst call
+if  inhandler
+// set the serve time when the response has to be sent later
+call timestamp   system currenttimemillis
+if  enqueueinselector call
+done   true
+if  log isdebugenabled
+log debug getname         call id
+call connection       numbytes
+error   false                  everything went off well
+finally
+if  error    call    null
+log warn getname       call
+done   true                   error  no more data for this channel
+closeconnection call connection
+return done
+//
+// enqueue for background thread to send responses out later.
+//
+private boolean enqueueinselector call call  throws ioexception
+boolean done   false
+incpending
+try
+// wake up the thread blocked on select, only then can the call
+// to channel.register() complete.
+socketchannel channel   call connection channel
+writeselector wakeup
+channel register writeselector  selectionkey op_write  call
+catch  closedchannelexception e
+//it's ok.  channel might be closed else where.
+done   true
+finally
+decpending
+return done
+//
+// enqueue a response from the application.
+//
+void dorespond call call  throws ioexception
+// set the serve time when the response has to be sent later
+call timestamp   system currenttimemillis
+boolean doregister   false
+synchronized  call connection responsequeue
+call connection responsequeue addlast call
+if  call connection responsequeue size      1
+doregister    processresponse call connection responsequeue  false
+if  doregister
+enqueueinselector call
+private synchronized void incpending          call waiting to be enqueued
+pending
+private synchronized void decpending        call done enqueueing
+pending
+notify
+private synchronized void waitpending   throws interruptedexception
+while  pending > 0
+wait
+/** reads calls from a connection and queues them for handling. */
+protected class connection
+private boolean versionread   false    if initial signature and
+//version are read
+private boolean headerread   false     if the connection header that
+//follows version is read.
+protected socketchannel channel
+private bytebuffer data
+private bytebuffer datalengthbuffer
+protected final linkedlist<call> responsequeue
+private volatile int rpccount   0     number of outstanding rpcs
+private long lastcontact
+private int datalength
+protected socket socket
+// cache the remote host & port info so that even if the socket is
+// disconnected, we can say where it used to connect to.
+protected string hostaddress
+protected int remoteport
+connectionheader header   new connectionheader
+class<? extends versionedprotocol> protocol
+protected user ticket   null
+public connection socketchannel channel  long lastcontact
+this channel   channel
+this lastcontact   lastcontact
+this data   null
+this datalengthbuffer   bytebuffer allocate 4
+this socket   channel socket
+inetaddress addr   socket getinetaddress
+if  addr    null
+this hostaddress
+else
+this hostaddress   addr gethostaddress
+this remoteport   socket getport
+this responsequeue   new linkedlist<call>
+if  socketsendbuffersize    0
+try
+socket setsendbuffersize socketsendbuffersize
+catch  ioexception e
+log warn
+socketsendbuffersize
+@override
+public string tostring
+return gethostaddress         remoteport
+public string gethostaddress
+return hostaddress
+public int getremoteport
+return remoteport
+public void setlastcontact long lastcontact
+this lastcontact   lastcontact
+public long getlastcontact
+return lastcontact
+/* return true if the connection has no outstanding rpc */
+private boolean isidle
+return rpccount    0
+/* decrement the outstanding rpc count */
+protected void decrpccount
+rpccount
+/* increment the outstanding rpc count */
+protected void incrpccount
+rpccount
+protected boolean timedout long currenttime
+return isidle      currenttime   lastcontact > maxidletime
+public int readandprocess   throws ioexception  interruptedexception
+while  true
+/* read at most one rpc. if the header is not read completely yet
+* then iterate until we read first rpc or until there is no data left.
+*/
+int count
+if  datalengthbuffer remaining   > 0
+count   channelread channel  datalengthbuffer
+if  count < 0    datalengthbuffer remaining   > 0
+return count
+if   versionread
+//every connection is expected to send the header.
+bytebuffer versionbuffer   bytebuffer allocate 1
+count   channelread channel  versionbuffer
+if  count <  0
+return count
+int version   versionbuffer get 0
+datalengthbuffer flip
+if   header equals datalengthbuffer     version    current_version
+//warning is ok since this is not supposed to happen.
+log warn
+hostaddress       remoteport
+version
+current_version
+setupbadversionresponse version
+return  1
+datalengthbuffer clear
+versionread   true
+continue
+if  data    null
+datalengthbuffer flip
+datalength   datalengthbuffer getint
+if  datalength    hbaseclient ping_call_id
+datalengthbuffer clear
+return 0     ping message
+data   bytebuffer allocate datalength
+incrpccount        increment the rpc count
+count   channelread channel  data
+if  data remaining      0
+datalengthbuffer clear
+data flip
+if  headerread
+processdata data array
+data   null
+return count
+processheader
+headerread   true
+data   null
+continue
+return count
+/**
+* try to set up the response to indicate that the client version
+* is incompatible with the server. this can contain special-case
+* code to speak enough of past ipc protocols to pass back
+* an exception to the caller.
+* @param clientversion the version the caller is using
+* @throws ioexception
+*/
+private void setupbadversionresponse int clientversion  throws ioexception
+string errmsg       current_version
+clientversion
+bytearrayoutputstream buffer   new bytearrayoutputstream
+if  clientversion >  3
+// we used to return an id of -1 which caused server to close the
+// connection without telling the client what the problem was.  now
+// we return 0 which will keep the socket up -- bad clients, unless
+// they switch to suit the running server -- will fail later doing
+// getprotocolversion.
+call fakecall    new call 0  null  this  responder  0
+// versions 3 and greater can interpret this exception
+// response in the same manner
+setupresponse buffer  fakecall  status fatal
+null  versionmismatch class getname    errmsg
+responder dorespond fakecall
+/// reads the connection header following version
+private void processheader   throws ioexception
+datainputstream in
+new datainputstream new bytearrayinputstream data array
+header readfields in
+try
+string protocolclassname   header getprotocol
+if  protocolclassname    null
+protocolclassname
+protocol   getprotocolclass protocolclassname  conf
+catch  classnotfoundexception cnfe
+throw new ioexception     header getprotocol
+ticket   header getuser
+protected void processdata byte buf  throws  ioexception  interruptedexception
+datainputstream dis
+new datainputstream new bytearrayinputstream buf
+int id   dis readint                          try to read an id
+long callsize   buf length
+if  log isdebugenabled
+log debug     id       callsize
+// enforcing the call queue size, this triggers a retry in the client
+if   callsize   callqueuesize get    > maxqueuesize
+final call calltoobig
+new call id  null  this  responder  callsize
+bytearrayoutputstream responsebuffer   new bytearrayoutputstream
+setupresponse responsebuffer  calltoobig  status fatal  null
+ioexception class getname
+responder dorespond calltoobig
+return
+writable param
+try
+param   reflectionutils newinstance paramclass  conf    read param
+param readfields dis
+catch  throwable t
+log warn
+gethostaddress    t
+final call readparamsfailedcall
+new call id  null  this  responder  callsize
+bytearrayoutputstream responsebuffer   new bytearrayoutputstream
+setupresponse responsebuffer  readparamsfailedcall  status fatal  null
+t getclass   getname
+t getmessage
+responder dorespond readparamsfailedcall
+return
+call call   new call id  param  this  responder  callsize
+callqueuesize add callsize
+if  prioritycallqueue    null    getqoslevel param  > highprioritylevel
+prioritycallqueue put call
+updatecallqueuelenmetrics prioritycallqueue
+else
+callqueue put call                   queue the call  maybe blocked here
+updatecallqueuelenmetrics callqueue
+protected synchronized void close
+data   null
+datalengthbuffer   null
+if   channel isopen
+return
+try  socket shutdownoutput     catch exception ignored        findbugs de_might_ignore
+if  channel isopen
+try  channel close     catch exception ignored
+try  socket close     catch exception ignored
+/**
+* reports length of the call queue to hbaserpcmetrics.
+* @param queue which queue to report
+*/
+private void updatecallqueuelenmetrics blockingqueue<call> queue
+if  queue    callqueue
+rpcmetrics callqueuelen set callqueue size
+else if  queue    prioritycallqueue
+rpcmetrics prioritycallqueuelen set prioritycallqueue size
+else
+log warn
+/** handles queued calls . */
+private class handler extends thread
+private final blockingqueue<call> mycallqueue
+private monitoredrpchandler status
+public handler final blockingqueue<call> cq  int instancenumber
+this mycallqueue   cq
+this setdaemon true
+string threadname       instancenumber       port
+if  cq    prioritycallqueue
+// this is just an amazing hack, but it works.
+threadname       threadname
+this setname threadname
+this status   taskmonitor get   createrpcstatus threadname
+@override
+public void run
+log info getname
+status setstatus
+server set hbaseserver this
+while  running
+try
+status pause
+call call   mycallqueue take       pop the queue  maybe blocked here
+updatecallqueuelenmetrics mycallqueue
+status setstatus
+status setconnection call connection gethostaddress
+call connection getremoteport
+if  log isdebugenabled
+log debug getname         call id
+call connection
+string errorclass   null
+string error   null
+writable value   null
+curcall set call
+try
+if   started
+throw new servernotrunningyetexception
+if  log isdebugenabled
+user remoteuser   call connection ticket
+log debug getname         call id
+remoteuser    null ?     remoteuser getname
+requestcontext set call connection ticket  getremoteip
+call connection protocol
+// make the call
+value   call call connection protocol  call param  call timestamp
+status
+catch  throwable e
+log debug getname     call     e  e
+errorclass   e getclass   getname
+error   stringutils stringifyexception e
+finally
+// must always clear the request context to avoid leaking
+// credentials between requests.
+requestcontext clear
+curcall set null
+callqueuesize add call getsize      1
+// set the response for undelayed calls and delayed calls with
+// undelayed responses.
+if   call isdelayed       call isreturnvaluedelayed
+call setresponse value
+errorclass    null? status success  status error
+errorclass  error
+call sendresponseifready
+status markcomplete
+catch  interruptedexception e
+if  running                                unexpected    log it
+log info getname
+stringutils stringifyexception e
+catch  outofmemoryerror e
+if  errorhandler    null
+if  errorhandler checkoome e
+log info getname
+return
+else
+// rethrow if no handler
+throw e
+catch  closedchannelexception cce
+log warn getname
+cce getmessage
+catch  exception e
+log warn getname
+stringutils stringifyexception e
+log info getname
+private function<writable integer> qosfunction   null
+/**
+* gets the qos level for this call.  if it is higher than the highprioritylevel and there
+* are priorityhandlers available it will be processed in it's own thread set.
+*
+* @param newfunc
+*/
+@override
+public void setqosfunction function<writable  integer> newfunc
+qosfunction   newfunc
+protected int getqoslevel writable param
+if  qosfunction    null
+return 0
+integer res   qosfunction apply param
+if  res    null
+return 0
+return res
+/* constructs a server listening on the named port and address.  parameters passed must
+* be of the named class.  the <code>handlercount</handlercount> determines
+* the number of handler threads that will be used to process calls.
+*
+*/
+protected hbaseserver string bindaddress  int port
+class<? extends writable> paramclass  int handlercount
+int priorityhandlercount  configuration conf  string servername
+int highprioritylevel
+throws ioexception
+this bindaddress   bindaddress
+this conf   conf
+this port   port
+this paramclass   paramclass
+this handlercount   handlercount
+this priorityhandlercount   priorityhandlercount
+this socketsendbuffersize   0
+// temporary backward compatibility
+string oldmaxqueuesize   this conf get
+if  oldmaxqueuesize    null
+this maxqueuelength
+this conf getint
+handlercount   default_max_callqueue_length_per_handler
+else
+log warn
+this maxqueuelength   integer getinteger oldmaxqueuesize
+this maxqueuesize
+this conf getint
+default_max_callqueue_size
+this readthreads   conf getint
+10
+this callqueue    new linkedblockingqueue<call> maxqueuelength
+if  priorityhandlercount > 0
+this prioritycallqueue   new linkedblockingqueue<call> maxqueuelength      todo hack on size
+else
+this prioritycallqueue   null
+this highprioritylevel   highprioritylevel
+this maxidletime   2 conf getint    1000
+this maxconnectionstonuke   conf getint    10
+this thresholdidleconnections   conf getint    4000
+this purgetimeout   conf getlong
+2   hconstants default_hbase_rpc_timeout
+// start the listener here and let it bind to the port
+listener   new listener
+this port   listener getaddress   getport
+this rpcmetrics   new hbaserpcmetrics
+servername  integer tostring this port
+this tcpnodelay   conf getboolean    false
+this tcpkeepalive   conf getboolean    true
+this warndelayedcalls   conf getint warn_delayed_calls
+default_warn_delayed_calls
+this delayedcalls   new atomicinteger 0
+// create the responder here
+responder   new responder
+/**
+* subclasses of hbaseserver can override this to provide their own
+* connection implementations.
+*/
+protected connection getconnection socketchannel channel  long time
+return new connection channel  time
+/**
+* setup response for the ipc call.
+*
+* @param response buffer to serialize the response into
+* @param call {@link call} to which we are setting up the response
+* @param status {@link status} of the ipc call
+* @param rv return value for the ipc call, if the call was successful
+* @param errorclass error class, if the the call failed
+* @param error error message, if the call failed
+* @throws ioexception
+*/
+private void setupresponse bytearrayoutputstream response
+call call  status status
+writable rv  string errorclass  string error
+throws ioexception
+response reset
+dataoutputstream out   new dataoutputstream response
+if  status    status success
+try
+rv write out
+call setresponse rv  status  null  null
+catch  throwable t
+log warn     call  t
+// call back to same function - this is ok since the
+// buffer is reset at the top, and since status is changed
+// to error it won't infinite loop.
+call setresponse null  status error  t getclass   getname
+stringutils stringifyexception t
+else
+call setresponse rv  status  errorclass  error
+protected void closeconnection connection connection
+synchronized  connectionlist
+if  connectionlist remove connection
+numconnections
+connection close
+rpcmetrics numopenconnections set numconnections
+/** sets the socket buffer size used for responding to rpcs.
+* @param size send size
+*/
+@override
+public void setsocketsendbufsize int size    this socketsendbuffersize   size
+/** starts the service.  must be called before any calls will be handled. */
+@override
+public void start
+startthreads
+openserver
+/**
+* open a previously started server.
+*/
+@override
+public void openserver
+started   true
+/**
+* starts the service threads but does not allow requests to be responded yet.
+* client will get {@link servernotrunningyetexception} instead.
+*/
+@override
+public synchronized void startthreads
+responder start
+listener start
+handlers   new handler
+for  int i   0  i < handlercount  i
+handlers   new handler callqueue  i
+handlers start
+if  priorityhandlercount > 0
+priorityhandlers   new handler
+for  int i   0   i < priorityhandlercount  i
+priorityhandlers   new handler prioritycallqueue  i
+priorityhandlers start
+/** stops the service.  no new calls will be handled after this is called. */
+@override
+public synchronized void stop
+log info     port
+running   false
+if  handlers    null
+for  handler handler   handlers
+if  handler    null
+handler interrupt
+if  priorityhandlers    null
+for  handler handler   priorityhandlers
+if  handler    null
+handler interrupt
+listener interrupt
+listener dostop
+responder interrupt
+notifyall
+if  this rpcmetrics    null
+this rpcmetrics shutdown
+/** wait for the server to be stopped.
+* does not wait for all subthreads to finish.
+*  see {@link #stop()}.
+* @throws interruptedexception e
+*/
+@override
+public synchronized void join   throws interruptedexception
+while  running
+wait
+/**
+* return the socket (ip+port) on which the rpc server is listening to.
+* @return the socket (ip+port) on which the rpc server is listening to.
+*/
+@override
+public synchronized inetsocketaddress getlisteneraddress
+return listener getaddress
+/**
+* set the handler for calling out of rpc for error conditions.
+* @param handler the handler implementation
+*/
+@override
+public void seterrorhandler hbaserpcerrorhandler handler
+this errorhandler   handler
+/**
+* returns the metrics instance for reporting rpc call statistics
+*/
+public hbaserpcmetrics getrpcmetrics
+return rpcmetrics
+/**
+* when the read or write buffer size is larger than this limit, i/o will be
+* done in chunks of this size. most rpc requests and responses would be
+* be smaller.
+*/
+private static int nio_buffer_limit   8 1024    should not be more than 64kb
+/**
+* this is a wrapper around {@link java.nio.channels.writablebytechannel#write(java.nio.bytebuffer)}.
+* if the amount of data is large, it writes to channel in smaller chunks.
+* this is to avoid jdk from creating many direct buffers as the size of
+* buffer increases. this also minimizes extra copies in nio layer
+* as a result of multiple write operations required to write a large
+* buffer.
+*
+* @param channel writable byte channel to write to
+* @param buffer buffer to write
+* @return number of bytes written
+* @throws java.io.ioexception e
+* @see java.nio.channels.writablebytechannel#write(java.nio.bytebuffer)
+*/
+protected int channelwrite writablebytechannel channel
+bytebuffer buffer  throws ioexception
+int count     buffer remaining   <  nio_buffer_limit  ?
+channel write buffer    channelio null  channel  buffer
+if  count > 0
+rpcmetrics sentbytes inc count
+return count
+/**
+* this is a wrapper around {@link java.nio.channels.readablebytechannel#read(java.nio.bytebuffer)}.
+* if the amount of data is large, it writes to channel in smaller chunks.
+* this is to avoid jdk from creating many direct buffers as the size of
+* bytebuffer increases. there should not be any performance degredation.
+*
+* @param channel writable byte channel to write on
+* @param buffer buffer to write
+* @return number of bytes written
+* @throws java.io.ioexception e
+* @see java.nio.channels.readablebytechannel#read(java.nio.bytebuffer)
+*/
+protected int channelread readablebytechannel channel
+bytebuffer buffer  throws ioexception
+int count    buffer remaining   <  nio_buffer_limit  ?
+channel read buffer    channelio channel  null  buffer
+if  count > 0
+rpcmetrics receivedbytes inc count
+return count
+/**
+* helper for {@link #channelread(java.nio.channels.readablebytechannel, java.nio.bytebuffer)}
+* and {@link #channelwrite(java.nio.channels.writablebytechannel, java.nio.bytebuffer)}. only
+* one of readch or writech should be non-null.
+*
+* @param readch read channel
+* @param writech write channel
+* @param buf buffer to read or write into/out of
+* @return bytes written
+* @throws java.io.ioexception e
+* @see #channelread(java.nio.channels.readablebytechannel, java.nio.bytebuffer)
+* @see #channelwrite(java.nio.channels.writablebytechannel, java.nio.bytebuffer)
+*/
+private static int channelio readablebytechannel readch
+writablebytechannel writech
+bytebuffer buf  throws ioexception
+int originallimit   buf limit
+int initialremaining   buf remaining
+int ret   0
+while  buf remaining   > 0
+try
+int iosize   math min buf remaining    nio_buffer_limit
+buf limit buf position     iosize
+ret    readch    null  ? writech write buf    readch read buf
+if  ret < iosize
+break
+finally
+buf limit originallimit
+int nbytes   initialremaining   buf remaining
+return  nbytes > 0  ? nbytes   ret
+public delayable getcurrentcall
+return curcall get

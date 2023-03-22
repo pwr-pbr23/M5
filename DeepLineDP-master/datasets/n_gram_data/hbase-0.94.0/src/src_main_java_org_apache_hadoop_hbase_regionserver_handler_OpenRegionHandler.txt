@@ -1,0 +1,341 @@
+/**
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver handler
+import java io ioexception
+import java util concurrent atomic atomicboolean
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase server
+import org apache hadoop hbase executor eventhandler
+import org apache hadoop hbase regionserver hregion
+import org apache hadoop hbase regionserver regionserveraccounting
+import org apache hadoop hbase regionserver regionserverservices
+import org apache hadoop hbase util cancelableprogressable
+import org apache hadoop hbase zookeeper zkassign
+import org apache zookeeper keeperexception
+/**
+* handles opening of a region on a region server.
+* <p>
+* this is executed after receiving an open rpc from the master or client.
+*/
+public class openregionhandler extends eventhandler
+private static final log log   logfactory getlog openregionhandler class
+private final regionserverservices rsservices
+private final hregioninfo regioninfo
+private final htabledescriptor htd
+// we get version of our znode at start of open process and monitor it across
+// the total open. we'll fail the open if someone hijacks our znode; we can
+// tell this has happened if version is not as expected.
+private volatile int version    1
+//version of the offline node that was set by the master
+private volatile int versionofofflinenode    1
+public openregionhandler final server server
+final regionserverservices rsservices  hregioninfo regioninfo
+htabledescriptor htd
+this server  rsservices  regioninfo  htd  eventtype m_rs_open_region   1
+public openregionhandler final server server
+final regionserverservices rsservices  hregioninfo regioninfo
+htabledescriptor htd  int versionofofflinenode
+this server  rsservices  regioninfo  htd  eventtype m_rs_open_region
+versionofofflinenode
+protected openregionhandler final server server
+final regionserverservices rsservices  final hregioninfo regioninfo
+final htabledescriptor htd  eventtype eventtype
+final int versionofofflinenode
+super server  eventtype
+this rsservices   rsservices
+this regioninfo   regioninfo
+this htd   htd
+this versionofofflinenode   versionofofflinenode
+public hregioninfo getregioninfo
+return regioninfo
+@override
+public void process   throws ioexception
+try
+final string name   regioninfo getregionnameasstring
+if  this server isstopped      this rsservices isstopping
+return
+final string encodedname   regioninfo getencodedname
+// check that this region is not already online
+hregion region   this rsservices getfromonlineregions encodedname
+// if fails, just return.  someone stole the region from under us.
+// calling transitionzookeeperofflinetoopening initalizes this.version.
+if   transitionzookeeperofflinetoopening encodedname
+versionofofflinenode
+log warn
+encodedname
+return
+// open region.  after a successful open, failures in subsequent
+// processing needs to do a close as part of cleanup.
+region   openregion
+if  region    null
+trytransitiontofailedopen regioninfo
+return
+boolean failed   true
+if  tickleopening
+if  updatemeta region
+failed   false
+if  failed    this server isstopped
+this rsservices isstopping
+cleanupfailedopen region
+trytransitiontofailedopen regioninfo
+return
+if   transitiontoopened region
+// if we fail to transition to opened, it's because of one of two cases:
+//    (a) we lost our zk lease
+// or (b) someone else opened the region before us
+// in either case, we don't need to transition to failed_open state.
+// in case (a), the master will process us as a dead server. in case
+// (b) the region is already being handled elsewhere anyway.
+cleanupfailedopen region
+return
+// successful region open, and add it to onlineregions
+this rsservices addtoonlineregions region
+// done!  successful region open
+log debug     name
+this server getservername
+finally
+this rsservices getregionsintransitioninrs
+remove this regioninfo getencodednameasbytes
+/**
+* update zk, root or meta.  this can take a while if for example the
+* .meta. is not available -- if server hosting .meta. crashed and we are
+* waiting on it to come back -- so run in a thread and keep updating znode
+* state meantime so master doesn't timeout our region-in-transition.
+* caller must cleanup region if this fails.
+*/
+boolean updatemeta final hregion r
+if  this server isstopped      this rsservices isstopping
+return false
+// object we do wait/notify on.  make it boolean.  if set, we're done.
+// else, wait.
+final atomicboolean signaller   new atomicboolean false
+postopendeploytasksthread t   new postopendeploytasksthread r
+this server  this rsservices  signaller
+t start
+int assignmenttimeout   this server getconfiguration
+getint    10000
+// total timeout for meta edit.  if we fail adding the edit then close out
+// the region and let it be assigned elsewhere.
+long timeout   assignmenttimeout   10
+long now   system currenttimemillis
+long endtime   now   timeout
+// let our period at which we update opening state to be be 1/3rd of the
+// regions-in-transition timeout period.
+long period   math max 1  assignmenttimeout  3
+long lastupdate   now
+boolean tickleopening   true
+while   signaller get      t isalive       this server isstopped
+this rsservices isstopping       endtime > now
+long elapsed   now   lastupdate
+if  elapsed > period
+// only tickle opening if postopendeploytasks is taking some time.
+lastupdate   now
+tickleopening   tickleopening
+synchronized  signaller
+try
+signaller wait period
+catch  interruptedexception e
+// go to the loop check.
+now   system currenttimemillis
+// is thread still alive?  we may have left above loop because server is
+// stopping or we timed out the edit.  is so, interrupt it.
+if  t isalive
+if   signaller get
+// thread still running; interrupt
+log debug     t
+t interrupt
+try
+t join
+catch  interruptedexception ie
+log warn
+r getregioninfo   getregionnameasstring    ie
+thread currentthread   interrupt
+// was there an exception opening the region?  this should trigger on
+// interruptedexception too.  if so, we failed.  even if tickle opening fails
+// then it is a failure.
+return    thread interrupted      t getexception      null     tickleopening
+/**
+* thread to run region post open tasks. call {@link #getexception()} after
+* the thread finishes to check for exceptions running
+* {@link regionserverservices#postopendeploytasks(hregion, org.apache.hadoop.hbase.catalog.catalogtracker, boolean)}
+* .
+*/
+static class postopendeploytasksthread extends thread
+private exception exception   null
+private final server server
+private final regionserverservices services
+private final hregion region
+private final atomicboolean signaller
+postopendeploytasksthread final hregion region  final server server
+final regionserverservices services  final atomicboolean signaller
+super     region getregioninfo   getencodedname
+this setdaemon true
+this server   server
+this services   services
+this region   region
+this signaller   signaller
+public void run
+try
+this services postopendeploytasks this region
+this server getcatalogtracker    false
+catch  exception e
+log warn
+this region getregioninfo   getencodedname    e
+this exception   e
+// we're done.  set flag then wake up anyone waiting on thread to complete.
+this signaller set true
+synchronized  this signaller
+this signaller notify
+/**
+* @return null or the run exception; call this method after thread is done.
+*/
+exception getexception
+return this exception
+/**
+* @param r region we're working on.
+* @return whether znode is successfully transitioned to opened state.
+* @throws ioexception
+*/
+private boolean transitiontoopened final hregion r  throws ioexception
+boolean result   false
+hregioninfo hri   r getregioninfo
+final string name   hri getregionnameasstring
+// finally, transition zk node to opened
+try
+if  zkassign transitionnodeopened this server getzookeeper    hri
+this server getservername    this version      1
+log warn     name
+this server getservername
+else
+log debug
+r getregioninfo         this server getservername
+result   true
+catch  keeperexception e
+log error     name
+e
+return result
+/**
+* @param  region we're working on.
+* this is not guaranteed to succeed, we just do our best.
+* @return whether znode is successfully transitioned to failed_open state.
+*/
+private boolean trytransitiontofailedopen final hregioninfo hri
+boolean result   false
+final string name   hri getregionnameasstring
+try
+log info     hri
+if  zkassign transitionnode
+this server getzookeeper    hri
+this server getservername
+eventtype rs_zk_region_opening
+eventtype rs_zk_region_failed_open
+this version      1
+log warn     hri
+else
+result   true
+catch  keeperexception e
+log error     name
+e
+return result
+/**
+* @return instance of hregion if successful open else null.
+*/
+hregion openregion
+hregion region   null
+try
+// instantiate the region.  this also periodically tickles our zk opening
+// state so master doesn't timeout this region in transition.
+region   hregion openhregion this regioninfo  this htd
+this rsservices getwal    this server getconfiguration
+this rsservices
+new cancelableprogressable
+public boolean progress
+// we may lose the znode ownership during the open.  currently its
+// too hard interrupting ongoing region open.  just let it complete
+// and check we still have the znode after region open.
+return tickleopening
+catch  throwable t
+// we failed open. our caller will see the 'null' return value
+// and transition the node back to failed_open. if that fails,
+// we rely on the timeout monitor in the master to reassign.
+log error
+this regioninfo getregionnameasstring
+t
+// decrease the global memstore size.
+if  this rsservices    null
+regionserveraccounting rsaccounting
+this rsservices getregionserveraccounting
+if  rsaccounting    null
+rsaccounting rollbackregionreplayeditssize this regioninfo getregionname
+return region
+private void cleanupfailedopen final hregion region  throws ioexception
+if  region    null  region close
+/**
+* transition zk node from offline to opening.
+* @param encodedname name of the znode file (region encodedname is the znode
+* name).
+* @param versionofofflinenode - version of offlinenode that needs to be compared
+* before changing the node's state from offline
+* @return true if successful transition.
+*/
+boolean transitionzookeeperofflinetoopening final string encodedname
+int versionofofflinenode
+// todo: should also handle transition from closed?
+try
+// initialize the znode version.
+this version   zkassign transitionnode server getzookeeper    regioninfo
+server getservername    eventtype m_zk_region_offline
+eventtype rs_zk_region_opening  versionofofflinenode
+catch  keeperexception e
+log error
+encodedname  e
+boolean b   isgoodversion
+if   b
+log warn
+encodedname
+return b
+/**
+* update our opening state in zookeeper.
+* do this so master doesn't timeout this region-in-transition.
+* @param context some context to add to logs if failure
+* @return true if successful transition.
+*/
+boolean tickleopening final string context
+// if previous checks failed... do not try again.
+if   isgoodversion    return false
+string encodedname   this regioninfo getencodedname
+try
+this version
+zkassign retransitionnodeopening server getzookeeper
+this regioninfo  this server getservername    this version
+catch  keeperexception e
+server abort     encodedname
+context  e
+this version    1
+boolean b   isgoodversion
+if   b
+log warn     encodedname
+context
+return b
+private boolean isgoodversion
+return this version     1

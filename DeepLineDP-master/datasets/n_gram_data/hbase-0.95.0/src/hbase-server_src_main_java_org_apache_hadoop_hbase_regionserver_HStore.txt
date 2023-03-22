@@ -1,0 +1,1443 @@
+/**
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver
+import java io ioexception
+import java io interruptedioexception
+import java util arraylist
+import java util collection
+import java util collections
+import java util iterator
+import java util list
+import java util navigableset
+import java util sortedset
+import java util concurrent callable
+import java util concurrent completionservice
+import java util concurrent copyonwritearrayset
+import java util concurrent executionexception
+import java util concurrent executorcompletionservice
+import java util concurrent future
+import java util concurrent threadpoolexecutor
+import java util concurrent atomic atomiclong
+import java util concurrent locks reentrantreadwritelock
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase cell
+import org apache hadoop hbase compoundconfiguration
+import org apache hadoop hbase hcolumndescriptor
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase remoteexceptionhandler
+import org apache hadoop hbase client scan
+import org apache hadoop hbase exceptions wrongregionexception
+import org apache hadoop hbase fs hfilesystem
+import org apache hadoop hbase io compress compression
+import org apache hadoop hbase io hfile cacheconfig
+import org apache hadoop hbase io hfile hfile
+import org apache hadoop hbase io hfile hfiledatablockencoder
+import org apache hadoop hbase io hfile hfiledatablockencoderimpl
+import org apache hadoop hbase io hfile hfilescanner
+import org apache hadoop hbase exceptions invalidhfileexception
+import org apache hadoop hbase io hfile noopdatablockencoder
+import org apache hadoop hbase monitoring monitoredtask
+import org apache hadoop hbase regionserver compactions compactioncontext
+import org apache hadoop hbase regionserver compactions compactionpolicy
+import org apache hadoop hbase regionserver compactions compactionprogress
+import org apache hadoop hbase regionserver compactions compactionrequest
+import org apache hadoop hbase regionserver compactions compactor
+import org apache hadoop hbase regionserver compactions offpeakcompactions
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util checksumtype
+import org apache hadoop hbase util classsize
+import org apache hadoop hbase util collectionbackedscanner
+import org apache hadoop hbase util environmentedgemanager
+import org apache hadoop util stringutils
+import com google common base preconditions
+import com google common collect immutablecollection
+import com google common collect immutablelist
+import com google common collect lists
+/**
+* a store holds a column family in a region.  its a memstore and a set of zero
+* or more storefiles, which stretch backwards over time.
+*
+* <p>there's no reason to consider append-logging at this level; all logging
+* and locking is handled at the hregion level.  store just provides
+* services to manage sets of storefiles.  one of the most important of those
+* services is compaction services where files are aggregated once they pass
+* a configurable threshold.
+*
+* <p>the only thing having to do with logs that store needs to deal with is
+* the reconstructionlog.  this is a segment of an hregion's log that might
+* not be present upon startup.  if the param is null, there's nothing to do.
+* if the param is non-null, we need to process the log to reconstruct
+* a treemap that might not have been written to disk before the process
+* died.
+*
+* <p>it's assumed that after this constructor returns, the reconstructionlog
+* file will be deleted (by whoever has instantiated the store).
+*
+* <p>locking and transactions are handled at a higher level.  this api should
+* not be called directly but by an hregion manager.
+*/
+@interfaceaudience private
+public class hstore implements store
+public static final string blocking_storefiles_key
+public static final int default_blocking_storefile_count   7
+static final log log   logfactory getlog hstore class
+protected final memstore memstore
+private final hregion region
+private final hcolumndescriptor family
+private final hregionfilesystem fs
+private final configuration conf
+private final cacheconfig cacheconf
+private long lastcompactsize   0
+volatile boolean forcemajor   false
+/* how many bytes to write between status checks */
+static int closecheckinterval   0
+private volatile long storesize   0l
+private volatile long totaluncompressedbytes   0l
+private final object flushlock   new object
+final reentrantreadwritelock lock   new reentrantreadwritelock
+private final boolean verifybulkloads
+private scaninfo scaninfo
+final list<storefile> filescompacting   lists newarraylist
+// all access must be synchronized.
+private final copyonwritearrayset<changedreadersobserver> changedreaderobservers
+new copyonwritearrayset<changedreadersobserver>
+private final int blocksize
+private hfiledatablockencoder datablockencoder
+/** checksum configuration */
+private checksumtype checksumtype
+private int bytesperchecksum
+// comparing keyvalues
+private final keyvalue kvcomparator comparator
+final storeengine<?  ?  ?> storeengine
+private offpeakcompactions offpeakcompactions
+private static final int default_flush_retries_number   10
+private static int flush_retries_number
+private static int pausetime
+private long blockingfilecount
+/**
+* constructor
+* @param region
+* @param family hcolumndescriptor for this column
+* @param confparam configuration object
+* failed.  can be null.
+* @throws ioexception
+*/
+protected hstore final hregion region  final hcolumndescriptor family
+final configuration confparam  throws ioexception
+hregioninfo info   region getregioninfo
+this fs   region getregionfilesystem
+// assemble the store's home directory and ensure it exists.
+fs createstoredir family getnameasstring
+this region   region
+this family   family
+// 'conf' renamed to 'confparam' b/c we use this.conf in the constructor
+// compoundconfiguration will look for keys in reverse order of addition, so we'd
+// add global config first, then table and cf overrides, then cf metadata.
+this conf   new compoundconfiguration
+add confparam
+addstringmap region gettabledesc   getconfiguration
+addstringmap family getconfiguration
+addwritablemap family getvalues
+this blocksize   family getblocksize
+this datablockencoder
+new hfiledatablockencoderimpl family getdatablockencodingondisk
+family getdatablockencoding
+this comparator   info getcomparator
+// used by scanquerymatcher
+long timetopurgedeletes
+math max conf getlong    0   0
+log trace     timetopurgedeletes
+this
+// get ttl
+long ttl   determinettlfromfamily family
+// why not just pass a hcolumndescriptor in here altogether?  even if have
+// to clone it?
+scaninfo   new scaninfo family  ttl  timetopurgedeletes  this comparator
+this memstore   new memstore conf  this comparator
+this offpeakcompactions   new offpeakcompactions conf
+// setting up cache configuration for this family
+this cacheconf   new cacheconfig conf  family
+this verifybulkloads   conf getboolean    false
+this blockingfilecount
+conf getint blocking_storefiles_key  default_blocking_storefile_count
+if  hstore closecheckinterval    0
+hstore closecheckinterval   conf getint
+10 1000 1000    10 mb
+this storeengine   storeengine create this  this conf  this comparator
+this storeengine getstorefilemanager   loadfiles loadstorefiles
+// initialize checksum type from name. the names are crc32, crc32c, etc.
+this checksumtype   getchecksumtype conf
+// initilize bytes per checksum
+this bytesperchecksum   getbytesperchecksum conf
+// create a compaction manager.
+if  hstore flush_retries_number    0
+hstore flush_retries_number   conf getint
+default_flush_retries_number
+hstore pausetime   conf getint hconstants hbase_server_pause
+hconstants default_hbase_server_pause
+if  hstore flush_retries_number <  0
+throw new illegalargumentexception
+hstore flush_retries_number
+/**
+* @param family
+* @return ttl in seconds of the specified family
+*/
+private static long determinettlfromfamily final hcolumndescriptor family
+// hcd.gettimetolive returns ttl in seconds.  convert to milliseconds.
+long ttl   family gettimetolive
+if  ttl    hconstants forever
+// default is unlimited ttl.
+ttl   long max_value
+else if  ttl     1
+ttl   long max_value
+else
+// second -> ms adjust for user data
+ttl    1000
+return ttl
+public string getcolumnfamilyname
+return this family getnameasstring
+@override
+public string gettablename
+return this getregioninfo   gettablenameasstring
+@override
+public filesystem getfilesystem
+return this fs getfilesystem
+public hregionfilesystem getregionfilesystem
+return this fs
+/* implementation of storeconfiginformation */
+@override
+public long getstorefilettl
+// ttl only applies if there's no min_versions setting on the column.
+return  this scaninfo getminversions      0  ? this scaninfo getttl     long max_value
+@override
+public long getmemstoreflushsize
+return this region memstoreflushsize
+/* end implementation of storeconfiginformation */
+/**
+* returns the configured bytesperchecksum value.
+* @param conf the configuration
+* @return the bytesperchecksum that is set in the configuration
+*/
+public static int getbytesperchecksum configuration conf
+return conf getint hconstants bytes_per_checksum
+hfile default_bytes_per_checksum
+/**
+* returns the configured checksum algorithm.
+* @param conf the configuration
+* @return the checksum algorithm that is set in the configuration
+*/
+public static checksumtype getchecksumtype configuration conf
+string checksumname   conf get hconstants checksum_type_name
+if  checksumname    null
+return hfile default_checksum_type
+else
+return checksumtype nametotype checksumname
+/**
+* @return how many bytes to write between status checks
+*/
+public static int getclosecheckinterval
+return closecheckinterval
+public hcolumndescriptor getfamily
+return this family
+/**
+* @return the maximum sequence id in all store files. used for log replay.
+*/
+long getmaxsequenceid boolean includebulkfiles
+return storefile getmaxsequenceidinlist this getstorefiles    includebulkfiles
+@override
+public long getmaxmemstorets
+return storefile getmaxmemstoretsinlist this getstorefiles
+/**
+* @param tabledir {@link path} to where the table is being stored
+* @param hri {@link hregioninfo} for the region.
+* @param family {@link hcolumndescriptor} describing the column family
+* @return path to family/store home directory.
+*/
+@deprecated
+public static path getstorehomedir final path tabledir
+final hregioninfo hri  final byte family
+return getstorehomedir tabledir  hri getencodedname    family
+/**
+* @param tabledir {@link path} to where the table is being stored
+* @param encodedname encoded region name.
+* @param family {@link hcolumndescriptor} describing the column family
+* @return path to family/store home directory.
+*/
+@deprecated
+public static path getstorehomedir final path tabledir
+final string encodedname  final byte family
+return new path tabledir  new path encodedname  bytes tostring family
+@override
+public hfiledatablockencoder getdatablockencoder
+return datablockencoder
+/**
+* should be used only in tests.
+* @param blockencoder the block delta encoder to use
+*/
+void setdatablockencoderintest hfiledatablockencoder blockencoder
+this datablockencoder   blockencoder
+/**
+* creates an unsorted list of storefile loaded in parallel
+* from the given directory.
+* @throws ioexception
+*/
+private list<storefile> loadstorefiles   throws ioexception
+collection<storefileinfo> files   fs getstorefiles getcolumnfamilyname
+if  files    null    files size      0
+return new arraylist<storefile>
+// initialize the thread pool for opening store files in parallel..
+threadpoolexecutor storefileopenerthreadpool
+this region getstorefileopenandclosethreadpool
+this getcolumnfamilyname
+completionservice<storefile> completionservice
+new executorcompletionservice<storefile> storefileopenerthreadpool
+int totalvalidstorefile   0
+final filesystem fs   this getfilesystem
+for  final storefileinfo storefileinfo  files
+// open each store file in parallel
+completionservice submit new callable<storefile>
+public storefile call   throws ioexception
+storefile storefile   new storefile fs  storefileinfo getpath    conf  cacheconf
+family getbloomfiltertype    datablockencoder
+storefile createreader
+return storefile
+totalvalidstorefile
+arraylist<storefile> results   new arraylist<storefile> files size
+ioexception ioe   null
+try
+for  int i   0  i < totalvalidstorefile  i
+try
+future<storefile> future   completionservice take
+storefile storefile   future get
+long length   storefile getreader   length
+this storesize    length
+this totaluncompressedbytes
+storefile getreader   gettotaluncompressedbytes
+if  log isdebugenabled
+log debug     storefile tostringdetailed
+results add storefile
+catch  interruptedexception e
+if  ioe    null  ioe   new interruptedioexception e getmessage
+catch  executionexception e
+if  ioe    null  ioe   new ioexception e getcause
+finally
+storefileopenerthreadpool shutdownnow
+if  ioe    null
+// close storefile readers
+try
+for  storefile file   results
+if  file    null  file closereader true
+catch  ioexception e
+throw ioe
+return results
+@override
+public long add final keyvalue kv
+lock readlock   lock
+try
+return this memstore add kv
+finally
+lock readlock   unlock
+/**
+* adds a value to the memstore
+*
+* @param kv
+* @return memstore size delta
+*/
+protected long delete final keyvalue kv
+lock readlock   lock
+try
+return this memstore delete kv
+finally
+lock readlock   unlock
+@override
+public void rollback final keyvalue kv
+lock readlock   lock
+try
+this memstore rollback kv
+finally
+lock readlock   unlock
+/**
+* @return all store files.
+*/
+@override
+public collection<storefile> getstorefiles
+return this storeengine getstorefilemanager   getstorefiles
+@override
+public void assertbulkloadhfileok path srcpath  throws ioexception
+hfile reader reader    null
+try
+log info     srcpath
+this       this getregioninfo   getregionnameasstring
+reader   hfile createreader srcpath getfilesystem conf
+srcpath  cacheconf
+reader loadfileinfo
+byte firstkey   reader getfirstrowkey
+preconditions checkstate firstkey    null
+byte lk   reader getlastkey
+preconditions checkstate lk    null
+byte lastkey    keyvalue createkeyvaluefromkey lk  getrow
+log debug     bytes tostringbinary firstkey
+bytes tostringbinary lastkey
+log debug
+bytes tostringbinary getregioninfo   getstartkey
+bytes tostringbinary getregioninfo   getendkey
+if   this getregioninfo   containsrange firstkey  lastkey
+throw new wrongregionexception
+srcpath tostring
+this getregioninfo   getregionnameasstring
+if  verifybulkloads
+keyvalue prevkv   null
+hfilescanner scanner   reader getscanner false  false  false
+scanner seekto
+do
+keyvalue kv   scanner getkeyvalue
+if  prevkv    null
+if  bytes compareto prevkv getbuffer    prevkv getrowoffset
+prevkv getrowlength    kv getbuffer    kv getrowoffset
+kv getrowlength    > 0
+throw new invalidhfileexception
+srcpath
+bytes tostringbinary prevkv getkey
+bytes tostringbinary kv getkey
+if  bytes compareto prevkv getbuffer    prevkv getfamilyoffset
+prevkv getfamilylength    kv getbuffer    kv getfamilyoffset
+kv getfamilylength       0
+throw new invalidhfileexception
+srcpath
+bytes tostringbinary prevkv getfamily
+bytes tostringbinary kv getfamily
+prevkv   kv
+while  scanner next
+finally
+if  reader    null  reader close
+@override
+public void bulkloadhfile string srcpathstr  long seqnum  throws ioexception
+path srcpath   new path srcpathstr
+path dstpath   fs bulkloadstorefile getcolumnfamilyname    srcpath  seqnum
+storefile sf   new storefile this getfilesystem    dstpath  this conf  this cacheconf
+this family getbloomfiltertype    this datablockencoder
+storefile reader r   sf createreader
+this storesize    r length
+this totaluncompressedbytes    r gettotaluncompressedbytes
+log info     srcpath       getcolumnfamilyname
+dstpath
+// append the new storefile into the list
+this lock writelock   lock
+try
+this storeengine getstorefilemanager   insertnewfile sf
+finally
+// we need the lock, as long as we are updating the storefiles
+// or changing the memstore. let us release it before calling
+// notifychangereadersobservers. see hbase-4485 for a possible
+// deadlock scenario that could have happened if continue to hold
+// the lock.
+this lock writelock   unlock
+notifychangedreadersobservers
+log info     srcpath
+this       dstpath
+@override
+public immutablecollection<storefile> close   throws ioexception
+this lock writelock   lock
+try
+// clear so metrics doesn't find them.
+immutablecollection<storefile> result   storeengine getstorefilemanager   clearfiles
+if   result isempty
+// initialize the thread pool for closing store files in parallel.
+threadpoolexecutor storefilecloserthreadpool   this region
+getstorefileopenandclosethreadpool
+this getcolumnfamilyname
+// close each store file in parallel
+completionservice<void> completionservice
+new executorcompletionservice<void> storefilecloserthreadpool
+for  final storefile f   result
+completionservice submit new callable<void>
+public void call   throws ioexception
+f closereader true
+return null
+ioexception ioe   null
+try
+for  int i   0  i < result size    i
+try
+future<void> future   completionservice take
+future get
+catch  interruptedexception e
+if  ioe    null
+ioe   new interruptedioexception
+ioe initcause e
+catch  executionexception e
+if  ioe    null  ioe   new ioexception e getcause
+finally
+storefilecloserthreadpool shutdownnow
+if  ioe    null  throw ioe
+log info     this
+return result
+finally
+this lock writelock   unlock
+/**
+* snapshot this stores memstore. call before running
+* {@link #flushcache(long, sortedset, timerangetracker, atomiclong, monitoredtask)}
+*  so it has some work to do.
+*/
+void snapshot
+this memstore snapshot
+/**
+* write out current snapshot.  presumes {@link #snapshot()} has been called
+* previously.
+* @param logcacheflushid flush sequence number
+* @param snapshot
+* @param snapshottimerangetracker
+* @param flushedsize the number of bytes flushed
+* @param status
+* @return path the path name of the tmp file to which the store was flushed
+* @throws ioexception
+*/
+protected path flushcache final long logcacheflushid
+sortedset<keyvalue> snapshot
+timerangetracker snapshottimerangetracker
+atomiclong flushedsize
+monitoredtask status  throws ioexception
+// if an exception happens flushing, we let it out without clearing
+// the memstore snapshot.  the old snapshot will be returned when we say
+// 'snapshot', the next time flush comes around.
+// retry after catching exception when flushing, otherwise server will abort
+// itself
+ioexception lastexception   null
+for  int i   0  i < hstore flush_retries_number  i
+try
+path pathname   internalflushcache snapshot  logcacheflushid
+snapshottimerangetracker  flushedsize  status
+try
+// path name is null if there is no entry to flush
+if  pathname    null
+validatestorefile pathname
+return pathname
+catch  exception e
+log warn     pathname
+i  e
+if  e instanceof ioexception
+lastexception    ioexception  e
+else
+lastexception   new ioexception e
+catch  ioexception e
+log warn     i  e
+lastexception   e
+if  lastexception    null
+try
+thread sleep pausetime
+catch  interruptedexception e
+ioexception iie   new interruptedioexception
+iie initcause e
+throw iie
+throw lastexception
+/*
+* @param cache
+* @param logcacheflushid
+* @param snapshottimerangetracker
+* @param flushedsize the number of bytes flushed
+* @return path the path name of the tmp file to which the store was flushed
+* @throws ioexception
+*/
+private path internalflushcache final sortedset<keyvalue> set
+final long logcacheflushid
+timerangetracker snapshottimerangetracker
+atomiclong flushedsize
+monitoredtask status
+throws ioexception
+storefile writer writer
+// find the smallest read point across all the scanners.
+long smallestreadpoint   region getsmallestreadpoint
+long flushed   0
+path pathname
+// don't flush if there are no entries.
+if  set size      0
+return null
+// use a store scanner to find which rows to flush.
+// note that we need to retain deletes, hence
+// treat this as a minor compaction.
+internalscanner scanner   null
+keyvaluescanner memstorescanner   new collectionbackedscanner set  this comparator
+if  this getcoprocessorhost      null
+scanner   this getcoprocessorhost   preflushscanneropen this  memstorescanner
+if  scanner    null
+scan scan   new scan
+scan setmaxversions scaninfo getmaxversions
+scanner   new storescanner this  scaninfo  scan
+collections singletonlist memstorescanner   scantype compact_retain_deletes
+smallestreadpoint  hconstants oldest_timestamp
+if  this getcoprocessorhost      null
+internalscanner cpscanner
+this getcoprocessorhost   preflush this  scanner
+// null scanner returned from coprocessor hooks means skip normal processing
+if  cpscanner    null
+return null
+scanner   cpscanner
+try
+int compactionkvmax   conf getint hconstants compaction_kv_max  10
+// todo:  we can fail in the below block before we complete adding this
+// flush to list of store files.  add cleanup of anything put on filesystem
+// if we fail.
+synchronized  flushlock
+status setstatus     this
+// a. write the map out to the disk
+writer   createwriterintmp set size
+writer settimerangetracker snapshottimerangetracker
+pathname   writer getpath
+try
+list<keyvalue> kvs   new arraylist<keyvalue>
+boolean hasmore
+do
+hasmore   scanner next kvs  compactionkvmax
+if   kvs isempty
+for  keyvalue kv   kvs
+// if we know that this kv is going to be included always, then let us
+// set its memstorets to 0. this will help us save space when writing to
+// disk.
+if  kv getmemstorets   <  smallestreadpoint
+// let us not change the original kv. it could be in the memstore
+// changing its memstorets could affect other threads/scanners.
+kv   kv shallowcopy
+kv setmemstorets 0
+writer append kv
+flushed    this memstore heapsizechange kv  true
+kvs clear
+while  hasmore
+finally
+// write out the log sequence number that corresponds to this output
+// hfile. also write current time in metadata as minflushtime.
+// the hfile is current up to and including logcacheflushid.
+status setstatus     this
+writer appendmetadata logcacheflushid  false
+status setstatus     this
+writer close
+finally
+flushedsize set flushed
+scanner close
+if  log isinfoenabled
+log info
+logcacheflushid
+stringutils humanreadableint flushed
+pathname
+return pathname
+/*
+* @param path the pathname of the tmp file into which the store was flushed
+* @param logcacheflushid
+* @return storefile created.
+* @throws ioexception
+*/
+private storefile commitfile final path path
+final long logcacheflushid
+timerangetracker snapshottimerangetracker
+atomiclong flushedsize
+monitoredtask status
+throws ioexception
+// write-out finished successfully, move into the right spot
+path dstpath   fs commitstorefile getcolumnfamilyname    path
+status setstatus     this
+storefile sf   new storefile this getfilesystem    dstpath  this conf  this cacheconf
+this family getbloomfiltertype    this datablockencoder
+storefile reader r   sf createreader
+this storesize    r length
+this totaluncompressedbytes    r gettotaluncompressedbytes
+if  log isinfoenabled
+log info     sf       r getentries
+logcacheflushid
+stringutils humanreadableint r length
+return sf
+/*
+* @param maxkeycount
+* @return writer for a new storefile in the tmp dir.
+*/
+private storefile writer createwriterintmp long maxkeycount
+throws ioexception
+return createwriterintmp maxkeycount  this family getcompression    false  true
+/*
+* @param maxkeycount
+* @param compression compression algorithm to use
+* @param iscompaction whether we are creating a new file in a compaction
+* @return writer for a new storefile in the tmp dir.
+*/
+public storefile writer createwriterintmp long maxkeycount
+compression algorithm compression  boolean iscompaction  boolean includemvccreadpoint
+throws ioexception
+final cacheconfig writercacheconf
+if  iscompaction
+// don't cache data on write on compactions.
+writercacheconf   new cacheconfig cacheconf
+writercacheconf setcachedataonwrite false
+else
+writercacheconf   cacheconf
+storefile writer w   new storefile writerbuilder conf  writercacheconf
+this getfilesystem    blocksize
+withfilepath fs createtempname
+withdatablockencoder datablockencoder
+withcomparator comparator
+withbloomtype family getbloomfiltertype
+withmaxkeycount maxkeycount
+withchecksumtype checksumtype
+withbytesperchecksum bytesperchecksum
+withcompression compression
+includemvccreadpoint includemvccreadpoint
+build
+return w
+/*
+* change storefiles adding into place the reader produced by this new flush.
+* @param sf
+* @param set that was used to make the passed file <code>p</code>.
+* @throws ioexception
+* @return whether compaction is required.
+*/
+private boolean updatestorefiles final storefile sf
+final sortedset<keyvalue> set
+throws ioexception
+this lock writelock   lock
+try
+this storeengine getstorefilemanager   insertnewfile sf
+this memstore clearsnapshot set
+finally
+// we need the lock, as long as we are updating the storefiles
+// or changing the memstore. let us release it before calling
+// notifychangereadersobservers. see hbase-4485 for a possible
+// deadlock scenario that could have happened if continue to hold
+// the lock.
+this lock writelock   unlock
+// tell listeners of the change in readers.
+notifychangedreadersobservers
+return needscompaction
+/*
+* notify all observers that set of readers has changed.
+* @throws ioexception
+*/
+private void notifychangedreadersobservers   throws ioexception
+for  changedreadersobserver o  this changedreaderobservers
+o updatereaders
+/**
+* get all scanners with no filtering based on ttl (that happens further down
+* the line).
+* @return all scanners for this store
+*/
+@override
+public list<keyvaluescanner> getscanners boolean cacheblocks
+boolean isget  boolean iscompaction  scanquerymatcher matcher  byte startrow
+byte stoprow  throws ioexception
+collection<storefile> storefilestoscan
+list<keyvaluescanner> memstorescanners
+this lock readlock   lock
+try
+storefilestoscan
+this storeengine getstorefilemanager   getfilesforscanorget isget  startrow  stoprow
+memstorescanners   this memstore getscanners
+finally
+this lock readlock   unlock
+// first the store file scanners
+// todo this used to get the store files in descending order,
+// but now we get them in ascending order, which i think is
+// actually more correct, since memstore get put at the end.
+list<storefilescanner> sfscanners   storefilescanner
+getscannersforstorefiles storefilestoscan  cacheblocks  isget  iscompaction  matcher
+list<keyvaluescanner> scanners
+new arraylist<keyvaluescanner> sfscanners size   1
+scanners addall sfscanners
+// then the memstore scanners
+scanners addall memstorescanners
+return scanners
+@override
+public void addchangedreaderobserver changedreadersobserver o
+this changedreaderobservers add o
+@override
+public void deletechangedreaderobserver changedreadersobserver o
+// we don't check if observer present; it may not be (legitimately)
+this changedreaderobservers remove o
+//////////////////////////////////////////////////////////////////////////////
+// compaction
+//////////////////////////////////////////////////////////////////////////////
+/**
+* compact the storefiles.  this method may take some time, so the calling
+* thread must be able to block for long periods.
+*
+* <p>during this time, the store can work as usual, getting values from
+* storefiles and writing new storefiles from the memstore.
+*
+* existing storefiles are not destroyed until the new compacted storefile is
+* completely written-out to disk.
+*
+* <p>the compactlock prevents multiple simultaneous compactions.
+* the structurelock prevents us from interfering with other write operations.
+*
+* <p>we don't want to hold the structurelock for the whole time, as a compact()
+* can be lengthy and we want to allow cache-flushes during this period.
+*
+* @param compaction compaction details obtained from requestcompaction()
+* @throws ioexception
+* @return storefile we compacted into or null if we failed or opted out early.
+*/
+public list<storefile> compact compactioncontext compaction  throws ioexception
+assert compaction    null    compaction hasselection
+compactionrequest cr   compaction getrequest
+collection<storefile> filestocompact   cr getfiles
+assert  filestocompact isempty
+synchronized  filescompacting
+// sanity check: we're compacting files that this store knows about
+// todo: change this to log.error() after more debugging
+preconditions checkargument filescompacting containsall filestocompact
+// ready to go. have list of files to compact.
+log info     filestocompact size
+this       this getregioninfo   getregionnameasstring
+fs gettempdir
+stringutils humanreadableint cr getsize
+list<storefile> sfs   new arraylist<storefile>
+long compactionstarttime   environmentedgemanager currenttimemillis
+try
+// commence the compaction.
+list<path> newfiles   compaction compact
+// move the compaction into place.
+if  this conf getboolean    true
+for  path newfile  newfiles
+assert newfile    null
+storefile sf   movefileintoplace newfile
+if  this getcoprocessorhost      null
+this getcoprocessorhost   postcompact this  sf  cr
+assert sf    null
+sfs add sf
+completecompaction filestocompact  sfs
+else
+for  path newfile  newfiles
+// create storefile around what we wrote with a reader on it.
+storefile sf   new storefile this getfilesystem    newfile  this conf  this cacheconf
+this family getbloomfiltertype    this datablockencoder
+sf createreader
+sfs add sf
+finally
+finishcompactionrequest cr
+logcompactionendmessage cr  sfs  compactionstarttime
+return sfs
+/**
+* log a very elaborate compaction completion message.
+* @param cr request.
+* @param sfs resulting files.
+* @param compactionstarttime start time.
+*/
+private void logcompactionendmessage
+compactionrequest cr  list<storefile> sfs  long compactionstarttime
+long now   environmentedgemanager currenttimemillis
+stringbuilder message   new stringbuilder
+cr ismajor   ?
+cr getfiles   size         this
+this getregioninfo   getregionnameasstring
+if  sfs isempty
+message append
+else
+for  storefile sf  sfs
+message append sf getpath   getname
+message append
+message append stringutils humanreadableint sf getreader   length
+message append
+message append
+append stringutils humanreadableint storesize
+append
+append stringutils formattimediff compactionstarttime  cr getselectiontime
+append    append stringutils formattimediff now  compactionstarttime
+append
+log info message tostring
+// package-visible for tests
+storefile movefileintoplace final path newfile  throws ioexception
+validatestorefile newfile
+// move the file into the right spot
+path destpath   fs commitstorefile getcolumnfamilyname    newfile
+storefile result   new storefile this getfilesystem    destpath  this conf  this cacheconf
+this family getbloomfiltertype    this datablockencoder
+result createreader
+return result
+/**
+* this method tries to compact n recent files for testing.
+* note that because compacting "recent" files only makes sense for some policies,
+* e.g. the default one, it assumes default policy is used. it doesn't use policy,
+* but instead makes a compaction candidate list by itself.
+* @param n number of files.
+*/
+public void compactrecentfortestingassumingdefaultpolicy int n  throws ioexception
+list<storefile> filestocompact
+boolean ismajor
+this lock readlock   lock
+try
+synchronized  filescompacting
+filestocompact   lists newarraylist storeengine getstorefilemanager   getstorefiles
+if   filescompacting isempty
+// exclude all files older than the newest file we're currently
+// compacting. this allows us to preserve contiguity (hbase-2856)
+storefile last   filescompacting get filescompacting size     1
+int idx   filestocompact indexof last
+preconditions checkargument idx     1
+filestocompact sublist 0  idx   1  clear
+int count   filestocompact size
+if  n > count
+throw new runtimeexception
+filestocompact   filestocompact sublist count   n  count
+ismajor    filestocompact size      storeengine getstorefilemanager   getstorefilecount
+filescompacting addall filestocompact
+collections sort filescompacting  storefile comparators seq_id
+finally
+this lock readlock   unlock
+try
+// ready to go. have list of files to compact.
+list<path> newfiles
+this storeengine getcompactor   compactfortesting filestocompact  ismajor
+for  path newfile  newfiles
+// move the compaction into place.
+storefile sf   movefileintoplace newfile
+if  this getcoprocessorhost      null
+this getcoprocessorhost   postcompact this  sf  null
+arraylist<storefile> tmp   new arraylist<storefile>
+tmp add sf
+completecompaction filestocompact  tmp
+finally
+synchronized  filescompacting
+filescompacting removeall filestocompact
+@override
+public boolean hasreferences
+return storeutils hasreferences this storeengine getstorefilemanager   getstorefiles
+@override
+public compactionprogress getcompactionprogress
+return this storeengine getcompactor   getprogress
+@override
+public boolean ismajorcompaction   throws ioexception
+for  storefile sf   this storeengine getstorefilemanager   getstorefiles
+// todo: what are these reader checks all over the place?
+if  sf getreader      null
+log debug     sf
+return false
+return storeengine getcompactionpolicy   ismajorcompaction
+this storeengine getstorefilemanager   getstorefiles
+@override
+public compactioncontext requestcompaction   throws ioexception
+return requestcompaction store no_priority  null
+@override
+public compactioncontext requestcompaction int priority  compactionrequest baserequest
+throws ioexception
+// don't even select for compaction if writes are disabled
+if   this arewritesenabled
+return null
+compactioncontext compaction   storeengine createcompaction
+this lock readlock   lock
+try
+synchronized  filescompacting
+// first, see if coprocessor would want to override selection.
+if  this getcoprocessorhost      null
+list<storefile> candidatesforcoproc   compaction preselect this filescompacting
+boolean override   this getcoprocessorhost   precompactselection
+this  candidatesforcoproc  baserequest
+if  override
+// coprocessor is overriding normal file selection.
+compaction forceselect new compactionrequest candidatesforcoproc
+// normal case - coprocessor is not overriding file selection.
+if   compaction hasselection
+boolean isusercompaction   priority    store priority_user
+boolean mayuseoffpeak   this offpeakcompactions trystartoffpeakrequest
+compaction select this filescompacting  isusercompaction
+mayuseoffpeak  forcemajor    filescompacting isempty
+assert compaction hasselection
+if  mayuseoffpeak     compaction getrequest   isoffpeak
+// compaction policy doesn't want to take advantage of off-peak.
+this offpeakcompactions endoffpeakrequest
+if  this getcoprocessorhost      null
+this getcoprocessorhost   postcompactselection
+this  immutablelist copyof compaction getrequest   getfiles     baserequest
+// selected files; see if we have a compaction with some custom base request.
+if  baserequest    null
+// update the request with what the system thinks the request should be;
+// its up to the request if it wants to listen.
+compaction forceselect
+baserequest combinewith compaction getrequest
+// finally, we have the resulting files list. check if we have any files at all.
+final collection<storefile> selectedfiles   compaction getrequest   getfiles
+if  selectedfiles isempty
+return null
+// update filescompacting (check that we do not try to compact the same storefile twice).
+if   collections disjoint filescompacting  selectedfiles
+// todo: change this from an iae to log.error after sufficient testing
+preconditions checkargument false
+selectedfiles  filescompacting
+filescompacting addall selectedfiles
+collections sort filescompacting  storefile comparators seq_id
+// if we're enqueuing a major, clear the force flag.
+boolean ismajor   selectedfiles size      this getstorefilescount
+this forcemajor   this forcemajor     ismajor
+// set common request properties.
+// set priority, either override value supplied by caller or from store.
+compaction getrequest   setpriority
+priority    store no_priority  ? priority   getcompactpriority
+compaction getrequest   setismajor ismajor
+compaction getrequest   setdescription
+getregioninfo   getregionnameasstring    getcolumnfamilyname
+finally
+this lock readlock   unlock
+log debug getregioninfo   getencodedname         getcolumnfamilyname
+compaction getrequest   ismajor   ?
+this region reportcompactionrequeststart compaction getrequest   ismajor
+return compaction
+public void cancelrequestedcompaction compactioncontext compaction
+finishcompactionrequest compaction getrequest
+private void finishcompactionrequest compactionrequest cr
+this region reportcompactionrequestend cr ismajor
+if  cr isoffpeak
+this offpeakcompactions endoffpeakrequest
+cr setoffpeak false
+synchronized  filescompacting
+filescompacting removeall cr getfiles
+/**
+* validates a store file by opening and closing it. in hfilev2 this should
+* not be an expensive operation.
+*
+* @param path the path to the store file
+*/
+private void validatestorefile path path
+throws ioexception
+storefile storefile   null
+try
+storefile   new storefile this getfilesystem    path  this conf
+this cacheconf  this family getbloomfiltertype
+noopdatablockencoder instance
+storefile createreader
+catch  ioexception e
+log error     path
+e
+throw e
+finally
+if  storefile    null
+storefile closereader false
+/*
+* <p>it works by processing a compaction that's been written to disk.
+*
+* <p>it is usually invoked at the end of a compaction, but might also be
+* invoked at hstore startup, if the prior execution died midway through.
+*
+* <p>moving the compacted treemap into place means:
+* <pre>
+* 1) moving the new compacted storefile into place
+* 2) unload all replaced storefile, close and collect list to delete.
+* 3) loading the new treemap.
+* 4) compute new store size
+* </pre>
+*
+* @param compactedfiles list of files that were compacted
+* @param newfile storefile that is the result of the compaction
+* @return storefile created. may be null.
+* @throws ioexception
+*/
+private void completecompaction final collection<storefile> compactedfiles
+final collection<storefile> result  throws ioexception
+try
+this lock writelock   lock
+try
+// change this.storefiles so it reflects new state but do not
+// delete old store files until we have sent out notification of
+// change in case old files are still being accessed by outstanding
+// scanners.
+this storeengine getstorefilemanager   addcompactionresults compactedfiles  result
+filescompacting removeall compactedfiles      safe bc  lock writelock
+finally
+// we need the lock, as long as we are updating the storefiles
+// or changing the memstore. let us release it before calling
+// notifychangereadersobservers. see hbase-4485 for a possible
+// deadlock scenario that could have happened if continue to hold
+// the lock.
+this lock writelock   unlock
+// tell observers that list of storefiles has changed.
+notifychangedreadersobservers
+// let the archive util decide if we should archive or delete the files
+log debug
+this fs removestorefiles this getcolumnfamilyname    compactedfiles
+catch  ioexception e
+e   remoteexceptionhandler checkioexception e
+log error     this
+result    null?    result tostring
+compactedfiles tostring
+e
+// 4. compute new store size
+this storesize   0l
+this totaluncompressedbytes   0l
+for  storefile hsf   this storeengine getstorefilemanager   getstorefiles
+storefile reader r   hsf getreader
+if  r    null
+log warn     hsf
+continue
+this storesize    r length
+this totaluncompressedbytes    r gettotaluncompressedbytes
+/*
+* @param wantedversions how many versions were asked for.
+* @return wantedversions or this families' {@link hconstants#versions}.
+*/
+int versionstoreturn final int wantedversions
+if  wantedversions <  0
+throw new illegalargumentexception
+// make sure we do not return more than maximum versions for this store.
+int maxversions   this family getmaxversions
+return wantedversions > maxversions ? maxversions  wantedversions
+static boolean isexpired final keyvalue key  final long oldesttimestamp
+return key gettimestamp   < oldesttimestamp
+@override
+public keyvalue getrowkeyatorbefore final byte row  throws ioexception
+// if minversions is set, we will not ignore expired kvs.
+// as we're only looking for the latest matches, that should be ok.
+// with minversions > 0 we guarantee that any kv that has any version
+// at all (expired or not) has at least one version that will not expire.
+// note that this method used to take a keyvalue as arguments. keyvalue
+// can be back-dated, a row key cannot.
+long ttltouse   scaninfo getminversions   > 0 ? long max_value   this scaninfo getttl
+keyvalue kv   new keyvalue row  hconstants latest_timestamp
+getclosestrowbeforetracker state   new getclosestrowbeforetracker
+this comparator  kv  ttltouse  this getregioninfo   ismetaregion
+this lock readlock   lock
+try
+// first go to the memstore.  pick up deletes and candidates.
+this memstore getrowkeyatorbefore state
+// check if match, if we got a candidate on the asked for 'kv' row.
+// process each relevant store file. run through from newest to oldest.
+iterator<storefile> sfiterator   this storeengine getstorefilemanager
+getcandidatefilesforrowkeybefore state gettargetkey
+while  sfiterator hasnext
+storefile sf   sfiterator next
+sfiterator remove       remove sf from iterator
+boolean havenewcandidate   rowatorbeforefromstorefile sf  state
+if  havenewcandidate
+// todo: we may have an optimization here which stops the search if we find exact match.
+sfiterator   this storeengine getstorefilemanager   updatecandidatefilesforrowkeybefore
+sfiterator  state gettargetkey    state getcandidate
+return state getcandidate
+finally
+this lock readlock   unlock
+/*
+* check an individual mapfile for the row at or before a given row.
+* @param f
+* @param state
+* @throws ioexception
+* @return true iff the candidate has been updated in the state.
+*/
+private boolean rowatorbeforefromstorefile final storefile f
+final getclosestrowbeforetracker state
+throws ioexception
+storefile reader r   f getreader
+if  r    null
+log warn     f
+return false
+if  r getentries      0
+log warn     f
+return false
+// todo: cache these keys rather than make each time?
+byte  fk   r getfirstkey
+if  fk    null  return false
+keyvalue firstkv   keyvalue createkeyvaluefromkey fk  0  fk length
+byte  lk   r getlastkey
+keyvalue lastkv   keyvalue createkeyvaluefromkey lk  0  lk length
+keyvalue firstonrow   state gettargetkey
+if  this comparator comparerows lastkv  firstonrow  < 0
+// if last key in file is not of the target table, no candidates in this
+// file.  return.
+if   state istargettable lastkv   return false
+// if the row we're looking for is past the end of file, set search key to
+// last key. todo: cache last and first key rather than make each time.
+firstonrow   new keyvalue lastkv getrow    hconstants latest_timestamp
+// get a scanner that caches blocks and that uses pread.
+hfilescanner scanner   r getscanner true  true  false
+// seek scanner.  if can't seek it, return.
+if   seektoscanner scanner  firstonrow  firstkv   return false
+// if we found candidate on firstonrow, just return. this will never happen!
+// unlikely that there'll be an instance of actual first row in table.
+if  walkforwardinsinglerow scanner  firstonrow  state   return true
+// if here, need to start backing up.
+while  scanner seekbefore firstonrow getbuffer    firstonrow getkeyoffset
+firstonrow getkeylength
+keyvalue kv   scanner getkeyvalue
+if   state istargettable kv   break
+if   state isbettercandidate kv   break
+// make new first on row.
+firstonrow   new keyvalue kv getrow    hconstants latest_timestamp
+// seek scanner.  if can't seek it, break.
+if   seektoscanner scanner  firstonrow  firstkv   return false
+// if we find something, break;
+if  walkforwardinsinglerow scanner  firstonrow  state   return true
+return false
+/*
+* seek the file scanner to firstonrow or first entry in file.
+* @param scanner
+* @param firstonrow
+* @param firstkv
+* @return true if we successfully seeked scanner.
+* @throws ioexception
+*/
+private boolean seektoscanner final hfilescanner scanner
+final keyvalue firstonrow
+final keyvalue firstkv
+throws ioexception
+keyvalue kv   firstonrow
+// if firstonrow < firstkv, set to firstkv
+if  this comparator comparerows firstkv  firstonrow     0  kv   firstkv
+int result   scanner seekto kv getbuffer    kv getkeyoffset
+kv getkeylength
+return result >  0
+/*
+* when we come in here, we are probably at the kv just before we break into
+* the row that firstonrow is on.  usually need to increment one time to get
+* on to the row we are interested in.
+* @param scanner
+* @param firstonrow
+* @param state
+* @return true we found a candidate.
+* @throws ioexception
+*/
+private boolean walkforwardinsinglerow final hfilescanner scanner
+final keyvalue firstonrow
+final getclosestrowbeforetracker state
+throws ioexception
+boolean foundcandidate   false
+do
+keyvalue kv   scanner getkeyvalue
+// if we are not in the row, skip.
+if  this comparator comparerows kv  firstonrow  < 0  continue
+// did we go beyond the target row? if so break.
+if  state istoofar kv  firstonrow   break
+if  state isexpired kv
+continue
+// if we added something, this row is a contender. break.
+if  state handle kv
+foundcandidate   true
+break
+while scanner next
+return foundcandidate
+public boolean cansplit
+this lock readlock   lock
+try
+// not split-able if we find a reference store file present in the store.
+boolean result    hasreferences
+if   result    log isdebugenabled
+log debug
+return result
+finally
+this lock readlock   unlock
+@override
+public byte getsplitpoint
+this lock readlock   lock
+try
+// should already be enforced by the split policy!
+assert  this getregioninfo   ismetaregion
+// not split-able if we find a reference store file present in the store.
+if  hasreferences
+assert false
+return null
+return this storeengine getstorefilemanager   getsplitpoint
+catch ioexception e
+log warn     this  e
+finally
+this lock readlock   unlock
+return null
+@override
+public long getlastcompactsize
+return this lastcompactsize
+@override
+public long getsize
+return storesize
+public void triggermajorcompaction
+this forcemajor   true
+boolean getforcemajorcompaction
+return this forcemajor
+//////////////////////////////////////////////////////////////////////////////
+// file administration
+//////////////////////////////////////////////////////////////////////////////
+@override
+public keyvaluescanner getscanner scan scan
+final navigableset<byte > targetcols  throws ioexception
+lock readlock   lock
+try
+keyvaluescanner scanner   null
+if  this getcoprocessorhost      null
+scanner   this getcoprocessorhost   prestorescanneropen this  scan  targetcols
+if  scanner    null
+scanner   new storescanner this  getscaninfo    scan  targetcols
+return scanner
+finally
+lock readlock   unlock
+@override
+public string tostring
+return this getcolumnfamilyname
+@override
+// todo: why is there this and also getnumberofstorefiles?! remove one.
+public int getstorefilescount
+return this storeengine getstorefilemanager   getstorefilecount
+@override
+public long getstoresizeuncompressed
+return this totaluncompressedbytes
+@override
+public long getstorefilessize
+long size   0
+for  storefile s  this storeengine getstorefilemanager   getstorefiles
+storefile reader r   s getreader
+if  r    null
+log warn     s
+continue
+size    r length
+return size
+@override
+public long getstorefilesindexsize
+long size   0
+for  storefile s  this storeengine getstorefilemanager   getstorefiles
+storefile reader r   s getreader
+if  r    null
+log warn     s
+continue
+size    r indexsize
+return size
+@override
+public long gettotalstaticindexsize
+long size   0
+for  storefile s   this storeengine getstorefilemanager   getstorefiles
+size    s getreader   getuncompresseddataindexsize
+return size
+@override
+public long gettotalstaticbloomsize
+long size   0
+for  storefile s   this storeengine getstorefilemanager   getstorefiles
+storefile reader r   s getreader
+size    r gettotalbloomsize
+return size
+@override
+public long getmemstoresize
+return this memstore heapsize
+@override
+public int getcompactpriority
+return this storeengine getstorefilemanager   getstorecompactionpriority
+@override
+public boolean throttlecompaction long compactionsize
+return storeengine getcompactionpolicy   throttlecompaction compactionsize
+public hregion gethregion
+return this region
+@override
+public regioncoprocessorhost getcoprocessorhost
+return this region getcoprocessorhost
+@override
+public hregioninfo getregioninfo
+return this fs getregioninfo
+@override
+public boolean arewritesenabled
+return this region arewritesenabled
+@override
+public long getsmallestreadpoint
+return this region getsmallestreadpoint
+/**
+* used in tests. todo: remove
+*
+* updates the value for the given row/family/qualifier. this function will always be seen as
+* atomic by other readers because it only puts a single kv to memstore. thus no read/write
+* control necessary.
+* @param row row to update
+* @param f family to update
+* @param qualifier qualifier to update
+* @param newvalue the new value to set into memstore
+* @return memstore size delta
+* @throws ioexception
+*/
+public long updatecolumnvalue byte  row  byte  f
+byte  qualifier  long newvalue
+throws ioexception
+this lock readlock   lock
+try
+long now   environmentedgemanager currenttimemillis
+return this memstore updatecolumnvalue row
+f
+qualifier
+newvalue
+now
+finally
+this lock readlock   unlock
+@override
+public long upsert iterable<? extends cell> cells  long readpoint  throws ioexception
+this lock readlock   lock
+try
+return this memstore upsert cells  readpoint
+finally
+this lock readlock   unlock
+public storeflusher getstoreflusher long cacheflushid
+return new storeflusherimpl cacheflushid
+private class storeflusherimpl implements storeflusher
+private long cacheflushid
+private sortedset<keyvalue> snapshot
+private storefile storefile
+private path storefilepath
+private timerangetracker snapshottimerangetracker
+private atomiclong flushedsize
+private storeflusherimpl long cacheflushid
+this cacheflushid   cacheflushid
+this flushedsize   new atomiclong
+@override
+public void prepare
+memstore snapshot
+this snapshot   memstore getsnapshot
+this snapshottimerangetracker   memstore getsnapshottimerangetracker
+@override
+public void flushcache monitoredtask status  throws ioexception
+storefilepath   hstore this flushcache
+cacheflushid  snapshot  snapshottimerangetracker  flushedsize  status
+@override
+public boolean commit monitoredtask status  throws ioexception
+if  storefilepath    null
+return false
+storefile   hstore this commitfile storefilepath  cacheflushid
+snapshottimerangetracker  flushedsize  status
+if  hstore this getcoprocessorhost      null
+hstore this getcoprocessorhost   postflush hstore this  storefile
+// add new file to store files.  clear snapshot too while we have
+// the store write lock.
+return hstore this updatestorefiles storefile  snapshot
+@override
+public boolean needscompaction
+return storeengine getcompactionpolicy   needscompaction
+this storeengine getstorefilemanager   getstorefiles    filescompacting
+@override
+public cacheconfig getcacheconfig
+return this cacheconf
+public static final long fixed_overhead
+classsize align  17   classsize reference     5   bytes sizeof_long
+2   bytes sizeof_int    bytes sizeof_boolean
+public static final long deep_overhead   classsize align fixed_overhead
+classsize object   classsize reentrant_lock
+classsize concurrent_skiplistmap
+classsize concurrent_skiplistmap_entry   classsize object
+scaninfo fixed_overhead
+@override
+public long heapsize
+return deep_overhead   this memstore heapsize
+public keyvalue kvcomparator getcomparator
+return comparator
+@override
+public scaninfo getscaninfo
+return scaninfo
+/**
+* set scan info, used by test
+* @param scaninfo new scan info to use for test
+*/
+void setscaninfo scaninfo scaninfo
+this scaninfo   scaninfo
+@override
+public boolean hastoomanystorefiles
+return getstorefilescount   > this blockingfilecount

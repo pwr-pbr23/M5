@@ -1,0 +1,474 @@
+/*
+derby - class org.apache.derby.impl.sql.execute.sortresultset
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl sql execute
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services stream headerprintwriter
+import org apache derby iapi services stream infostreams
+import org apache derby iapi services io formatable
+import org apache derby iapi sql execute cursorresultset
+import org apache derby iapi sql resultset
+import org apache derby iapi sql execute execrow
+import org apache derby iapi sql execute noputresultset
+import org apache derby iapi sql activation
+import org apache derby iapi store access columnordering
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi store access sortobserver
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi store access sortcontroller
+import org apache derby iapi store access scancontroller
+import org apache derby iapi services loader generatedmethod
+import org apache derby iapi sql conn languageconnectioncontext
+import org apache derby iapi error standardexception
+import org apache derby iapi types rowlocation
+import org apache derby iapi services io formatablearrayholder
+import java util properties
+import java util vector
+import java util enumeration
+/**
+* takes a source result set, sends it to the sorter,
+* and returns the results.  if distinct is true, removes
+* all but one copy of duplicate rows using distinctaggregator,
+* which really doesn't aggregate anything at all -- the sorter
+* assumes that the presence of an aggregator means that
+* it should return a single row for each set with identical
+* ordering columns.
+* <p>
+* if aggregate is true, then it feeds any number of aggregates
+* to the sorter.  each aggregate is an instance of genericaggregator
+* which knows which aggregator to call to perform the
+* aggregation.
+* <p>
+* brief background on the sorter and aggregates: the sorter
+* has some rudimentary knowledge about aggregates.  if
+* it is passed aggregates, it will eliminate duplicates
+* on the ordering columns.  in the process it will call the
+* aggregator on each row that is discarded.
+* <p>
+* note that a distinct on the select list and an aggregate cannot
+* be processed by the same sortresultset(), if there are both
+* aggregates (distinct or otherwise) and a distinct on the select
+* list, then 2 separate sortresultsets are required (the distinct
+* is a sort on the output of the sort with the aggregation).
+* <p>
+* currently, all rows are fed through the sorter.  this is
+* true even if there is no sorting needed.  in this case
+* we feed every row in and just pull every row out (this is
+* an obvious area for a performance improvement).  we'll
+* need to know if the rows are sorted before we can make
+* any optimizations in this area.
+* <p>
+* <b>cloning</b>: cloning and sorts are an important topic.
+* currently we do a lot of cloning.  we clone the following: <ul>
+* <li> every row that is inserted into the sorter.  we
+* need to clone the rows because the source result set might
+* be reusing rows, and we need to be able to accumulate the
+* entire result set in the sorter. </li>
+* <p>
+* there are two cloning apis: cloning by the sorter on
+* rows that are not discarded as duplicates or cloning
+* in the sortresultset prior to inserting into the sorter.
+* if we have any aggregates at all we always clone prior
+* to inserting into the sorter.  we need to do this
+* because we have to set up the aggregators before passing
+* them into the sorter.  when we don't have aggregates
+* we let the sorter to the cloning to avoid unnecessary
+* clones on duplicate rows that are going to be discarded
+* anyway.
+*
+* @author ames, rewrite for aggregates by jamie, aggregate removal by jerry
+*/
+class sortresultset extends noputresultsetimpl
+implements cursorresultset
+/* run time statistics variables */
+public int rowsinput
+public int rowsreturned
+public boolean distinct
+// set in constructor and not altered during
+// life of object.
+public noputresultset source
+private generatedmethod rowallocator
+private columnordering order
+private columnordering savedorder
+private sortobserver observer
+private execrow sorttemplaterow
+public	boolean isinsortedorder 				   true if source results in sorted order
+private	noputresultset	originalsource     used for run time stats only
+private int maxrowsize
+// set in open and not modified thereafter
+private scancontroller scancontroller
+// argument to getnextrowfromrs()
+private execrow sortresultrow
+// in order distincts
+private execrow currsortedrow
+private boolean nextcalled
+private int numcolumns
+// used to track and close sorts
+private long genericsortid
+private boolean dropgenericsort
+// remember whether or not any sort was performed
+private boolean sorted
+// rts
+public properties sortproperties   new properties
+/**
+* constructor
+*
+* @param	s			input result set
+* @param	distinct	if this is a distinct select list.
+*		also set to true for a group by w/o aggretates
+* @param	isinsortedorder	true if the source results are in sorted order
+* @param	orderingitem	indicates the number of the
+*		savedobject off of the preparedstatement that holds the
+*		columordering array used by this routine
+* @param	a				activation
+* @param	ra				generated method to build an empty
+*	 	output row
+* @param	maxrowsize		approx row size, passed to sorter
+* @param	resultsetnumber	the resultsetnumber for this result set
+*
+* @exception standardexception thrown on error
+*/
+public sortresultset noputresultset s
+boolean distinct
+boolean isinsortedorder
+int	orderingitem
+activation a
+generatedmethod ra
+int maxrowsize
+int resultsetnumber
+double optimizerestimatedrowcount
+double optimizerestimatedcost  throws standardexception
+super a  resultsetnumber  optimizerestimatedrowcount  optimizerestimatedcost
+this distinct   distinct
+this isinsortedorder   isinsortedorder
+source   s
+originalsource   s
+rowallocator   ra
+this maxrowsize   maxrowsize
+sorttemplaterow    execrow  rowallocator invoke activation
+order    columnordering
+formatablearrayholder
+a getpreparedstatement   getsavedobject orderingitem
+getarray columnordering class
+/* note: we need to save order to another variable
+* in the constructor and reset it on every open.
+* this is important because order can get reset in the
+* guts of execution below.  subsequent sorts could get
+* the wrong result without this logic.
+*/
+savedorder   order
+/*
+** create a sort observer that are retained by the
+** sort.
+*/
+observer   new basicsortobserver true  distinct  sorttemplaterow  true
+constructortime    getelapsedmillis begintime
+///////////////////////////////////////////////////////////////////////////////
+//
+// resultset interface (leftover from noputresultset)
+//
+///////////////////////////////////////////////////////////////////////////////
+/**
+* open the scan.  load the sorter and prepare to get
+* rows from it.
+*
+* @exception standardexception thrown if cursor finished.
+*/
+public void	opencore   throws standardexception
+nextcalled   false
+begintime   getcurrenttimemillis
+// revisit: through the direct db api, this needs to be an
+// error, not an assert; users can open twice. only through jdbc
+// is access to open controlled and ensured valid.
+if  sanitymanager debug
+sanitymanager assert    isopen
+/* note: we need to save order to another variable
+* in the constructor and reset it on every open.
+* this is important because order can get reset in the
+* guts of execution below.  subsequent sorts could get
+* the wrong result without this logic.
+*/
+order   savedorder
+sortresultrow   sorttemplaterow getclone
+source opencore
+/* if this is an in-order distinct then we do not need the sorter.
+* (we filter out the duplicate rows ourselves.)
+* we save a clone of the first row so that subsequent next()s
+* do not overwrite the saved row.
+*/
+if  isinsortedorder    distinct
+currsortedrow   getnextrowfromrs
+if  currsortedrow    null
+currsortedrow    execrow  currsortedrow getclone
+else
+/*
+** load up the sorter.
+*/
+scancontroller   loadsorter
+sorted   true
+isopen   true
+numopens
+opentime    getelapsedmillis begintime
+/**
+* load up the sorter.  feed it every row from the
+* source scan.  when done, close
+* the source scan and open the sort.  return the sort
+* scan controller.
+*
+* @exception standardexception thrown on failure.
+*
+* @return	the sort controller
+*/
+private scancontroller loadsorter
+throws standardexception
+sortcontroller 			sorter
+long 					sortid
+execrow 				sourcerow
+execrow					inputrow
+boolean					inorder    order length    0    isinsortedorder
+int						inputrowcountestimate    int  optimizerestimatedrowcount
+// find the language context and
+// get the current transaction controller
+transactioncontroller tc   gettransactioncontroller
+sortid   tc createsort  properties null
+sorttemplaterow getrowarray
+order
+observer
+inorder
+inputrowcountestimate     est rows
+maxrowsize			   est rowsize
+sorter   tc opensort sortid
+genericsortid   sortid
+dropgenericsort   true
+/* the sorter is responsible for doing the cloning */
+while   inputrow   getnextrowfromrs       null
+/* the sorter is responsible for doing the cloning */
+sorter insert inputrow getrowarray
+source close
+sortproperties   sorter getsortinfo   getallsortinfo sortproperties
+sorter close
+return tc opensortscan sortid  activation getresultsetholdability
+/**
+* return the next row.
+*
+* @exception standardexception thrown on failure.
+* @exception standardexception resultsetnotopen thrown if not yet open.
+*
+* @return the next row in the result
+*/
+public execrow	getnextrowcore   throws standardexception
+if   isopen
+return null
+begintime   getcurrenttimemillis
+// in order distinct
+if  isinsortedorder    distinct
+// no rows, no work to do
+if  currsortedrow    null
+nexttime    getelapsedmillis begintime
+return null
+/* if this is the 1st next, then simply return the 1st row
+* (which we got on the open()).
+*/
+if    nextcalled
+nextcalled   true
+numcolumns   currsortedrow getrowarray   length
+nexttime    getelapsedmillis begintime
+rowsreturned
+setcurrentrow currsortedrow
+return currsortedrow
+execrow sortresult   getnextrowfromrs
+/* drain and throw away rows until we find a new distinct row. */
+while  sortresult    null
+/* we found a new row.  update the current row and return this one. */
+if    filterrow currsortedrow  sortresult
+/* save a clone of the new row so that it doesn't get overwritten */
+currsortedrow    execrow  sortresult getclone
+setcurrentrow currsortedrow
+nexttime    getelapsedmillis begintime
+rowsreturned
+return currsortedrow
+// get the next row
+sortresult   getnextrowfromrs
+// we've drained the source, so no more rows to return
+currsortedrow   null
+nexttime    getelapsedmillis begintime
+return null
+else
+execrow sortresult   getnextrowfromrs
+if  sortresult    null
+setcurrentrow sortresult
+rowsreturned
+nexttime    getelapsedmillis begintime
+return sortresult
+/**
+* filter out the new row if it has the same contents as
+* the current row.  (this allows us to process in-order
+* distincts without a sorter.)
+*
+* @param currrow	the current row.
+* @param newrow	the new row.
+*
+* @return	whether or not to filter out the new row.
+*
+* @exception standardexception thrown on failure to get row location
+*/
+private boolean filterrow execrow currrow  execrow newrow
+throws standardexception
+for  int index   1  index <  numcolumns  index
+datavaluedescriptor currorderable   currrow getcolumn index
+datavaluedescriptor neworderable   newrow getcolumn index
+if     currorderable compare datavaluedescriptor order_op_equals  neworderable  true  true
+return false
+return true
+/**
+* if the result set has been opened,
+* close the open scan.
+*
+* @exception standardexception thrown on error
+*/
+public void	close   throws standardexception
+begintime   getcurrenttimemillis
+if   isopen
+// we don't want to keep around a pointer to the
+// row ... so it can be thrown away.
+// revisit: does this need to be in a finally
+// block, to ensure that it is executed?
+clearcurrentrow
+sortresultrow   null
+closesource
+if  dropgenericsort
+gettransactioncontroller   dropsort genericsortid
+dropgenericsort   false
+super close
+else
+if  sanitymanager debug
+sanitymanager debug
+closetime    getelapsedmillis begintime
+isopen   false
+public void	finish   throws standardexception
+source finish
+finishandrts
+/**
+* return the total amount of time spent in this resultset
+*
+* @param type	current_resultset_only - time spent only in this resultset
+*				entire_resultset_tree  - time spent in this resultset and below.
+*
+* @return long		the total amount of time spent (in milliseconds).
+*/
+public long gettimespent int type
+long tottime   constructortime   opentime   nexttime
+closetime
+if  type    noputresultset current_resultset_only
+return	tottime   originalsource gettimespent entire_resultset_tree
+else
+return tottime
+///////////////////////////////////////////////////////////////////////////////
+//
+// cursorresultset interface
+//
+///////////////////////////////////////////////////////////////////////////////
+/**
+* this result set has its row location from
+* the last fetch done. if the cursor is closed,
+* a null is returned.
+*
+* @see cursorresultset
+*
+* @return the row location of the current cursor row.
+* @exception standardexception thrown on failure to get row location
+*/
+public rowlocation getrowlocation   throws standardexception
+if    isopen  return null
+// revisit: could we reuse the same rowlocation object
+// across several calls?
+rowlocation rl
+rl   scancontroller newrowlocationtemplate
+scancontroller fetchlocation rl
+return rl
+/**
+* this result set has its row from the last fetch done.
+* if the cursor is closed, a null is returned.
+*
+* @see cursorresultset
+*
+* @return the last row returned;
+* @exception standardexception thrown on failure.
+*/
+/* resolve - this should return activation.getcurrentrow(resultsetnumber),
+* once there is such a method.  (currentrow is redundant)
+*/
+public execrow getcurrentrow   throws standardexception
+if  sanitymanager debug
+sanitymanager assert isopen
+/*
+distinct assumes the currentrow is good, since it
+is the only one with access to its sort scan result
+*/
+return currentrow
+///////////////////////////////////////////////////////////////////////////////
+//
+// scan abstraction utilities
+//
+///////////////////////////////////////////////////////////////////////////////
+/**
+* get the next output row for processing
+*/
+private execrow getnextrowfromrs
+throws standardexception
+return  scancontroller    null  ?
+getrowfromresultset
+getrowfromsorter
+/**
+* get a row from the input result set.
+*/
+private execrow getrowfromresultset
+throws standardexception
+execrow				sourcerow
+execrow			inputrow   null
+if   sourcerow   source getnextrowcore       null
+rowsinput
+inputrow   sourcerow
+return inputrow
+/**
+* get a row from the sorter.  side effects:
+* sets currentrow.
+*/
+private execrow getrowfromsorter
+throws standardexception
+execrow			inputrow   null
+if  scancontroller next
+// remind: hackalert we are assuming that result will
+// point to what sortresult is manipulating when
+// we complete the fetch.
+currentrow   sortresultrow
+inputrow   sortresultrow
+scancontroller fetch inputrow getrowarray
+return inputrow
+/**
+* close the source of whatever we have been scanning.
+*/
+private void closesource   throws standardexception
+if  scancontroller    null
+/*
+** note: do not null out source, we
+** may be opened again, in which case
+** we will open source again.
+*/
+source close
+else
+scancontroller close
+scancontroller   null

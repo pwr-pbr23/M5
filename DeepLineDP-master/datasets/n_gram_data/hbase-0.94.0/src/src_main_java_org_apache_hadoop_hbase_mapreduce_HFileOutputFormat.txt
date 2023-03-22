@@ -1,0 +1,350 @@
+/**
+* copyright 2009 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase mapreduce
+import java io ioexception
+import java io unsupportedencodingexception
+import java net uri
+import java net urisyntaxexception
+import java net urldecoder
+import java net urlencoder
+import java util arraylist
+import java util collection
+import java util list
+import java util map
+import java util treemap
+import java util treeset
+import java util uuid
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop filecache distributedcache
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase hcolumndescriptor
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase client htable
+import org apache hadoop hbase client put
+import org apache hadoop hbase io immutablebyteswritable
+import org apache hadoop hbase io hfile cacheconfig
+import org apache hadoop hbase io hfile compression
+import org apache hadoop hbase io hfile hfile
+import org apache hadoop hbase regionserver storefile
+import org apache hadoop hbase regionserver timerangetracker
+import org apache hadoop hbase util bytes
+import org apache hadoop io nullwritable
+import org apache hadoop io sequencefile
+import org apache hadoop io writableutils
+import org apache hadoop mapreduce job
+import org apache hadoop mapreduce partitioner
+import org apache hadoop mapreduce recordwriter
+import org apache hadoop mapreduce taskattemptcontext
+import org apache hadoop mapreduce lib output fileoutputcommitter
+import org apache hadoop mapreduce lib output fileoutputformat
+/**
+* writes hfiles. passed keyvalues must arrive in order.
+* currently, can only write files to a single column family at a
+* time.  multiple column families requires coordinating keys cross family.
+* writes current time as the sequence id for the file. sets the major compacted
+* attribute on created hfiles. calling write(null,null) will forceably roll
+* all hfiles being written.
+* @see keyvaluesortreducer
+*/
+public class hfileoutputformat extends fileoutputformat<immutablebyteswritable  keyvalue>
+static log log   logfactory getlog hfileoutputformat class
+static final string compression_conf_key
+timerangetracker trt   new timerangetracker
+public recordwriter<immutablebyteswritable  keyvalue> getrecordwriter final taskattemptcontext context
+throws ioexception  interruptedexception
+// get the path of the temporary output file
+final path outputpath   fileoutputformat getoutputpath context
+final path outputdir   new fileoutputcommitter outputpath  context  getworkpath
+final configuration conf   context getconfiguration
+final filesystem fs   outputdir getfilesystem conf
+// these configs. are from hbase-*.xml
+final long maxsize   conf getlong hconstants hregion_max_filesize
+hconstants default_max_file_size
+final int blocksize   conf getint
+hfile default_blocksize
+// invented config.  add to hbase-*.xml if other than default compression.
+final string defaultcompression   conf get
+compression algorithm none getname
+final boolean compactionexclude   conf getboolean
+false
+// create a map from column family to the compression algorithm
+final map<byte  string> compressionmap   createfamilycompressionmap conf
+return new recordwriter<immutablebyteswritable  keyvalue>
+// map of families to writers and how much has been output on the writer.
+private final map<byte   writerlength> writers
+new treemap<byte   writerlength> bytes bytes_comparator
+private byte  previousrow   hconstants empty_byte_array
+private final byte  now   bytes tobytes system currenttimemillis
+private boolean rollrequested   false
+public void write immutablebyteswritable row  keyvalue kv
+throws ioexception
+// null input == user explicitly wants to flush
+if  row    null    kv    null
+rollwriters
+return
+byte  rowkey   kv getrow
+long length   kv getlength
+byte  family   kv getfamily
+writerlength wl   this writers get family
+// if this is a new column family, verify that the directory exists
+if  wl    null
+fs mkdirs new path outputdir  bytes tostring family
+// if any of the hfiles for the column families has reached
+// maxsize, we need to roll all the writers
+if  wl    null    wl written   length >  maxsize
+this rollrequested   true
+// this can only happen once a row is finished though
+if  rollrequested    bytes compareto this previousrow  rowkey     0
+rollwriters
+// create a new hlog writer, if necessary
+if  wl    null    wl writer    null
+wl   getnewwriter family  conf
+// we now have the proper hlog writer. full steam ahead
+kv updatelateststamp this now
+trt includetimestamp kv
+wl writer append kv
+wl written    length
+// copy the row so we know when a row transition.
+this previousrow   rowkey
+private void rollwriters   throws ioexception
+for  writerlength wl   this writers values
+if  wl writer    null
+log info     wl writer getpath
+wl written    0 ?        wl written
+close wl writer
+wl writer   null
+wl written   0
+this rollrequested   false
+/* create a new hfile.writer.
+* @param family
+* @return a writerlength, containing a new hfile.writer.
+* @throws ioexception
+*/
+private writerlength getnewwriter byte family  configuration conf
+throws ioexception
+writerlength wl   new writerlength
+path familydir   new path outputdir  bytes tostring family
+string compression   compressionmap get family
+compression   compression    null ? defaultcompression   compression
+wl writer   hfile getwriterfactorynocache conf
+withpath fs  storefile getuniquefile fs  familydir
+withblocksize blocksize
+withcompression compression
+withcomparator keyvalue key_comparator
+create
+this writers put family  wl
+return wl
+private void close final hfile writer w  throws ioexception
+if  w    null
+w appendfileinfo storefile bulkload_time_key
+bytes tobytes system currenttimemillis
+w appendfileinfo storefile bulkload_task_key
+bytes tobytes context gettaskattemptid   tostring
+w appendfileinfo storefile major_compaction_key
+bytes tobytes true
+w appendfileinfo storefile exclude_from_minor_compaction_key
+bytes tobytes compactionexclude
+w appendfileinfo storefile timerange_key
+writableutils tobytearray trt
+w close
+public void close taskattemptcontext c
+throws ioexception  interruptedexception
+for  writerlength wl  this writers values
+close wl writer
+/*
+* data structure to hold a writer and amount of data written on it.
+*/
+static class writerlength
+long written   0
+hfile writer writer   null
+/**
+* return the start keys of all of the regions in this table,
+* as a list of immutablebyteswritable.
+*/
+private static list<immutablebyteswritable> getregionstartkeys htable table
+throws ioexception
+byte bytekeys   table getstartkeys
+arraylist<immutablebyteswritable> ret
+new arraylist<immutablebyteswritable> bytekeys length
+for  byte bytekey   bytekeys
+ret add new immutablebyteswritable bytekey
+return ret
+/**
+* write out a sequencefile that can be read by totalorderpartitioner
+* that contains the split points in startkeys.
+* @param partitionspath output path for sequencefile
+* @param startkeys the region start keys
+*/
+private static void writepartitions configuration conf  path partitionspath
+list<immutablebyteswritable> startkeys  throws ioexception
+if  startkeys isempty
+throw new illegalargumentexception
+// we're generating a list of split points, and we don't ever
+// have keys < the first region (which has an empty start key)
+// so we need to remove it. otherwise we would end up with an
+// empty reducer with index 0
+treeset<immutablebyteswritable> sorted
+new treeset<immutablebyteswritable> startkeys
+immutablebyteswritable first   sorted first
+if   first equals hconstants empty_byte_array
+throw new illegalargumentexception
+bytes tostringbinary first get
+sorted remove first
+// write the actual file
+filesystem fs   partitionspath getfilesystem conf
+sequencefile writer writer   sequencefile createwriter fs
+conf  partitionspath  immutablebyteswritable class  nullwritable class
+try
+for  immutablebyteswritable startkey   sorted
+writer append startkey  nullwritable get
+finally
+writer close
+/**
+* configure a mapreduce job to perform an incremental load into the given
+* table. this
+* <ul>
+*   <li>inspects the table to configure a total order partitioner</li>
+*   <li>uploads the partitions file to the cluster and adds it to the distributedcache</li>
+*   <li>sets the number of reduce tasks to match the current number of regions</li>
+*   <li>sets the output key/value class to match hfileoutputformat's requirements</li>
+*   <li>sets the reducer up to perform the appropriate sorting (either keyvaluesortreducer or
+*     putsortreducer)</li>
+* </ul>
+* the user should be sure to set the map output value class to either keyvalue or put before
+* running this function.
+*/
+public static void configureincrementalload job job  htable table
+throws ioexception
+configuration conf   job getconfiguration
+class<? extends partitioner> topclass
+try
+topclass   gettotalorderpartitionerclass
+catch  classnotfoundexception e
+throw new ioexception    e
+job setpartitionerclass topclass
+job setoutputkeyclass immutablebyteswritable class
+job setoutputvalueclass keyvalue class
+job setoutputformatclass hfileoutputformat class
+// based on the configured map output class, set the correct reducer to properly
+// sort the incoming values.
+// todo it would be nice to pick one or the other of these formats.
+if  keyvalue class equals job getmapoutputvalueclass
+job setreducerclass keyvaluesortreducer class
+else if  put class equals job getmapoutputvalueclass
+job setreducerclass putsortreducer class
+else
+log warn     job getmapoutputvalueclass
+log info     table
+list<immutablebyteswritable> startkeys   getregionstartkeys table
+log info     startkeys size
+job setnumreducetasks startkeys size
+path partitionspath   new path job getworkingdirectory
+uuid randomuuid
+log info     partitionspath
+filesystem fs   partitionspath getfilesystem conf
+writepartitions conf  partitionspath  startkeys
+partitionspath makequalified fs
+uri cacheuri
+try
+// below we make explicit reference to the bundled top.  its cheating.
+// we are assume the define in the hbase bundled top is as it is in
+// hadoop (whether 0.20 or 0.22, etc.)
+cacheuri   new uri partitionspath tostring
+org apache hadoop hbase mapreduce hadoopbackport totalorderpartitioner default_path
+catch  urisyntaxexception e
+throw new ioexception e
+distributedcache addcachefile cacheuri  conf
+distributedcache createsymlink conf
+// set compression algorithms based on column families
+configurecompression table  conf
+tablemapreduceutil adddependencyjars job
+log info
+/**
+* if > hadoop 0.20, then we want to use the hadoop totalorderpartitioner.
+* if 0.20, then we want to use the top that we have under hadoopbackport.
+* this method is about hbase being able to run on different versions of
+* hadoop.  in 0.20.x hadoops, we have to use the top that is bundled with
+* hbase.  otherwise, we use the one in hadoop.
+* @return instance of the totalorderpartitioner class
+* @throws classnotfoundexception if can't find a totalorderpartitioner.
+*/
+private static class<? extends partitioner> gettotalorderpartitionerclass
+throws classnotfoundexception
+class<? extends partitioner> clazz   null
+try
+clazz    class<? extends partitioner>  class forname
+catch  classnotfoundexception e
+clazz
+class<? extends partitioner>  class forname
+return clazz
+/**
+* run inside the task to deserialize column family to compression algorithm
+* map from the
+* configuration.
+*
+* package-private for unit tests only.
+*
+* @return a map from column family to the name of the configured compression
+*         algorithm
+*/
+static map<byte  string> createfamilycompressionmap configuration conf
+map<byte  string> compressionmap   new treemap<byte  string> bytes bytes_comparator
+string compressionconf   conf get compression_conf_key
+for  string familyconf   compressionconf split
+string familysplit   familyconf split
+if  familysplit length    2
+continue
+try
+compressionmap put urldecoder decode familysplit     getbytes
+urldecoder decode familysplit
+catch  unsupportedencodingexception e
+// will not happen with utf-8 encoding
+throw new assertionerror e
+return compressionmap
+/**
+* serialize column family to compression algorithm map to configuration.
+* invoked while configuring the mr job for incremental load.
+*
+* package-private for unit tests only.
+*
+* @throws ioexception
+*           on failure to read column family descriptors
+*/
+static void configurecompression htable table  configuration conf  throws ioexception
+stringbuilder compressionconfigvalue   new stringbuilder
+htabledescriptor tabledescriptor   table gettabledescriptor
+if tabledescriptor    null
+// could happen with mock table instance
+return
+collection<hcolumndescriptor> families   tabledescriptor getfamilies
+int i   0
+for  hcolumndescriptor familydescriptor   families
+if  i   > 0
+compressionconfigvalue append
+compressionconfigvalue append urlencoder encode familydescriptor getnameasstring
+compressionconfigvalue append
+compressionconfigvalue append urlencoder encode familydescriptor getcompression   getname
+// get rid of the last ampersand
+conf set compression_conf_key  compressionconfigvalue tostring

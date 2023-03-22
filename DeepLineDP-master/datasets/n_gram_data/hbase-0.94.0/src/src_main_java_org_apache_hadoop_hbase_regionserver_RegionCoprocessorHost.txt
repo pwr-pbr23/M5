@@ -1,0 +1,979 @@
+/*
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+* http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver
+import com google common collect immutablelist
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs path
+import org apache hadoop hbase hbaseconfiguration
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase coprocessor
+import org apache hadoop hbase coprocessorenvironment
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase client
+import org apache hadoop hbase coprocessor
+import org apache hadoop hbase filter comparefilter compareop
+import org apache hadoop hbase filter writablebytearraycomparable
+import org apache hadoop hbase io immutablebyteswritable
+import org apache hadoop hbase ipc coprocessorprotocol
+import org apache hadoop hbase regionserver wal hlogkey
+import org apache hadoop hbase regionserver wal waledit
+import org apache hadoop hbase util bytes
+import org apache hadoop util stringutils
+import java io ioexception
+import java util
+import java util regex matcher
+/**
+* implements the coprocessor environment and runtime support for coprocessors
+* loaded within a {@link hregion}.
+*/
+public class regioncoprocessorhost
+extends coprocessorhost<regioncoprocessorhost regionenvironment>
+private static final log log   logfactory getlog regioncoprocessorhost class
+/**
+* encapsulation of the environment of each coprocessor
+*/
+static class regionenvironment extends coprocessorhost environment
+implements regioncoprocessorenvironment
+private hregion region
+private regionserverservices rsservices
+/**
+* constructor
+* @param impl the coprocessor instance
+* @param priority chaining priority
+*/
+public regionenvironment final coprocessor impl  final int priority
+final int seq  final configuration conf  final hregion region
+final regionserverservices services
+super impl  priority  seq  conf
+this region   region
+this rsservices   services
+/** @return the region */
+@override
+public hregion getregion
+return region
+/** @return reference to the region server services */
+@override
+public regionserverservices getregionserverservices
+return rsservices
+public void shutdown
+super shutdown
+/** the region server services */
+regionserverservices rsservices
+/** the region */
+hregion region
+/**
+* constructor
+* @param region the region
+* @param rsservices interface to available region server functionality
+* @param conf the configuration
+*/
+public regioncoprocessorhost final hregion region
+final regionserverservices rsservices  final configuration conf
+this rsservices   rsservices
+this region   region
+this pathprefix   integer tostring this region getregioninfo   hashcode
+// load system default cp's from configuration.
+loadsystemcoprocessors conf  region_coprocessor_conf_key
+// load system default cp's for user tables from configuration.
+if   htabledescriptor ismetatable region getregioninfo   gettablename
+loadsystemcoprocessors conf  user_region_coprocessor_conf_key
+// load coprocessor from hdfs
+loadtablecoprocessors conf
+void loadtablecoprocessors final configuration conf
+// scan the table attributes for coprocessor load specifications
+// initialize the coprocessors
+list<regionenvironment> configured   new arraylist<regionenvironment>
+for  map entry<immutablebyteswritable immutablebyteswritable> e
+region gettabledesc   getvalues   entryset
+string key   bytes tostring e getkey   get    trim
+string spec   bytes tostring e getvalue   get    trim
+if  hconstants cp_htd_attr_key_pattern matcher key  matches
+// found one
+try
+matcher matcher   hconstants cp_htd_attr_value_pattern matcher spec
+if  matcher matches
+// jar file path can be empty if the cp class can be loaded
+// from class loader.
+path path   matcher group 1  trim   isempty   ?
+null   new path matcher group 1  trim
+string classname   matcher group 2  trim
+int priority   matcher group 3  trim   isempty   ?
+coprocessor priority_user   integer valueof matcher group 3
+string cfgspec   null
+try
+cfgspec   matcher group 4
+catch  indexoutofboundsexception ex
+// ignore
+if  cfgspec    null
+cfgspec   cfgspec substring cfgspec indexof      1
+configuration newconf   hbaseconfiguration create conf
+matcher m   hconstants cp_htd_attr_value_param_pattern matcher cfgspec
+while  m find
+newconf set m group 1   m group 2
+configured add load path  classname  priority  newconf
+else
+configured add load path  classname  priority  conf
+log info     classname
+bytes tostring region gettabledesc   getname
+else
+throw new runtimeexception
+catch  exception ex
+log warn     key
+spec
+log warn stringutils stringifyexception ex
+// add together to coprocessor set for cow efficiency
+coprocessors addall configured
+@override
+public regionenvironment createenvironment class<?> implclass
+coprocessor instance  int priority  int seq  configuration conf
+// check if it's an endpoint.
+// due to current dynamic protocol design, endpoint
+// uses a different way to be registered and executed.
+// it uses a visitor pattern to invoke registered endpoint
+// method.
+for  class c   implclass getinterfaces
+if  coprocessorprotocol class isassignablefrom c
+region registerprotocol c   coprocessorprotocol instance
+break
+return new regionenvironment instance  priority  seq  conf  region
+rsservices
+@override
+protected void abortserver final coprocessorenvironment env  final throwable e
+abortserver    rsservices  env  e
+/**
+* hbase-4014 : this is used by coprocessor hooks which are not declared to throw exceptions.
+*
+* for example, {@link
+* org.apache.hadoop.hbase.regionserver.regioncoprocessorhost#preopen()} and
+* {@link org.apache.hadoop.hbase.regionserver.regioncoprocessorhost#postopen()} are such hooks.
+*
+* see also {@link org.apache.hadoop.hbase.master.mastercoprocessorhost#handlecoprocessorthrowable()}
+* @param env the coprocessor that threw the exception.
+* @param e the exception that was thrown.
+*/
+private void handlecoprocessorthrowablenorethrow
+final coprocessorenvironment env  final throwable e
+try
+handlecoprocessorthrowable env e
+catch  ioexception ioe
+// we cannot throw exceptions from the caller hook, so ignore.
+log warn     e
+e
+/**
+* invoked before a region open
+*/
+public void preopen
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    preopen ctx
+catch  throwable e
+handlecoprocessorthrowablenorethrow env  e
+if  ctx shouldcomplete
+break
+/**
+* invoked after a region open
+*/
+public void postopen
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    postopen ctx
+catch  throwable e
+handlecoprocessorthrowablenorethrow env  e
+if  ctx shouldcomplete
+break
+/**
+* invoked before a region is closed
+* @param abortrequested true if the server is aborting
+*/
+public void preclose boolean abortrequested
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    preclose ctx  abortrequested
+catch  throwable e
+handlecoprocessorthrowablenorethrow env  e
+/**
+* invoked after a region is closed
+* @param abortrequested true if the server is aborting
+*/
+public void postclose boolean abortrequested
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    postclose ctx  abortrequested
+catch  throwable e
+handlecoprocessorthrowablenorethrow env  e
+shutdown env
+/**
+* called prior to selecting the {@link storefile}s for compaction from
+* the list of currently available candidates.
+* @param store the store where compaction is being requested
+* @param candidates the currently available store files
+* @return if {@code true}, skip the normal selection process and use the current list
+*/
+public boolean precompactselection store store  list<storefile> candidates
+observercontext<regioncoprocessorenvironment> ctx   null
+boolean bypass   false
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+regionobserver env getinstance    precompactselection
+ctx  store  candidates
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass
+/**
+* called after the {@link storefile}s to be compacted have been selected
+* from the available candidates.
+* @param store the store where compaction is being requested
+* @param selected the store files selected to compact
+*/
+public void postcompactselection store store
+immutablelist<storefile> selected
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    postcompactselection
+ctx  store  selected
+catch  throwable e
+handlecoprocessorthrowablenorethrow env e
+if  ctx shouldcomplete
+break
+/**
+* called prior to rewriting the store files selected for compaction
+* @param store the store being compacted
+* @param scanner the scanner used to read store data during compaction
+*/
+public internalscanner precompact store store  internalscanner scanner
+observercontext<regioncoprocessorenvironment> ctx   null
+boolean bypass   false
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+scanner     regionobserver env getinstance    precompact
+ctx  store  scanner
+catch  throwable e
+handlecoprocessorthrowablenorethrow env e
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass ? null   scanner
+/**
+* called after the store compaction has completed.
+* @param store the store being compacted
+* @param resultfile the new store file written during compaction
+*/
+public void postcompact store store  storefile resultfile
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    postcompact ctx  store  resultfile
+catch  throwable e
+handlecoprocessorthrowablenorethrow env  e
+if  ctx shouldcomplete
+break
+/**
+* invoked before a memstore flush
+*/
+public void preflush
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    preflush ctx
+catch  throwable e
+handlecoprocessorthrowablenorethrow env  e
+if  ctx shouldcomplete
+break
+/**
+* invoked after a memstore flush
+*/
+public void postflush
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    postflush ctx
+catch  throwable e
+handlecoprocessorthrowablenorethrow env  e
+if  ctx shouldcomplete
+break
+/**
+* invoked just before a split
+*/
+public void presplit
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    presplit ctx
+catch  throwable e
+handlecoprocessorthrowablenorethrow env  e
+if  ctx shouldcomplete
+break
+/**
+* invoked just after a split
+* @param l the new left-hand daughter region
+* @param r the new right-hand daughter region
+*/
+public void postsplit hregion l  hregion r
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    postsplit ctx  l  r
+catch  throwable e
+handlecoprocessorthrowablenorethrow env  e
+if  ctx shouldcomplete
+break
+// regionobserver support
+/**
+* @param row the row key
+* @param family the family
+* @param result the result set from the region
+* @return true if default processing should be bypassed
+* @exception ioexception exception
+*/
+public boolean pregetclosestrowbefore final byte row  final byte family
+final result result  throws ioexception
+boolean bypass   false
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    pregetclosestrowbefore ctx  row
+family  result
+catch  throwable e
+handlecoprocessorthrowable env  e
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass
+/**
+* @param row the row key
+* @param family the family
+* @param result the result set from the region
+* @exception ioexception exception
+*/
+public void postgetclosestrowbefore final byte row  final byte family
+final result result  throws ioexception
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    postgetclosestrowbefore ctx  row
+family  result
+catch  throwable e
+handlecoprocessorthrowable env  e
+if  ctx shouldcomplete
+break
+/**
+* @param get the get request
+* @return true if default processing should be bypassed
+* @exception ioexception exception
+*/
+public boolean preget final get get  final list<keyvalue> results
+throws ioexception
+boolean bypass   false
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    preget ctx  get  results
+catch  throwable e
+handlecoprocessorthrowable env  e
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass
+/**
+* @param get the get request
+* @param results the result set
+* @exception ioexception exception
+*/
+public void postget final get get  final list<keyvalue> results
+throws ioexception
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    postget ctx  get  results
+catch  throwable e
+handlecoprocessorthrowable env  e
+if  ctx shouldcomplete
+break
+/**
+* @param get the get request
+* @return true or false to return to client if bypassing normal operation,
+* or null otherwise
+* @exception ioexception exception
+*/
+public boolean preexists final get get  throws ioexception
+boolean bypass   false
+boolean exists   false
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+exists     regionobserver env getinstance    preexists ctx  get  exists
+catch  throwable e
+handlecoprocessorthrowable env  e
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass ? exists   null
+/**
+* @param get the get request
+* @param exists the result returned by the region server
+* @return the result to return to the client
+* @exception ioexception exception
+*/
+public boolean postexists final get get  boolean exists
+throws ioexception
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+exists     regionobserver env getinstance    postexists ctx  get  exists
+catch  throwable e
+handlecoprocessorthrowable env  e
+if  ctx shouldcomplete
+break
+return exists
+/**
+* @param put the put object
+* @param edit the waledit object.
+* @param writetowal true if the change should be written to the wal
+* @return true if default processing should be bypassed
+* @exception ioexception exception
+*/
+public boolean preput put put  waledit edit
+final boolean writetowal  throws ioexception
+boolean bypass   false
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    preput ctx  put  edit  writetowal
+catch  throwable e
+handlecoprocessorthrowable env  e
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass
+/**
+* @param put the put object
+* @param edit the waledit object.
+* @param writetowal true if the change should be written to the wal
+* @exception ioexception exception
+*/
+public void postput put put  waledit edit
+final boolean writetowal  throws ioexception
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    postput ctx  put  edit  writetowal
+catch  throwable e
+handlecoprocessorthrowable env  e
+if  ctx shouldcomplete
+break
+/**
+* @param delete the delete object
+* @param edit the waledit object.
+* @param writetowal true if the change should be written to the wal
+* @return true if default processing should be bypassed
+* @exception ioexception exception
+*/
+public boolean predelete delete delete  waledit edit
+final boolean writetowal  throws ioexception
+boolean bypass   false
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    predelete ctx  delete  edit  writetowal
+catch  throwable e
+handlecoprocessorthrowable env  e
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass
+/**
+* @param delete the delete object
+* @param edit the waledit object.
+* @param writetowal true if the change should be written to the wal
+* @exception ioexception exception
+*/
+public void postdelete delete delete  waledit edit
+final boolean writetowal  throws ioexception
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    postdelete ctx  delete  edit  writetowal
+catch  throwable e
+handlecoprocessorthrowable env  e
+if  ctx shouldcomplete
+break
+/**
+* @param row row to check
+* @param family column family
+* @param qualifier column qualifier
+* @param compareop the comparison operation
+* @param comparator the comparator
+* @param put data to put if check succeeds
+* @return true or false to return to client if default processing should
+* be bypassed, or null otherwise
+* @throws ioexception e
+*/
+public boolean precheckandput final byte  row  final byte  family
+final byte  qualifier  final compareop compareop
+final writablebytearraycomparable comparator  put put
+throws ioexception
+boolean bypass   false
+boolean result   false
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+result     regionobserver env getinstance    precheckandput ctx  row  family
+qualifier  compareop  comparator  put  result
+catch  throwable e
+handlecoprocessorthrowable env  e
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass ? result   null
+/**
+* @param row row to check
+* @param family column family
+* @param qualifier column qualifier
+* @param compareop the comparison operation
+* @param comparator the comparator
+* @param put data to put if check succeeds
+* @throws ioexception e
+*/
+public boolean postcheckandput final byte  row  final byte  family
+final byte  qualifier  final compareop compareop
+final writablebytearraycomparable comparator  final put put
+boolean result
+throws ioexception
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+result     regionobserver env getinstance    postcheckandput ctx  row
+family  qualifier  compareop  comparator  put  result
+catch  throwable e
+handlecoprocessorthrowable env  e
+if  ctx shouldcomplete
+break
+return result
+/**
+* @param row row to check
+* @param family column family
+* @param qualifier column qualifier
+* @param compareop the comparison operation
+* @param comparator the comparator
+* @param delete delete to commit if check succeeds
+* @return true or false to return to client if default processing should
+* be bypassed, or null otherwise
+* @throws ioexception e
+*/
+public boolean precheckanddelete final byte  row  final byte  family
+final byte  qualifier  final compareop compareop
+final writablebytearraycomparable comparator  delete delete
+throws ioexception
+boolean bypass   false
+boolean result   false
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+result     regionobserver env getinstance    precheckanddelete ctx  row
+family  qualifier  compareop  comparator  delete  result
+catch  throwable e
+handlecoprocessorthrowable env  e
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass ? result   null
+/**
+* @param row row to check
+* @param family column family
+* @param qualifier column qualifier
+* @param compareop the comparison operation
+* @param comparator the comparator
+* @param delete delete to commit if check succeeds
+* @throws ioexception e
+*/
+public boolean postcheckanddelete final byte  row  final byte  family
+final byte  qualifier  final compareop compareop
+final writablebytearraycomparable comparator  final delete delete
+boolean result
+throws ioexception
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+result     regionobserver env getinstance
+postcheckanddelete ctx  row  family  qualifier  compareop
+comparator  delete  result
+catch  throwable e
+handlecoprocessorthrowable env  e
+if  ctx shouldcomplete
+break
+return result
+/**
+* @param row row to check
+* @param family column family
+* @param qualifier column qualifier
+* @param amount long amount to increment
+* @param writetowal true if the change should be written to the wal
+* @return return value for client if default operation should be bypassed,
+* or null otherwise
+* @throws ioexception if an error occurred on the coprocessor
+*/
+public long preincrementcolumnvalue final byte  row  final byte  family
+final byte  qualifier  long amount  final boolean writetowal
+throws ioexception
+boolean bypass   false
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+amount     regionobserver env getinstance    preincrementcolumnvalue ctx
+row  family  qualifier  amount  writetowal
+catch  throwable e
+handlecoprocessorthrowable env  e
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass ? amount   null
+/**
+* @param row row to check
+* @param family column family
+* @param qualifier column qualifier
+* @param amount long amount to increment
+* @param writetowal true if the change should be written to the wal
+* @param result the result returned by incrementcolumnvalue
+* @return the result to return to the client
+* @throws ioexception if an error occurred on the coprocessor
+*/
+public long postincrementcolumnvalue final byte  row  final byte  family
+final byte  qualifier  final long amount  final boolean writetowal
+long result  throws ioexception
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+result     regionobserver env getinstance    postincrementcolumnvalue ctx
+row  family  qualifier  amount  writetowal  result
+catch  throwable e
+handlecoprocessorthrowable env  e
+if  ctx shouldcomplete
+break
+return result
+/**
+* @param append append object
+* @return result to return to client if default operation should be
+* bypassed, null otherwise
+* @throws ioexception if an error occurred on the coprocessor
+*/
+public result preappend append append
+throws ioexception
+boolean bypass   false
+result result   null
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+result     regionobserver env getinstance    preappend ctx  append
+catch  throwable e
+handlecoprocessorthrowable env  e
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass ? result   null
+/**
+* @param increment increment object
+* @return result to return to client if default operation should be
+* bypassed, null otherwise
+* @throws ioexception if an error occurred on the coprocessor
+*/
+public result preincrement increment increment
+throws ioexception
+boolean bypass   false
+result result   null
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+result     regionobserver env getinstance    preincrement ctx  increment
+catch  throwable e
+handlecoprocessorthrowable env  e
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass ? result   null
+/**
+* @param append append object
+* @param result the result returned by postappend
+* @throws ioexception if an error occurred on the coprocessor
+*/
+public void postappend final append append  result result
+throws ioexception
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    postappend ctx  append  result
+catch  throwable e
+handlecoprocessorthrowable env  e
+if  ctx shouldcomplete
+break
+/**
+* @param increment increment object
+* @param result the result returned by postincrement
+* @throws ioexception if an error occurred on the coprocessor
+*/
+public result postincrement final increment increment  result result
+throws ioexception
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+result     regionobserver env getinstance    postincrement ctx  increment  result
+catch  throwable e
+handlecoprocessorthrowable env  e
+if  ctx shouldcomplete
+break
+return result
+/**
+* @param scan the scan specification
+* @return scanner id to return to client if default operation should be
+* bypassed, false otherwise
+* @exception ioexception exception
+*/
+public regionscanner prescanneropen scan scan  throws ioexception
+boolean bypass   false
+regionscanner s   null
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+s     regionobserver env getinstance    prescanneropen ctx  scan  s
+catch  throwable e
+handlecoprocessorthrowable env  e
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass ? s   null
+/**
+* @param scan the scan specification
+* @param s the scanner
+* @return the scanner instance to use
+* @exception ioexception exception
+*/
+public regionscanner postscanneropen final scan scan  regionscanner s
+throws ioexception
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+s     regionobserver env getinstance    postscanneropen ctx  scan  s
+catch  throwable e
+handlecoprocessorthrowable env  e
+if  ctx shouldcomplete
+break
+return s
+/**
+* @param s the scanner
+* @param results the result set returned by the region server
+* @param limit the maximum number of results to return
+* @return 'has next' indication to client if bypassing default behavior, or
+* null otherwise
+* @exception ioexception exception
+*/
+public boolean prescannernext final internalscanner s
+final list<result> results  int limit  throws ioexception
+boolean bypass   false
+boolean hasnext   false
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+hasnext     regionobserver env getinstance    prescannernext ctx  s  results
+limit  hasnext
+catch  throwable e
+handlecoprocessorthrowable env  e
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass ? hasnext   null
+/**
+* @param s the scanner
+* @param results the result set returned by the region server
+* @param limit the maximum number of results to return
+* @param hasmore
+* @return 'has more' indication to give to client
+* @exception ioexception exception
+*/
+public boolean postscannernext final internalscanner s
+final list<result> results  final int limit  boolean hasmore
+throws ioexception
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+hasmore     regionobserver env getinstance    postscannernext ctx  s
+results  limit  hasmore
+catch  throwable e
+handlecoprocessorthrowable env  e
+if  ctx shouldcomplete
+break
+return hasmore
+/**
+* @param s the scanner
+* @return true if default behavior should be bypassed, false otherwise
+* @exception ioexception exception
+*/
+public boolean prescannerclose final internalscanner s
+throws ioexception
+boolean bypass   false
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    prescannerclose ctx  s
+catch  throwable e
+handlecoprocessorthrowable env  e
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass
+/**
+* @param s the scanner
+* @exception ioexception exception
+*/
+public void postscannerclose final internalscanner s
+throws ioexception
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    postscannerclose ctx  s
+catch  throwable e
+handlecoprocessorthrowable env  e
+if  ctx shouldcomplete
+break
+/**
+* @param info
+* @param logkey
+* @param logedit
+* @return true if default behavior should be bypassed, false otherwise
+* @throws ioexception
+*/
+public boolean prewalrestore hregioninfo info  hlogkey logkey
+waledit logedit  throws ioexception
+boolean bypass   false
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    prewalrestore ctx  info  logkey
+logedit
+catch  throwable e
+handlecoprocessorthrowable env  e
+bypass    ctx shouldbypass
+if  ctx shouldcomplete
+break
+return bypass
+/**
+* @param info
+* @param logkey
+* @param logedit
+* @throws ioexception
+*/
+public void postwalrestore hregioninfo info  hlogkey logkey
+waledit logedit  throws ioexception
+observercontext<regioncoprocessorenvironment> ctx   null
+for  regionenvironment env  coprocessors
+if  env getinstance   instanceof regionobserver
+ctx   observercontext createandprepare env  ctx
+try
+regionobserver env getinstance    postwalrestore ctx  info
+logkey  logedit
+catch  throwable e
+handlecoprocessorthrowable env  e
+if  ctx shouldcomplete
+break

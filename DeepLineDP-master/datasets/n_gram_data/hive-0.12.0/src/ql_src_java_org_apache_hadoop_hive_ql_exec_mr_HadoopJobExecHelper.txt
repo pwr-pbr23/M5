@@ -1,0 +1,460 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql exec mr
+import java io ioexception
+import java io serializable
+import java text simpledateformat
+import java util arraylist
+import java util calendar
+import java util collections
+import java util enumeration
+import java util hashmap
+import java util list
+import java util map
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop fs path
+import org apache hadoop hive common javautils
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive ql mapredstats
+import org apache hadoop hive ql exec task
+import org apache hadoop hive ql exec taskhandle
+import org apache hadoop hive ql exec utilities
+import org apache hadoop hive ql exec operator progresscounter
+import org apache hadoop hive ql history hivehistory keys
+import org apache hadoop hive ql plan reducertimestatsperjob
+import org apache hadoop hive ql session sessionstate
+import org apache hadoop hive ql session sessionstate loghelper
+import org apache hadoop hive ql stats clientstatspublisher
+import org apache hadoop hive shims shimloader
+import org apache hadoop mapred counters
+import org apache hadoop mapred counters counter
+import org apache hadoop mapred jobclient
+import org apache hadoop mapred jobconf
+import org apache hadoop mapred runningjob
+import org apache hadoop mapred taskcompletionevent
+import org apache hadoop mapred taskreport
+import org apache log4j appender
+import org apache log4j fileappender
+import org apache log4j logmanager
+public class hadoopjobexechelper
+static final private log log   logfactory getlog hadoopjobexechelper class getname
+protected transient jobconf job
+protected task<? extends serializable> task
+protected transient int mapprogress   0
+protected transient int reduceprogress   0
+public transient string jobid
+private loghelper console
+private hadoopjobexechook callbackobj
+/**
+* update counters relevant to this task.
+*/
+private void updatecounters counters ctrs  runningjob rj  throws ioexception
+mapprogress   math round rj mapprogress     100
+mapprogress   mapprogress    100 ?  int math floor rj mapprogress     100    mapprogress
+reduceprogress   math round rj reduceprogress     100
+reduceprogress   reduceprogress    100 ?  int math floor rj reduceprogress     100    reduceprogress
+task taskcounters put     task getid        long valueof mapprogress
+task taskcounters put     task getid        long valueof reduceprogress
+if  ctrs    null
+// hadoop might return null if it cannot locate the job.
+// we may still be able to retrieve the job status - so ignore
+return
+if callbackobj    null
+callbackobj updatecounters ctrs  rj
+/**
+* this msg pattern is used to track when a job is started.
+*
+* @param jobid
+* @return
+*/
+private static string getjobstartmsg string jobid
+return     jobid
+/**
+* this msg pattern is used to track when a job is successfully done.
+*
+* @param jobid
+* @return the job end message
+*/
+public static string getjobendmsg string jobid
+return     jobid
+public boolean mapstarted
+return mapprogress > 0
+public boolean reducestarted
+return reduceprogress > 0
+public boolean mapdone
+return mapprogress    100
+public boolean reducedone
+return reduceprogress    100
+public string getjobid
+return jobid
+public void setjobid string jobid
+this jobid   jobid
+public hadoopjobexechelper
+public hadoopjobexechelper jobconf job  loghelper console
+task<? extends serializable> task  hadoopjobexechook hookcallback
+this job   job
+this console   console
+this task   task
+this callbackobj   hookcallback
+/**
+* a list of the currently running jobs spawned in this hive instance that is used to kill all
+* running jobs in the event of an unexpected shutdown - i.e., the jvm shuts down while there are
+* still jobs running.
+*/
+public static map<string  string> runningjobkilluris   collections
+synchronizedmap new hashmap<string  string>
+/**
+* in hive, when the user control-c's the command line, any running jobs spawned from that command
+* line are best-effort killed.
+*
+* this static constructor registers a shutdown thread to iterate over all the running job kill
+* urls and do a get on them.
+*
+*/
+static
+if  new org apache hadoop conf configuration
+getboolean    false
+runtime getruntime   addshutdownhook new thread
+@override
+public void run
+killrunningjobs
+public static void killrunningjobs
+synchronized  runningjobkilluris
+for  string uri   runningjobkilluris values
+try
+system err println     uri
+java net httpurlconnection conn    java net httpurlconnection  new java net url uri
+openconnection
+conn setrequestmethod
+int retcode   conn getresponsecode
+if  retcode    200
+system err println     uri
+retcode
+catch  exception e
+system err println     e
+// do nothing
+public boolean checkfatalerrors counters ctrs  stringbuilder errmsg
+if  ctrs    null
+// hadoop might return null if it cannot locate the job.
+// we may still be able to retrieve the job status - so ignore
+return false
+// check for number of created files
+long numfiles   ctrs getcounter progresscounter created_files
+long upperlimit   hiveconf getlongvar job  hiveconf confvars maxcreatedfiles
+if  numfiles > upperlimit
+errmsg append     numfiles      append upperlimit
+return true
+return this callbackobj checkfatalerrors ctrs  errmsg
+private mapredstats progress execdrivertaskhandle th  throws ioexception
+jobclient jc   th getjobclient
+runningjob rj   th getrunningjob
+string lastreport
+simpledateformat dateformat   new simpledateformat
+//decimalformat longformatter = new decimalformat("###,###");
+long reporttime   system currenttimemillis
+long maxreportinterval
+hiveconf getlongvar job  hiveconf confvars hive_log_incremental_plan_progress_interval
+boolean fatal   false
+stringbuilder errmsg   new stringbuilder
+long pullinterval   hiveconf getlongvar job  hiveconf confvars hivecounterspullinterval
+boolean initializing   true
+boolean initoutputprinted   false
+long cpumsec    1
+int nummap    1
+int numreduce    1
+list<clientstatspublisher> clientstatpublishers   getclientstatpublishers
+while   rj iscomplete
+try
+thread sleep pullinterval
+catch  interruptedexception e
+if  initializing    shimloader gethadoopshims   isjobpreparing rj
+// no reason to poll untill the job is initialized
+continue
+else
+// by now the job is initialized so no reason to do
+// rj.getjobstate() again and we do not want to do an extra rpc call
+initializing   false
+if   initoutputprinted
+sessionstate ss   sessionstate get
+string logmapper
+string logreducer
+taskreport mappers   jc getmaptaskreports rj getjobid
+if  mappers    null
+logmapper
+else
+nummap   mappers length
+if  ss    null
+ss gethivehistory   settaskproperty sessionstate get   getqueryid    getid
+keys task_num_mappers  integer tostring nummap
+logmapper       nummap
+taskreport reducers   jc getreducetaskreports rj getjobid
+if  reducers    null
+logreducer
+else
+numreduce   reducers length
+if  ss    null
+ss gethivehistory   settaskproperty sessionstate get   getqueryid    getid
+keys task_num_reducers  integer tostring numreduce
+logreducer       numreduce
+console
+printinfo     getid         logmapper   logreducer
+initoutputprinted   true
+runningjob newrj   jc getjob rj getjobid
+if  newrj    null
+// under exceptional load, hadoop may not be able to look up status
+// of finished jobs (because it has purged them from memory). from
+// hive's perspective - it's equivalent to the job having failed.
+// so raise a meaningful exception
+throw new ioexception     rj getjobid
+else
+th setrunningjob newrj
+rj   newrj
+// if fatal errors happen we should kill the job immediately rather than
+// let the job retry several times, which eventually lead to failure.
+if  fatal
+continue     wait until rj iscomplete
+counters ctrs   th getcounters
+if  fatal   checkfatalerrors ctrs  errmsg
+console printerror     errmsg tostring
+rj killjob
+continue
+errmsg setlength 0
+updatecounters ctrs  rj
+// prepare data for client stat publishers (if any present) and execute them
+if  clientstatpublishers size   > 0    ctrs    null
+map<string  double> exctractedcounters   extractallcountervalues ctrs
+for  clientstatspublisher clientstatpublisher   clientstatpublishers
+try
+clientstatpublisher run exctractedcounters  rj getid   tostring
+catch  runtimeexception runtimeexception
+log error     runtimeexception getclass   getcanonicalname
+runtimeexception
+string report       getid         mapprogress       reduceprogress
+if   report equals lastreport
+system currenttimemillis   >  reporttime   maxreportinterval
+// find out cpu msecs
+// in the case that we can't find out this number, we just skip the step to print
+// it out.
+if  ctrs    null
+counter countercpumsec   ctrs findcounter
+if  countercpumsec    null
+long newcpumsec   countercpumsec getvalue
+if  newcpumsec > 0
+cpumsec   newcpumsec
+report
+cpumsec   1000d
+// write out serialized plan with counters to log file
+// log.info(queryplan);
+string output   dateformat format calendar getinstance   gettime      report
+sessionstate ss   sessionstate get
+if  ss    null
+ss gethivehistory   settaskcounters sessionstate get   getqueryid    getid    ctrs
+ss gethivehistory   settaskproperty sessionstate get   getqueryid    getid
+keys task_hadoop_progress  output
+if  ss getconf   getboolvar hiveconf confvars hive_log_incremental_plan_progress
+ss gethivehistory   progresstask sessionstate get   getqueryid    this task
+this callbackobj logplanprogress ss
+console printinfo output
+lastreport   report
+reporttime   system currenttimemillis
+if  cpumsec > 0
+console printinfo
+utilities formatmsectostr cpumsec
+boolean success
+counters ctrs   th getcounters
+if  fatal
+success   false
+else
+// check for fatal error again in case it occurred after
+// the last check before the job is completed
+if  checkfatalerrors ctrs  errmsg
+console printerror     errmsg tostring
+success   false
+else
+sessionstate ss   sessionstate get
+if  ss    null
+ss gethivehistory   settaskcounters sessionstate get   getqueryid    getid    ctrs
+success   rj issuccessful
+if  ctrs    null
+counter countercpumsec   ctrs findcounter
+if  countercpumsec    null
+long newcpumsec   countercpumsec getvalue
+if  newcpumsec > cpumsec
+cpumsec   newcpumsec
+mapredstats mapredstats   new mapredstats nummap  numreduce  cpumsec  success  rj getid   tostring
+mapredstats setcounters ctrs
+// update based on the final value of the counters
+updatecounters ctrs  rj
+sessionstate ss   sessionstate get
+if  ss    null
+this callbackobj logplanprogress ss
+// log.info(queryplan);
+return mapredstats
+private string getid
+return this task getid
+/**
+* from streamjob.java.
+*/
+public void jobinfo runningjob rj
+if  shimloader gethadoopshims   islocalmode job
+console printinfo
+else
+if  sessionstate get      null
+sessionstate get   gethivehistory   settaskproperty sessionstate get   getqueryid
+getid    keys task_hadoop_id  rj getjobid
+console printinfo getjobstartmsg rj getjobid
+rj gettrackingurl
+console printinfo     hiveconf getvar job  hiveconf confvars hadoopbin
+rj getjobid
+/**
+* this class contains the state of the running task going forward, we will return this handle
+* from execute and driver can split execute into start, monitorprogess and postprocess.
+*/
+private static class execdrivertaskhandle extends taskhandle
+jobclient jc
+runningjob rj
+jobclient getjobclient
+return jc
+runningjob getrunningjob
+return rj
+public execdrivertaskhandle jobclient jc  runningjob rj
+this jc   jc
+this rj   rj
+public void setrunningjob runningjob job
+rj   job
+@override
+public counters getcounters   throws ioexception
+return rj getcounters
+public void localjobdebugger int exitval  string taskid
+stringbuilder sb   new stringbuilder
+sb append
+sb append
+sb append     taskid
+sb append
+console printerror sb tostring
+for  appender a   collections list  enumeration<appender>
+logmanager getrootlogger   getallappenders
+if  a instanceof fileappender
+console printerror  new path   fileappender a  getfile     touri   getpath
+public int progresslocal process runningjob  string taskid
+int exitval    101
+try
+exitval   runningjob waitfor      todo  poll periodically
+catch  interruptedexception e
+if  exitval    0
+console printerror     exitval
+console printerror
+if  hiveconf getboolvar job  hiveconf confvars show_job_fail_debug_info
+// since local jobs are run sequentially, all relevant information is already available
+// therefore, no need to fetch job debug info asynchronously
+localjobdebugger exitval  taskid
+else
+console printinfo
+console printinfo
+return exitval
+public int progress runningjob rj  jobclient jc  throws ioexception
+jobid   rj getjobid
+int returnval   0
+// remove the pwd from conf file so that job tracker doesn't show this
+// logs
+string pwd   hiveconf getvar job  hiveconf confvars metastorepwd
+if  pwd    null
+hiveconf setvar job  hiveconf confvars metastorepwd
+// replace it back
+if  pwd    null
+hiveconf setvar job  hiveconf confvars metastorepwd  pwd
+// add to list of running jobs to kill in case of abnormal shutdown
+runningjobkilluris put rj getjobid    rj gettrackingurl
+execdrivertaskhandle th   new execdrivertaskhandle jc  rj
+jobinfo rj
+mapredstats mapredstats   progress th
+this task taskhandle   th
+// not always there is a sessionstate. sometimes exedriver is directly invoked
+// for special modes. in that case, sessionstate.get() is empty.
+if  sessionstate get      null
+sessionstate get   getlastmapredstatslist   add mapredstats
+// computes the skew for all the mapreduce irrespective
+// of success or failure
+if  this task getqueryplan      null
+computereducertimestatsperjob rj
+boolean success   mapredstats issuccess
+string statusmesg   getjobendmsg rj getjobid
+if   success
+statusmesg
+returnval   2
+console printerror statusmesg
+if  hiveconf getboolvar job  hiveconf confvars show_job_fail_debug_info
+hiveconf getboolvar job  hiveconf confvars job_debug_capture_stacktraces
+try
+jobdebugger jd
+if  sessionstate get      null
+jd   new jobdebugger job  rj  console  sessionstate get   getstacktraces
+else
+jd   new jobdebugger job  rj  console
+thread t   new thread jd
+t start
+t join hiveconf getintvar job  hiveconf confvars job_debug_timeout
+int ec   jd geterrorcode
+if  ec > 0
+returnval   ec
+catch  interruptedexception e
+console printerror
+else
+console printinfo statusmesg
+return returnval
+private void computereducertimestatsperjob runningjob rj  throws ioexception
+taskcompletionevent taskcompletions   rj gettaskcompletionevents 0
+list<integer> reducersruntimes   new arraylist<integer>
+for  taskcompletionevent taskcompletion   taskcompletions
+string taskjobids   shimloader gethadoopshims   gettaskjobids taskcompletion
+if  taskjobids    null
+// task attempt info is unavailable in this hadoop version");
+continue
+string taskid   taskjobids
+if   taskcompletion ismaptask
+reducersruntimes add new integer taskcompletion gettaskruntime
+// compute the reducers run time statistics for the job
+reducertimestatsperjob reducertimestatsperjob   new reducertimestatsperjob reducersruntimes
+new string this jobid
+// adding the reducers run time statistics for the job in the queryplan
+this task getqueryplan   getreducertimestatsperjoblist   add reducertimestatsperjob
+return
+private map<string  double> extractallcountervalues counters counters
+map<string  double> exctractedcounters   new hashmap<string  double>
+for  counters group cg   counters
+for  counter c   cg
+exctractedcounters put cg getname         c getname    new double c getcounter
+return exctractedcounters
+private list<clientstatspublisher> getclientstatpublishers
+list<clientstatspublisher> clientstatspublishers   new arraylist<clientstatspublisher>
+string confstring   hiveconf getvar job  hiveconf confvars clientstatspublishers
+confstring   confstring trim
+if  confstring equals
+return clientstatspublishers
+string clientstatspublisherclasses   confstring split
+for  string clientstatspublisherclass   clientstatspublisherclasses
+try
+clientstatspublishers add  clientstatspublisher  class forname
+clientstatspublisherclass trim    true  javautils getclassloader    newinstance
+catch  exception e
+log warn e getclass   getname
+clientstatspublisherclass trim
+log warn     e getmessage
+log warn
+return clientstatspublishers

@@ -1,0 +1,603 @@
+/**
+* copyright 2009 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase io hfile
+import java io ioexception
+import java lang ref weakreference
+import java util arraylist
+import java util collections
+import java util enummap
+import java util hashmap
+import java util list
+import java util map
+import java util priorityqueue
+import java util sortedset
+import java util treeset
+import java util concurrent concurrenthashmap
+import java util concurrent executors
+import java util concurrent scheduledexecutorservice
+import java util concurrent timeunit
+import java util concurrent atomic atomiclong
+import java util concurrent locks reentrantlock
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hbase io heapsize
+import org apache hadoop hbase io encoding datablockencoding
+import org apache hadoop hbase regionserver metrics schemametrics
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util classsize
+import org apache hadoop hbase util fsutils
+import org apache hadoop hbase util hasthread
+import org apache hadoop hbase util threads
+import org apache hadoop util stringutils
+import com google common util concurrent threadfactorybuilder
+/**
+* a block cache implementation that is memory-aware using {@link heapsize},
+* memory-bound using an lru eviction algorithm, and concurrent: backed by a
+* {@link concurrenthashmap} and with a non-blocking eviction thread giving
+* constant-time {@link #cacheblock} and {@link #getblock} operations.<p>
+*
+* contains three levels of block priority to allow for
+* scan-resistance and in-memory families.  a block is added with an inmemory
+* flag if necessary, otherwise a block becomes a single access priority.  once
+* a blocked is accessed again, it changes to multiple access.  this is used
+* to prevent scans from thrashing the cache, adding a least-frequently-used
+* element to the eviction algorithm.<p>
+*
+* each priority is given its own chunk of the total cache to ensure
+* fairness during eviction.  each priority will retain close to its maximum
+* size, however, if any priority is not using its entire chunk the others
+* are able to grow beyond their chunk size.<p>
+*
+* instantiated at a minimum with the total size and average block size.
+* all sizes are in bytes.  the block size is not especially important as this
+* cache is fully dynamic in its sizing of blocks.  it is only used for
+* pre-allocating data structures and in initial heap estimation of the map.<p>
+*
+* the detailed constructor defines the sizes for the three priorities (they
+* should total to the maximum size defined).  it also sets the levels that
+* trigger and control the eviction thread.<p>
+*
+* the acceptable size is the cache size level which triggers the eviction
+* process to start.  it evicts enough blocks to get the size below the
+* minimum size specified.<p>
+*
+* eviction happens in a separate thread and involves a single full-scan
+* of the map.  it determines how many bytes must be freed to reach the minimum
+* size, and then while scanning determines the fewest least-recently-used
+* blocks necessary from each of the three priorities (would be 3 times bytes
+* to free).  it then uses the priority chunk sizes to evict fairly according
+* to the relative sizes and usage.
+*/
+public class lrublockcache implements blockcache  heapsize
+static final log log   logfactory getlog lrublockcache class
+/** default configuration parameters*/
+/** backing concurrent map configuration */
+static final float default_load_factor   0 75f
+static final int default_concurrency_level   16
+/** eviction thresholds */
+static final float default_min_factor   0 75f
+static final float default_acceptable_factor   0 85f
+/** priority buckets */
+static final float default_single_factor   0 25f
+static final float default_multi_factor   0 50f
+static final float default_memory_factor   0 25f
+/** statistics thread */
+static final int statthreadperiod   60   5
+/** concurrent map (the cache) */
+private final concurrenthashmap<blockcachekey cachedblock> map
+/** eviction lock (locked when eviction in process) */
+private final reentrantlock evictionlock   new reentrantlock true
+/** volatile boolean to track if we are in an eviction process or not */
+private volatile boolean evictioninprogress   false
+/** eviction thread */
+private final evictionthread evictionthread
+/** statistics thread schedule pool (for heavy debugging, could remove) */
+private final scheduledexecutorservice schedulethreadpool
+executors newscheduledthreadpool 1
+new threadfactorybuilder
+setnameformat
+setdaemon true
+build
+/** current size of cache */
+private final atomiclong size
+/** current number of cached elements */
+private final atomiclong elements
+/** cache access count (sequential id) */
+private final atomiclong count
+/** cache statistics */
+private final cachestats stats
+/** maximum allowable size of cache (block put if size > max, evict) */
+private long maxsize
+/** approximate block size */
+private long blocksize
+/** acceptable size of cache (no evictions if size < acceptable) */
+private float acceptablefactor
+/** minimum threshold of cache (when evicting, evict until size < min) */
+private float minfactor
+/** single access bucket size */
+private float singlefactor
+/** multiple access bucket size */
+private float multifactor
+/** in-memory bucket size */
+private float memoryfactor
+/** overhead of the structure itself */
+private long overhead
+/**
+* default constructor.  specify maximum size and expected average block
+* size (approximation is fine).
+*
+* <p>all other factors will be calculated based on defaults specified in
+* this class.
+* @param maxsize maximum size of cache, in bytes
+* @param blocksize approximate size of each block, in bytes
+*/
+public lrublockcache long maxsize  long blocksize
+this maxsize  blocksize  true
+/**
+* constructor used for testing.  allows disabling of the eviction thread.
+*/
+public lrublockcache long maxsize  long blocksize  boolean evictionthread
+this maxsize  blocksize  evictionthread
+int math ceil 1 2 maxsize blocksize
+default_load_factor  default_concurrency_level
+default_min_factor  default_acceptable_factor
+default_single_factor  default_multi_factor
+default_memory_factor
+/**
+* configurable constructor.  use this constructor if not using defaults.
+* @param maxsize maximum size of this cache, in bytes
+* @param blocksize expected average size of blocks, in bytes
+* @param evictionthread whether to run evictions in a bg thread or not
+* @param mapinitialsize initial size of backing concurrenthashmap
+* @param maploadfactor initial load factor of backing concurrenthashmap
+* @param mapconcurrencylevel initial concurrency factor for backing chm
+* @param minfactor percentage of total size that eviction will evict until
+* @param acceptablefactor percentage of total size that triggers eviction
+* @param singlefactor percentage of total size for single-access blocks
+* @param multifactor percentage of total size for multiple-access blocks
+* @param memoryfactor percentage of total size for in-memory blocks
+*/
+public lrublockcache long maxsize  long blocksize  boolean evictionthread
+int mapinitialsize  float maploadfactor  int mapconcurrencylevel
+float minfactor  float acceptablefactor
+float singlefactor  float multifactor  float memoryfactor
+if singlefactor   multifactor   memoryfactor    1
+throw new illegalargumentexception
+if minfactor >  acceptablefactor
+throw new illegalargumentexception
+if minfactor >  1 0f    acceptablefactor >  1 0f
+throw new illegalargumentexception
+this maxsize   maxsize
+this blocksize   blocksize
+map   new concurrenthashmap<blockcachekey cachedblock> mapinitialsize
+maploadfactor  mapconcurrencylevel
+this minfactor   minfactor
+this acceptablefactor   acceptablefactor
+this singlefactor   singlefactor
+this multifactor   multifactor
+this memoryfactor   memoryfactor
+this stats   new cachestats
+this count   new atomiclong 0
+this elements   new atomiclong 0
+this overhead   calculateoverhead maxsize  blocksize  mapconcurrencylevel
+this size   new atomiclong this overhead
+if evictionthread
+this evictionthread   new evictionthread this
+this evictionthread start       findbugs sc_start_in_ctor
+else
+this evictionthread   null
+this schedulethreadpool scheduleatfixedrate new statisticsthread this
+statthreadperiod  statthreadperiod  timeunit seconds
+public void setmaxsize long maxsize
+this maxsize   maxsize
+if this size get   > acceptablesize       evictioninprogress
+runeviction
+// blockcache implementation
+/**
+* cache the block with the specified name and buffer.
+* <p>
+* it is assumed this will never be called on an already cached block.  if
+* that is done, an exception will be thrown.
+* @param cachekey block's cache key
+* @param buf block buffer
+* @param inmemory if block is in-memory
+*/
+public void cacheblock blockcachekey cachekey  cacheable buf  boolean inmemory
+cachedblock cb   map get cachekey
+if cb    null
+throw new runtimeexception
+cb   new cachedblock cachekey  buf  count incrementandget    inmemory
+long newsize   updatesizemetrics cb  false
+map put cachekey  cb
+elements incrementandget
+if newsize > acceptablesize       evictioninprogress
+runeviction
+/**
+* cache the block with the specified name and buffer.
+* <p>
+* it is assumed this will never be called on an already cached block.  if
+* that is done, it is assumed that you are reinserting the same exact
+* block due to a race condition and will update the buffer but not modify
+* the size of the cache.
+* @param cachekey block's cache key
+* @param buf block buffer
+*/
+public void cacheblock blockcachekey cachekey  cacheable buf
+cacheblock cachekey  buf  false
+/**
+* helper function that updates the local size counter and also updates any
+* per-cf or per-blocktype metrics it can discern from given
+* {@link cachedblock}
+*
+* @param cb
+* @param evict
+*/
+protected long updatesizemetrics cachedblock cb  boolean evict
+long heapsize   cb heapsize
+if  evict
+heapsize     1
+cacheable cachedblock   cb getbuffer
+schemametrics schemametrics   cachedblock getschemametrics
+if  schemametrics    null
+schemametrics updateoncacheputorevict
+cachedblock getblocktype   getcategory    heapsize  evict
+return size addandget heapsize
+/**
+* get the buffer of the block with the specified name.
+* @param cachekey block's cache key
+* @param caching true if the caller caches blocks on cache misses
+* @return buffer of specified cache key, or null if not in cache
+*/
+@override
+public cacheable getblock blockcachekey cachekey  boolean caching
+cachedblock cb   map get cachekey
+if cb    null
+stats miss caching
+return null
+stats hit caching
+cb access count incrementandget
+return cb getbuffer
+@override
+public boolean evictblock blockcachekey cachekey
+cachedblock cb   map get cachekey
+if  cb    null  return false
+evictblock cb
+return true
+/**
+* evicts all blocks for a specific hfile. this is an
+* expensive operation implemented as a linear-time search through all blocks
+* in the cache. ideally this should be a search in a log-access-time map.
+*
+* <p>
+* this is used for evict-on-close to remove all blocks of a specific hfile.
+*
+* @return the number of blocks evicted
+*/
+@override
+public int evictblocksbyhfilename string hfilename
+int numevicted   0
+for  blockcachekey key   map keyset
+if  key gethfilename   equals hfilename
+if  evictblock key
+numevicted
+return numevicted
+protected long evictblock cachedblock block
+map remove block getcachekey
+updatesizemetrics block  true
+elements decrementandget
+stats evicted
+return block heapsize
+/**
+* multi-threaded call to run the eviction process.
+*/
+private void runeviction
+if evictionthread    null
+evict
+else
+evictionthread evict
+/**
+* eviction method.
+*/
+void evict
+// ensure only one eviction at a time
+if  evictionlock trylock    return
+try
+evictioninprogress   true
+long currentsize   this size get
+long bytestofree   currentsize   minsize
+if  log isdebugenabled
+log debug
+stringutils bytedesc bytestofree
+stringutils bytedesc currentsize
+if bytestofree <  0  return
+// instantiate priority buckets
+blockbucket bucketsingle   new blockbucket bytestofree  blocksize
+singlesize
+blockbucket bucketmulti   new blockbucket bytestofree  blocksize
+multisize
+blockbucket bucketmemory   new blockbucket bytestofree  blocksize
+memorysize
+// scan entire map putting into appropriate buckets
+for cachedblock cachedblock   map values
+switch cachedblock getpriority
+case single
+bucketsingle add cachedblock
+break
+case multi
+bucketmulti add cachedblock
+break
+case memory
+bucketmemory add cachedblock
+break
+priorityqueue<blockbucket> bucketqueue
+new priorityqueue<blockbucket> 3
+bucketqueue add bucketsingle
+bucketqueue add bucketmulti
+bucketqueue add bucketmemory
+int remainingbuckets   3
+long bytesfreed   0
+blockbucket bucket
+while  bucket   bucketqueue poll       null
+long overflow   bucket overflow
+if overflow > 0
+long bucketbytestofree   math min overflow
+bytestofree   bytesfreed    remainingbuckets
+bytesfreed    bucket free bucketbytestofree
+remainingbuckets
+if  log isdebugenabled
+long single   bucketsingle totalsize
+long multi   bucketmulti totalsize
+long memory   bucketmemory totalsize
+log debug
+stringutils bytedesc bytesfreed
+stringutils bytedesc this size get
+stringutils bytedesc single
+stringutils bytedesc multi
+stringutils bytedesc memory
+finally
+stats evict
+evictioninprogress   false
+evictionlock unlock
+/**
+* used to group blocks into priority buckets.  there will be a blockbucket
+* for each priority (single, multi, memory).  once bucketed, the eviction
+* algorithm takes the appropriate number of elements out of each according
+* to configuration parameters and their relatives sizes.
+*/
+private class blockbucket implements comparable<blockbucket>
+private cachedblockqueue queue
+private long totalsize   0
+private long bucketsize
+public blockbucket long bytestofree  long blocksize  long bucketsize
+this bucketsize   bucketsize
+queue   new cachedblockqueue bytestofree  blocksize
+totalsize   0
+public void add cachedblock block
+totalsize    block heapsize
+queue add block
+public long free long tofree
+cachedblock cb
+long freedbytes   0
+while   cb   queue polllast       null
+freedbytes    evictblock cb
+if  freedbytes >  tofree
+return freedbytes
+return freedbytes
+public long overflow
+return totalsize   bucketsize
+public long totalsize
+return totalsize
+public int compareto blockbucket that
+if this overflow      that overflow    return 0
+return this overflow   > that overflow   ? 1    1
+/**
+* get the maximum size of this cache.
+* @return max size in bytes
+*/
+public long getmaxsize
+return this maxsize
+/**
+* get the current size of this cache.
+* @return current size in bytes
+*/
+public long getcurrentsize
+return this size get
+/**
+* get the current size of this cache.
+* @return current size in bytes
+*/
+public long getfreesize
+return getmaxsize     getcurrentsize
+/**
+* get the size of this cache (number of cached blocks)
+* @return number of cached blocks
+*/
+public long size
+return this elements get
+@override
+public long getblockcount
+return this elements get
+/**
+* get the number of eviction runs that have occurred
+*/
+public long getevictioncount
+return this stats getevictioncount
+/**
+* get the number of blocks that have been evicted during the lifetime
+* of this cache.
+*/
+public long getevictedcount
+return this stats getevictedcount
+/*
+* eviction thread.  sits in waiting state until an eviction is triggered
+* when the cache size grows above the acceptable level.<p>
+*
+* thread is triggered into action by {@link lrublockcache#runeviction()}
+*/
+private static class evictionthread extends hasthread
+private weakreference<lrublockcache> cache
+private boolean go   true
+public evictionthread lrublockcache cache
+super thread currentthread   getname
+setdaemon true
+this cache   new weakreference<lrublockcache> cache
+@override
+public void run
+while  this go
+synchronized this
+try
+this wait
+catch interruptedexception e
+lrublockcache cache   this cache get
+if cache    null  break
+cache evict
+public void evict
+synchronized this
+this notify       findbugs nn_naked_notify
+void shutdown
+this go   false
+interrupt
+/*
+* statistics thread.  periodically prints the cache statistics to the log.
+*/
+static class statisticsthread extends thread
+lrublockcache lru
+public statisticsthread lrublockcache lru
+super
+setdaemon true
+this lru   lru
+@override
+public void run
+lru logstats
+public void logstats
+if   log isdebugenabled    return
+// log size
+long totalsize   heapsize
+long freesize   maxsize   totalsize
+lrublockcache log debug
+stringutils bytedesc totalsize
+stringutils bytedesc freesize
+stringutils bytedesc this maxsize
+size
+stats getrequestcount
+stats gethitcount
+stats gethitcount      0 ?      stringutils formatpercent stats gethitratio    2
+stats getrequestcachingcount
+stats gethitcachingcount
+stats gethitcachingcount      0 ?      stringutils formatpercent stats gethitcachingratio    2
+stats getevictioncount
+stats getevictedcount
+stats evictedpereviction
+/**
+* get counter statistics for this cache.
+*
+* <p>includes: total accesses, hits, misses, evicted blocks, and runs
+* of the eviction processes.
+*/
+public cachestats getstats
+return this stats
+public final static long cache_fixed_overhead   classsize align
+3   bytes sizeof_long     8   classsize reference
+5   bytes sizeof_float    bytes sizeof_boolean
+classsize object
+// heapsize implementation
+public long heapsize
+return getcurrentsize
+public static long calculateoverhead long maxsize  long blocksize  int concurrency
+// findbugs icast_integer_multiply_cast_to_long
+return cache_fixed_overhead   classsize concurrent_hashmap
+long math ceil maxsize 1 2 blocksize
+classsize concurrent_hashmap_entry
+concurrency   classsize concurrent_hashmap_segment
+@override
+public list<blockcachecolumnfamilysummary> getblockcachecolumnfamilysummaries configuration conf  throws ioexception
+map<string  path> sfmap   fsutils gettablestorefilepathmap
+filesystem get conf
+fsutils getrootdir conf
+// quirky, but it's a compound key and this is a shortcut taken instead of
+// creating a class that would represent only a key.
+map<blockcachecolumnfamilysummary  blockcachecolumnfamilysummary> bcs
+new hashmap<blockcachecolumnfamilysummary  blockcachecolumnfamilysummary>
+for  cachedblock cb   map values
+string sf   cb getcachekey   gethfilename
+path path   sfmap get sf
+if   path    null
+blockcachecolumnfamilysummary lookup
+blockcachecolumnfamilysummary createfromstorefilepath path
+blockcachecolumnfamilysummary bcse   bcs get lookup
+if  bcse    null
+bcse   blockcachecolumnfamilysummary create lookup
+bcs put lookup bcse
+bcse incrementblocks
+bcse incrementheapsize cb heapsize
+list<blockcachecolumnfamilysummary> list
+new arraylist<blockcachecolumnfamilysummary> bcs values
+collections sort  list
+return list
+// simple calculators of sizes given factors and maxsize
+private long acceptablesize
+return  long math floor this maxsize   this acceptablefactor
+private long minsize
+return  long math floor this maxsize   this minfactor
+private long singlesize
+return  long math floor this maxsize   this singlefactor   this minfactor
+private long multisize
+return  long math floor this maxsize   this multifactor   this minfactor
+private long memorysize
+return  long math floor this maxsize   this memoryfactor   this minfactor
+public void shutdown
+this schedulethreadpool shutdown
+for  int i   0  i < 10  i
+if   this schedulethreadpool isshutdown    threads sleep 10
+if   this schedulethreadpool isshutdown
+list<runnable> runnables   this schedulethreadpool shutdownnow
+log debug     runnables
+this evictionthread shutdown
+/** clears the cache. used in tests. */
+public void clearcache
+map clear
+/**
+* used in testing. may be very inefficient.
+* @return the set of cached file names
+*/
+sortedset<string> getcachedfilenamesfortest
+sortedset<string> filenames   new treeset<string>
+for  blockcachekey cachekey   map keyset
+filenames add cachekey gethfilename
+return filenames
+map<blocktype  integer> getblocktypecountsfortest
+map<blocktype  integer> counts
+new enummap<blocktype  integer> blocktype class
+for  cachedblock cb   map values
+blocktype blocktype     hfileblock  cb getbuffer    getblocktype
+integer count   counts get blocktype
+counts put blocktype   count    null ? 0   count    1
+return counts
+public map<datablockencoding  integer> getencodingcountsfortest
+map<datablockencoding  integer> counts
+new enummap<datablockencoding  integer> datablockencoding class
+for  blockcachekey cachekey   map keyset
+datablockencoding encoding   cachekey getdatablockencoding
+integer count   counts get encoding
+counts put encoding   count    null ? 0   count    1
+return counts

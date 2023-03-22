@@ -1,0 +1,754 @@
+/**
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver
+import java lang management managementfactory
+import java lang management runtimemxbean
+import java rmi unexpectedexception
+import java util arrays
+import java util collections
+import java util iterator
+import java util list
+import java util navigableset
+import java util sortedset
+import java util concurrent atomic atomiclong
+import java util concurrent locks reentrantreadwritelock
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop hbase hbaseconfiguration
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase client scan
+import org apache hadoop hbase io heapsize
+import org apache hadoop hbase regionserver memstorelab allocation
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util classsize
+/**
+* the memstore holds in-memory modifications to the store.  modifications
+* are {@link keyvalue}s.  when asked to flush, current memstore is moved
+* to snapshot and is cleared.  we continue to serve edits out of new memstore
+* and backing snapshot until flusher reports in that the flush succeeded. at
+* this point we let the snapshot go.
+* todo: adjust size of the memstore when we remove items because they have
+* been deleted.
+* todo: with new kvsls, need to make sure we update heapsize with difference
+* in kv size.
+*/
+public class memstore implements heapsize
+private static final log log   logfactory getlog memstore class
+static final string usemslab_key
+private static final boolean usemslab_default   false
+private configuration conf
+// memstore.  use a keyvalueskiplistset rather than skiplistset because of the
+// better semantics.  the map will overwrite if passed a key it already had
+// whereas the set will not add new kv if key is same though value might be
+// different.  value is not important -- just make sure always same
+// reference passed.
+volatile keyvalueskiplistset kvset
+// snapshot of memstore.  made for flusher.
+volatile keyvalueskiplistset snapshot
+final reentrantreadwritelock lock   new reentrantreadwritelock
+final keyvalue kvcomparator comparator
+// used comparing versions -- same r/c and ts but different type.
+final keyvalue kvcomparator comparatorignoretype
+// used comparing versions -- same r/c and type but different timestamp.
+final keyvalue kvcomparator comparatorignoretimestamp
+// used to track own heapsize
+final atomiclong size
+timerangetracker timerangetracker
+timerangetracker snapshottimerangetracker
+memstorelab allocator
+/**
+* default constructor. used for tests.
+*/
+public memstore
+this hbaseconfiguration create    keyvalue comparator
+/**
+* constructor.
+* @param c comparator
+*/
+public memstore final configuration conf
+final keyvalue kvcomparator c
+this conf   conf
+this comparator   c
+this comparatorignoretimestamp
+this comparator getcomparatorignoringtimestamps
+this comparatorignoretype   this comparator getcomparatorignoringtype
+this kvset   new keyvalueskiplistset c
+this snapshot   new keyvalueskiplistset c
+timerangetracker   new timerangetracker
+snapshottimerangetracker   new timerangetracker
+this size   new atomiclong deep_overhead
+if  conf getboolean usemslab_key  usemslab_default
+this allocator   new memstorelab conf
+else
+this allocator   null
+void dump
+for  keyvalue kv  this kvset
+log info kv
+for  keyvalue kv  this snapshot
+log info kv
+/**
+* creates a snapshot of the current memstore.
+* snapshot must be cleared by call to {@link #clearsnapshot(sortedset<keyvalue>)}
+* to get the snapshot made by this method, use {@link #getsnapshot()}
+*/
+void snapshot
+this lock writelock   lock
+try
+// if snapshot currently has entries, then flusher failed or didn't call
+// cleanup.  log a warning.
+if   this snapshot isempty
+log warn
+else
+if   this kvset isempty
+this snapshot   this kvset
+this kvset   new keyvalueskiplistset this comparator
+this snapshottimerangetracker   this timerangetracker
+this timerangetracker   new timerangetracker
+// reset heap to not include any keys
+this size set deep_overhead
+// reset allocator so we get a fresh buffer for the new memstore
+if  allocator    null
+this allocator   new memstorelab conf
+finally
+this lock writelock   unlock
+/**
+* return the current snapshot.
+* called by flusher to get current snapshot made by a previous
+* call to {@link #snapshot()}
+* @return return snapshot.
+* @see {@link #snapshot()}
+* @see {@link #clearsnapshot(sortedset<keyvalue>)}
+*/
+keyvalueskiplistset getsnapshot
+return this snapshot
+/**
+* the passed snapshot was successfully persisted; it can be let go.
+* @param ss the snapshot to clean out.
+* @throws unexpectedexception
+* @see {@link #snapshot()}
+*/
+void clearsnapshot final sortedset<keyvalue> ss
+throws unexpectedexception
+this lock writelock   lock
+try
+if  this snapshot    ss
+throw new unexpectedexception
+this snapshot       ss
+// ok. passed in snapshot is same as current snapshot.  if not-empty,
+// create a new snapshot and let the old one go.
+if   ss isempty
+this snapshot   new keyvalueskiplistset this comparator
+this snapshottimerangetracker   new timerangetracker
+finally
+this lock writelock   unlock
+/**
+* write an update
+* @param kv
+* @return approximate size of the passed key and value.
+*/
+long add final keyvalue kv
+this lock readlock   lock
+try
+keyvalue toadd   maybeclonewithallocator kv
+return internaladd toadd
+finally
+this lock readlock   unlock
+/**
+* internal version of add() that doesn't clone kvs with the
+* allocator, and doesn't take the lock.
+*
+* callers should ensure they already have the read lock taken
+*/
+private long internaladd final keyvalue toadd
+long s   heapsizechange toadd  this kvset add toadd
+timerangetracker includetimestamp toadd
+this size addandget s
+return s
+private keyvalue maybeclonewithallocator keyvalue kv
+if  allocator    null
+return kv
+int len   kv getlength
+allocation alloc   allocator allocatebytes len
+if  alloc    null
+// the allocation was too large, allocator decided
+// not to do anything with it.
+return kv
+assert alloc    null    alloc getdata      null
+system arraycopy kv getbuffer    kv getoffset    alloc getdata    alloc getoffset    len
+keyvalue newkv   new keyvalue alloc getdata    alloc getoffset    len
+newkv setmemstorets kv getmemstorets
+return newkv
+/**
+* remove n key from the memstore. only kvs that have the same key and the
+* same memstorets are removed.  it is ok to not update timerangetracker
+* in this call. it is possible that we can optimize this method by using
+* tailmap/iterator, but since this method is called rarely (only for
+* error recovery), we can leave those optimization for the future.
+* @param kv
+*/
+void rollback final keyvalue kv
+this lock readlock   lock
+try
+// if the key is in the snapshot, delete it. we should not update
+// this.size, because that tracks the size of only the memstore and
+// not the snapshot. the flush of this snapshot to disk has not
+// yet started because store.flush() waits for all rwcc transactions to
+// commit before starting the flush to disk.
+keyvalue found   this snapshot get kv
+if  found    null    found getmemstorets      kv getmemstorets
+this snapshot remove kv
+// if the key is in the memstore, delete it. update this.size.
+found   this kvset get kv
+if  found    null    found getmemstorets      kv getmemstorets
+this kvset remove kv
+long s   heapsizechange kv  true
+this size addandget  s
+finally
+this lock readlock   unlock
+/**
+* write a delete
+* @param delete
+* @return approximate size of the passed key and value.
+*/
+long delete final keyvalue delete
+long s   0
+this lock readlock   lock
+try
+keyvalue toadd   maybeclonewithallocator delete
+s    heapsizechange toadd  this kvset add toadd
+timerangetracker includetimestamp toadd
+finally
+this lock readlock   unlock
+this size addandget s
+return s
+/**
+* @param kv find the row that comes after this one.  if null, we return the
+* first.
+* @return next row or null if none found.
+*/
+keyvalue getnextrow final keyvalue kv
+this lock readlock   lock
+try
+return getlowest getnextrow kv  this kvset   getnextrow kv  this snapshot
+finally
+this lock readlock   unlock
+/*
+* @param a
+* @param b
+* @return return lowest of a or b or null if both a and b are null
+*/
+private keyvalue getlowest final keyvalue a  final keyvalue b
+if  a    null
+return b
+if  b    null
+return a
+return comparator comparerows a  b  <  0? a  b
+/*
+* @param key find row that follows this one.  if null, return first.
+* @param map set to look in for a row beyond <code>row</code>.
+* @return next row or null if none found.  if one found, will be a new
+* keyvalue -- can be destroyed by subsequent calls to this method.
+*/
+private keyvalue getnextrow final keyvalue key
+final navigableset<keyvalue> set
+keyvalue result   null
+sortedset<keyvalue> tail   key    null? set  set tailset key
+// iterate until we fall into the next row; i.e. move off current row
+for  keyvalue kv  tail
+if  comparator comparerows kv  key  <  0
+continue
+// note: not suppressing deletes or expired cells.  needs to be handled
+// by higher up functions.
+result   kv
+break
+return result
+/**
+* @param state column/delete tracking state
+*/
+void getrowkeyatorbefore final getclosestrowbeforetracker state
+this lock readlock   lock
+try
+getrowkeyatorbefore kvset  state
+getrowkeyatorbefore snapshot  state
+finally
+this lock readlock   unlock
+/*
+* @param set
+* @param state accumulates deletes and candidates.
+*/
+private void getrowkeyatorbefore final navigableset<keyvalue> set
+final getclosestrowbeforetracker state
+if  set isempty
+return
+if   walkforwardinsinglerow set  state gettargetkey    state
+// found nothing in row.  try backing up.
+getrowkeybefore set  state
+/*
+* walk forward in a row from <code>firstonrow</code>.  presumption is that
+* we have been passed the first possible key on a row.  as we walk forward
+* we accumulate deletes until we hit a candidate on the row at which point
+* we return.
+* @param set
+* @param firstonrow first possible key on this row.
+* @param state
+* @return true if we found a candidate walking this row.
+*/
+private boolean walkforwardinsinglerow final sortedset<keyvalue> set
+final keyvalue firstonrow  final getclosestrowbeforetracker state
+boolean foundcandidate   false
+sortedset<keyvalue> tail   set tailset firstonrow
+if  tail isempty    return foundcandidate
+for  iterator<keyvalue> i   tail iterator    i hasnext
+keyvalue kv   i next
+// did we go beyond the target row? if so break.
+if  state istoofar kv  firstonrow   break
+if  state isexpired kv
+i remove
+continue
+// if we added something, this row is a contender. break.
+if  state handle kv
+foundcandidate   true
+break
+return foundcandidate
+/*
+* walk backwards through the passed set a row at a time until we run out of
+* set or until we get a candidate.
+* @param set
+* @param state
+*/
+private void getrowkeybefore navigableset<keyvalue> set
+final getclosestrowbeforetracker state
+keyvalue firstonrow   state gettargetkey
+for  member p   memberofpreviousrow set  state  firstonrow
+p    null  p   memberofpreviousrow p set  state  firstonrow
+// make sure we don't fall out of our table.
+if   state istargettable p kv   break
+// stop looking if we've exited the better candidate range.
+if   state isbettercandidate p kv   break
+// make into firstonrow
+firstonrow   new keyvalue p kv getrow    hconstants latest_timestamp
+// if we find something, break;
+if  walkforwardinsinglerow p set  firstonrow  state   break
+/**
+* given the specs of a column, update it, first by inserting a new record,
+* then removing the old one.  since there is only 1 keyvalue involved, the memstorets
+* will be set to 0, thus ensuring that they instantly appear to anyone. the underlying
+* store will ensure that the insert/delete each are atomic. a scanner/reader will either
+* get the new value, or the old value and all readers will eventually only see the new
+* value after the old was removed.
+*
+* @param row
+* @param family
+* @param qualifier
+* @param newvalue
+* @param now
+* @return  timestamp
+*/
+public long updatecolumnvalue byte row
+byte family
+byte qualifier
+long newvalue
+long now
+this lock readlock   lock
+try
+keyvalue firstkv   keyvalue createfirstonrow
+row  family  qualifier
+// is there a keyvalue in 'snapshot' with the same ts? if so, upgrade the timestamp a bit.
+sortedset<keyvalue> snss   snapshot tailset firstkv
+if   snss isempty
+keyvalue snkv   snss first
+// is there a matching kv in the snapshot?
+if  snkv matchingrow firstkv     snkv matchingqualifier firstkv
+if  snkv gettimestamp      now
+// poop,
+now    1
+// logic here: the new ts must be at least 'now'. but it could be larger if necessary.
+// but the timestamp should also be max(now, mostrecenttsinmemstore)
+// so we cant add the new kv w/o knowing what's there already, but we also
+// want to take this chance to delete some kvs. so two loops (sad)
+sortedset<keyvalue> ss   kvset tailset firstkv
+iterator<keyvalue> it   ss iterator
+while   it hasnext
+keyvalue kv   it next
+// if this isnt the row we are interested in, then bail:
+if   kv matchingcolumn family qualifier      kv matchingrow firstkv
+break     rows dont match  bail
+// if the qualifier matches and it's a put, just rm it out of the kvset.
+if  kv gettype      keyvalue type put getcode
+kv gettimestamp   > now    firstkv matchingqualifier kv
+now   kv gettimestamp
+// create or update (upsert) a new keyvalue with
+// 'now' and a 0 memstorets == immediately visible
+return upsert arrays aslist
+new keyvalue row  family  qualifier  now  bytes tobytes newvalue
+finally
+this lock readlock   unlock
+/**
+* update or insert the specified keyvalues.
+* <p>
+* for each keyvalue, insert into memstore.  this will atomically upsert the
+* value for that row/family/qualifier.  if a keyvalue did already exist,
+* it will then be removed.
+* <p>
+* currently the memstorets is kept at 0 so as each insert happens, it will
+* be immediately visible.  may want to change this so it is atomic across
+* all keyvalues.
+* <p>
+* this is called under row lock, so get operations will still see updates
+* atomically.  scans will only see each keyvalue update as atomic.
+*
+* @param kvs
+* @return change in memstore size
+*/
+public long upsert list<keyvalue> kvs
+this lock readlock   lock
+try
+long size   0
+for  keyvalue kv   kvs
+kv setmemstorets 0
+size    upsert kv
+return size
+finally
+this lock readlock   unlock
+/**
+* inserts the specified keyvalue into memstore and deletes any existing
+* versions of the same row/family/qualifier as the specified keyvalue.
+* <p>
+* first, the specified keyvalue is inserted into the memstore.
+* <p>
+* if there are any existing keyvalues in this memstore with the same row,
+* family, and qualifier, they are removed.
+* <p>
+* callers must hold the read lock.
+*
+* @param kv
+* @return change in size of memstore
+*/
+private long upsert keyvalue kv
+// add the keyvalue to the memstore
+// use the internaladd method here since we (a) already have a lock
+// and (b) cannot safely use the mslab here without potentially
+// hitting oome - see testmemstore.testupsertmslab for a
+// test that triggers the pathological case if we don't avoid mslab
+// here.
+long addedsize   internaladd kv
+// get the keyvalues for the row/family/qualifier regardless of timestamp.
+// for this case we want to clean up any other puts
+keyvalue firstkv   keyvalue createfirstonrow
+kv getbuffer    kv getrowoffset    kv getrowlength
+kv getbuffer    kv getfamilyoffset    kv getfamilylength
+kv getbuffer    kv getqualifieroffset    kv getqualifierlength
+sortedset<keyvalue> ss   kvset tailset firstkv
+iterator<keyvalue> it   ss iterator
+while   it hasnext
+keyvalue cur   it next
+if  kv    cur
+// ignore the one just put in
+continue
+// if this isn't the row we are interested in, then bail
+if   kv matchingrow cur
+break
+// if the qualifier matches and it's a put, remove it
+if  kv matchingqualifier cur
+// to be extra safe we only remove puts that have a memstorets==0
+if  kv gettype      keyvalue type put getcode
+kv getmemstorets      0
+// false means there was a change, so give us the size.
+addedsize    heapsizechange kv  true
+it remove
+else
+// past the column, done
+break
+return addedsize
+/*
+* immutable data structure to hold member found in set and the set it was
+* found in.  include set because it is carrying context.
+*/
+private static class member
+final keyvalue kv
+final navigableset<keyvalue> set
+member final navigableset<keyvalue> s  final keyvalue kv
+this kv   kv
+this set   s
+/*
+* @param set set to walk back in.  pass a first in row or we'll return
+* same row (loop).
+* @param state utility and context.
+* @param firstonrow first item on the row after the one we want to find a
+* member in.
+* @return null or member of row previous to <code>firstonrow</code>
+*/
+private member memberofpreviousrow navigableset<keyvalue> set
+final getclosestrowbeforetracker state  final keyvalue firstonrow
+navigableset<keyvalue> head   set headset firstonrow  false
+if  head isempty    return null
+for  iterator<keyvalue> i   head descendingiterator    i hasnext
+keyvalue found   i next
+if  state isexpired found
+i remove
+continue
+return new member head  found
+return null
+/**
+* @return scanner on memstore and snapshot in this order.
+*/
+list<keyvaluescanner> getscanners
+this lock readlock   lock
+try
+return collections <keyvaluescanner>singletonlist
+new memstorescanner
+finally
+this lock readlock   unlock
+/**
+* check if this memstore may contain the required keys
+* @param scan
+* @return false if the key definitely does not exist in this memstore
+*/
+public boolean shouldseek scan scan  long oldestunexpiredts
+return  timerangetracker includestimerange scan gettimerange
+snapshottimerangetracker includestimerange scan gettimerange
+math max timerangetracker getmaximumtimestamp
+snapshottimerangetracker getmaximumtimestamp    >
+oldestunexpiredts
+public timerangetracker getsnapshottimerangetracker
+return this snapshottimerangetracker
+/*
+* memstorescanner implements the keyvaluescanner.
+* it lets the caller scan the contents of a memstore -- both current
+* map and snapshot.
+* this behaves as if it were a real scanner but does not maintain position.
+*/
+protected class memstorescanner extends nonlazykeyvaluescanner
+// next row information for either kvset or snapshot
+private keyvalue kvsetnextrow   null
+private keyvalue snapshotnextrow   null
+// iterator based scanning.
+private iterator<keyvalue> kvsetit
+private iterator<keyvalue> snapshotit
+// the kvset and snapshot at the time of creating this scanner
+volatile keyvalueskiplistset kvsetatcreation
+volatile keyvalueskiplistset snapshotatcreation
+// sub lists on which we're iterating
+private sortedset<keyvalue> kvtail
+private sortedset<keyvalue> snapshottail
+// the pre-calculated keyvalue to be returned by peek() or next()
+private keyvalue thenext
+/*
+some notes...
+so memstorescanner is fixed at creation time. this includes pointers/iterators into
+existing kvset/snapshot.  during a snapshot creation, the kvset is null, and the
+snapshot is moved.  since kvset is null there is no point on reseeking on both,
+we can save us the trouble. during the snapshot->hfile transition, the memstore
+scanner is re-created by storescanner#updatereaders().  storescanner should
+potentially do something smarter by adjusting the existing memstore scanner.
+but there is a greater problem here, that being once a scanner has progressed
+during a snapshot scenario, we currently iterate past the kvset then 'finish' up.
+if a scan lasts a little while, there is a chance for new entries in kvset to
+become available but we will never see them.  this needs to be handled at the
+storescanner level with coordination with memstorescanner.
+currently, this problem is only partly managed: during the small amount of time
+when the storescanner has not yet created a new memstorescanner, we will miss
+the adds to kvset in the memstorescanner.
+*/
+memstorescanner
+super
+kvsetatcreation   kvset
+snapshotatcreation   snapshot
+protected keyvalue getnext iterator<keyvalue> it
+long readpoint   multiversionconsistencycontrol getthreadreadpoint
+while  it hasnext
+keyvalue v   it next
+if  v getmemstorets   <  readpoint
+return v
+return null
+/**
+*  set the scanner at the seek key.
+*  must be called only once: there is no thread safety between the scanner
+*   and the memstore.
+* @param key seek value
+* @return false if the key is null or if there is no data
+*/
+@override
+public synchronized boolean seek keyvalue key
+if  key    null
+close
+return false
+// kvset and snapshot will never be null.
+// if tailset can't find anything, sortedset is empty (not null).
+kvtail   kvsetatcreation tailset key
+snapshottail   snapshotatcreation tailset key
+return seekinsublists key
+/**
+* (re)initialize the iterators after a seek or a reseek.
+*/
+private synchronized boolean seekinsublists keyvalue key
+kvsetit   kvtail iterator
+snapshotit   snapshottail iterator
+kvsetnextrow   getnext kvsetit
+snapshotnextrow   getnext snapshotit
+// calculate the next value
+thenext   getlowest kvsetnextrow  snapshotnextrow
+// has data
+return  thenext    null
+/**
+* move forward on the sub-lists set previously by seek.
+* @param key seek value (should be non-null)
+* @return true if there is at least one kv to read, false otherwise
+*/
+@override
+public synchronized boolean reseek keyvalue key
+/*
+see hbase-4195 & hbase-3855 for the background on this implementation.
+this code is executed concurrently with flush and puts, without locks.
+two points must be known when working on this code:
+1) it's not possible to use the 'kvtail' and 'snapshot'
+variables, as they are modified during a flush.
+2) the ideal implementation for performances would use the sub skip list
+implicitly pointed by the iterators 'kvsetit' and
+'snapshotit'. unfortunately the java api does not offer a method to
+get it. so we're using the skip list that we kept when we created
+the iterators. as these iterators could have been moved forward after
+their creation, we're doing a kind of rewind here. it has a small
+performance impact (we're using a wider list than necessary), and we
+could see values that were not here when we read the list the first
+time. we expect that the new values will be skipped by the test on
+readpoint performed in the next() function.
+*/
+kvtail   kvtail tailset key
+snapshottail   snapshottail tailset key
+return seekinsublists key
+@override
+public synchronized keyvalue peek
+//debugprint.println(" ms@" + hashcode() + " peek = " + getlowest());
+return thenext
+@override
+public synchronized keyvalue next
+if  thenext    null
+return null
+final keyvalue ret   thenext
+// advance one of the iterators
+if  thenext    kvsetnextrow
+kvsetnextrow   getnext kvsetit
+else
+snapshotnextrow   getnext snapshotit
+// calculate the next value
+thenext   getlowest kvsetnextrow  snapshotnextrow
+//long readpoint = readwriteconsistencycontrol.getthreadreadpoint();
+//debugprint.println(" ms@" + hashcode() + " next: " + thenext + " next_next: " +
+//    getlowest() + " threadpoint=" + readpoint);
+return ret
+/*
+* returns the lower of the two key values, or null if they are both null.
+* this uses comparator.compare() to compare the keyvalue using the memstore
+* comparator.
+*/
+protected keyvalue getlowest keyvalue first  keyvalue second
+if  first    null    second    null
+return null
+if  first    null    second    null
+int compare   comparator compare first  second
+return  compare <  0 ? first   second
+return  first    null ? first   second
+public synchronized void close
+this kvsetnextrow   null
+this snapshotnextrow   null
+this kvsetit   null
+this snapshotit   null
+/**
+* memstorescanner returns max value as sequence id because it will
+* always have the latest data among all files.
+*/
+@override
+public long getsequenceid
+return long max_value
+@override
+public boolean shouldusescanner scan scan  sortedset<byte> columns
+long oldestunexpiredts
+return shouldseek scan  oldestunexpiredts
+public final static long fixed_overhead   classsize align
+classsize object    11   classsize reference
+public final static long deep_overhead   classsize align fixed_overhead
+classsize reentrant_lock   classsize atomic_long
+classsize copyonwrite_arrayset   classsize copyonwrite_arraylist
+2   classsize concurrent_skiplistmap
+/** used for readability when we don't store memstore timestamp in hfile */
+public static final boolean no_persistent_ts   false
+/*
+* calculate how the memstore size has changed.  includes overhead of the
+* backing map.
+* @param kv
+* @param notpresent true if the kv was not present in the set.
+* @return size
+*/
+long heapsizechange final keyvalue kv  final boolean notpresent
+return notpresent ?
+classsize align classsize concurrent_skiplistmap_entry   kv heapsize
+0
+/**
+* get the entire heap usage for this memstore not including keys in the
+* snapshot.
+*/
+@override
+public long heapsize
+return size get
+/**
+* get the heap usage of kvs in this memstore.
+*/
+public long keysize
+return heapsize     deep_overhead
+/**
+* code to help figure if our approximation of object heap sizes is close
+* enough.  see hbase-900.  fills memstores then waits so user can heap
+* dump and bring up resultant hprof in something like jprofiler which
+* allows you get 'deep size' on objects.
+* @param args main args
+*/
+public static void main string  args
+runtimemxbean runtime   managementfactory getruntimemxbean
+log info     runtime getvmname
+runtime getvmvendor         runtime getvmversion
+log info     runtime getinputarguments
+memstore memstore1   new memstore
+// todo: x32 vs x64
+long size   0
+final int count   10000
+byte  fam   bytes tobytes
+byte  qf   bytes tobytes
+byte  empty   new byte
+for  int i   0  i < count  i
+// give each its own ts
+size    memstore1 add new keyvalue bytes tobytes i   fam  qf  i  empty
+log info     size
+for  int i   0  i < count  i
+size    memstore1 add new keyvalue bytes tobytes i   fam  qf  i  empty
+log info     size
+// make a variably sized memstore.
+memstore memstore2   new memstore
+for  int i   0  i < count  i
+size    memstore2 add new keyvalue bytes tobytes i   fam  qf  i
+new byte
+log info     size
+final int seconds   30
+log info     seconds
+for  int i   0  i < seconds  i
+// thread.sleep(1000);
+log info

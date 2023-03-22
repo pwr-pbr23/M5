@@ -1,0 +1,466 @@
+/*
+derby - class org.apache.derby.impl.sql.execute.indexrowtobaserowresultset
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl sql execute
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services stream headerprintwriter
+import org apache derby iapi services stream infostreams
+import org apache derby iapi sql execute cursorresultset
+import org apache derby iapi sql execute execrow
+import org apache derby iapi sql execute noputresultset
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi sql activation
+import org apache derby iapi sql resultset
+import org apache derby iapi sql conn languageconnectioncontext
+import org apache derby iapi sql conn statementcontext
+import org apache derby iapi store access conglomeratecontroller
+import org apache derby iapi store access dynamiccompiledopenconglominfo
+import org apache derby iapi store access staticcompiledopenconglominfo
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi services loader generatedmethod
+import org apache derby iapi reference sqlstate
+import org apache derby iapi error standardexception
+import org apache derby iapi types rowlocation
+import org apache derby iapi services io formatablebitset
+import org apache derby catalog types referencedcolumnsdescriptorimpl
+/**
+* takes a result set with a rowlocation as the last column, and uses the
+* rowlocation to get and return a row from the given base conglomerate.
+* normally, the input result set will be a tablescanresultset scanning an
+* index conglomerate.
+*
+* @author jeff
+*/
+class indexrowtobaserowresultset extends noputresultsetimpl
+implements cursorresultset
+// set in constructor and not altered during
+// life of object.
+private long conglomid
+public noputresultset source
+private generatedmethod resultrowallocator
+private generatedmethod restriction
+private long baseconglomid
+public formatablebitset accessedheapcols
+private formatablebitset accessedindexcols
+//caching accessed columns (heap+index) beetle 3865
+private formatablebitset accessedallcols
+public string indexname
+private int indexcols
+private dynamiccompiledopenconglominfo dcoci
+private staticcompiledopenconglominfo scoci
+// set in open() and not changed after that
+private conglomeratecontroller	basecc
+private boolean                 closebasecchere
+private execrow					resultrow
+private execrow					compactrow
+private boolean					forupdate
+private datavaluedescriptor	rowarray
+// changed a whole bunch
+rowlocation	baserowlocation
+/* remember whether or not we have copied any
+* columns from the source row to our row yet.
+*/
+boolean copiedfromsource
+/* run time statistics variables */
+public long restrictiontime
+protected boolean currentrowprescanned
+private boolean sourceisforupdateindexscan
+//
+// class interface
+//
+indexrowtobaserowresultset
+long conglomid
+int scociitem
+activation a
+noputresultset source
+generatedmethod resultrowallocator
+int resultsetnumber
+string indexname
+int heapcolrefitem
+int indexcolrefitem
+int indexcolmapitem
+generatedmethod restriction
+boolean forupdate
+double optimizerestimatedrowcount
+double optimizerestimatedcost
+throws standardexception
+super a  resultsetnumber  optimizerestimatedrowcount  optimizerestimatedcost
+scoci    staticcompiledopenconglominfo  activation getpreparedstatement
+getsavedobject scociitem
+transactioncontroller tc   activation gettransactioncontroller
+dcoci   tc getdynamiccompiledconglominfo conglomid
+this source   source
+this resultrowallocator   resultrowallocator
+this indexname   indexname
+this forupdate   forupdate
+this restriction   restriction
+/* resolve - once we push qualifiers into the store we
+* need to clear their orderable cache on each open/reopen.
+*/
+// retrieve the valid column list from
+// the saved objects, if it exists
+this accessedheapcols   null
+if  heapcolrefitem     1
+this accessedheapcols    formatablebitset  a getpreparedstatement
+getsavedobject heapcolrefitem
+if  indexcolrefitem     1
+this accessedindexcols    formatablebitset  a getpreparedstatement
+getsavedobject indexcolrefitem
+if  accessedindexcols    null
+accessedallcols   accessedheapcols
+else
+accessedallcols   new formatablebitset accessedheapcols
+accessedallcols or accessedindexcols
+// retrieve the array of columns coming from the index
+indexcols     referencedcolumnsdescriptorimpl   a getpreparedstatement
+getsavedobject indexcolmapitem    getreferencedcolumnpositions
+/* get the result row template */
+resultrow    execrow  resultrowallocator invoke activation
+compactrow
+getcompactrow resultrow
+accessedheapcols
+accessedindexcols
+false
+/* if there's no partial row bit map, then we want the entire
+* row, otherwise we need to diddle with the row array so that
+* we only get the columns coming from the heap on the fetch.
+*/
+if  accessedheapcols    null
+rowarray   resultrow getrowarray
+else
+// figure out how many columns are coming from the heap
+int arraysize   accessedheapcols getnumbitsset
+int accessedheapcolssize   accessedheapcols size
+rowarray   new datavaluedescriptor
+// now, fill in rowarray with the desired columns
+int partialindex   0
+int numfromindex   0
+for  int index   0  index < accessedheapcolssize  index
+if  accessedindexcols    null    accessedindexcols get index
+numfromindex
+continue
+if  accessedheapcols get index
+rowarray
+resultrow getrowarray
+partialindex
+constructortime    getelapsedmillis begintime
+//
+// resultset interface (leftover from noputresultset)
+//
+/**
+* open this resultset.
+*
+* @exception standardexception thrown if cursor finished.
+*/
+public void	opencore   throws standardexception
+boolean						lockingrequired   false
+transactioncontroller		tc
+// revisit: through the direct db api, this needs to be an
+// error, not an assert; users can open twice. only through jdbc
+// is access to open controlled and ensured valid.
+if  sanitymanager debug
+sanitymanager assert    isopen
+begintime   getcurrenttimemillis
+source opencore
+if   source instanceof tablescanresultset
+tablescanresultset  source  indexcols    null
+sourceisforupdateindexscan   true
+/* get a conglomeratecontroller for the base conglomerate
+* note: we only need to acquire locks on the data pages when
+* going through the index when we are at read committed and
+* the source is a bulktablescan or hashscan.  (the underlying
+* row will not be guaranteed to be locked.)
+*/
+if  source requiresrelocking
+lockingrequired   true
+tc   activation gettransactioncontroller
+int openmode
+int isolationlevel
+if  forupdate
+openmode   transactioncontroller openmode_forupdate
+else
+openmode   0
+isolationlevel   source getscanisolationlevel
+if   lockingrequired
+// flag indicates that lock has already been acquired by access to
+// the secondary index, and need not be gotten again in the base
+// table.
+openmode    transactioncontroller openmode_secondary_locked
+/* try to get the conglomeratecontroller from the activation
+* first, for the case that we are part of an update or delete.
+* if so, then the rowchangerimpl did the correct locking.
+* if not there, then we go off and open it ourself.
+*/
+if  forupdate
+basecc   activation getheapconglomeratecontroller
+if  basecc    null
+basecc
+tc opencompiledconglomerate
+activation getresultsetholdability
+openmode
+// consistent with frombasetable's updatetargetlockmode
+transactioncontroller mode_record
+isolationlevel
+scoci
+dcoci
+closebasecchere   true
+isopen   true
+numopens
+opentime    getelapsedmillis begintime
+/**
+* reopen this resultset.
+*
+* @exception standardexception thrown if cursor finished.
+*/
+public void	reopencore   throws standardexception
+transactioncontroller		tc
+if  sanitymanager debug
+sanitymanager assert isopen
+begintime   getcurrenttimemillis
+source reopencore
+numopens
+opentime    getelapsedmillis begintime
+/**
+* return the requested values computed
+* from the next row (if any) for which
+* the restriction evaluates to true.
+* <p>
+* restriction and projection parameters
+* are evaluated for each row.
+*
+* @exception standardexception thrown on failure.
+* @exception standardexception resultsetnotopen thrown if not yet open.
+*
+* @return the next row in the result
+*/
+public execrow	getnextrowcore   throws standardexception
+execrow sourcerow   null
+execrow retval   null
+boolean restrict   false
+datavaluedescriptor restrictboolean
+long	beginrt   0
+begintime   getcurrenttimemillis
+if     isopen
+throw standardexception newexception sqlstate lang_result_set_not_open
+/* beetle 3865, updateable cursor using index.  when in-memory hash table was full, we
+* read forward and saved future row id's in a virtual-memory-like temp table.  so if
+* we have rid's saved, and we are here, it must be non-covering index.  intercept it
+* here, so that we don't have to go to underlying index scan.  we get both heap cols
+* and index cols together here for better performance.
+*/
+if  sourceisforupdateindexscan      tablescanresultset  source  futureforupdaterows    null
+currentrowprescanned   false
+tablescanresultset src    tablescanresultset  source
+if  src futurerowresultset    null
+src futurerowresultset    temporaryrowholderresultset  src futureforupdaterows getresultset
+src futurerowresultset opencore
+execrow ridrow   src futurerowresultset getnextrowcore
+currentrow   null
+if  ridrow    null
+/* to maximize performance, we only use virtual memory style heap, no
+* position index is ever created.  and we save and retrieve rows from the
+* in-memory part of the heap as much as possible.  we can also insert after
+* we start retrieving, the assumption is that we delete the current row right
+* after we retrieve it.
+*/
+src futurerowresultset deletecurrentrow
+baserowlocation    rowlocation  ridrow getcolumn 1
+basecc fetch
+baserowlocation  compactrow getrowarray    accessedallcols
+currentrow   compactrow
+currentrowprescanned   true
+else if  src sourcedrained
+currentrowprescanned   true
+if  currentrowprescanned
+setcurrentrow currentrow
+nexttime    getelapsedmillis begintime
+return currentrow
+/* loop until we get a row from the base page that qualifies or
+* there's no more rows from the index that qualify. (if the rid
+* returned by the index does not qualify, then we have to go back
+* to the index to see if there is another rid to consider.)
+*/
+do
+sourcerow   source getnextrowcore
+if  sourcerow    null
+if  sanitymanager debug
+sanitymanager assert
+sourcerow getcolumn sourcerow ncolumns
+instanceof rowlocation
+baserowlocation    rowlocation
+sourcerow getcolumn sourcerow ncolumns
+// fetch the columns coming from the heap
+boolean row_exists
+basecc fetch
+baserowlocation  rowarray  accessedheapcols
+if  row_exists
+/* we only need to copy columns from the index row
+* to our result row once as we will be reusing the
+* wrappers in that case.
+* note: when the underlying resultset got an
+* instantaneous lock (bulktablescan or hashscan)
+* then we will be getting all of the columns anew
+* from the index (indexcols == null).
+*/
+if    copiedfromsource
+copiedfromsource   true
+// copy the columns coming from the index into resultrow
+for  int index   0  index < indexcols length  index
+if  indexcols     1
+compactrow setcolumn
+index   1
+sourcerow getcolumn indexcols   1
+setcurrentrow compactrow
+restrictboolean    datavaluedescriptor
+restriction    null  ?
+null   restriction invoke activation
+restrictiontime    getelapsedmillis beginrt
+// if the result is null, we make it false --
+// so the row won't be returned.
+restrict    restrictboolean    null
+restrictboolean isnull
+restrictboolean getboolean
+if    restrict      row_exists
+rowsfiltered
+clearcurrentrow
+baserowlocation   null
+else
+currentrow   compactrow
+/* update the run time statistics */
+rowsseen
+retval   currentrow
+else
+clearcurrentrow
+baserowlocation   null
+retval   null
+while    sourcerow    null        restrict
+nexttime    getelapsedmillis begintime
+return retval
+/**
+* if the result set has been opened,
+* close the open scan.
+*
+* @exception standardexception thrown on error
+*/
+public void	close   throws standardexception
+begintime   getcurrenttimemillis
+if   isopen
+// we don't want to keep around a pointer to the
+// row ... so it can be thrown away.
+// revisit: does this need to be in a finally
+// block, to ensure that it is executed?
+clearcurrentrow
+if  closebasecchere
+// this check should only be needed in the error case where
+// we may call this close() routine as part of transaction
+// backout cleanup if any of the following routines fail.
+// if one of the subsequent statements gets an error, we
+// will try to close this result set as part of transaction
+// cleanup, and without this check we get a null pointer
+// exception because we have null'd out basecc.
+if  basecc    null
+basecc close
+/* make sure to null out basecc since
+* we check for null basecc after looking
+* in the statementcontext.
+*/
+basecc   null
+source close
+super close
+else if  sanitymanager debug
+sanitymanager debug
+closetime    getelapsedmillis begintime
+/**
+* return the total amount of time spent in this resultset
+*
+* @param type	current_resultset_only - time spent only in this resultset
+*				entire_resultset_tree  - time spent in this resultset and below.
+*
+* @return long		the total amount of time spent (in milliseconds).
+*/
+public long gettimespent int type
+long tottime   constructortime   opentime   nexttime   closetime
+if  type    noputresultset current_resultset_only
+return	tottime   source gettimespent entire_resultset_tree
+else
+return tottime
+//
+// cursorresultset interface
+//
+/**
+* return the rowlocation of the base row.
+*
+* @see cursorresultset
+*
+* @return the row location of the current cursor row.
+* @exception standardexception thrown on failure.
+*/
+public rowlocation getrowlocation   throws standardexception
+return baserowlocation
+/**
+* @see noputresultset#positionscanatrowlocation
+*
+* also remembers row location so that subsequent invocations of
+* getcurrentrow will not read the index row to look up the row
+* location base row, but reuse the saved row location.
+*/
+public void positionscanatrowlocation rowlocation rl
+throws standardexception
+baserowlocation   rl
+source positionscanatrowlocation rl
+/**	 * gets last row returned.
+*
+* @see cursorresultset
+*
+* @return the last row returned.
+* @exception standardexception thrown on failure.
+*/
+/* resolve - this should return activation.getcurrentrow(resultsetnumber),
+* once there is such a method.  (currentrow is redundant)
+*/
+public execrow getcurrentrow   throws standardexception
+execrow sourcerow   null
+if  sanitymanager debug
+sanitymanager assert isopen
+if  currentrowprescanned
+return currentrow
+/* nothing to do if we're not currently on a row */
+if  currentrow    null
+return null
+// we do not need to read the row from the index first, since we already
+// have the rowlocation of the current row and can read it directly from
+// the heap.
+sourcerow   activation getexecutionfactory
+getvaluerow indexcols length
+sourcerow setrowarray rowarray
+// fetch the columns coming from the heap
+boolean row_exists
+basecc fetch
+baserowlocation  rowarray   formatablebitset  null
+if  row_exists
+setcurrentrow sourcerow
+else
+clearcurrentrow
+return currentrow
+/**
+* is this resultset or it's source result set for update.
+* beetle 3865: updateable cursor using index scan.  we didn't need this function
+* before because we couldn't use index for update cursor.
+*
+* @return whether or not the result set is for update.
+*/
+public boolean isforupdate
+return source isforupdate

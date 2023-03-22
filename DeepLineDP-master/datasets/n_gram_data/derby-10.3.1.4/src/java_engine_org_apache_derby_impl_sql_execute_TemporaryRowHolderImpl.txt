@@ -1,0 +1,518 @@
+/*
+derby - class org.apache.derby.impl.sql.execute.temporaryrowholderimpl
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl sql execute
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby iapi sql execute cursorresultset
+import org apache derby iapi sql execute execrow
+import org apache derby iapi sql execute executionfactory
+import org apache derby iapi sql execute temporaryrowholder
+import org apache derby iapi sql activation
+import org apache derby iapi sql resultdescription
+import org apache derby iapi store access conglomeratecontroller
+import org apache derby iapi store access scancontroller
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi types cloneableobject
+import org apache derby iapi types rowlocation
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi types sqlref
+import org apache derby iapi types sqllongint
+import org apache derby iapi services io formatablebitset
+import java util properties
+/**
+* this is a class that is used to temporarily
+* (non-persistently) hold rows that are used in
+* language execution.  it will store them in an
+* array, or a temporary conglomerate, depending
+* on the number of rows.
+* <p>
+* it is used for deferred dml processing.
+*
+*/
+class temporaryrowholderimpl implements temporaryrowholder
+{
+public static final int default_overflowthreshold   5
+protected static final int state_uninit   0
+protected static final int state_insert   1
+protected static final int state_drain   2
+protected execrow 	rowarray
+protected int 		lastarrayslot
+private int			numrowsin
+protected int		state   state_uninit
+protected	long				cid
+private boolean					conglomcreated
+private conglomeratecontroller	cc
+private properties				properties
+private scancontroller			scan
+private	resultdescription		resultdescription
+/** activation object with local state information. */
+activation						activation
+private boolean     isuniquestream
+/* beetle 3865 updateable cursor use index. a virtual memory heap is a heap that has in-memory
+* part to get better performance, less overhead. no position index needed. we read from and write
+* to the in-memory part as much as possible. and we can insert after we start retrieving results.
+* could be used for other things too.
+*/
+private boolean     isvirtualmemheap
+private boolean     uniqueindexcreated
+private boolean     positionindexcreated
+private long        uniqueindexconglomid
+private long        positionindexconglomid
+private conglomeratecontroller uniqueindex_cc
+private conglomeratecontroller positionindex_cc
+private datavaluedescriptor  uniqueindexrow   null
+private datavaluedescriptor  positionindexrow   null
+private rowlocation            destrowlocation    row location in the temporary conglomerate
+private sqllongint             position_sqllong
+/**
+* uses the default overflow to
+* a conglomerate threshold (5).
+*
+* @param activation the activation
+* @param properties the properties of the original table.  used
+*		to help the store use optimal page size, etc.
+* @param resultdescription the result description.  relevant for the getresultdescription
+* 		call on the result set returned by getresultset.  may be null
+*/
+public temporaryrowholderimpl
+activation				activation
+properties 				properties
+resultdescription		resultdescription
+{
+this activation  properties  resultdescription
+default_overflowthreshold  false  false
+}
+/**
+* uses the default overflow to
+* a conglomerate threshold (5).
+*
+* @param activation the activation
+* @param properties the properties of the original table.  used
+*		to help the store use optimal page size, etc.
+* @param resultdescription the result description.  relevant for the getresultdescription
+* 		call on the result set returned by getresultset.  may be null
+* @param isuniquestream - true , if it has to be temporary row holder unique stream
+*/
+public temporaryrowholderimpl
+activation				activation
+properties 				properties
+resultdescription		resultdescription
+boolean                 isuniquestream
+{
+this activation  properties  resultdescription  1  isuniquestream
+false
+}
+/**
+* create a temporary row holder with the defined overflow to conglom
+*
+* @param activation the activation
+* @param properties the properties of the original table.  used
+*		to help the store use optimal page size, etc.
+* @param resultdescription the result description.  relevant for the getresultdescription
+* 		call on the result set returned by getresultset.  may be null
+* @param overflowtoconglomthreshold on an attempt to insert
+* 		this number of rows, the rows will be put
+*		into a temporary conglomerate.
+*/
+public temporaryrowholderimpl
+activation			 	activation
+properties				properties
+resultdescription		resultdescription
+int 					overflowtoconglomthreshold
+boolean                 isuniquestream
+boolean					isvirtualmemheap
+{
+if  sanitymanager debug
+{
+if  overflowtoconglomthreshold <  0
+{
+sanitymanager throwassert
+}
+}
+this activation   activation
+this properties   properties
+this resultdescription   resultdescription
+this isuniquestream   isuniquestream
+this isvirtualmemheap   isvirtualmemheap
+rowarray   new execrow
+lastarrayslot    1
+}
+/* avoid materializing a stream just because it goes through a temp table.  it is ok to
+* have a stream in the temp table (in memory or spilled to disk).  the assumption is
+* that one stream does not appear in two rows.  for "update", one stream can be in two
+* rows and the materialization is done in updateresultset.  note to future users of this
+* class who may insert a stream into this temp holder: (1) as mentioned above, one
+* un-materialized stream can't appear in two rows; you need to objectify it first otherwise.
+* (2) if you need to retrieve a un-materialized stream more than once from the temp holder,
+* you need to either materialize the stream the first time, or, if there's a memory constraint,
+* in the first time create a rememberbytesinputstream with the byte holder being
+* backingstorebyteholder, finish it, and reset it after usage.
+* beetle 4896.
+*/
+private execrow clonerow execrow inputrow
+{
+datavaluedescriptor cols   inputrow getrowarray
+int ncols   cols length
+execrow cloned     valuerow  inputrow  cloneme
+for  int i   0  i < ncols  i
+{
+if  cols    null
+{
+/* rows are 1-based, cols[] is 0-based */
+cloned setcolumn i   1   datavaluedescriptor   cloneableobject  cols  cloneobject
+}
+}
+if  inputrow instanceof indexvaluerow
+return new indexvaluerow cloned
+else
+return cloned
+}
+/**
+* insert a row
+*
+* @param inputrow the row to insert
+*
+* @exception standardexception on error
+*/
+public void insert execrow inputrow
+throws standardexception
+{
+if  sanitymanager debug
+{
+if  isuniquestream     isvirtualmemheap
+sanitymanager assert state    state_drain
+}
+if    isvirtualmemheap
+state   state_insert
+if uniqueindexcreated
+{
+if isrowalreadyexist inputrow
+return
+}
+numrowsin
+if  lastarrayslot   1 < rowarray length
+{
+rowarray   clonerow inputrow
+//in case of unique stream we push every thing into the
+// conglomerates for time being, we keep one row in the array for
+// the template.
+if  isuniquestream
+return
+}
+if   conglomcreated
+{
+transactioncontroller tc   activation gettransactioncontroller
+// todo-collate, i think collation needs to get set always correctly
+// but did see what to get collate id when there was no result
+// description.  the problem comes if row holder is used to stream
+// row to temp disk, then row is read from disk using an interface
+// where store creates the datavaluedescriptor template itself,
+// and subsquently the returned column is used for some sort of
+// comparison.  also could be a problem is reader of tempoary
+// table uses qualifiers, that would result in comparisons internal
+// to store.  i believe the below impl is incomplete - either
+// it should always be default, or real collate_ids should be
+// passed in.
+// null collate_ids in createconglomerate call indicates to use all
+// default collate ids.
+int collation_ids   null
+/*
+todo-collate - if we could count on resultdescription i think the
+following would work.
+if (resultdescription != null)
+{
+// init collation id info from resultdescription for create call
+collation_ids = new int[resultdescription.getcolumncount()];
+for (int i = 0; i < collation_ids.length; i++)
+{
+collation_ids[i] =
+resultdescription.getcolumndescriptor(
+i + 1).gettype().getcollationtype();
+}
+}
+*/
+/*
+** create the conglomerate with the template row.
+*/
+cid
+tc createconglomerate
+inputrow getrowarray
+null    column sort order   not required for heap
+collation_ids
+properties
+transactioncontroller is_temporary
+transactioncontroller is_kept
+conglomcreated   true
+cc   tc openconglomerate cid
+false
+transactioncontroller openmode_forupdate
+transactioncontroller mode_table
+transactioncontroller isolation_serializable
+if isuniquestream
+destrowlocation   cc newrowlocationtemplate
+}
+int status   0
+if isuniquestream
+{
+cc insertandfetchlocation inputrow getrowarray    destrowlocation
+inserttopositionindex numrowsin  1  destrowlocation
+//create the unique index based on input row row location
+if  uniqueindexcreated
+isrowalreadyexist inputrow
+else
+{
+status   cc insert inputrow getrowarray
+if  isvirtualmemheap
+state   state_insert
+}
+if  sanitymanager debug
+{
+if  status    0
+{
+sanitymanager throwassert   status
+}
+}
+}
+/**
+* maintain an unique index based on the input row's row location in the
+* base table, this index make sures that we don't insert duplicate rows
+* into the temporary heap.
+* @param inputrow  the row we are inserting to temporary row holder
+* @exception standardexception on error
+*/
+private boolean isrowalreadyexist execrow inputrow  throws  standardexception
+{
+datavaluedescriptor		rlcolumn
+rowlocation	baserowlocation
+rlcolumn   inputrow getcolumn inputrow ncolumns
+if cid  0    rlcolumn instanceof sqlref
+{
+baserowlocation
+rowlocation   rlcolumn  getobject
+if  uniqueindexcreated
+{
+transactioncontroller tc
+activation gettransactioncontroller
+int numkeys   2
+uniqueindexrow   new datavaluedescriptor
+uniqueindexrow   baserowlocation
+uniqueindexrow   baserowlocation
+properties props   makeindexproperties uniqueindexrow  cid
+uniqueindexconglomid
+tc createconglomerate
+uniqueindexrow
+
+null     no collation needed for index on row locations
+props
+transactioncontroller is_temporary
+transactioncontroller is_kept
+uniqueindex_cc   tc openconglomerate
+uniqueindexconglomid
+false
+transactioncontroller openmode_forupdate
+transactioncontroller mode_table
+transactioncontroller isolation_serializable
+uniqueindexcreated   true
+}
+uniqueindexrow   baserowlocation
+uniqueindexrow   baserowlocation
+// insert the row into the secondary index.
+int status
+if   status   uniqueindex_cc insert uniqueindexrow     0
+{
+if status    conglomeratecontroller rowisduplicate
+{
+return true      okay  we don't insert duplicates
+}
+else
+{
+if  sanitymanager debug
+{
+if  status    0
+{
+sanitymanager throwassert   status
+}
+}
+}
+}
+}
+return false
+}
+/**
+* maintain an index that will allow us to read  from the
+* temporary heap in the order we inserted.
+* @param position - the number of the row we are inserting into heap
+* @param rl the row to location in the temporary heap
+* @exception standardexception on error
+*/
+private void inserttopositionindex int position  rowlocation rl   throws  standardexception
+{
+if  positionindexcreated
+{
+transactioncontroller tc   activation gettransactioncontroller
+int numkeys   2
+position_sqllong   new sqllongint
+positionindexrow   new datavaluedescriptor
+positionindexrow   position_sqllong
+positionindexrow   rl
+properties props   makeindexproperties positionindexrow  cid
+positionindexconglomid
+tc createconglomerate
+positionindexrow
+
+null     no collation needed for index on row locations
+props
+transactioncontroller is_temporary
+transactioncontroller is_kept
+positionindex_cc
+tc openconglomerate
+positionindexconglomid
+false
+transactioncontroller openmode_forupdate
+transactioncontroller mode_table
+transactioncontroller isolation_serializable
+positionindexcreated   true
+}
+position_sqllong setvalue position
+positionindexrow   position_sqllong
+positionindexrow   rl
+//insert the row location to position index
+positionindex_cc insert positionindexrow
+}
+/**
+* get a result set for scanning what has been inserted
+* so far.
+*
+* @return a result set to use
+*/
+public cursorresultset getresultset
+{
+state   state_drain
+transactioncontroller tc   activation gettransactioncontroller
+if isuniquestream
+{
+return new temporaryrowholderresultset tc  rowarray
+resultdescription  isvirtualmemheap
+true  positionindexconglomid  this
+}
+else
+{
+return new temporaryrowholderresultset tc  rowarray  resultdescription  isvirtualmemheap  this
+}
+}
+/**
+* purge the row holder of all its rows.
+* resets the row holder so that it can
+* accept new inserts.  a cheap way to
+* recycle a row holder.
+*
+* @exception standardexception on error
+*/
+public void truncate   throws standardexception
+{
+close
+for  int i   0  i < rowarray length  i
+{
+rowarray   null
+}
+lastarrayslot    1
+numrowsin   0
+state   state_uninit
+/*
+** we are not expecting this to be called
+** when we have a temporary conglomerate
+** but just to be on the safe side, drop
+** it.  we'd like do something cheaper,
+** but there is no truncate on congloms.
+*/
+if  conglomcreated
+{
+transactioncontroller tc   activation gettransactioncontroller
+tc dropconglomerate cid
+conglomcreated   false
+}
+}
+public long gettemporaryconglomid
+{
+return cid
+}
+public long getpositionindexconglomid
+{
+return positionindexconglomid
+}
+private properties makeindexproperties datavaluedescriptor
+indexrowarray  long conglomid   throws standardexception
+int ncols   indexrowarray length
+properties props   new properties
+props put
+// all columns form the key, (currently) required
+props put    string valueof ncols
+props put    string valueof ncols 1
+props put    string valueof ncols 1
+props put    string valueof conglomid
+return props
+}
+public void setrowholdertypetouniquestream
+{
+isuniquestream   true
+}
+/**
+* clean up
+*
+* @exception standardexception on error
+*/
+public void close   throws standardexception
+{
+if  scan    null
+{
+scan close
+scan   null
+}
+if  cc    null
+{
+cc close
+cc   null
+}
+if  uniqueindex_cc    null
+{
+uniqueindex_cc close
+uniqueindex_cc   null
+}
+if  positionindex_cc    null
+{
+positionindex_cc close
+positionindex_cc   null
+}
+transactioncontroller tc   activation gettransactioncontroller
+if  uniqueindexcreated
+{
+tc dropconglomerate uniqueindexconglomid
+uniqueindexcreated   false
+}
+if  positionindexcreated
+{
+tc dropconglomerate positionindexconglomid
+positionindexcreated   false
+}
+if  conglomcreated
+{
+tc dropconglomerate cid
+conglomcreated   false
+}
+state   state_uninit
+lastarrayslot    1
+}
+}

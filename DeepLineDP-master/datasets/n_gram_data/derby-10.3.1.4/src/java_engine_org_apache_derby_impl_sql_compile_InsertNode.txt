@@ -1,0 +1,691 @@
+/*
+derby - class org.apache.derby.impl.sql.compile.insertnode
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package	org apache derby impl sql compile
+import org apache derby iapi services context contextmanager
+import org apache derby iapi services loader generatedmethod
+import org apache derby iapi services compiler javafactory
+import org apache derby iapi services compiler methodbuilder
+import org apache derby iapi reference sqlstate
+import org apache derby iapi error standardexception
+import org apache derby iapi sql compile c_nodetypes
+import org apache derby iapi sql conn authorizer
+import org apache derby iapi sql conn languageconnectioncontext
+import org apache derby iapi sql compile visitable
+import org apache derby iapi sql compile visitor
+import org apache derby iapi sql compile compilercontext
+import org apache derby iapi reference classname
+import org apache derby iapi sql dictionary conglomeratedescriptor
+import org apache derby iapi sql dictionary constraintdescriptor
+import org apache derby iapi sql dictionary datadictionary
+import org apache derby iapi sql dictionary tabledescriptor
+import org apache derby iapi sql dictionary indexlister
+import org apache derby iapi sql dictionary indexrowgenerator
+import org apache derby iapi types typeid
+import org apache derby iapi sql resultset
+import org apache derby iapi sql activation
+import org apache derby iapi sql statementtype
+import org apache derby iapi sql execute constantaction
+import org apache derby iapi store access staticcompiledopenconglominfo
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi types rowlocation
+import org apache derby impl sql compile activationclassbuilder
+import org apache derby iapi services compiler methodbuilder
+import org apache derby iapi services sanity sanitymanager
+import org apache derby vti defermodification
+import org apache derby iapi services classfile vmopcode
+import org apache derby iapi util stringutil
+import org apache derby catalog uuid
+import org apache derby impl sql execute fkinfo
+import java util properties
+import org apache derby iapi services io formatablebitset
+import org apache derby iapi util reusefactory
+/**
+* an insertnode is the top node in a query tree for an
+* insert statement.
+* <p>
+* after parsing, the node contains
+*   targettablename: the target table for the insert
+*   collist: a list of column names, if specified
+*   queryexpr: the expression being inserted, either
+*				a values clause or a select form; both
+*			    of these are represented via the selectnode,
+*				potentially with a tableoperatornode such as
+*				unionnode above it.
+* <p>
+* after binding, the node has had the target table's
+* descriptor located and inserted, and the queryexpr
+* and collist have been massaged so that they are identical
+* to the table layout.  this involves adding any default
+* values for missing columns, and reordering the columns
+* to match the table's ordering of them.
+* <p>
+* after optimizing, ...
+*/
+public final class insertnode extends dmlmodstatementnode
+public		resultcolumnlist	targetcolumnlist
+public 		boolean				deferred
+public		valuenode			checkconstraints
+public		properties			targetproperties
+public		fkinfo				fkinfo
+protected	boolean				bulkinsert
+private 	boolean				bulkinsertreplace
+protected   rowlocation 		autoincrowlocation
+/**
+* initializer for an insertnode.
+*
+* @param targetname	the name of the table/vti to insert into
+* @param insertcolumns	a resultcolumnlist with the names of the
+*			columns to insert into.  may be null if the
+*			user did not specify the columns - in this
+*			case, the binding phase will have to figure
+*			it out.
+* @param queryexpression	the query expression that will generate
+*				the rows to insert into the given table
+* @param targetproperties	the properties specified on the target table
+*/
+public void init
+object targetname
+object insertcolumns
+object queryexpression
+object targetproperties
+/* statementtype gets set in super() before we've validated
+* any properties, so we've kludged the code to get the
+* right statementtype for a bulk insert replace.
+*/
+super init
+queryexpression
+reusefactory getinteger getstatementtype
+properties  targetproperties
+settarget  querytreenode  targetname
+targetcolumnlist    resultcolumnlist  insertcolumns
+this targetproperties    properties  targetproperties
+/* remember that the query expression is the source to an insert */
+getresultsetnode   setinsertsource
+/**
+* convert this object to a string.  see comments in querytreenode.java
+* for how this should be done for tree printing.
+*
+* @return	this object as a string
+*/
+public string tostring
+if  sanitymanager debug
+try
+return    targettablename  null  ? targettablename   targetvti gettablename     tostring
+targetproperties
+super tostring
+catch  org apache derby iapi error standardexception e
+return
+targetproperties
+super tostring
+else
+return
+public string statementtostring
+return
+/**
+* prints the sub-nodes of this object.  see querytreenode.java for
+* how tree printing is supposed to work.
+*
+* @param depth		the depth of this node in the tree
+*/
+public void printsubnodes int depth
+if  sanitymanager debug
+super printsubnodes depth
+if  targettablename    null
+printlabel depth
+targettablename treeprint depth   1
+if  targetcolumnlist    null
+printlabel depth
+targetcolumnlist treeprint depth   1
+/* resolve - need to print out targettabledescriptor */
+/**
+* bind this insertnode.  this means looking up tables and columns and
+* getting their types, and figuring out the result types of all
+* expressions, as well as doing view resolution, permissions checking,
+* etc.
+* <p>
+* binding an insert will also massage the tree so that
+* the collist and select column order/number are the
+* same as the layout of the table in the store.
+*
+*
+* @exception standardexception		thrown on error
+*/
+public void bindstatement   throws standardexception
+// we just need select privilege on the expressions
+getcompilercontext   pushcurrentprivtype  authorizer select_priv
+fromlist	fromlist    fromlist  getnodefactory   getnode
+c_nodetypes from_list
+getnodefactory   dojoinorderoptimization
+getcontextmanager
+/* if any underlying resultsetnode is a selectnode, then we
+* need to do a full bind(), including the expressions
+* (since the fromlist may include a fromsubquery).
+*/
+datadictionary datadictionary   getdatadictionary
+super bindresultsetswithtables datadictionary
+/*
+** get the tabledescriptor for the table we are inserting into
+*/
+verifytargettable
+// check the validity of the targetproperties, if they exist
+if  targetproperties    null
+verifytargetproperties datadictionary
+/*
+** get the resultcolumnlist representing the columns in the base
+** table or vti.
+*/
+getresultcolumnlist
+/* if we have a target column list, then it must have the same # of
+* entries as the result set's rcl.
+*/
+if  targetcolumnlist    null
+/*
+* normalize synonym qualifers for column references.
+*/
+if  synonymtablename    null
+normalizesynonymcolumns   targetcolumnlist  targettablename
+/* bind the target column list */
+getcompilercontext   pushcurrentprivtype  getprivtype
+if  targettabledescriptor    null
+targetcolumnlist bindresultcolumnsbyname targettabledescriptor
+dmlstatementnode  this
+else
+targetcolumnlist bindresultcolumnsbyname targetvti getresultcolumns    targetvti
+this
+getcompilercontext   popcurrentprivtype
+/* verify that all underlying resultsets reclaimed their fromlist */
+if  sanitymanager debug
+sanitymanager assert fromlist size      0
+fromlist size
+/* replace any defaults with the associated tree */
+resultset replacedefaults targettabledescriptor  targetcolumnlist
+/* bind the expressions now that the result columns are bound
+* note: this will be the 2nd time for those underlying resultsets
+* that have tables (no harm done), but it is necessary for those
+* that do not have tables.  it's too hard/not work the effort to
+* avoid the redundancy.
+*/
+super bindexpressions
+/*
+** if the result set is a union, it could be a table constructor.
+** bind any nulls in the result columns of the table constructor
+** to the types of the table being inserted into.
+**
+** the types of ? parameters in row constructors and table constructors
+** in an insert statement come from the result columns.
+**
+** if there is a target column list, use that instead of the result
+** columns for the whole table, since the columns in the result set
+** correspond to the target column list.
+*/
+if  targetcolumnlist    null
+if  resultset getresultcolumns   visiblesize   > targetcolumnlist size
+throw standardexception newexception sqlstate lang_db2_invalid_cols_specified
+resultset binduntypednullstoresultcolumns targetcolumnlist
+resultset settableconstructortypes targetcolumnlist
+else
+if  resultset getresultcolumns   visiblesize   > resultcolumnlist size
+throw standardexception newexception sqlstate lang_db2_invalid_cols_specified
+resultset binduntypednullstoresultcolumns resultcolumnlist
+resultset settableconstructortypes resultcolumnlist
+/* bind the columns of the result set to their expressions */
+resultset bindresultcolumns fromlist
+int rescols   resultset getresultcolumns   visiblesize
+datadictionary dd   getdatadictionary
+if  targetcolumnlist    null
+if  targetcolumnlist size      rescols
+throw standardexception newexception sqlstate lang_db2_invalid_cols_specified
+else
+if  targettabledescriptor    null
+targettabledescriptor getnumberofcolumns      rescols
+throw standardexception newexception sqlstate lang_db2_invalid_cols_specified
+/* see if the resultset's rcl needs to be ordered to match the target
+* list, or "enhanced" to accommodate defaults.  it can only need to
+* be ordered if there is a target column list.  it needs to be
+* enhanced if there are fewer source columns than there are columns
+* in the table.
+*/
+boolean inorder   true
+int numtablecolumns   resultcolumnlist size
+/* colmap[] will be the size of the target list, which could be larger
+* than the current size of the source list.  in that case, the source
+* list will be "enhanced" to include defaults.
+*/
+int colmap   new int
+// set the fields to an unused value
+for  int i   0  i < colmap length  i
+colmap    1
+/* create the source/target list mapping */
+if  targetcolumnlist    null
+/*
+** there is a target column list, so the result columns might
+** need to be ordered.  step through the target column list
+** and remember the position in the target table of each column.
+** remember if any of the columns are out of order.
+*/
+int targetsize   targetcolumnlist size
+for  int index   0  index < targetsize  index
+int position
+resultcolumn   targetcolumnlist elementat index
+columndescriptor getposition
+if  index    position 1
+inorder   false
+// position is 1-base; colmap indexes and entries are 0-based.
+colmap   index
+else
+/*
+** there is no target column list, so the result columns in the
+** source are presumed to be in the same order as the target
+** table.
+*/
+for  int position   0
+position < resultset getresultcolumns   visiblesize
+position
+colmap   position
+enhanceandcheckforautoincrement resultset  inorder
+numtablecolumns  colmap  datadictionary
+targettabledescriptor  targetvti
+resultcolumnlist checkstorableexpressions resultset getresultcolumns
+/* insert a normalizeresultsetnode above the source if the source
+* and target column types and lengths do not match.
+*/
+if    resultcolumnlist columntypesandlengthsmatch
+resultset getresultcolumns
+resultset   resultset gennormalizeresultsetnode resultset  false
+resultcolumnlist copytypesandlengthstosource resultset getresultcolumns
+if  targettabledescriptor    null
+/* get and bind all constraints on the table */
+resultcolumnlist sourcercl   resultset getresultcolumns
+sourcercl copyresultcolumnnames resultcolumnlist
+checkconstraints   bindconstraints datadictionary
+getnodefactory
+targettabledescriptor
+
+sourcercl
+int  null
+formatablebitset  null
+false
+true       we always include
+* triggers in core language */
+/* do we need to do a deferred mode insert */
+/*
+** deferred if:
+**	if the target table is also a source table
+**	self-referencing foreign key constraint
+**	trigger
+*/
+if  resultset referencestarget
+targettabledescriptor getname    true
+requiresdeferredprocessing
+deferred   true
+/* disallow bulk insert replace when target table
+* is also a source table.
+*/
+if  bulkinsertreplace
+resultset referencestarget
+targettabledescriptor getname    true
+throw standardexception newexception sqlstate lang_invalid_bulk_insert_replace
+targettabledescriptor getqualifiedname
+/* get the list of indexes on the table being inserted into */
+getaffectedindexes targettabledescriptor
+transactioncontroller tc
+getlanguageconnectioncontext   gettransactioncompile
+autoincrowlocation
+dd computeautoincrowlocations tc  targettabledescriptor
+if  isprivilegecollectionrequired
+getcompilercontext   pushcurrentprivtype getprivtype
+getcompilercontext   addrequiredtablepriv targettabledescriptor
+getcompilercontext   popcurrentprivtype
+else
+deferred   vtidefermodpolicy deferit  defermodification insert_statement
+targetvti
+
+resultset
+getcompilercontext   popcurrentprivtype
+/**
+* process resultset column lists for projection and autoincrement.
+*
+* this method recursively descends the result set node tree. when
+* it finds a simple result set, it processes any autoincrement
+* columns in that rs by calling checkautoincrement. when it finds
+* a compound result set, like a union or a prn, it recursively
+* descends to the child(ren) nodes. union nodes can arise due to
+* multi-rows in values clause), prn nodes can arise when the set
+* of columns being inserted is a subset of the set of columns in
+* the table.
+*
+* in addition to checking for autoincrement columns in the result set,
+* we may need to enhance and re-order the column list to match the
+* column list of the table we are inserting into. this work is handled
+* by resultsetnode.enhancerclforinsert.
+*
+* note that, at the leaf level, we need to enhance the rcl first, then
+* check for autoincrement columns. at the non-leaf levels, we have
+* to enhance the rcl, but we don't have to check for autoincrement
+* columns, since they only occur at the leaf level.
+*
+* this way, all columndescriptor of all rows will be set properly.
+*
+* @param resultset			current node in the result set tree
+* @param inorder			false if the column list needs reordering
+* @param numtablecolumns   # of columns in target rcl
+* @param colmap            correspondence between rcls
+* @param datadictionary    datadictionary to use
+* @param targettabledescriptor    table descriptor for target
+* @param targetvti         target description if it is a vti
+*
+* @exception standardexception thrown on error
+*/
+private void enhanceandcheckforautoincrement resultsetnode resultset
+boolean inorder  int numtablecolumns  int colmap
+datadictionary datadictionary
+tabledescriptor targettabledescriptor
+fromvti targetvti
+throws standardexception
+/*
+* some implementation notes:
+*
+* colmap[x] == y means that column x in the target table
+* maps to column y in the source result set.
+* colmap[x] == -1 means that column x in the target table
+* maps to its default value.
+* both colmap indexes and values are 0-based.
+*
+* if the list is in order and complete, we don't have to change
+* the tree. if it is not, then we call rsn.enhancerclforinsert()
+* which will reorder ("enhance") the source rcl within the same rsn)
+*
+* one thing we do know is that all of the resultsets underneath
+* us have their resultcolumn names filled in with the names of
+* the target table columns.  that makes generating the mapping
+* "easier" -- we simply generate the names of the target table columns
+* that are included.  for the missing columns, we generate default
+* value expressions.
+*/
+if  resultset instanceof singlechildresultsetnode
+enhanceandcheckforautoincrement
+singlechildresultsetnode resultset  getchildresult
+inorder  numtablecolumns  colmap  datadictionary
+targettabledescriptor  targetvti
+if    inorder    resultset resultcolumns size   < numtablecolumns
+resultset enhancerclforinsert
+numtablecolumns  colmap  datadictionary
+targettabledescriptor  targetvti
+else if  resultset instanceof unionnode
+enhanceandcheckforautoincrement
+tableoperatornode resultset  getleftresultset
+inorder  numtablecolumns  colmap  datadictionary
+targettabledescriptor  targetvti
+enhanceandcheckforautoincrement
+tableoperatornode resultset  getrightresultset
+inorder  numtablecolumns  colmap  datadictionary
+targettabledescriptor  targetvti
+if    inorder    resultset resultcolumns size   < numtablecolumns
+resultset enhancerclforinsert
+numtablecolumns  colmap  datadictionary
+targettabledescriptor  targetvti
+else
+if    inorder    resultset resultcolumns size   < numtablecolumns
+resultset enhancerclforinsert
+numtablecolumns  colmap  datadictionary
+targettabledescriptor  targetvti
+resultcolumnlist checkautoincrement resultset getresultcolumns
+int getprivtype
+return authorizer insert_priv
+/**
+* return true if the node references session schema tables (temporary or permanent)
+*
+* @return	true if references session schema tables, else false
+*
+* @exception standardexception		thrown on error
+*/
+public boolean referencessessionschema
+throws standardexception
+boolean returnvalue   false
+//if this node references a session schema table, then return true.
+if  targettabledescriptor    null
+returnvalue   issessionschema targettabledescriptor getschemadescriptor
+if  returnvalue    false
+returnvalue   resultset referencessessionschema
+return returnvalue
+/**
+* verify that the target properties that we are interested in
+* all hold valid values.
+* note: any target property which is valid but cannot be supported
+* due to a target database, etc. will be turned off quietly.
+*
+* @param dd	the datadictionary
+*
+* @exception standardexception		thrown on error
+*/
+private void verifytargetproperties datadictionary dd
+throws standardexception
+// the only property that we're currently interested in is insertmode
+string insertmode   targetproperties getproperty
+if  insertmode    null
+string uppervalue   stringutil sqltouppercase insertmode
+if    uppervalue equals
+uppervalue equals
+throw standardexception newexception sqlstate lang_invalid_insert_mode
+insertmode
+targettablename
+else
+/* turn off bulkinsert if it is on and we can't support it. */
+if    verifybulkinsert dd  uppervalue
+targetproperties remove
+else
+/* now we know we're doing bulk insert */
+bulkinsert   true
+if  uppervalue equals
+bulkinsertreplace   true
+// validate the bulkfetch property if specified
+string bulkfetchstr   targetproperties getproperty
+if  bulkfetchstr    null
+int bulkfetch   getintproperty bulkfetchstr
+// verify that the specified value is valid
+if  bulkfetch <  0
+throw standardexception newexception sqlstate lang_invalid_bulk_fetch_value
+string valueof bulkfetch
+/**
+* do the bind time checks to see if bulkinsert is allowed on
+* this table.  bulkinsert is disallowed at bind time for:
+*		o  target databases
+*		o  (tables with triggers?)
+* (it is disallowed at execution time if the table has at
+* least 1 row in it or if it is a deferred mode insert.)
+*
+* @param dd	the datadictionary
+* @param mode	the insert mode
+*
+* @return whether or not bulkinsert is allowed.
+*
+* @exception standardexception		thrown on error
+*/
+private boolean verifybulkinsert datadictionary dd  string mode
+throws standardexception
+return true
+/**
+* compile constants that execution will use
+*
+* @exception standardexception		thrown on failure
+*/
+public constantaction	makeconstantaction   throws standardexception
+/* different constant actions for base tables and updatable vtis */
+if  targettabledescriptor    null
+// base table
+long heapconglomid   targettabledescriptor getheapconglomerateid
+transactioncontroller tc
+getlanguageconnectioncontext   gettransactioncompile
+int numindexes    targettabledescriptor    null  ?
+indexconglomeratenumbers length   0
+staticcompiledopenconglominfo indexscocis
+new staticcompiledopenconglominfo
+for  int index   0  index < numindexes  index
+indexscocis   tc getstaticcompiledconglominfo indexconglomeratenumbers
+/*
+** if we're doing bulk insert, do table locking regardless of
+** what the optimizer decided.  this is because bulk insert is
+** generally done with a large number of rows into an empty table.
+** we also do table locking if the table's lock granularity is
+** set to table.
+*/
+if  bulkinsert
+targettabledescriptor getlockgranularity      tabledescriptor table_lock_granularity
+lockmode   transactioncontroller mode_table
+return	getgenericconstantactionfactory   getinsertconstantaction
+targettabledescriptor
+heapconglomid
+tc getstaticcompiledconglominfo heapconglomid
+indicestomaintain
+indexconglomeratenumbers
+indexscocis
+indexnames
+deferred
+false
+targettabledescriptor getuuid
+lockmode
+null  null
+targetproperties
+getfkinfo
+gettriggerinfo
+resultcolumnlist getstreamstorablecolids targettabledescriptor getnumberofcolumns
+getindexedcols
+uuid  null
+
+
+resultset isonerowresultset
+autoincrowlocation
+else
+/* return constant action for vti
+* note: constantaction responsible for preserving instantiated
+* vtis for in-memory queries and for only preserving vtis
+* that implement serializable for spss.
+*/
+return	getgenericconstantactionfactory   getupdatablevticonstantaction  defermodification insert_statement
+deferred
+/**
+* create a boolean[] to track the (0-based) columns which are indexed.
+*
+* @return a boolean[] to track the (0-based) columns which are indexed.
+*
+* @exception standardexception		thrown on failure
+*/
+public boolean getindexedcols   throws standardexception
+/* create a boolean[] to track the (0-based) columns which are indexed */
+boolean indexedcols   new boolean
+for  int index   0  index < indicestomaintain length  index
+int colids   indicestomaintain getindexdescriptor   basecolumnpositions
+for  int index2   0  index2 < colids length  index2
+indexedcols   1]   true
+return indexedcols
+/**
+* code generation for insert
+* creates an expression for:
+*   resultsetfactory.getinsertresultset(resultset.generate(ps), this )
+*
+* @param acb	the activationclassbuilder for the class being built
+* @param mb the method  for the execute() method to be built
+*
+* @exception standardexception		thrown on error
+*/
+public void generate activationclassbuilder acb
+methodbuilder mb
+throws standardexception
+// if the dml is on the temporary table, generate the code to
+// mark temporary table as modified in the current uow. after
+// derby-827 this must be done in execute() since
+// fillresultset() will only be called once.
+generatecodefortemporarytable acb  acb getexecutemethod
+/* generate the parameters */
+generateparametervalueset acb
+// base table
+if  targettabledescriptor    null
+/*
+** generate the insert result set, giving it either the original
+** source or the normalize result set, the constant action,
+** and "this".
+*/
+acb pushgetresultsetfactoryexpression mb
+// arg 1
+resultset generate acb  mb
+// arg 2 generate code to evaluate check constraints
+generatecheckconstraints  checkconstraints  acb  mb
+mb callmethod vmopcode invokeinterface   string  null     classname resultset  2
+else
+/* generate code for the vti
+* note: we need to create a dummy cost estimate for the
+* targetvti since we never optimized it.
+* resolvevti - we will have to optimize it in order to
+* push predicates into the vti.
+*/
+targetvti assigncostestimate resultset getnewcostestimate
+/*
+** generate the insert vti result set, giving it either the original
+** source or the normalize result set, the constant action,
+*/
+acb pushgetresultsetfactoryexpression mb
+// arg 1
+resultset generate acb  mb
+// arg 2
+targetvti generate acb  mb
+mb callmethod vmopcode invokeinterface   string  null     classname resultset  2
+/**
+* return the type of statement, something from
+* statementtype.
+*
+* @return the type of statement
+*/
+protected final int getstatementtype
+return statementtype insert
+/**
+* return the statement type, where it is dependent on
+* the targetproperties.  (insertmode = replace causes
+* statement type to be bulk_insert_replace.
+*
+* @return the type of statement
+*/
+static final int getstatementtype properties targetproperties
+int retval   statementtype insert
+// the only property that we're currently interested in is insertmode
+string insertmode    targetproperties    null  ? null   targetproperties getproperty
+if  insertmode    null
+string uppervalue   stringutil sqltouppercase insertmode
+if  uppervalue equals
+retval   statementtype bulk_insert_replace
+return retval
+/**
+* get the list of indexes on the table being inserted into.  this
+* is used by insert.  this is an optimized version of what
+* update and delete use.
+*
+* @param td	tabledescriptor for the table being inserted into
+*				or deleted from
+*
+* @exception standardexception		thrown on error
+*/
+private void getaffectedindexes
+tabledescriptor 	td
+throws standardexception
+indexlister	indexlister   td getindexlister
+indicestomaintain   indexlister getdistinctindexrowgenerators
+indexconglomeratenumbers   indexlister getdistinctindexconglomeratenumbers
+indexnames   indexlister getdistinctindexnames
+/* add dependencies on all indexes in the list */
+conglomeratedescriptor	cds   td getconglomeratedescriptors
+compilercontext cc   getcompilercontext
+for  int index   0  index < cds length  index
+cc createdependency cds
+end of class insertnode

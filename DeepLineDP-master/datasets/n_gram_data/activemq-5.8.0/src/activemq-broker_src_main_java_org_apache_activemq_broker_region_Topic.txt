@@ -1,0 +1,541 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq broker region
+import java io ioexception
+import java util arraylist
+import java util linkedlist
+import java util list
+import java util map
+import java util concurrent cancellationexception
+import java util concurrent concurrenthashmap
+import java util concurrent copyonwritearraylist
+import java util concurrent future
+import java util concurrent locks reentrantreadwritelock
+import org apache activemq advisory advisorysupport
+import org apache activemq broker brokerservice
+import org apache activemq broker connectioncontext
+import org apache activemq broker producerbrokerexchange
+import org apache activemq broker region policy dispatchpolicy
+import org apache activemq broker region policy lastimagesubscriptionrecoverypolicy
+import org apache activemq broker region policy nosubscriptionrecoverypolicy
+import org apache activemq broker region policy simpledispatchpolicy
+import org apache activemq broker region policy subscriptionrecoverypolicy
+import org apache activemq broker util insertioncountlist
+import org apache activemq command activemqdestination
+import org apache activemq command exceptionresponse
+import org apache activemq command message
+import org apache activemq command messageack
+import org apache activemq command messageid
+import org apache activemq command producerack
+import org apache activemq command producerinfo
+import org apache activemq command response
+import org apache activemq command subscriptioninfo
+import org apache activemq filter messageevaluationcontext
+import org apache activemq filter noncachedmessageevaluationcontext
+import org apache activemq store messagerecoverylistener
+import org apache activemq store topicmessagestore
+import org apache activemq thread task
+import org apache activemq thread taskrunner
+import org apache activemq thread taskrunnerfactory
+import org apache activemq transaction synchronization
+import org apache activemq util subscriptionkey
+import org slf4j logger
+import org slf4j loggerfactory
+/**
+* the topic is a destination that sends a copy of a message to every active
+* subscription registered.
+*/
+public class topic extends basedestination implements task
+protected static final logger log   loggerfactory getlogger topic class
+private final topicmessagestore topicstore
+protected final copyonwritearraylist<subscription> consumers   new copyonwritearraylist<subscription>
+private final reentrantreadwritelock dispatchlock   new reentrantreadwritelock
+private dispatchpolicy dispatchpolicy   new simpledispatchpolicy
+private subscriptionrecoverypolicy subscriptionrecoverypolicy
+private final concurrenthashmap<subscriptionkey  durabletopicsubscription> durablesubscribers   new concurrenthashmap<subscriptionkey  durabletopicsubscription>
+private final taskrunner taskrunner
+private final linkedlist<runnable> messageswaitingforspace   new linkedlist<runnable>
+private final runnable sendmessageswaitingforspacetask   new runnable
+public void run
+try
+topic this taskrunner wakeup
+catch  interruptedexception e
+public topic brokerservice brokerservice  activemqdestination destination  topicmessagestore store
+destinationstatistics parentstats  taskrunnerfactory taskfactory  throws exception
+super brokerservice  store  destination  parentstats
+this topicstore   store
+// set default subscription recovery policy
+if  advisorysupport ismasterbrokeradvisorytopic destination
+subscriptionrecoverypolicy   new lastimagesubscriptionrecoverypolicy
+setalwaysretroactive true
+else
+subscriptionrecoverypolicy   new nosubscriptionrecoverypolicy
+this taskrunner   taskfactory createtaskrunner this      destination getphysicalname
+@override
+public void initialize   throws exception
+super initialize
+if  store    null
+// amq-2586: better to leave this stat at zero than to give the user
+// misleading metrics.
+// int messagecount = store.getmessagecount();
+// destinationstatistics.getmessages().setcount(messagecount);
+public list<subscription> getconsumers
+synchronized  consumers
+return new arraylist<subscription> consumers
+public boolean lock messagereference node  lockowner sub
+return true
+public void addsubscription connectioncontext context  final subscription sub  throws exception
+if   sub getconsumerinfo   isdurable
+// do a retroactive recovery if needed.
+if  sub getconsumerinfo   isretroactive      isalwaysretroactive
+// synchronize with dispatch method so that no new messages are sent
+// while we are recovering a subscription to avoid out of order messages.
+dispatchlock writelock   lock
+try
+boolean applyrecovery   false
+synchronized  consumers
+if   consumers contains sub
+sub add context  this
+consumers add sub
+applyrecovery true
+super addsubscription context  sub
+if  applyrecovery
+subscriptionrecoverypolicy recover context  this  sub
+finally
+dispatchlock writelock   unlock
+else
+synchronized  consumers
+if   consumers contains sub
+sub add context  this
+consumers add sub
+super addsubscription context  sub
+else
+durabletopicsubscription dsub    durabletopicsubscription  sub
+super addsubscription context  sub
+sub add context  this
+if dsub isactive
+synchronized  consumers
+boolean hassubscription   false
+if  consumers size      0
+hassubscription   false
+else
+for  subscription currentsub   consumers
+if  currentsub getconsumerinfo   isdurable
+durabletopicsubscription dcurrentsub    durabletopicsubscription  currentsub
+if  dcurrentsub getsubscriptionkey   equals dsub getsubscriptionkey
+hassubscription   true
+break
+if   hassubscription
+consumers add sub
+durablesubscribers put dsub getsubscriptionkey    dsub
+public void removesubscription connectioncontext context  subscription sub  long lastdeliveredsequenceid  throws exception
+if   sub getconsumerinfo   isdurable
+super removesubscription context  sub  lastdeliveredsequenceid
+synchronized  consumers
+consumers remove sub
+sub remove context  this
+public void deletesubscription connectioncontext context  subscriptionkey key  throws exception
+if  topicstore    null
+topicstore deletesubscription key clientid  key subscriptionname
+durabletopicsubscription removed   durablesubscribers remove key
+if  removed    null
+destinationstatistics getconsumers   decrement
+// deactivate and remove
+removed deactivate false
+consumers remove removed
+public void activate connectioncontext context  final durabletopicsubscription subscription  throws exception
+// synchronize with dispatch method so that no new messages are sent
+// while we are recovering a subscription to avoid out of order messages.
+dispatchlock writelock   lock
+try
+if  topicstore    null
+return
+// recover the durable subscription.
+string clientid   subscription getsubscriptionkey   getclientid
+string subscriptionname   subscription getsubscriptionkey   getsubscriptionname
+string selector   subscription getconsumerinfo   getselector
+subscriptioninfo info   topicstore lookupsubscription clientid  subscriptionname
+if  info    null
+// check to see if selector changed.
+string s1   info getselector
+if  s1    null ^ selector    null     s1    null     s1 equals selector
+// need to delete the subscription
+topicstore deletesubscription clientid  subscriptionname
+info   null
+synchronized  consumers
+consumers remove subscription
+else
+synchronized  consumers
+if   consumers contains subscription
+consumers add subscription
+// do we need to create the subscription?
+if  info    null
+info   new subscriptioninfo
+info setclientid clientid
+info setselector selector
+info setsubscriptionname subscriptionname
+info setdestination getactivemqdestination
+// this destination is an actual destination id.
+info setsubscribeddestination subscription getconsumerinfo   getdestination
+// this destination might be a pattern
+synchronized  consumers
+consumers add subscription
+topicstore addsubsciption info  subscription getconsumerinfo   isretroactive
+final messageevaluationcontext msgcontext   new noncachedmessageevaluationcontext
+msgcontext setdestination destination
+if  subscription isrecoveryrequired
+topicstore recoversubscription clientid  subscriptionname  new messagerecoverylistener
+public boolean recovermessage message message  throws exception
+message setregiondestination topic this
+try
+msgcontext setmessagereference message
+if  subscription matches message  msgcontext
+subscription add message
+catch  ioexception e
+log error     message
+return true
+public boolean recovermessagereference messageid messagereference  throws exception
+throw new runtimeexception
+public boolean hasspace
+return true
+public boolean isduplicate messageid id
+return false
+finally
+dispatchlock writelock   unlock
+public void deactivate connectioncontext context  durabletopicsubscription sub  throws exception
+synchronized  consumers
+consumers remove sub
+sub remove context  this
+protected void recoverretroactivemessages connectioncontext context  subscription subscription  throws exception
+if  subscription getconsumerinfo   isretroactive
+subscriptionrecoverypolicy recover context  this  subscription
+public void send final producerbrokerexchange producerexchange  final message message  throws exception
+final connectioncontext context   producerexchange getconnectioncontext
+final producerinfo producerinfo   producerexchange getproducerstate   getinfo
+final boolean sendproducerack    message isresponserequired      producerinfo getwindowsize   > 0
+context isinrecoverymode
+// there is delay between the client sending it and it arriving at the
+// destination.. it may have expired.
+if  message isexpired
+broker messageexpired context  message  null
+getdestinationstatistics   getexpired   increment
+if  sendproducerack
+producerack ack   new producerack producerinfo getproducerid    message getsize
+context getconnection   dispatchasync ack
+return
+if  memoryusage isfull
+isfull context  memoryusage
+fastproducer context  producerinfo
+if  isproducerflowcontrol      context isproducerflowcontrol
+if  warnonproducerflowcontrol
+warnonproducerflowcontrol   false
+log info memoryusage
+getactivemqdestination   getqualifiedname
+if   context isnetworkconnection      systemusage issendfailifnospace
+throw new javax jms resourceallocationexception
+memoryusage getlimit         message getproducerid
+getactivemqdestination   getqualifiedname
+// we can avoid blocking due to low usage if the producer is sending a sync message or
+// if it is using a producer window
+if  producerinfo getwindowsize   > 0    message isresponserequired
+synchronized  messageswaitingforspace
+messageswaitingforspace add new runnable
+public void run
+try
+// while waiting for space to free up... the
+// message may have expired.
+if  message isexpired
+broker messageexpired context  message  null
+getdestinationstatistics   getexpired   increment
+else
+domessagesend producerexchange  message
+if  sendproducerack
+producerack ack   new producerack producerinfo getproducerid    message
+getsize
+context getconnection   dispatchasync ack
+else
+response response   new response
+response setcorrelationid message getcommandid
+context getconnection   dispatchasync response
+catch  exception e
+if   sendproducerack     context isinrecoverymode
+exceptionresponse response   new exceptionresponse e
+response setcorrelationid message getcommandid
+context getconnection   dispatchasync response
+registercallbackfornotfullnotification
+context setdontsendreponse true
+return
+else
+// producer flow control cannot be used, so we have do the flow control
+// at the broker by blocking this thread until there is space available.
+if  memoryusage isfull
+if  context isintransaction
+int count   0
+while   memoryusage waitforspace 1000
+if  context getstopping   get
+throw new ioexception
+if  count > 2    context isintransaction
+count   0
+int size   context gettransaction   size
+log warn
+size       message
+count
+else
+waitforspace
+context
+memoryusage
+message getproducerid
+getactivemqdestination   getqualifiedname
+// the usage manager could have delayed us by the time
+// we unblock the message could have expired..
+if  message isexpired
+getdestinationstatistics   getexpired   increment
+if  log isdebugenabled
+log debug     message
+return
+domessagesend producerexchange  message
+messagedelivered context  message
+if  sendproducerack
+producerack ack   new producerack producerinfo getproducerid    message getsize
+context getconnection   dispatchasync ack
+/**
+* do send the message - this needs to be synchronized to ensure messages
+* are stored and dispatched in the right order
+*
+* @param producerexchange
+* @param message
+* @throws ioexception
+* @throws exception
+*/
+synchronized void domessagesend final producerbrokerexchange producerexchange  final message message
+throws ioexception  exception
+final connectioncontext context   producerexchange getconnectioncontext
+message setregiondestination this
+message getmessageid   setbrokersequenceid getdestinationsequenceid
+future<object> result   null
+if  topicstore    null    message ispersistent       canoptimizeoutpersistence
+if  systemusage getstoreusage   isfull getstoreusagehighwatermark
+final string logmessage       getstoreusagehighwatermark
+systemusage getstoreusage   getlimit         message getproducerid
+getactivemqdestination   getqualifiedname
+if   context isnetworkconnection      systemusage issendfailifnospace
+throw new javax jms resourceallocationexception logmessage
+waitforspace context  systemusage getstoreusage    getstoreusagehighwatermark    logmessage
+result   topicstore asyncaddtopicmessage context  message isoptimizestorage
+message incrementreferencecount
+if  context isintransaction
+context gettransaction   addsynchronization new synchronization
+@override
+public void aftercommit   throws exception
+// it could take while before we receive the commit
+// operation.. by that time the message could have
+// expired..
+if  broker isexpired message
+getdestinationstatistics   getexpired   increment
+broker messageexpired context  message  null
+message decrementreferencecount
+return
+try
+dispatch context  message
+finally
+message decrementreferencecount
+else
+try
+dispatch context  message
+finally
+message decrementreferencecount
+if  result    null     result iscancelled
+try
+result get
+catch  cancellationexception e
+// ignore - the task has been cancelled if the message
+// has already been deleted
+private boolean canoptimizeoutpersistence
+return durablesubscribers size      0
+@override
+public string tostring
+return     destination getphysicalname         consumers size
+public void acknowledge connectioncontext context  subscription sub  final messageack ack
+final messagereference node  throws ioexception
+if  topicstore    null    node ispersistent
+durabletopicsubscription dsub    durabletopicsubscription  sub
+subscriptionkey key   dsub getsubscriptionkey
+topicstore acknowledge context  key getclientid    key getsubscriptionname    node getmessageid
+converttononrangedack ack  node
+messageconsumed context  node
+public void gc
+public message loadmessage messageid messageid  throws ioexception
+return topicstore    null ? topicstore getmessage messageid    null
+public void start   throws exception
+this subscriptionrecoverypolicy start
+if  memoryusage    null
+memoryusage start
+if  getexpiremessagesperiod   > 0
+scheduler schedualperiodically expiremessagestask  getexpiremessagesperiod
+public void stop   throws exception
+if  taskrunner    null
+taskrunner shutdown
+this subscriptionrecoverypolicy stop
+if  memoryusage    null
+memoryusage stop
+if  this topicstore    null
+this topicstore stop
+scheduler cancel expiremessagestask
+public message browse
+final list<message> result   new arraylist<message>
+dobrowse result  getmaxbrowsepagesize
+return result toarray new message
+private void dobrowse final list<message> browselist  final int max
+try
+if  topicstore    null
+final list<message> toexpire   new arraylist<message>
+topicstore recover new messagerecoverylistener
+public boolean recovermessage message message  throws exception
+if  message isexpired
+toexpire add message
+browselist add message
+return true
+public boolean recovermessagereference messageid messagereference  throws exception
+return true
+public boolean hasspace
+return browselist size   < max
+public boolean isduplicate messageid id
+return false
+final connectioncontext connectioncontext   createconnectioncontext
+for  message message   toexpire
+for  durabletopicsubscription sub   durablesubscribers values
+if   sub isactive
+messageexpired connectioncontext  sub  message
+message msgs   subscriptionrecoverypolicy browse getactivemqdestination
+if  msgs    null
+for  int i   0  i < msgs length    browselist size   < max  i
+browselist add msgs
+catch  throwable e
+log warn     getactivemqdestination   getphysicalname    e
+public boolean iterate
+synchronized  messageswaitingforspace
+while   memoryusage isfull       messageswaitingforspace isempty
+runnable op   messageswaitingforspace removefirst
+op run
+if   messageswaitingforspace isempty
+registercallbackfornotfullnotification
+return false
+private void registercallbackfornotfullnotification
+// if the usage manager is not full, then the task will not
+// get called..
+if   memoryusage notifycallbackwhennotfull sendmessageswaitingforspacetask
+// so call it directly here.
+sendmessageswaitingforspacetask run
+// properties
+// -------------------------------------------------------------------------
+public dispatchpolicy getdispatchpolicy
+return dispatchpolicy
+public void setdispatchpolicy dispatchpolicy dispatchpolicy
+this dispatchpolicy   dispatchpolicy
+public subscriptionrecoverypolicy getsubscriptionrecoverypolicy
+return subscriptionrecoverypolicy
+public void setsubscriptionrecoverypolicy subscriptionrecoverypolicy subscriptionrecoverypolicy
+this subscriptionrecoverypolicy   subscriptionrecoverypolicy
+// implementation methods
+// -------------------------------------------------------------------------
+public final void wakeup
+protected void dispatch final connectioncontext context  message message  throws exception
+// amq-2586: better to leave this stat at zero than to give the user
+// misleading metrics.
+// destinationstatistics.getmessages().increment();
+destinationstatistics getenqueues   increment
+messageevaluationcontext msgcontext   null
+dispatchlock readlock   lock
+try
+if   subscriptionrecoverypolicy add context  message
+return
+synchronized  consumers
+if  consumers isempty
+onmessagewithnoconsumers context  message
+return
+msgcontext   context getmessageevaluationcontext
+msgcontext setdestination destination
+msgcontext setmessagereference message
+if   dispatchpolicy dispatch message  msgcontext  consumers
+onmessagewithnoconsumers context  message
+finally
+dispatchlock readlock   unlock
+if  msgcontext    null
+msgcontext clear
+private final runnable expiremessagestask   new runnable
+public void run
+list<message> browsedmessages   new insertioncountlist<message>
+dobrowse browsedmessages  getmaxexpirepagesize
+public void messageexpired connectioncontext context  subscription subs  messagereference reference
+broker messageexpired context  reference  subs
+// amq-2586: better to leave this stat at zero than to give the user
+// misleading metrics.
+// destinationstatistics.getmessages().decrement();
+destinationstatistics getenqueues   decrement
+destinationstatistics getexpired   increment
+messageack ack   new messageack
+ack setacktype messageack standard_ack_type
+ack setdestination destination
+ack setmessageid reference getmessageid
+try
+if  subs instanceof durabletopicsubscription
+durabletopicsubscription subs  removepending reference
+acknowledge context  subs  ack  reference
+catch  exception e
+log error    e
+@override
+protected logger getlog
+return log
+protected boolean isoptimizestorage
+boolean result   false
+if  isdooptimzemessagestorage      durablesubscribers isempty    false
+result   true
+for  durabletopicsubscription s   durablesubscribers values
+if  s isactive     false
+result   false
+break
+if  s getprefetchsize    0
+result   false
+break
+if  s isslowconsumer
+result   false
+break
+if  s getinflightusage   > getoptimizemessagestoreinflightlimit
+result   false
+break
+return result
+/**
+* force a reread of the store - after transaction recovery completion
+*/
+public void clearpendingmessages
+dispatchlock readlock   lock
+try
+for  durabletopicsubscription durabletopicsubscription   durablesubscribers values
+clearpendinganddispatch durabletopicsubscription
+finally
+dispatchlock readlock   unlock
+private void clearpendinganddispatch durabletopicsubscription durabletopicsubscription
+synchronized  durabletopicsubscription pendinglock
+durabletopicsubscription pending clear
+try
+durabletopicsubscription dispatchpending
+catch  ioexception exception
+log warn
+durabletopicsubscription       destination
+durabletopicsubscription pending  exception
+public map<subscriptionkey  durabletopicsubscription> getdurabletopicsubs
+return durablesubscribers

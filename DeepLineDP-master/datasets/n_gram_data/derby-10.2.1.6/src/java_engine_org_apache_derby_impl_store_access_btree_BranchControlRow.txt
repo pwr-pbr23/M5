@@ -1,0 +1,1093 @@
+/*
+derby - class org.apache.derby.impl.store.access.btree.branchcontrolrow
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store access btree
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services io formatidutil
+import org apache derby iapi services io storable
+import org apache derby iapi services io storedformatids
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby iapi store access conglomerate logicalundo
+import org apache derby iapi store access accessfactoryglobals
+import org apache derby iapi store access qualifier
+import org apache derby iapi store access rowutil
+import org apache derby iapi store access scancontroller
+import org apache derby iapi store raw containerhandle
+import org apache derby iapi store raw fetchdescriptor
+import org apache derby iapi store raw page
+import org apache derby iapi store raw recordhandle
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi types sqllongint
+import org apache derby iapi services io formatablebitset
+/**
+* @format_id access_btree_branchcontrolrow_v1_id
+*
+* @purpose    btree pages all have a control row at the front of every page.
+*             to determine the type of row, read the first column which is a
+*             format id and it tells what kind of control row it is.
+*
+* @upgrade    resolve.
+*
+* @disk_layout
+* column 1 - control row type         : storableformatid
+* column 2 - left sibling page number : sqllongint
+* column 3 - right sibling page number: sqllongint
+* column 4 - parent page number       : sqllongint
+* column 5 - level number (0 is leaf) : sqllongint
+* column 6 - isroot                   : sqllongint
+* column 7 - conglomerate object      : null unless it is root else
+*                                       a conglomerate object, matching
+*                                       that of current table.
+*                                       currently this field
+*                                       is only used by logical undo and
+*                                       the type of object is inferred by
+*                                       the logical undo code.
+* column 8 - left child page number   : sqllongint
+**/
+/**
+a branch row contains key fields and the pointer to the child page.
+**/
+public class branchcontrolrow extends controlrow
+protected sqllongint    left_child_page   null
+/**
+* only allocate one child_pageno_buf to read the page pointer field into,
+* then cache to "empty" object for reuse by the page itself.
+**/
+transient sqllongint     child_pageno_buf   null
+/* column assignments */
+private static final int cr_leftchild       controlrow cr_colid_last   1
+private static final int cr_colid_last      cr_leftchild
+private static final int cr_ncolumns        cr_colid_last   1
+/**
+* bit sets used to fetch single columns at a time.
+**/
+protected static final formatablebitset   cr_leftchild_bitmap
+new formatablebitset cr_leftchild   1
+/*
+** constructors of branchcontrolrow
+*/
+static
+cr_leftchild_bitmap set cr_leftchild
+/**
+* no arg constructor.
+* <p>
+* public no arg constructor is for the monitor to call for format
+* id implementation, it should not be called for any other reason.
+**/
+public branchcontrolrow
+public branchcontrolrow
+openbtree       open_btree
+page            page
+int             level
+controlrow      parent
+boolean         isroot
+long            left_child
+throws standardexception
+super open_btree  page
+level  parent  isroot
+this left_child_page   new sqllongint left_child
+// finish initializing the row to be used for interacting with
+// raw store to insert, fetch, and update the control row on the page.
+this row   left_child_page
+// set up buffer to read a branch row's page number into.
+child_pageno_buf   new sqllongint
+/*
+** non - debug/consistency check methods of controlrow:
+*/
+/**
+* perform page specific initialization.
+* <p>
+**/
+protected final void controlrowinit
+child_pageno_buf   new sqllongint
+/**
+* is the current page the leftmost leaf of tree?
+* <p>
+*
+* @return true if the current page is the leftmost leaf of the tree,
+*              else return false.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public boolean isleftmostleaf
+throws standardexception
+return false
+/**
+* is the current page the rightmost leaf of tree?
+* <p>
+*
+* @return true if the current page is the rightmost leaf of the tree,
+*              else return false.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public boolean isrightmostleaf
+throws standardexception
+return false
+/**
+* get the number of columns in the control row.
+* <p>
+* control rows all share the first columns as defined by this class and
+* then add columns to the end of the control row.  for instance a branch
+* control row add a child page pointer field.
+* <p>
+*
+* @return the total number of columns in the control row.
+**/
+protected final int getnumberofcontrolrowcolumns
+return this cr_ncolumns
+public static long restartsplitfor
+openbtree               open_btree
+datavaluedescriptor	template
+branchcontrolrow        parent
+controlrow              child
+datavaluedescriptor	newbranchrow
+datavaluedescriptor	splitrow
+int                     flag
+throws standardexception
+// release parent and current latch
+parent release
+child release
+parent   null
+child    null
+// get the root page back, and perform a split following the
+// branch row which would not fit.
+controlrow root   controlrow get open_btree  btree rootpageid
+if  sanitymanager debug
+sanitymanager assert root page islatched
+return root splitfor open_btree  template  null  newbranchrow  flag
+/**
+** perform a recursive search, ultimately returning the latched
+** leaf page and row slot after which the given key belongs.
+** the slot is returned in the result structure.  if the key
+** exists on the page, the result.exact will be true.  otherwise,
+** result.exact will be false, and the row slot returned will be
+** the one immediately preceding the position at which the key
+** belongs.
+**
+** @exception standardexception standard exception policy.
+**/
+public controlrow search searchparameters sp
+throws standardexception
+controlrow childpage      null
+long       childpageid
+boolean    got_error      true
+try
+searchforentry sp
+if  sp searchforoptimizer
+// update left_fraction to be used to esitimate the number of
+// rows left of the current search key.
+// some search results leave the search positioned on the 0th
+// slot which is a control row, in branch pages this results
+// in following the left page pointer, there is no key
+// associated with this slot.  set left_rows to be the number
+// of leaf page pointers on the page which are left
+// of the current slot.
+float left_rows   sp resultslot
+// include the control row count here, as it accounts for the
+// left page pointer which has no associated key.
+int   row_count   this page recordcount
+if  this getisroot
+sp current_fraction   1
+sp left_fraction      0
+// calculate the fraction of rows in the table which are left
+// of the current slot in the search.  this number represents
+// the fraction of rows in the sub-tree which includes all
+// rows left of rows pointed at by the sub-tree to be followed
+// by the code below which descends the child page pointer.
+// after the search is
+// completed (sp.left_fraction * number of rows), is the
+// estimated number of rows to the left of the current row.
+sp left_fraction
+sp current_fraction     left_rows   row_count
+sp current_fraction
+sp current_fraction       float  1    row_count
+childpage
+this getchildpageatslot sp btree  sp resultslot
+this release
+got_error   false
+return childpage search sp
+finally
+if  got_error
+if  childpage    null
+childpage release
+if  this page islatched
+this release
+/**
+* search and return the left most leaf page.
+* <p>
+* perform a recursive search, ultimately returning the
+* leftmost leaf page which is the first leaf page in the
+* leaf sibling chain.  (this method might better be called
+* getfirstleafpage()).
+*
+* @return the leftmost leaf page.
+*
+* @param btree  the open btree to associate latches/locks with.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected controlrow searchleft openbtree btree
+throws standardexception
+controlrow childpage      null
+boolean    got_error      true
+try
+childpage   this getleftchild btree
+this release
+got_error   false
+return childpage searchleft btree
+finally
+if  got_error
+if  childpage    null
+childpage release
+if  this page islatched
+this release
+/**
+* search and return the right most leaf page.
+* <p>
+* perform a recursive search, ultimately returning the
+* rightmost leaf page which is the last leaf page in the
+* leaf sibling chain.  (this method might better be called
+* getlastleafpage()).
+*
+* @return the rightmost leaf page.
+*
+* @param btree  the open btree to associate latches/locks with.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected controlrow searchright openbtree btree
+throws standardexception
+controlrow childpage      null
+boolean    got_error      true
+try
+childpage   this getrightchild btree
+this release
+got_error   false
+return childpage searchright btree
+finally
+if  got_error
+if  childpage    null
+childpage release
+if  this page islatched
+this release
+/**
+**	perform a recursive shrink operation for the key.
+** if this method returns true, the caller should
+** remove the corresponding entry for the page.
+** this routine is not guaranteed to successfully
+** shrink anything.  the page lead to by the key might
+** turn out not to be empty by the time shrink gets
+** there, and shrinks will give up if there is a deadlock.
+** <p>
+** the receiver page must be latched on entry and is
+** returned latched.
+**
+** @exception standardexception standard exception policy.
+**/
+protected boolean shrinkfor
+openbtree               open_btree
+datavaluedescriptor   shrink_key
+throws standardexception
+controlrow childpage   null
+boolean    shrinkme    false
+try
+if  sanitymanager debug
+sanitymanager assert this page islatched
+// find the child page for the shrink key.
+branchrow branch_template
+branchrow createemptytemplate open_btree getconglomerate
+searchparameters sp   new searchparameters
+shrink_key
+searchparameters position_left_of_partial_key_match
+branch_template getrow    open_btree  false
+this searchforentry sp
+childpage   this getchildpageatslot sp btree  sp resultslot
+// recursively shrink the child.  if this call returns
+// true, then the child page has been deleted from its
+// sibling chain, and we have to delete the entry for it
+// in this page.
+if  childpage shrinkfor open_btree  shrink_key
+// child was deallocated.
+if  sp resultslot    0
+// remove the corresponding branch row.  this call assumes
+// that raw store will shift all higher slots down to fill
+// the purged slot.
+this page purgeatslot sp resultslot  1  true
+else
+// shrunk slot is zero, which means the left child page was
+// deallocated. if the current page is empty, then
+// we have to deallocate it.  otherwise, we "slide" the rows
+// down, making the first index row into the left child,
+// and the second index row into the first, etc.
+if  this page recordcount   > 1
+// there is a branch row on this page (besides the
+// control row).  make the first branch row into the
+// left child.
+long leftchildpageid
+getchildpageidatslot open_btree  1
+this setleftchildpageno leftchildpageid
+// purge the row we just made the "left child", this
+// will automatically shifta all other rows "left" in
+// the tree.
+this page purgeatslot 1  1  true
+else
+// we shrunk the left child which was the last child on
+// the page.  this means that this entire subtree is
+// empty.  again, there are two cases: root vs.
+// non-root.  because this method waits till pages are
+// completely empty before deallocating them from the
+// index, an empty root page means an empty index.
+// if this page is not the root, then simply
+// deallocate it and return that fact to the caller.
+if  this getisroot
+// the root page has become empty.  if the root page
+// is empty, then the index is empty.  what has to
+// happen here is that this page has to be
+// converted back to an empty leaf page.
+// with the current interface, after this page has
+// been converted to a leaf, the caller will be
+// left with a branch control row object, although
+// the page is a leaf page.  this same problem was
+// addressed in splitfor by adjusting the interface
+// - the two routines should at least have the same
+// interface style.
+if  sanitymanager debug
+sanitymanager assert
+this page recordcount      1
+leafcontrolrow newleafroot   new leafcontrolrow
+open_btree  this page  null  true
+newleafroot page updateatslot
+0  newleafroot getrow
+formatablebitset  null
+newleafroot release
+shrinkme   true
+else
+// this page is empty, but it's not the root.  we
+// have to unlink this page from its siblings, and
+// return to the parent branch page that its
+// branch row should be removed.
+// unlink this page from its siblings.
+if  this unlink open_btree
+// tell the caller to remove entry.
+shrinkme   true
+finally
+// if shrinkme then the page has been unlatched either by
+// page.removepage(), or by the process of changing the root branch
+// page to a root leaf page.
+if   shrinkme
+this release
+return shrinkme
+/**
+* perform a top down split pass making room for the the key in "row".
+* <p>
+* perform a split such that a subsequent call to insert
+* given the argument index row will likely find room for it.  since
+* latches are released the client must code for the case where another
+* user has grabbed the space made available by the split pass and be
+* ready to do another split.
+* <p>
+* latches:
+* o parent    : is latched on entry (unless the split is the root then
+*               there is no parent.
+* o thisbranch: the current page is latched on entry.
+* o child     : latch the child page which will be pointed at by the
+*               left child pointer of the new page.
+*               resolve (mikem) -see comments below
+* o newpage   : allocate and latch new page.
+* o child     : release. (resolve)
+* o fixparents: latch pages and reset their parent pointers.
+*               conditionally fix up the parent links on the pages
+*               pointed at by the newly allocated page.  first get latch
+*               and release on the left child page and then loop through
+*               slots on newpage, from left to right getting and
+*               releasing latches.
+*
+*
+* @return page number of the newly allocated leaf page created by split.
+*
+* @param open_btree the open btree to associate latches with.
+* @param template   a scratch area to use while searching for split pass.
+* @param parent     the parent page of the current page in the split pass.
+*                   starts at null for root.
+* @param splitrow   the key to make room for during the split pass.
+* @param flag       a flag used to direct where point of split should be
+*                   chosen.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected long splitfor
+openbtree               open_btree
+datavaluedescriptor	template
+branchcontrolrow        parent
+datavaluedescriptor	splitrow
+int                     flag
+throws standardexception
+int        childpageid
+controlrow childpage
+// on entry, the parent page is either latched by the caller,
+// or it's null (which implies that this object is the root).
+if  sanitymanager debug
+sanitymanager assert parent    null    this getisroot
+sanitymanager assert
+parent    null    parent page islatched
+sanitymanager assert this page islatched
+if   this page recordcount     1 >
+open_btree getconglomerate   maxrowsperpage
+this page spaceforinsert splitrow   formatablebitset  null
+accessfactoryglobals btree_overflow_threshold
+if  this page recordcount      1
+// resolve (mikem) long row issue.  for now it makes no sense
+// to split if there are no rows.  so if spaceforrecord() fails
+// on empty page, we throw exception.
+throw standardexception newexception
+sqlstate btree_no_space_for_key
+// track.branchsplit++;
+if  this getisroot
+// track.branchsplitroot++;
+growroot open_btree  template  this
+parent    branchcontrolrow
+controlrow get open_btree  btree rootpageid
+return parent splitfor
+open_btree  template  null  splitrow  flag
+// at this point we know that this page has to be split and
+// that it isn't a root page.
+if  sanitymanager debug
+sanitymanager assert  this getisroot
+sanitymanager assert parent    null
+int splitpoint    this page recordcount     1    2   1
+if   flag   controlrow split_flag_first_on_page     0
+// move all the row to the new page
+splitpoint   1
+else if   flag   controlrow split_flag_last_on_page     0
+// this is not optimal as we would rather move no rows to the
+// next page, but what should we use as a discriminator?
+splitpoint   this page recordcount     1
+if  sanitymanager debug
+if  splitpoint <  0
+sanitymanager throwassert this
+// before any logged operation is done in the current internal
+// xact, make sure that there is room in the parent to insert
+// the new branch row.
+//
+// create a new branch row which points to the new page,
+// and insert it on parent page.
+// read in the branch row which is at the split point.
+branchrow split_branch_row
+branchrow createemptytemplate open_btree getconglomerate
+this page fetchfromslot
+recordhandle  null  splitpoint  split_branch_row getrow
+fetchdescriptor  null  true
+// create the branch row to insert onto the parent page.  for now
+// use a fake page number because we don't know the real page
+// number until the allocate is done, but want to delay the
+// allocate until we know the insert will succeed.
+branchrow newbranchrow
+split_branch_row createbranchrowfromoldbranchrow
+branchrow dummy_page_number
+// at this point we have guaranteed there is space in the parent
+// page for splitrow, but it could be the case that the new
+// "newbranchrow" does not fit on the parent page.
+if   parent page spaceforinsert
+newbranchrow getrow     formatablebitset  null
+accessfactoryglobals btree_overflow_threshold
+// there is no room on the parent page to complete a split at
+// the current level, so restart the split at top with the
+// branchrow that did not fit.  on return from this routine
+// there is no way to know the state of the tree, so the
+// current split pass recursion must end.
+return
+parent restartsplitfor
+open_btree  template  parent  this
+newbranchrow getrow    splitrow  flag
+// get the child page for the index row at the split point
+// this will be the left child for	the new page.  we're
+// getting the page because branchcontrolrow.allocate
+// sets the left child pointer from a branchcontrolrow.
+// if there were a version which just took the pageid,
+// we wouldn't have to get the page (the latch on this
+// page is enough to ensure that the child page won't
+// disappear).
+childpage   this getchildpageatslot open_btree  splitpoint
+// allocate a new branch page and link it to the
+// right of the current page.
+branchcontrolrow newbranch
+branchcontrolrow allocate open_btree  childpage
+this getlevel    parent
+newbranch linkright open_btree  this
+// test fail after allocation
+if  sanitymanager debug
+if  sanitymanager debug_on
+throw standardexception newexception
+sqlstate btree_abort_through_trace
+// done with the child page.
+childpage release
+// now that we know the page number of the new child page update
+// the branch row to be inserted with the correct value.
+newbranchrow setpagenumber newbranch page getpagenumber
+branchrow branch_template
+branchrow createemptytemplate open_btree getconglomerate
+searchparameters sp   new searchparameters
+newbranchrow getrow
+searchparameters position_left_of_partial_key_match
+branch_template getrow
+open_btree  false
+parent searchforentry sp
+byte insertflag   page insert_initial
+insertflag    page insert_default
+insertflag    page insert_undo_with_purge
+if  parent page insertatslot
+sp resultslot   1
+newbranchrow getrow
+formatablebitset  null
+logicalundo null
+insertflag  accessfactoryglobals btree_overflow_threshold
+
+throw standardexception newexception
+sqlstate btree_no_space_for_key
+// test fail after of row onto parent page.
+if  sanitymanager debug
+if  sanitymanager debug_on
+throw standardexception newexception
+sqlstate btree_abort_through_trace
+// newbranchrow only valid while contents of split_branch_row
+// remain unchanged.
+newbranchrow   null
+// copy the rows from the split point, but not including it (since
+// the split point is turning into the left child of the new
+// branch), onto the new page.  purge the rows including the split
+// point from the current page.
+int num_rows_to_move   this page recordcount      splitpoint   1
+if  num_rows_to_move > 0
+this page copyandpurge
+newbranch page  splitpoint   1  num_rows_to_move  1
+// remove the splitpoint row, we didn't copy it because it became
+// the "left child", but we do need to get rid of it.
+this page purgeatslot splitpoint  1  true
+// test fail after of copy of rows to new page.
+if  sanitymanager debug
+if  sanitymanager debug_on
+throw standardexception newexception
+sqlstate btree_abort_through_trace
+// test fail after purge of rows on old page.
+if  sanitymanager debug
+if  sanitymanager debug_on
+throw standardexception newexception
+sqlstate btree_abort_through_trace
+// check pages that have been altered by above split
+if  sanitymanager debug
+if  sanitymanager debug_on
+parent checkconsistency open_btree  null  false
+newbranch checkconsistency open_btree  parent  false
+this checkconsistency open_btree  parent  false
+// fix up the parent links on the pages for the rows that moved to
+// the new branch.
+newbranch fixchildrensparents open_btree  null
+// at this point a unit of work in the split down the tree has
+// been performed in an internal transaction (ie. writes have been
+// done to latched pages), and the resulting
+// tree is logically consistent, thus the work can be committed.
+// this work must be committed before any latches are released.
+open_btree getxactmgr   commit
+// decide whether we're following the current page or the new page.
+branchcontrolrow pagetofollow
+if  compareindexrowtokey
+splitrow
+split_branch_row getrow
+split_branch_row getrow   length   1  0
+open_btree getconglomerate   ascdescinfo  >  0
+// follow the new branch
+pagetofollow   newbranch
+this release
+else
+// follow the current branch
+pagetofollow   this
+newbranch release
+// at this point we hold latches on the parent, and the current
+// child of the page that we are following.  note that committing
+// the internal transaction did not release the latches.
+if  sanitymanager debug
+sanitymanager assert parent    null
+sanitymanager assert parent page islatched
+sanitymanager assert
+pagetofollow page islatched
+// recurse down the tree splitting if necessary.
+return
+pagetofollow splitfor
+open_btree  template  parent  splitrow  flag
+if  sanitymanager debug
+if  sanitymanager debug_on
+this checkconsistency open_btree  parent  false
+// don't need the parent any more.
+if  parent    null
+parent release
+// resolve (mikem) - should this be passed in?
+branchrow branch_template
+branchrow createemptytemplate open_btree getconglomerate
+searchparameters sp   new searchparameters
+splitrow
+searchparameters position_left_of_partial_key_match
+branch_template getrow
+open_btree  false
+searchforentry sp
+childpage   this getchildpageatslot open_btree  sp resultslot
+return childpage splitfor open_btree  template  this  splitrow  flag
+/*
+** debug/consistency check methods of controlrow:
+*/
+/**
+** perform consistency checks for a branch page.  the checks
+** specific to a branch page are:
+** <menu>
+** <li> the rows on the page are indeed branch rows, and
+**      they all have the correct number of fields (which
+**      is the b-tree's key fields plus one for the child
+**      page number.
+** <li> the child pages pointed to by the left child pointer
+**      and the index rows are linked together in the same
+**      order that they appear on the page.
+** <li> the child pages themselves are all consistent.
+** </menu>
+** this method also performs the consistency checks that
+** are common to both leaf and branch pages (see
+** controlrow.checkgeneric).
+**
+** @exception standardexception standard exception policy.
+**/
+public int checkconsistency
+openbtree  btree
+controlrow parent
+boolean    check_other_pages
+throws standardexception
+// do the consistency checks that are common to all
+// types of pages.
+checkgeneric btree  parent  check_other_pages
+// branch specific control row checks.
+if  sanitymanager debug
+sanitymanager assert
+this getlevel   > 0
+// resolve (mikem) - how to check right version?
+/*
+if (this.getversion() != current_branch_version)
+sanitymanager.throwassert(
+"expected branch version:(" + current_branch_version +
+") but got (" + this.getversion());
+*/
+sanitymanager assert
+this page fetchnumfieldsatslot cr_slot
+branchcontrolrow cr_ncolumns
+sanitymanager assert getleftchildpageno
+containerhandle invalid_page_number
+// resolve (mikem) - this makes an assumption about page numbering,
+// that may not be always valid in all implementations but has
+// been useful in finding bugs with uninitialized fields.
+sanitymanager assert getleftchildpageno   >  btree rootpageid
+// the remaining checks are specific to branch pages.
+if  sanitymanager debug
+// check that all the branch rows are branch rows
+// (we'll get a case error otherwise), and have the right
+// number of columns.  every branch row should have the
+// btree's	key columns plus one for the child link.
+int numslots   this page recordcount
+for  int slot   1  slot < numslots  slot
+if   this page fetchnumfieldsatslot slot
+btree getconglomerate   nkeyfields   1
+sanitymanager.throwassert(
+slot
+this page fetchnumfieldsatslot slot
+btree getconglomerate   nkeyfields   1
+sanitymanager assert this getchildpageidatslot btree  slot
+containerhandle invalid_page_number
+// rows on branch pages are never deleted, they are only purged.
+sanitymanager assert  this page isdeletedatslot slot
+// resolve (mikem) - this makes an assumption about page
+// numbering, that may not be always valid in all
+// implementations but has been useful in finding bugs with
+// uninitialized fields.
+sanitymanager assert getleftchildpageno   >  btree rootpageid
+// check that the linkage of the children is in the
+// same order as the branch rows.
+// resolve (mikem) enable when multiple latches work.
+if  check_other_pages
+checkchildorderagainstroworder btree
+// check the children.
+int nchildren   0
+// resolve (mikem) enable when multiple latches work.
+if  check_other_pages
+nchildren   checkchildren btree
+// return the number of children visited plus one for this page.
+return nchildren   1
+private int checkchildren openbtree btree
+throws standardexception
+int         nchildren   0
+controlrow  childpage   null
+try
+// check the left child.
+childpage   this getleftchild btree
+nchildren    childpage checkconsistency btree  this  true
+childpage release
+childpage   null
+// check children from each index row.
+int numslots   this page recordcount
+for  int slot   1  slot < numslots  slot
+childpage   this getchildpageatslot btree  slot
+nchildren    childpage checkconsistency btree  this  true
+childpage release
+childpage   null
+return nchildren
+finally
+if  childpage    null
+childpage release
+private void checkchildorderagainstroworder openbtree btree
+throws standardexception
+controlrow cur    null
+controlrow prev   null
+try
+prev   this getleftchild btree
+int numslots   this page recordcount
+for  int slot   1  slot < numslots  slot
+cur   this getchildpageatslot btree  slot
+long shouldbecur_pageno   prev getrightsiblingpagenumber
+if  sanitymanager debug
+if  shouldbecur_pageno    cur page getpagenumber
+sanitymanager.throwassert(
+cur
+prev
+long shouldbeprev_pageno   cur getleftsiblingpagenumber
+if  sanitymanager debug
+sanitymanager assert
+shouldbeprev_pageno    prev page getpagenumber
+prev release
+prev   cur
+cur    null
+prev release
+prev   null
+finally
+if  prev    null
+prev release
+if  cur    null
+cur release
+return
+/**
+* recursively print the tree starting at current node in tree.
+*
+* @param btree the open btree to print.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public void printtree
+openbtree  btree
+throws standardexception
+if  sanitymanager debug
+sanitymanager debug_print    this debugpage btree
+controlrow      child   null
+try
+child   this getleftchild btree
+child printtree btree
+child release
+child   null
+int numslots   this page recordcount
+for  int slot   1  slot < numslots  slot
+child   this getchildpageatslot btree  slot
+child printtree btree
+child release
+child   null
+finally
+if  child    null
+child release
+return
+/*
+* private methods of branchcontrolrow
+*/
+/**
+** add a level to the tree by moving the current branch-root page up
+** one level and adding a new page as it's left child.  on exit the
+** current root page remains the root of the tree.
+** <p>
+** on entry, the current branch root page is expected to be latched.
+** on exit, all latches will have been released.
+** <p>
+** latch order:
+**    o root: on entry current root is latched.
+**            no other latches should be held.
+**    o root_oldchild: get and latch root's left child page.
+**    o root_newchild: allocate a new branch page with latch.
+**    o conditionally fix up the parent links on the pages pointed at
+**      by the newly allocated page.  loop through slots on root_newchild,
+**      from left to right getting and releasing latches.  note that
+**      fixchildrensparents() must not latch the leftchild as root_oldchild
+**      is already latched.
+**    resolve: (mikem) does order of release matter.
+**    o root         : released.
+**    o root_newchild: released.
+**    o root_oldchild: released.
+**/
+private static void growroot
+openbtree               open_btree
+datavaluedescriptor   template
+branchcontrolrow        root
+throws standardexception
+controlrow       leftchild   null
+branchcontrolrow branch      null
+try
+if  sanitymanager debug
+sanitymanager assert root page islatched
+sanitymanager assert root getisroot
+// system.out.println("growing root: control row = " + root);
+// system.out.println("growing root: page = " + root.page);
+// get and latch the current root's left child.  this will become
+// the left child on the new branch page (and the new
+// branch will become the left child of the root).
+leftchild   root getleftchild open_btree
+// allocate a new branch page.	 this one will take the
+// rows from the root, and remain at the old root's level.
+// its parent is the root.
+branch
+branchcontrolrow allocate
+open_btree  leftchild  root getlevel    root
+// copy all the index rows from the root to the new branch.
+// purge the index rows from the root now that they're safely on the
+// new branch page.  leave the branch control row on the page.
+root page copyandpurge branch page  1  root page recordcount     1  1
+// set the root's left child to be the new branch.
+root setleftchild branch
+// move the root up a level
+root setlevel root getlevel     1
+// the parent of the old root's children has changed.
+// it used to be page 0 (the old root, but now it's
+// the new branch page.  fix this up.
+branch fixchildrensparents open_btree  leftchild
+if  sanitymanager debug
+if  sanitymanager debug_on
+root checkconsistency open_btree  null  false
+branch checkconsistency open_btree  root  false
+leftchild checkconsistency open_btree  branch  false
+// at this point a unit of work in the split down the tree has
+// been performed in an internal transaction.  this work must
+// be committed before any latches are released.
+open_btree getxactmgr   commit
+finally
+// at the end of a growroot() no latches are held, the caller must
+// restart at the root.
+//
+root release
+if  branch    null
+branch release
+if  leftchild    null
+leftchild release
+return
+/**
+* allocate a new leaf page to the conglomerate.
+*
+* @exception standardexception standard exception policy.
+*/
+private static branchcontrolrow allocate
+openbtree         open_btree
+controlrow        leftchild
+int               level
+controlrow        parent
+throws standardexception
+page      page        open_btree container addpage
+// create a control row for the new page.
+branchcontrolrow control_row
+new branchcontrolrow
+open_btree  page  level
+parent  false  leftchild page getpagenumber
+// insert the control row on the page.
+byte insertflag   page insert_initial
+insertflag    page insert_default
+page insertatslot
+page first_slot_number
+control_row getrow
+formatablebitset  null
+logicalundo null
+insertflag  accessfactoryglobals btree_overflow_threshold
+// page is returned latched.
+return control_row
+protected void setleftchildpageno long leftchild_pageno
+throws standardexception
+// store the field.
+if  left_child_page    null
+left_child_page   new sqllongint leftchild_pageno
+else
+this left_child_page setvalue leftchild_pageno
+// write the field through to the underlying row
+this page updatefieldatslot
+cr_slot  cr_leftchild  this left_child_page  null
+protected void setleftchild controlrow leftchild
+throws standardexception
+this setleftchildpageno leftchild page getpagenumber
+/**
+** a branch page that has just been allocated as part
+** of a split has index rows and a left child pointer
+** that were copied from another page.  the parent
+** link on the corresponding pages will still point to
+** the original page.  this method fixes their parent
+** pointers so that they point to the curren page like
+** they're supposed to.
+** <p>
+** note that maintaining the parent link is kind of a
+** pain, and will slow down applications.  it's only
+** needed for consistency checks, so we may want to
+** have implementations that don't bother to maintain it.
+** <p)
+** this
+**/
+private void fixchildrensparents
+openbtree       btree
+controlrow      leftchild
+throws standardexception
+controlrow child   null
+try
+if  leftchild    null
+child   this getleftchild btree
+child setparent this page getpagenumber
+if  sanitymanager debug
+if  sanitymanager debug_on
+child checkconsistency btree  this  false
+child release
+child   null
+else
+leftchild setparent this page getpagenumber
+if  sanitymanager debug
+if  sanitymanager debug_on
+leftchild checkconsistency btree  this  false
+int numslots   this page recordcount
+for  int slot   1  slot < numslots  slot
+child   getchildpageatslot btree  slot
+child setparent this page getpagenumber
+if  sanitymanager debug
+if  sanitymanager debug_on
+child checkconsistency btree  this  false
+child release
+child   null
+finally
+if  child    null
+child release
+private long getchildpageidatslot
+openbtree       btree
+int             slot
+throws standardexception
+long child_page_id
+if  slot    0
+child_page_id   this getleftchildpageno
+else
+this page fetchfieldfromslot
+slot  btree getconglomerate   nkeyfields  child_pageno_buf
+child_page_id   child_pageno_buf getlong
+return child_page_id
+protected controlrow getchildpageatslot
+openbtree       open_btree
+int             slot
+throws standardexception
+controlrow  child_control_row
+if  slot    0
+child_control_row   this getleftchild open_btree
+else
+this page fetchfieldfromslot
+slot  open_btree getconglomerate   nkeyfields
+child_pageno_buf
+child_control_row
+controlrow get open_btree  child_pageno_buf getlong
+return child_control_row
+/**
+* return the left child pointer for the page.
+* <p>
+* leaf pages don't have children, so they override this and return null.
+*
+* @return the page which is the leftmost child of this page.
+*
+* @param open_btree  the open btree to associate latches/locks with.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public controlrow getleftchild openbtree open_btree
+throws standardexception
+return controlrow get open_btree  this getleftchildpageno
+/**
+* return the right child pointer for the page.
+* <p>
+* leaf pages don't have children, so they override this and return null.
+*
+* @return the page which is the rightmost child of this page.
+*
+* @param open_btree  the open btree to associate latches/locks with.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected controlrow getrightchild openbtree open_btree
+throws standardexception
+controlrow right_child
+int        num_slots   this page recordcount
+// if num_slots is 1 then there are no branch rows, so just follow
+// the left page pointer, else if num_slots is > 1 then follow the
+// last branch row to find the rightmost child.
+right_child
+num_slots    1 ?
+controlrow get open_btree  this getleftchildpageno
+getchildpageatslot open_btree   num_slots   1
+return right_child
+/**
+** return the left child page number for the page.  leaf pages
+** don't have left children, so they override this and return
+** null.
+**/
+long getleftchildpageno
+throws standardexception
+if  this left_child_page    null
+this left_child_page   new sqllongint
+scratch_row   this left_child_page
+fetchdesc setvalidcolumns cr_leftchild_bitmap
+this page fetchfromslot
+recordhandle  null  cr_slot  scratch_row  fetchdesc  false
+return left_child_page getlong
+/*
+* typedformat:
+*/
+/**
+return my format identifier.
+@see org.apache.derby.iapi.services.io.typedformat#gettypeformatid
+*/
+public int gettypeformatid
+return storedformatids access_btree_branchcontrolrow_v1_id
+/**
+* return a new template for reading a data row from the current page.
+* <p>
+* default implementation for rows which are the same as the conglomerates
+* template, sub-classes can alter if underlying template is different
+* (for instance branch rows add an extra field at the end).
+*
+* @return newly allocated template.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public datavaluedescriptor getrowtemplate openbtree    open_btree
+throws standardexception
+return branchrow createemptytemplate
+open_btree getconglomerate    getrow
+/**
+** the standard tostring.
+**/
+public string tostring
+if  sanitymanager debug
+string string   super tostring
+try
+string        getleftchildpageno
+catch  throwable t
+string
+return string
+else
+return null

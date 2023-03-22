@@ -1,0 +1,926 @@
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*      http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache activemq store kahadb
+import java io datainputstream
+import java io ioexception
+import java io interruptedioexception
+import java util arraylist
+import java util hashmap
+import java util hashset
+import java util iterator
+import java util linkedlist
+import java util list
+import java util map
+import java util set
+import java util map entry
+import java util concurrent
+import java util concurrent atomic atomicboolean
+import java util concurrent atomic atomicinteger
+import org apache activemq broker connectioncontext
+import org apache activemq broker region destination
+import org apache activemq broker region regionbroker
+import org apache activemq command activemqdestination
+import org apache activemq command activemqqueue
+import org apache activemq command activemqtempqueue
+import org apache activemq command activemqtemptopic
+import org apache activemq command activemqtopic
+import org apache activemq command message
+import org apache activemq command messageack
+import org apache activemq command messageid
+import org apache activemq command producerid
+import org apache activemq command subscriptioninfo
+import org apache activemq command transactionid
+import org apache activemq openwire openwireformat
+import org apache activemq protobuf buffer
+import org apache activemq store abstractmessagestore
+import org apache activemq store messagerecoverylistener
+import org apache activemq store messagestore
+import org apache activemq store persistenceadapter
+import org apache activemq store topicmessagestore
+import org apache activemq store transactionstore
+import org apache activemq store kahadb data kahaaddmessagecommand
+import org apache activemq store kahadb data kahadestination
+import org apache activemq store kahadb data kahalocation
+import org apache activemq store kahadb data kaharemovedestinationcommand
+import org apache activemq store kahadb data kaharemovemessagecommand
+import org apache activemq store kahadb data kahasubscriptioncommand
+import org apache activemq store kahadb data kahatransactioninfo
+import org apache activemq store kahadb data kahadestination destinationtype
+import org apache activemq usage memoryusage
+import org apache activemq usage systemusage
+import org apache activemq util servicestopper
+import org apache activemq util threadpoolutils
+import org apache activemq wireformat wireformat
+import org slf4j logger
+import org slf4j loggerfactory
+import org apache activemq store kahadb disk journal location
+import org apache activemq store kahadb disk page transaction
+public class kahadbstore extends messagedatabase implements persistenceadapter
+static final logger log   loggerfactory getlogger kahadbstore class
+private static final int max_async_jobs   10000
+public static final string property_canceled_task_mod_metric
+public static final int cancelledtaskmodmetric   integer parseint system getproperty
+property_canceled_task_mod_metric      10
+public static final string property_async_executor_max_threads
+private static final int asyncexecutormaxthreads   integer parseint system getproperty
+property_async_executor_max_threads      10
+protected executorservice queueexecutor
+protected executorservice topicexecutor
+protected final list<map<asyncjobkey  storetask>> asyncqueuemaps   new linkedlist<map<asyncjobkey  storetask>>
+protected final list<map<asyncjobkey  storetask>> asynctopicmaps   new linkedlist<map<asyncjobkey  storetask>>
+final wireformat wireformat   new openwireformat
+private systemusage usagemanager
+private linkedblockingqueue<runnable> asyncqueuejobqueue
+private linkedblockingqueue<runnable> asynctopicjobqueue
+semaphore globalqueuesemaphore
+semaphore globaltopicsemaphore
+private boolean concurrentstoreanddispatchqueues   true
+// when true, message order may be compromised when cache is exhausted if store is out
+// or order w.r.t cache
+private boolean concurrentstoreanddispatchtopics   false
+private boolean concurrentstoreanddispatchtransactions   false
+private int maxasyncjobs   max_async_jobs
+private final kahadbtransactionstore transactionstore
+private transactionidtransformer transactionidtransformer
+public kahadbstore
+this transactionstore   new kahadbtransactionstore this
+this transactionidtransformer   new transactionidtransformer
+@override
+public kahatransactioninfo transform transactionid txid
+return transactionidconversion convert txid
+@override
+public string tostring
+return     directory getabsolutepath
+public void setbrokername string brokername
+public void setusagemanager systemusage usagemanager
+this usagemanager   usagemanager
+public systemusage getusagemanager
+return this usagemanager
+/**
+* @return the concurrentstoreanddispatch
+*/
+public boolean isconcurrentstoreanddispatchqueues
+return this concurrentstoreanddispatchqueues
+/**
+* @param concurrentstoreanddispatch
+*            the concurrentstoreanddispatch to set
+*/
+public void setconcurrentstoreanddispatchqueues boolean concurrentstoreanddispatch
+this concurrentstoreanddispatchqueues   concurrentstoreanddispatch
+/**
+* @return the concurrentstoreanddispatch
+*/
+public boolean isconcurrentstoreanddispatchtopics
+return this concurrentstoreanddispatchtopics
+/**
+* @param concurrentstoreanddispatch
+*            the concurrentstoreanddispatch to set
+*/
+public void setconcurrentstoreanddispatchtopics boolean concurrentstoreanddispatch
+this concurrentstoreanddispatchtopics   concurrentstoreanddispatch
+public boolean isconcurrentstoreanddispatchtransactions
+return this concurrentstoreanddispatchtransactions
+/**
+* @return the maxasyncjobs
+*/
+public int getmaxasyncjobs
+return this maxasyncjobs
+/**
+* @param maxasyncjobs
+*            the maxasyncjobs to set
+*/
+public void setmaxasyncjobs int maxasyncjobs
+this maxasyncjobs   maxasyncjobs
+@override
+public void dostart   throws exception
+super dostart
+this globalqueuesemaphore   new semaphore getmaxasyncjobs
+this globaltopicsemaphore   new semaphore getmaxasyncjobs
+this asyncqueuejobqueue   new linkedblockingqueue<runnable> getmaxasyncjobs
+this asynctopicjobqueue   new linkedblockingqueue<runnable> getmaxasyncjobs
+this queueexecutor   new storetaskexecutor 1  asyncexecutormaxthreads  0l  timeunit milliseconds
+asyncqueuejobqueue  new threadfactory
+public thread newthread runnable runnable
+thread thread   new thread runnable
+thread setdaemon true
+return thread
+this topicexecutor   new storetaskexecutor 1  asyncexecutormaxthreads  0l  timeunit milliseconds
+asynctopicjobqueue  new threadfactory
+public thread newthread runnable runnable
+thread thread   new thread runnable
+thread setdaemon true
+return thread
+@override
+public void dostop servicestopper stopper  throws exception
+// drain down async jobs
+log info
+if  this globalqueuesemaphore    null
+this globalqueuesemaphore tryacquire this maxasyncjobs  60  timeunit seconds
+synchronized  this asyncqueuemaps
+for  map<asyncjobkey  storetask> m   asyncqueuemaps
+synchronized  m
+for  storetask task   m values
+task cancel
+this asyncqueuemaps clear
+log info
+if  this globaltopicsemaphore    null
+this globaltopicsemaphore tryacquire this maxasyncjobs  60  timeunit seconds
+synchronized  this asynctopicmaps
+for  map<asyncjobkey  storetask> m   asynctopicmaps
+synchronized  m
+for  storetask task   m values
+task cancel
+this asynctopicmaps clear
+if  this globalqueuesemaphore    null
+this globalqueuesemaphore drainpermits
+if  this globaltopicsemaphore    null
+this globaltopicsemaphore drainpermits
+if  this queueexecutor    null
+threadpoolutils shutdownnow queueexecutor
+queueexecutor   null
+if  this topicexecutor    null
+threadpoolutils shutdownnow topicexecutor
+topicexecutor   null
+log info
+super dostop stopper
+void incrementredeliveryandrewrite final string key  final kahadestination destination  throws ioexception
+location location
+this indexlock writelock   lock
+try
+location   findmessagelocation key  destination
+finally
+this indexlock writelock   unlock
+if  location    null
+kahaaddmessagecommand addmessage    kahaaddmessagecommand  load location
+message message    message  wireformat unmarshal new datainputstream addmessage getmessage   newinput
+message incrementredeliverycounter
+if  log istraceenabled
+log trace     key       message getredeliverycounter
+org apache activemq util bytesequence packet   wireformat marshal message
+addmessage setmessage new buffer packet getdata    packet getoffset    packet getlength
+final location rewritelocation   journal write tobytesequence addmessage   true
+this indexlock writelock   lock
+try
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+storeddestination sd   getstoreddestination destination  tx
+long sequence   sd messageidindex get tx  key
+messagekeys keys   sd orderindex get tx  sequence
+sd orderindex put tx  sd orderindex lastgetpriority    sequence  new messagekeys keys messageid  rewritelocation
+finally
+this indexlock writelock   unlock
+@override
+void rollbackstatsonduplicate kahadestination commanddestination
+if  brokerservice    null
+regionbroker regionbroker    regionbroker  brokerservice getregionbroker
+if  regionbroker    null
+set<destination> destinationset   regionbroker getdestinations convert commanddestination
+for  destination destination   destinationset
+destination getdestinationstatistics   getmessages   decrement
+destination getdestinationstatistics   getenqueues   decrement
+private location findmessagelocation final string key  final kahadestination destination  throws ioexception
+return pagefile tx   execute new transaction callableclosure<location  ioexception>
+public location execute transaction tx  throws ioexception
+storeddestination sd   getstoreddestination destination  tx
+long sequence   sd messageidindex get tx  key
+if  sequence    null
+return null
+return sd orderindex get tx  sequence  location
+protected storequeuetask removequeuetask kahadbmessagestore store  messageid id
+storequeuetask task   null
+synchronized  store asynctaskmap
+task    storequeuetask  store asynctaskmap remove new asyncjobkey id  store getdestination
+return task
+protected void addqueuetask kahadbmessagestore store  storequeuetask task  throws ioexception
+synchronized  store asynctaskmap
+store asynctaskmap put new asyncjobkey task getmessage   getmessageid    store getdestination     task
+this queueexecutor execute task
+protected storetopictask removetopictask kahadbtopicmessagestore store  messageid id
+storetopictask task   null
+synchronized  store asynctaskmap
+task    storetopictask  store asynctaskmap remove new asyncjobkey id  store getdestination
+return task
+protected void addtopictask kahadbtopicmessagestore store  storetopictask task  throws ioexception
+synchronized  store asynctaskmap
+store asynctaskmap put new asyncjobkey task getmessage   getmessageid    store getdestination     task
+this topicexecutor execute task
+public transactionstore createtransactionstore   throws ioexception
+return this transactionstore
+public boolean getforcerecoverindex
+return this forcerecoverindex
+public void setforcerecoverindex boolean forcerecoverindex
+this forcerecoverindex   forcerecoverindex
+public class kahadbmessagestore extends abstractmessagestore
+protected final map<asyncjobkey  storetask> asynctaskmap   new hashmap<asyncjobkey  storetask>
+protected kahadestination dest
+private final int maxasyncjobs
+private final semaphore localdestinationsemaphore
+double donetasks  canceledtasks   0
+public kahadbmessagestore activemqdestination destination
+super destination
+this dest   convert destination
+this maxasyncjobs   getmaxasyncjobs
+this localdestinationsemaphore   new semaphore this maxasyncjobs
+@override
+public activemqdestination getdestination
+return destination
+@override
+public future<object> asyncaddqueuemessage final connectioncontext context  final message message
+throws ioexception
+if  isconcurrentstoreanddispatchqueues
+storequeuetask result   new storequeuetask this  context  message
+result aquirelocks
+addqueuetask this  result
+return result getfuture
+else
+return super asyncaddqueuemessage context  message
+@override
+public void removeasyncmessage connectioncontext context  messageack ack  throws ioexception
+if  isconcurrentstoreanddispatchqueues
+asyncjobkey key   new asyncjobkey ack getlastmessageid    getdestination
+storequeuetask task   null
+synchronized  asynctaskmap
+task    storequeuetask  asynctaskmap get key
+if  task    null
+if  ack isintransaction       task cancel
+try
+task future get
+catch  interruptedexception e
+throw new interruptedioexception e tostring
+catch  exception ignored
+log debug    ignored
+removemessage context  ack
+else
+synchronized  asynctaskmap
+asynctaskmap remove key
+else
+removemessage context  ack
+else
+removemessage context  ack
+public void addmessage connectioncontext context  message message  throws ioexception
+kahaaddmessagecommand command   new kahaaddmessagecommand
+command setdestination dest
+command setmessageid message getmessageid   tostring
+command settransactioninfo transactionidtransformer transform message gettransactionid
+command setpriority message getpriority
+command setprioritysupported isprioritizedmessages
+org apache activemq util bytesequence packet   wireformat marshal message
+command setmessage new buffer packet getdata    packet getoffset    packet getlength
+store command  isenablejournaldisksyncs      message isresponserequired    null  null
+public void removemessage connectioncontext context  messageack ack  throws ioexception
+kaharemovemessagecommand command   new kaharemovemessagecommand
+command setdestination dest
+command setmessageid ack getlastmessageid   tostring
+command settransactioninfo transactionidtransformer transform ack gettransactionid
+org apache activemq util bytesequence packet   wireformat marshal ack
+command setack new buffer packet getdata    packet getoffset    packet getlength
+store command  isenablejournaldisksyncs      ack isresponserequired    null  null
+public void removeallmessages connectioncontext context  throws ioexception
+kaharemovedestinationcommand command   new kaharemovedestinationcommand
+command setdestination dest
+store command  true  null  null
+public message getmessage messageid identity  throws ioexception
+final string key   identity tostring
+// hopefully one day the page file supports concurrent read
+// operations... but for now we must
+// externally synchronize...
+location location
+indexlock writelock   lock
+try
+location   findmessagelocation key  dest
+finally
+indexlock writelock   unlock
+if  location    null
+return null
+return loadmessage location
+public int getmessagecount   throws ioexception
+try
+lockasyncjobqueue
+indexlock writelock   lock
+try
+return pagefile tx   execute new transaction callableclosure<integer  ioexception>
+public integer execute transaction tx  throws ioexception
+// iterate through all index entries to get a count
+// of
+// messages in the destination.
+storeddestination sd   getstoreddestination dest  tx
+int rc   0
+for  iterator<entry<location  long>> iterator   sd locationindex iterator tx   iterator
+hasnext
+iterator next
+rc
+return rc
+finally
+indexlock writelock   unlock
+finally
+unlockasyncjobqueue
+@override
+public boolean isempty   throws ioexception
+indexlock writelock   lock
+try
+return pagefile tx   execute new transaction callableclosure<boolean  ioexception>
+public boolean execute transaction tx  throws ioexception
+// iterate through all index entries to get a count of
+// messages in the destination.
+storeddestination sd   getstoreddestination dest  tx
+return sd locationindex isempty tx
+finally
+indexlock writelock   unlock
+public void recover final messagerecoverylistener listener  throws exception
+// recovery may involve expiry which will modify
+indexlock writelock   lock
+try
+pagefile tx   execute new transaction closure<exception>
+public void execute transaction tx  throws exception
+storeddestination sd   getstoreddestination dest  tx
+sd orderindex resetcursorposition
+for  iterator<entry<long  messagekeys>> iterator   sd orderindex iterator tx   listener hasspace      iterator
+hasnext
+entry<long  messagekeys> entry   iterator next
+if  ackedandprepared contains entry getvalue   messageid
+continue
+message msg   loadmessage entry getvalue   location
+listener recovermessage msg
+finally
+indexlock writelock   unlock
+public void recovernextmessages final int maxreturned  final messagerecoverylistener listener  throws exception
+indexlock writelock   lock
+try
+pagefile tx   execute new transaction closure<exception>
+public void execute transaction tx  throws exception
+storeddestination sd   getstoreddestination dest  tx
+entry<long  messagekeys> entry   null
+int counter   0
+for  iterator<entry<long  messagekeys>> iterator   sd orderindex iterator tx
+listener hasspace      iterator hasnext
+entry   iterator next
+if  ackedandprepared contains entry getvalue   messageid
+continue
+message msg   loadmessage entry getvalue   location
+listener recovermessage msg
+counter
+if  counter >  maxreturned
+break
+sd orderindex stoppediterating
+finally
+indexlock writelock   unlock
+public void resetbatching
+if  pagefile isloaded
+indexlock writelock   lock
+try
+pagefile tx   execute new transaction closure<exception>
+public void execute transaction tx  throws exception
+storeddestination sd   getexistingstoreddestination dest  tx
+if  sd    null
+sd orderindex resetcursorposition
+catch  exception e
+log error   e
+finally
+indexlock writelock   unlock
+@override
+public void setbatch messageid identity  throws ioexception
+try
+final string key   identity tostring
+lockasyncjobqueue
+// hopefully one day the page file supports concurrent read
+// operations... but for now we must
+// externally synchronize...
+indexlock writelock   lock
+try
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+storeddestination sd   getstoreddestination dest  tx
+long location   sd messageidindex get tx  key
+if  location    null
+sd orderindex setbatch tx  location
+finally
+indexlock writelock   unlock
+finally
+unlockasyncjobqueue
+@override
+public void setmemoryusage memoryusage memoeyusage
+@override
+public void start   throws exception
+super start
+@override
+public void stop   throws exception
+super stop
+protected void lockasyncjobqueue
+try
+this localdestinationsemaphore tryacquire this maxasyncjobs  60  timeunit seconds
+catch  exception e
+log error     this destination  e
+protected void unlockasyncjobqueue
+this localdestinationsemaphore release this maxasyncjobs
+protected void acquirelocalasynclock
+try
+this localdestinationsemaphore acquire
+catch  interruptedexception e
+log error     this destination  e
+protected void releaselocalasynclock
+this localdestinationsemaphore release
+class kahadbtopicmessagestore extends kahadbmessagestore implements topicmessagestore
+private final atomicinteger subscriptioncount   new atomicinteger
+public kahadbtopicmessagestore activemqtopic destination  throws ioexception
+super destination
+this subscriptioncount set getallsubscriptions   length
+asynctopicmaps add asynctaskmap
+@override
+public future<object> asyncaddtopicmessage final connectioncontext context  final message message
+throws ioexception
+if  isconcurrentstoreanddispatchtopics
+storetopictask result   new storetopictask this  context  message  subscriptioncount get
+result aquirelocks
+addtopictask this  result
+return result getfuture
+else
+return super asyncaddtopicmessage context  message
+public void acknowledge connectioncontext context  string clientid  string subscriptionname
+messageid messageid  messageack ack
+throws ioexception
+string subscriptionkey   subscriptionkey clientid  subscriptionname  tostring
+if  isconcurrentstoreanddispatchtopics
+asyncjobkey key   new asyncjobkey messageid  getdestination
+storetopictask task   null
+synchronized  asynctaskmap
+task    storetopictask  asynctaskmap get key
+if  task    null
+if  task addsubscriptionkey subscriptionkey
+removetopictask this  messageid
+if  task cancel
+synchronized  asynctaskmap
+asynctaskmap remove key
+else
+doacknowledge context  subscriptionkey  messageid  ack
+else
+doacknowledge context  subscriptionkey  messageid  ack
+protected void doacknowledge connectioncontext context  string subscriptionkey  messageid messageid  messageack ack
+throws ioexception
+kaharemovemessagecommand command   new kaharemovemessagecommand
+command setdestination dest
+command setsubscriptionkey subscriptionkey
+command setmessageid messageid tostring
+command settransactioninfo ack    null ? transactionidtransformer transform ack gettransactionid      null
+if  ack    null    ack isunmatchedack
+command setack unmatched
+else
+org apache activemq util bytesequence packet   wireformat marshal ack
+command setack new buffer packet getdata    packet getoffset    packet getlength
+store command  false  null  null
+public void addsubsciption subscriptioninfo subscriptioninfo  boolean retroactive  throws ioexception
+string subscriptionkey   subscriptionkey subscriptioninfo getclientid    subscriptioninfo
+getsubscriptionname
+kahasubscriptioncommand command   new kahasubscriptioncommand
+command setdestination dest
+command setsubscriptionkey subscriptionkey tostring
+command setretroactive retroactive
+org apache activemq util bytesequence packet   wireformat marshal subscriptioninfo
+command setsubscriptioninfo new buffer packet getdata    packet getoffset    packet getlength
+store command  isenablejournaldisksyncs      true  null  null
+this subscriptioncount incrementandget
+public void deletesubscription string clientid  string subscriptionname  throws ioexception
+kahasubscriptioncommand command   new kahasubscriptioncommand
+command setdestination dest
+command setsubscriptionkey subscriptionkey clientid  subscriptionname  tostring
+store command  isenablejournaldisksyncs      true  null  null
+this subscriptioncount decrementandget
+public subscriptioninfo getallsubscriptions   throws ioexception
+final arraylist<subscriptioninfo> subscriptions   new arraylist<subscriptioninfo>
+indexlock writelock   lock
+try
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+storeddestination sd   getstoreddestination dest  tx
+for  iterator<entry<string  kahasubscriptioncommand>> iterator   sd subscriptions iterator tx   iterator
+hasnext
+entry<string  kahasubscriptioncommand> entry   iterator next
+subscriptioninfo info    subscriptioninfo  wireformat unmarshal new datainputstream entry
+getvalue   getsubscriptioninfo   newinput
+subscriptions add info
+finally
+indexlock writelock   unlock
+subscriptioninfo rc   new subscriptioninfo
+subscriptions toarray rc
+return rc
+public subscriptioninfo lookupsubscription string clientid  string subscriptionname  throws ioexception
+final string subscriptionkey   subscriptionkey clientid  subscriptionname
+indexlock writelock   lock
+try
+return pagefile tx   execute new transaction callableclosure<subscriptioninfo  ioexception>
+public subscriptioninfo execute transaction tx  throws ioexception
+storeddestination sd   getstoreddestination dest  tx
+kahasubscriptioncommand command   sd subscriptions get tx  subscriptionkey
+if  command    null
+return null
+return  subscriptioninfo  wireformat unmarshal new datainputstream command
+getsubscriptioninfo   newinput
+finally
+indexlock writelock   unlock
+public int getmessagecount string clientid  string subscriptionname  throws ioexception
+final string subscriptionkey   subscriptionkey clientid  subscriptionname
+indexlock writelock   lock
+try
+return pagefile tx   execute new transaction callableclosure<integer  ioexception>
+public integer execute transaction tx  throws ioexception
+storeddestination sd   getstoreddestination dest  tx
+lastack cursorpos   getlastack tx  sd  subscriptionkey
+if  cursorpos    null
+// the subscription might not exist.
+return 0
+return  int  getstoredmessagecount tx  sd  subscriptionkey
+finally
+indexlock writelock   unlock
+public void recoversubscription string clientid  string subscriptionname  final messagerecoverylistener listener
+throws exception
+final string subscriptionkey   subscriptionkey clientid  subscriptionname
+@suppresswarnings
+final subscriptioninfo info   lookupsubscription clientid  subscriptionname
+indexlock writelock   lock
+try
+pagefile tx   execute new transaction closure<exception>
+public void execute transaction tx  throws exception
+storeddestination sd   getstoreddestination dest  tx
+lastack cursorpos   getlastack tx  sd  subscriptionkey
+sd orderindex setbatch tx  cursorpos
+for  iterator<entry<long  messagekeys>> iterator   sd orderindex iterator tx   iterator
+hasnext
+entry<long  messagekeys> entry   iterator next
+if  ackedandprepared contains entry getvalue   messageid
+continue
+listener recovermessage loadmessage entry getvalue   location
+sd orderindex resetcursorposition
+finally
+indexlock writelock   unlock
+public void recovernextmessages string clientid  string subscriptionname  final int maxreturned
+final messagerecoverylistener listener  throws exception
+final string subscriptionkey   subscriptionkey clientid  subscriptionname
+@suppresswarnings
+final subscriptioninfo info   lookupsubscription clientid  subscriptionname
+indexlock writelock   lock
+try
+pagefile tx   execute new transaction closure<exception>
+public void execute transaction tx  throws exception
+storeddestination sd   getstoreddestination dest  tx
+sd orderindex resetcursorposition
+messageordercursor moc   sd subscriptioncursors get subscriptionkey
+if  moc    null
+lastack pos   getlastack tx  sd  subscriptionkey
+if  pos    null
+// sub deleted
+return
+sd orderindex setbatch tx  pos
+moc   sd orderindex cursor
+else
+sd orderindex cursor sync moc
+entry<long  messagekeys> entry   null
+int counter   0
+for  iterator<entry<long  messagekeys>> iterator   sd orderindex iterator tx  moc   iterator
+hasnext
+entry   iterator next
+if  ackedandprepared contains entry getvalue   messageid
+continue
+if  listener recovermessage loadmessage entry getvalue   location
+counter
+if  counter >  maxreturned    listener hasspace      false
+break
+sd orderindex stoppediterating
+if  entry    null
+messageordercursor copy   sd orderindex cursor copy
+sd subscriptioncursors put subscriptionkey  copy
+finally
+indexlock writelock   unlock
+public void resetbatching string clientid  string subscriptionname
+try
+final string subscriptionkey   subscriptionkey clientid  subscriptionname
+indexlock writelock   lock
+try
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+storeddestination sd   getstoreddestination dest  tx
+sd subscriptioncursors remove subscriptionkey
+finally
+indexlock writelock   unlock
+catch  ioexception e
+throw new runtimeexception e
+string subscriptionkey string clientid  string subscriptionname
+return clientid       subscriptionname
+public messagestore createqueuemessagestore activemqqueue destination  throws ioexception
+return this transactionstore proxy new kahadbmessagestore destination
+public topicmessagestore createtopicmessagestore activemqtopic destination  throws ioexception
+return this transactionstore proxy new kahadbtopicmessagestore destination
+/**
+* cleanup method to remove any state associated with the given destination.
+* this method does not stop the message store (it might not be cached).
+*
+* @param destination
+*            destination to forget
+*/
+public void removequeuemessagestore activemqqueue destination
+/**
+* cleanup method to remove any state associated with the given destination
+* this method does not stop the message store (it might not be cached).
+*
+* @param destination
+*            destination to forget
+*/
+public void removetopicmessagestore activemqtopic destination
+public void deleteallmessages   throws ioexception
+deleteallmessages   true
+public set<activemqdestination> getdestinations
+try
+final hashset<activemqdestination> rc   new hashset<activemqdestination>
+indexlock writelock   lock
+try
+pagefile tx   execute new transaction closure<ioexception>
+public void execute transaction tx  throws ioexception
+for  iterator<entry<string  storeddestination>> iterator   metadata destinations iterator tx   iterator
+hasnext
+entry<string  storeddestination> entry   iterator next
+if   isemptytopic entry  tx
+rc add convert entry getkey
+private boolean isemptytopic entry<string  storeddestination> entry  transaction tx
+throws ioexception
+boolean isemptytopic   false
+activemqdestination dest   convert entry getkey
+if  dest istopic
+storeddestination loadedstore   getstoreddestination convert dest   tx
+if  loadedstore subscriptionacks isempty tx
+isemptytopic   true
+return isemptytopic
+finally
+indexlock writelock   unlock
+return rc
+catch  ioexception e
+throw new runtimeexception e
+public long getlastmessagebrokersequenceid   throws ioexception
+return 0
+public long getlastproducersequenceid producerid id
+indexlock readlock   lock
+try
+return metadata producersequenceidtracker getlastseqid id
+finally
+indexlock readlock   unlock
+public long size
+try
+return journalsize get     getpagefile   getdisksize
+catch  ioexception e
+throw new runtimeexception e
+public void begintransaction connectioncontext context  throws ioexception
+throw new ioexception
+public void committransaction connectioncontext context  throws ioexception
+throw new ioexception
+public void rollbacktransaction connectioncontext context  throws ioexception
+throw new ioexception
+public void checkpoint boolean sync  throws ioexception
+super checkpointcleanup sync
+// /////////////////////////////////////////////////////////////////
+// internal helper methods.
+// /////////////////////////////////////////////////////////////////
+/**
+* @param location
+* @return
+* @throws ioexception
+*/
+message loadmessage location location  throws ioexception
+kahaaddmessagecommand addmessage    kahaaddmessagecommand  load location
+message msg    message  wireformat unmarshal new datainputstream addmessage getmessage   newinput
+return msg
+// /////////////////////////////////////////////////////////////////
+// internal conversion methods.
+// /////////////////////////////////////////////////////////////////
+kahalocation convert location location
+kahalocation rc   new kahalocation
+rc setlogid location getdatafileid
+rc setoffset location getoffset
+return rc
+kahadestination convert activemqdestination dest
+kahadestination rc   new kahadestination
+rc setname dest getphysicalname
+switch  dest getdestinationtype
+case activemqdestination queue_type
+rc settype destinationtype queue
+return rc
+case activemqdestination topic_type
+rc settype destinationtype topic
+return rc
+case activemqdestination temp_queue_type
+rc settype destinationtype temp_queue
+return rc
+case activemqdestination temp_topic_type
+rc settype destinationtype temp_topic
+return rc
+default
+return null
+activemqdestination convert string dest
+int p   dest indexof
+if  p < 0
+throw new illegalargumentexception
+int type   integer parseint dest substring 0  p
+string name   dest substring p   1
+return convert type  name
+private activemqdestination convert kahadestination commanddestination
+return convert commanddestination gettype   getnumber    commanddestination getname
+private activemqdestination convert int type  string name
+switch  kahadestination destinationtype valueof type
+case queue
+return new activemqqueue name
+case topic
+return new activemqtopic name
+case temp_queue
+return new activemqtempqueue name
+case temp_topic
+return new activemqtemptopic name
+default
+throw new illegalargumentexception
+public transactionidtransformer gettransactionidtransformer
+return transactionidtransformer
+public void settransactionidtransformer transactionidtransformer transactionidtransformer
+this transactionidtransformer   transactionidtransformer
+static class asyncjobkey
+messageid id
+activemqdestination destination
+asyncjobkey messageid id  activemqdestination destination
+this id   id
+this destination   destination
+@override
+public boolean equals object obj
+if  obj    this
+return true
+return obj instanceof asyncjobkey    id equals   asyncjobkey  obj  id
+destination equals   asyncjobkey  obj  destination
+@override
+public int hashcode
+return id hashcode     destination hashcode
+@override
+public string tostring
+return destination getphysicalname         id
+public interface storetask
+public boolean cancel
+public void aquirelocks
+public void releaselocks
+class storequeuetask implements runnable  storetask
+protected final message message
+protected final connectioncontext context
+protected final kahadbmessagestore store
+protected final innerfuturetask future
+protected final atomicboolean done   new atomicboolean
+protected final atomicboolean locked   new atomicboolean
+public storequeuetask kahadbmessagestore store  connectioncontext context  message message
+this store   store
+this context   context
+this message   message
+this future   new innerfuturetask this
+public future<object> getfuture
+return this future
+public boolean cancel
+if  this done compareandset false  true
+return this future cancel false
+return false
+public void aquirelocks
+if  this locked compareandset false  true
+try
+globalqueuesemaphore acquire
+store acquirelocalasynclock
+message incrementreferencecount
+catch  interruptedexception e
+log warn    e
+public void releaselocks
+if  this locked compareandset true  false
+store releaselocalasynclock
+globalqueuesemaphore release
+message decrementreferencecount
+public void run
+this store donetasks
+try
+if  this done compareandset false  true
+this store addmessage context  message
+removequeuetask this store  this message getmessageid
+this future complete
+else if  cancelledtaskmodmetric > 0    this store canceledtasks   % cancelledtaskmodmetric    0
+system err println this store dest getname
+this store canceledtasks   this store donetasks    100
+this store canceledtasks   this store donetasks   0
+catch  exception e
+this future setexception e
+protected message getmessage
+return this message
+private class innerfuturetask extends futuretask<object>
+public innerfuturetask runnable runnable
+super runnable  null
+public void setexception final exception e
+super setexception e
+public void complete
+super set null
+class storetopictask extends storequeuetask
+private final int subscriptioncount
+private final list<string> subscriptionkeys   new arraylist<string> 1
+private final kahadbtopicmessagestore topicstore
+public storetopictask kahadbtopicmessagestore store  connectioncontext context  message message
+int subscriptioncount
+super store  context  message
+this topicstore   store
+this subscriptioncount   subscriptioncount
+@override
+public void aquirelocks
+if  this locked compareandset false  true
+try
+globaltopicsemaphore acquire
+store acquirelocalasynclock
+message incrementreferencecount
+catch  interruptedexception e
+log warn    e
+@override
+public void releaselocks
+if  this locked compareandset true  false
+message decrementreferencecount
+store releaselocalasynclock
+globaltopicsemaphore release
+/**
+* add a key
+*
+* @param key
+* @return true if all acknowledgements received
+*/
+public boolean addsubscriptionkey string key
+synchronized  this subscriptionkeys
+this subscriptionkeys add key
+return this subscriptionkeys size   >  this subscriptioncount
+@override
+public void run
+this store donetasks
+try
+if  this done compareandset false  true
+this topicstore addmessage context  message
+// apply any acks we have
+synchronized  this subscriptionkeys
+for  string key   this subscriptionkeys
+this topicstore doacknowledge context  key  this message getmessageid    null
+removetopictask this topicstore  this message getmessageid
+this future complete
+else if  cancelledtaskmodmetric > 0    this store canceledtasks   % cancelledtaskmodmetric    0
+system err println this store dest getname
+this store canceledtasks   this store donetasks    100
+this store canceledtasks   this store donetasks   0
+catch  exception e
+this future setexception e
+public class storetaskexecutor extends threadpoolexecutor
+public storetaskexecutor int corepoolsize  int maximumpoolsize  long keepalivetime  timeunit timeunit  blockingqueue<runnable> queue  threadfactory threadfactory
+super corepoolsize  maximumpoolsize  keepalivetime  timeunit  queue  threadfactory
+protected void afterexecute runnable runnable  throwable throwable
+super afterexecute runnable  throwable
+if  runnable instanceof storetask
+storetask runnable  releaselocks

@@ -1,0 +1,977 @@
+/*
+derby - class org.apache.derby.impl.sql.compile.groupbynode
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package	org apache derby impl sql compile
+import java util iterator
+import java util vector
+import org apache derby catalog indexdescriptor
+import org apache derby iapi error standardexception
+import org apache derby iapi reference classname
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services classfile vmopcode
+import org apache derby iapi services compiler methodbuilder
+import org apache derby iapi services io formatablearrayholder
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi sql languagefactory
+import org apache derby iapi sql resultcolumndescriptor
+import org apache derby iapi sql compile accesspath
+import org apache derby iapi sql compile c_nodetypes
+import org apache derby iapi sql compile costestimate
+import org apache derby iapi sql compile optimizable
+import org apache derby iapi sql compile optimizablepredicate
+import org apache derby iapi sql compile optimizablepredicatelist
+import org apache derby iapi sql compile optimizer
+import org apache derby iapi sql compile requiredrowordering
+import org apache derby iapi sql compile rowordering
+import org apache derby iapi sql dictionary conglomeratedescriptor
+import org apache derby iapi sql dictionary datadictionary
+import org apache derby iapi store access columnordering
+import org apache derby impl sql execute aggregatorinfo
+import org apache derby impl sql execute aggregatorinfolist
+/**
+* a groupbynode represents a result set for a grouping operation
+* on a select.  note that this includes a select with aggregates
+* and no grouping columns (in which case the select list is null)
+* it has the same description as its input result set.
+* <p>
+* for the most part, it simply delegates operations to its bottomprset,
+* which is currently expected to be a projectrestrictresultset generated
+* for a selectnode.
+* <p>
+* note: a groupbynode extends fromtable since it can exist in a fromlist.
+* <p>
+* there is a lot of room for optimizations here: <ul>
+* <li> agg(distinct x) group by x => agg(x) group by x (for min and max) </li>
+* <li> min()/max() use index scans if possible, no sort may
+*		be needed. </li>
+* </ul>
+*
+*
+*/
+public class groupbynode extends singlechildresultsetnode
+/**
+* the group by list
+*/
+groupbylist groupinglist
+/**
+* the list of all aggregates in the query block
+* that contains this group by.
+*/
+vector	aggregatevector
+/**
+* information that is used at execution time to
+* process aggregates.
+*/
+private aggregatorinfolist	agginfo
+/**
+* the parent to the groupbynode.  if we need to
+* generate a projectrestrict over the group by
+* then this is set to that node.  otherwise it
+* is null.
+*/
+fromtable	parent
+private boolean	adddistinctaggregate
+private boolean singleinputrowoptimization
+private int		adddistinctaggregatecolumnnum
+// is the source in sorted order
+private boolean isinsortedorder
+private valuenode havingclause
+private subquerylist havingsubquerys
+/**
+* intializer for a groupbynode.
+*
+* @param bottompr	the child fromtable
+* @param groupinglist	the groupinglist
+* @param aggregatevector	the vector of aggregates from
+*		the query block.  since aggregation is done
+*		at the same time as grouping, we need them
+*		here.
+* @param havingclause the having clause.
+* @param havingsubquerys subqueries in the having clause.
+* @param tableproperties	properties list associated with the table
+* @param nestinglevel nestinglevel of this group by node. this is used for
+*     error checking of group by queries with having clause.
+* @exception standardexception		thrown on error
+*/
+public void init
+object bottompr
+object groupinglist
+object aggregatevector
+object havingclause
+object havingsubquerys
+object tableproperties
+object nestinglevel
+throws standardexception
+super init bottompr  tableproperties
+setlevel   integer nestinglevel  intvalue
+this havingclause    valuenode havingclause
+this havingsubquerys    subquerylist havingsubquerys
+/* group by without aggregates gets xformed into distinct */
+if  sanitymanager debug
+//			aggregage vector can be null if we have a having clause.
+//          select c1 from t1 group by c1 having c1 > 1;
+//			sanitymanager.assert(((vector) aggregatevector).size() > 0,
+//			"aggregatevector expected to be non-empty");
+if    childresult instanceof optimizable
+sanitymanager throwassert     childresult getclass   getname
+if    childresult instanceof fromtable
+sanitymanager throwassert     childresult getclass   getname
+resultcolumnlist newbottomrcl
+this groupinglist    groupbylist  groupinglist
+this aggregatevector    vector  aggregatevector
+this parent   this
+/*
+** the first thing we do is put ourselves on
+** top of the select.  the select becomes the
+** childresult.  so our rcl becomes its rcl (so
+** nodes above it now point to us).  map our
+** rcl to its columns.
+*/
+newbottomrcl   childresult getresultcolumns   copylistandobjects
+resultcolumns   childresult getresultcolumns
+childresult setresultcolumns newbottomrcl
+/*
+** we have aggregates, so we need to add
+** an extra prnode and we also have to muck around
+** with our trees a might.
+*/
+addaggregates
+/* we say that the source is never in sorted order if there is a distinct aggregate.
+* (not sure what happens if it is, so just skip it for now.)
+* otherwise, we check to see if the source is in sorted order on any permutation
+* of the grouping columns.)
+*/
+if    adddistinctaggregate    groupinglist    null
+columnreference crs
+new columnreference
+// now populate the cr array and see if ordered
+int glsize   this groupinglist size
+int index
+for  index   0  index < glsize  index
+groupbycolumn gc
+groupbycolumn  this groupinglist elementat index
+if  gc getcolumnexpression   instanceof columnreference
+crs    columnreference gc getcolumnexpression
+else
+isinsortedorder   false
+break
+if  index    glsize
+isinsortedorder   childresult isorderedon crs  true   vector null
+/**
+* get whether or not the source is in sorted order.
+*
+* @return whether or not the source is in sorted order.
+*/
+boolean getisinsortedorder
+return isinsortedorder
+/**
+* add the extra result columns required by the aggregates
+* to the result list.
+*
+* @exception standard exception
+*/
+private void addaggregates
+throws standardexception
+addnewprnode
+addnewcolumnsforaggregation
+adddistinctaggregatestoorderby
+/**
+* add any distinct aggregates to the order by list.
+* asserts that there are 0 or more distincts.
+*/
+private void adddistinctaggregatestoorderby
+int numdistinct   numdistinctaggregates aggregatevector
+if  numdistinct    0
+if  sanitymanager debug
+sanitymanager assert numdistinct    1
+aggregatorinfo agg   null
+int count   agginfo size
+for  int i   0  i < count  i
+agg    aggregatorinfo  agginfo elementat i
+if  agg isdistinct
+break
+if  sanitymanager debug
+sanitymanager assert agg    null    agg isdistinct
+adddistinctaggregate   true
+adddistinctaggregatecolumnnum   agg getinputcolnum
+/**
+* add a new pr node for aggregation.  put the
+* new pr under the sort.
+*
+* @exception standard exception
+*/
+private void addnewprnode
+throws standardexception
+/*
+** get the new pr, put above the groupby.
+*/
+resultcolumnlist rclnew    resultcolumnlist getnodefactory   getnode
+c_nodetypes result_column_list
+getcontextmanager
+int sz   resultcolumns size
+for  int i   0  i < sz  i
+resultcolumn rc    resultcolumn  resultcolumns elementat i
+if   rc isgenerated
+rclnew addelement rc
+// if any columns in the source rcl were generated for an order by
+// remember it in the new rcl as well. after the sort is done it will
+// have to be projected out upstream.
+rclnew copyorderbyselect resultcolumns
+parent    fromtable  getnodefactory   getnode
+c_nodetypes project_restrict_node
+this  	   child
+rclnew
+null    havingclause
+null 				   restriction list
+null 				   project subqueries
+havingsubquerys
+tableproperties
+getcontextmanager
+/*
+** reset the bottom rcl to be empty.
+*/
+childresult setresultcolumns  resultcolumnlist
+getnodefactory   getnode
+c_nodetypes result_column_list
+getcontextmanager
+/*
+** set the group by rcl to be empty
+*/
+resultcolumns    resultcolumnlist  getnodefactory   getnode
+c_nodetypes result_column_list
+getcontextmanager
+/**
+* in the query rewrite for group by, add the columns on which
+* we are doing the group by.
+* @see #addnewcolumnsforaggregation
+*/
+private void addunaggcolumns   throws standardexception
+resultcolumnlist bottomrcl    childresult getresultcolumns
+resultcolumnlist groupbyrcl   resultcolumns
+int sz   groupinglist size
+for  int i   0  i < sz  i
+groupbycolumn gbc    groupbycolumn  groupinglist elementat i
+resultcolumn newrc    resultcolumn  getnodefactory   getnode
+c_nodetypes result_column
+gbc getcolumnexpression
+getcontextmanager
+// add this result column to the bottom rcl
+bottomrcl addelement newrc
+newrc markgenerated
+newrc bindresultcolumntoexpression
+newrc setvirtualcolumnid bottomrcl size
+// now add this column to the groupbylist
+resultcolumn gbrc    resultcolumn  getnodefactory   getnode
+c_nodetypes result_column
+gbc getcolumnexpression
+getcontextmanager
+groupbyrcl addelement gbrc
+gbrc markgenerated
+gbrc bindresultcolumntoexpression
+gbrc setvirtualcolumnid groupbyrcl size
+/*
+** reset the original node to point to the
+** group by result set.
+*/
+virtualcolumnnode vc    virtualcolumnnode  getnodefactory   getnode
+c_nodetypes virtual_column_node
+this     source result set
+gbrc
+new integer groupbyrcl size
+getcontextmanager
+// we replace each group by expression
+// in the projection list with a virtual column node
+// that effectively points to a result column
+// in the result set doing the group by
+substituteexpressionvisitor se
+new substituteexpressionvisitor
+gbc getcolumnexpression
+vc
+aggregatenode class
+parent getresultcolumns   accept se
+// since we always need a pr node on top of the gb
+// node to perform projection we can use it to perform
+// the having clause restriction as well.
+// to evaluate the having clause correctly, we need to
+// convert each aggregate and expression to point
+// to the appropriate result column in the group by node.
+// this is no different from the transformations we do to
+// correctly evaluate aggregates and expressions in the
+// projection list.
+//
+//
+// for this query:
+// select c1, sum(c2), max(c3)
+//    from t1
+//    having c1+max(c3) > 0;
+// prsn rcl -> (ptr(gbn:rcl[0]), ptr(gbn:rcl[1]), ptr(gbn:rcl[4]))
+// restriction: (> (+ ptr(gbn:rcl[0]) ptr(gbn:rcl[4])) 0)
+//              |
+// gbn (rcl) -> (c1, sum(c2), <input>, <aggregator>, max(c3), <input>, <aggregator>
+//              |
+//       fbt (c1, c2)
+if  havingclause    null
+substituteexpressionvisitor havingse
+new substituteexpressionvisitor
+gbc getcolumnexpression
+vc  null
+havingclause accept havingse
+gbc setcolumnposition bottomrcl size
+/**
+* add a whole slew of columns needed for
+* aggregation. basically, for each aggregate we add
+* 3 columns: the aggregate input expression
+* and the aggregator column and a column where the aggregate
+* result is stored.  the input expression is
+* taken directly from the aggregator node.  the aggregator
+* is the run time aggregator.  we add it to the rc list
+* as a new object coming into the sort node.
+* <p>
+* at this point this is invoked, we have the following
+* tree: <ul>
+*      pr - (parent): rcl is the original select list
+*       |
+*      pr - group by:  rcl is empty
+*       |
+*      pr - from table: rcl is empty </ul> <p>
+*
+* for each columnreference in pr rcl <ul>
+*	<li> clone the ref </li>
+*	<li> create a new rc in the bottom rcl and set it
+*		 to the col ref </li>
+*	<li> create a new rc in the groupby rcl and set it to
+*		 point to the bottom rc </li>
+*	<li> reset the top pr ref to point to the new groupby
+*		 rc</li></ul>
+*
+* for each aggregate in aggregatevector <ul>
+*	<li> create rc in from table.  fill it with
+* 		aggs operator.
+*	<li> create rc in from table for agg result</li>
+*	<li> create rc in from table for aggregator</li>
+*	<li> create rc in groupby for agg input, set it
+*		to point to from table rc </li>
+*	<li> create rc in groupby for agg result</li>
+*	<li> create rc in groupby for aggregator</li>
+*	<li> replace agg with reference to rc for agg result </li></ul>.
+* <p>
+* for a query like,
+* <pre>
+select c1, sum(c2), max(c3)
+from t1
+group by c1;
+</pre>
+* the query tree ends up looking like this:
+<pre>
+projectrestrictnode rcl -> (ptr to gbn(column[0]), ptr to gbn(column[1]), ptr to gbn(column[4]))
+|
+groupbynode rcl->(c1, sum(c2), <agg-input>, <aggregator>, max(c3), <agg-input>, <aggregator>)
+|
+projectrestrict rcl->(c1, c2, c3)
+|
+frombasetable
+</pre>
+*
+* the rcl of the groupbynode contains all the unagg (or grouping columns)
+* followed by 3 rc's for each aggregate in this order: the final computed
+* aggregate value, the aggregate input and the aggregator function.
+* <p>
+* the aggregator function puts the results in the first of the 3 rc's
+* and the pr resultset in turn picks up the value from there.
+* <p>
+* the notation (ptr to gbn(column[0])) basically means that it is
+* a pointer to the 0th rc in the rcl of the groupbynode.
+* <p>
+* the addition of these unagg and agg columns to the groupbynode and
+* to the prn is performed in addunaggcolumns and addaggregatecolumns.
+* <p>
+* note that that addition of the groupbynode is done after the
+* query is optimized (in selectnode#modifyaccesspaths) which means a
+* fair amount of patching up is needed to account for generated group by columns.
+* @exception standard exception
+*/
+private void addnewcolumnsforaggregation
+throws standardexception
+agginfo   new aggregatorinfolist
+if  groupinglist    null
+addunaggcolumns
+if  havingclause    null
+// we have replaced group by expressions in the having clause.
+// there should be no column references in the having clause
+// referencing this table. skip over aggregate nodes.
+//   select a, sum(b) from t group by a having a+c > 1
+//  is not valid because of column c.
+//
+// it is allright to have columns from parent or child subqueries;
+//   select * from p where p.p1 in
+//      (select c.c1 from c group by c.c1 having count(*) = p.p2
+collectnodesvisitor collectnodesvisitor
+new collectnodesvisitor columnreference class  aggregatenode class
+havingclause accept collectnodesvisitor
+for  iterator it   collectnodesvisitor getlist   iterator
+it hasnext
+columnreference cr    columnreference it next
+if   cr getgeneratedtoreplaceaggregate
+cr getsourcelevel      level
+throw standardexception newexception
+sqlstate lang_invalid_col_having_clause
+cr getsqlcolumnname
+addaggregatecolumns
+/**
+* in the query rewrite involving aggregates, add the columns for
+* aggregation.
+*
+* @see #addnewcolumnsforaggregation
+*/
+private void addaggregatecolumns   throws standardexception
+datadictionary			dd   getdatadictionary
+aggregatenode	aggregate   null
+columnreference	newcolumnref
+resultcolumn	newrc
+resultcolumn	tmprc
+resultcolumn	agginputrc
+resultcolumnlist bottomrcl    childresult getresultcolumns
+resultcolumnlist groupbyrcl   resultcolumns
+resultcolumnlist aggrcl
+int				aggregatorvcolid
+int				agginputvcolid
+int				aggresultvcolid
+/*
+** now process all of the aggregates.  replace
+** every aggregate with an rc.  we toss out
+** the list of rcs, we need to get each rc
+** as we process its corresponding aggregate.
+*/
+languagefactory lf   getlanguageconnectioncontext   getlanguagefactory
+replaceaggregateswithcrvisitor replaceaggsvisitor
+new replaceaggregateswithcrvisitor
+resultcolumnlist  getnodefactory   getnode
+c_nodetypes result_column_list
+getcontextmanager
+fromtable  childresult  gettablenumber
+resultsetnode class
+parent getresultcolumns   accept replaceaggsvisitor
+if  havingclause    null
+// replace aggregates in the having clause with column references.
+replaceaggsvisitor   new replaceaggregateswithcrvisitor
+resultcolumnlist  getnodefactory   getnode
+c_nodetypes result_column_list
+getcontextmanager
+fromtable childresult  gettablenumber
+havingclause accept replaceaggsvisitor
+// make having clause a restriction list in the parent
+// project restrict node.
+projectrestrictnode parentprsn    projectrestrictnode parent
+parentprsn setrestriction havingclause
+/*
+** for each aggregate
+*/
+int alsize   aggregatevector size
+for  int index   0  index < alsize  index
+aggregate    aggregatenode  aggregatevector elementat index
+/*
+** agg result: set the aggregate result to null in the
+** bottom project restrict.
+*/
+newrc    resultcolumn  getnodefactory   getnode
+c_nodetypes result_column
+aggregate getnewnullresultexpression
+getcontextmanager
+newrc markgenerated
+newrc bindresultcolumntoexpression
+bottomrcl addelement newrc
+newrc setvirtualcolumnid bottomrcl size
+aggresultvcolid   newrc getvirtualcolumnid
+/*
+** set the gb aggregrate result column to
+** point to this.  the gb aggregate result
+** was created when we called
+** replaceaggregateswithcolumnreferencesvisitor()
+*/
+newcolumnref    columnreference  getnodefactory   getnode
+c_nodetypes column_reference
+newrc getname
+
+getcontextmanager
+newcolumnref setsource newrc
+newcolumnref settype newrc getexpressiontype
+newcolumnref setnestinglevel this getlevel
+newcolumnref setsourcelevel this getlevel
+tmprc    resultcolumn  getnodefactory   getnode
+c_nodetypes result_column
+newrc getcolumnname
+newcolumnref
+getcontextmanager
+tmprc markgenerated
+tmprc bindresultcolumntoexpression
+groupbyrcl addelement tmprc
+tmprc setvirtualcolumnid groupbyrcl size
+/*
+** set the column reference to point to
+** this.
+*/
+newcolumnref   aggregate getgeneratedref
+newcolumnref setsource tmprc
+/*
+** agg input: create a resultcolumn in the bottom
+** project restrict that has the expression that is
+** to be aggregated
+*/
+newrc   aggregate getnewexpressionresultcolumn dd
+newrc markgenerated
+newrc bindresultcolumntoexpression
+bottomrcl addelement newrc
+newrc setvirtualcolumnid bottomrcl size
+agginputvcolid   newrc getvirtualcolumnid
+agginputrc   newrc
+/*
+** add a reference to this column into the
+** group by columns.
+*/
+tmprc   getcolumnreference newrc  dd
+groupbyrcl addelement tmprc
+tmprc setvirtualcolumnid groupbyrcl size
+/*
+** aggregator: add a getaggregator method call
+** to the bottom result column list.
+*/
+newrc   aggregate getnewaggregatorresultcolumn dd
+newrc markgenerated
+newrc bindresultcolumntoexpression
+bottomrcl addelement newrc
+newrc setvirtualcolumnid bottomrcl size
+aggregatorvcolid   newrc getvirtualcolumnid
+/*
+** add a reference to this column in the group by result
+** set.
+*/
+tmprc   getcolumnreference newrc  dd
+groupbyrcl addelement tmprc
+tmprc setvirtualcolumnid groupbyrcl size
+/*
+** piece together a fake one column rcl that we will use
+** to generate a proper result description for input
+** to this agg if it is a user agg.
+*/
+aggrcl    resultcolumnlist  getnodefactory   getnode
+c_nodetypes result_column_list
+getcontextmanager
+aggrcl addelement agginputrc
+/*
+** note that the column ids in the row are 0 based
+** so we have to subtract 1.
+*/
+agginfo addelement new aggregatorinfo
+aggregate getaggregatename
+aggregate getaggregatorclassname
+agginputvcolid   1 			   aggregate input column
+aggresultvcolid  1 			   the aggregate result column
+aggregatorvcolid   1 		   the aggregator column
+aggregate isdistinct
+lf getresultdescription aggrcl makeresultdescriptors
+/**
+* return the parent node to this one, if there is
+* one.  it will return 'this' if there is no generated
+* node above this one.
+*
+* @return the parent node
+*/
+public fromtable getparent
+return parent
+/*
+*  optimizable interface
+*/
+/**
+* @see optimizable#optimizeit
+*
+* @exception standardexception		thrown on error
+*/
+public costestimate optimizeit
+optimizer optimizer
+optimizablepredicatelist predlist
+costestimate outercost
+rowordering rowordering
+throws standardexception
+// resolve: need to factor in the cost of grouping (sorting) here
+costestimate childcost     optimizable  childresult  optimizeit
+optimizer
+predlist
+outercost
+rowordering
+costestimate retval   super optimizeit
+optimizer
+predlist
+outercost
+rowordering
+return retval
+/**
+* @see optimizable#estimatecost
+*
+* @exception standardexception		thrown on error
+*/
+public costestimate estimatecost optimizablepredicatelist predlist
+conglomeratedescriptor cd
+costestimate outercost
+optimizer optimizer
+rowordering rowordering
+throws standardexception
+// resolve: need to factor in the cost of grouping (sorting) here
+//
+costestimate childcost     optimizable  childresult  estimatecost
+predlist
+cd
+outercost
+optimizer
+rowordering
+costestimate costestimate   getcostestimate optimizer
+costestimate setcost childcost getestimatedcost
+childcost rowcount
+childcost singlescanrowcount
+return costestimate
+/**
+* @see org.apache.derby.iapi.sql.compile.optimizable#pushoptpredicate
+*
+* @exception standardexception		thrown on error
+*/
+public boolean pushoptpredicate optimizablepredicate optimizablepredicate
+throws standardexception
+return   optimizable  childresult  pushoptpredicate optimizablepredicate
+/**
+* convert this object to a string.  see comments in querytreenode.java
+* for how this should be done for tree printing.
+*
+* @return	this object as a string
+*/
+public string tostring
+if  sanitymanager debug
+return     singleinputrowoptimization
+childresult tostring         super tostring
+else
+return
+/**
+* evaluate whether or not the subquery in a fromsubquery is flattenable.
+* currently, a fsqry is flattenable if all of the following are true:
+*		o  subquery is a selectnode.
+*		o  it contains no top level subqueries.  (resolve - we can relax this)
+*		o  it does not contain a group by or having clause
+*		o  it does not contain aggregates.
+*
+* @param fromlist	the outer from list
+*
+* @return boolean	whether or not the fromsubquery is flattenable.
+*/
+public boolean flattenableinfromsubquery fromlist fromlist
+/* can't flatten a groupbynode */
+return false
+/**
+* optimize this groupbynode.
+*
+* @param datadictionary	the datadictionary to use for optimization
+* @param predicates		the predicatelist to optimize.  this should
+*							be a join predicate.
+* @param outerrows			the number of outer joining rows
+*
+* @return	resultsetnode	the top of the optimized subtree
+*
+* @exception standardexception		thrown on error
+*/
+public resultsetnode optimize datadictionary datadictionary
+predicatelist predicates
+double outerrows
+throws standardexception
+/* we need to implement this method since a prn can appear above a
+* selectnode in a query tree.
+*/
+childresult    fromtable  childresult optimize
+datadictionary
+predicates
+outerrows
+optimizer optimizer   getoptimizer
+fromlist  getnodefactory   getnode
+c_nodetypes from_list
+getnodefactory   dojoinorderoptimization
+getcontextmanager
+predicates
+datadictionary
+requiredrowordering  null
+// resolve: need to factor in cost of sorting and figure out how
+// many rows have been eliminated.
+costestimate   optimizer newcostestimate
+costestimate setcost childresult getcostestimate   getestimatedcost
+childresult getcostestimate   rowcount
+childresult getcostestimate   singlescanrowcount
+return this
+resultcolumndescriptor makeresultdescriptors
+return childresult makeresultdescriptors
+/**
+* return whether or not the underlying resultset tree will return
+* a single row, at most.
+* this is important for join nodes where we can save the extra next
+* on the right side if we know that it will return at most 1 row.
+*
+* @return whether or not the underlying resultset tree will return a single row.
+* @exception standardexception		thrown on error
+*/
+public boolean isonerowresultset  	throws standardexception
+// only consider scalar aggregates for now
+return   groupinglist    null       groupinglist size      0
+/**
+* generate the sort result set operating over the source
+* resultset.  adds distinct aggregates to the sort if
+* necessary.
+*
+* @exception standardexception		thrown on error
+*/
+public void generate activationclassbuilder acb
+methodbuilder mb
+throws standardexception
+int					orderingitem   0
+int					agginfoitem   0
+formatablearrayholder	orderingholder
+/* get the next resultset#, so we can number this resultsetnode, its
+* resultcolumnlist and resultset.
+*/
+assignresultsetnumber
+// get the final cost estimate from the child.
+costestimate   childresult getfinalcostestimate
+/*
+** get the column ordering for the sort.  note that
+** for a scalar aggegate we may not have any ordering
+** columns (if there are no distinct aggregates).
+** warning: if a distinct aggregate is passed to
+** sortresultset it assumes that the last column
+** is the distinct one.  if this assumption changes
+** then sortresultset will have to change.
+*/
+orderingholder   acb getcolumnordering groupinglist
+if  adddistinctaggregate
+orderingholder   acb addcolumntoordering
+orderingholder
+adddistinctaggregatecolumnnum
+if  sanitymanager debug
+if  sanitymanager debug_on
+stringbuffer s   new stringbuffer
+s append
+columnordering ordering
+columnordering orderingholder getarray columnordering class
+for  int i   0  i < ordering length  i
+s append ordering getcolumnid
+s append
+s append
+sanitymanager debug    s tostring
+orderingitem   acb additem orderingholder
+/*
+** we have aggregates, so save the agginfo
+** struct in the activation and store the number
+*/
+if  sanitymanager debug
+sanitymanager assert agginfo    null
+agginfoitem   acb additem agginfo
+acb pushgetresultsetfactoryexpression mb
+// generate the child resultset
+childresult generate acb  mb
+mb push isinsortedorder
+mb push agginfoitem
+mb push orderingitem
+resultcolumns generateholder acb  mb
+mb push resultcolumns gettotalcolumnsize
+mb push resultsetnumber
+/* generate a (distinct)scalaraggregateresultset if scalar aggregates */
+if   groupinglist    null       groupinglist size      0
+genscalaraggregateresultset acb  mb
+/* generate a (distinct)groupedaggregateresultset if grouped aggregates */
+else
+gengroupedaggregateresultset acb  mb
+/**
+* generate the code to evaluate scalar aggregates.
+*
+*/
+private	void genscalaraggregateresultset activationclassbuilder acb
+methodbuilder mb
+/* generate the (distinct)scalaraggregateresultset:
+*	arg1: childexpress - expression for childresult
+*  arg2: isinsortedorder - true if source result set in sorted order
+*  arg3: aggregateitem - entry in saved objects for the aggregates,
+*  arg4: orderitem - entry in saved objects for the ordering
+*  arg5: activation
+*  arg6: rowallocator - method to construct rows for fetching
+*			from the sort
+*  arg7: row size
+*  arg8: resultsetnumber
+*  arg9: whether or not to perform min optimization.
+*/
+string resultset    adddistinctaggregate  ?
+mb push singleinputrowoptimization
+mb push costestimate rowcount
+mb push costestimate getestimatedcost
+mb callmethod vmopcode invokeinterface   string  null  resultset
+classname noputresultset  10
+/**
+* generate the code to evaluate grouped aggregates.
+*
+*/
+private	void gengroupedaggregateresultset activationclassbuilder acb
+methodbuilder mb
+throws standardexception
+/* generate the (distinct)groupedaggregateresultset:
+*	arg1: childexpress - expression for childresult
+*  arg2: isinsortedorder - true if source result set in sorted order
+*  arg3: aggregateitem - entry in saved objects for the aggregates,
+*  arg4: orderitem - entry in saved objects for the ordering
+*  arg5: activation
+*  arg6: rowallocator - method to construct rows for fetching
+*			from the sort
+*  arg7: row size
+*  arg8: resultsetnumber
+*/
+string resultset    adddistinctaggregate  ?
+mb push costestimate rowcount
+mb push costestimate getestimatedcost
+mb callmethod vmopcode invokeinterface   string  null  resultset
+classname noputresultset  9
+///////////////////////////////////////////////////////////////
+//
+// utilities
+//
+///////////////////////////////////////////////////////////////
+/**
+* method for creating a new result column referencing
+* the one passed in.
+*
+* @param	targetrc	the source
+* @param	dd
+*
+* @return the new result column
+*
+* @exception standardexception	on error
+*/
+private resultcolumn getcolumnreference resultcolumn targetrc
+datadictionary		dd
+throws standardexception
+columnreference	tmpcolumnref
+resultcolumn	newrc
+tmpcolumnref    columnreference  getnodefactory   getnode
+c_nodetypes column_reference
+targetrc getname
+
+getcontextmanager
+tmpcolumnref setsource targetrc
+tmpcolumnref settype targetrc getexpressiontype
+tmpcolumnref setnestinglevel this getlevel
+tmpcolumnref setsourcelevel this getlevel
+newrc    resultcolumn  getnodefactory   getnode
+c_nodetypes result_column
+targetrc getcolumnname
+tmpcolumnref
+getcontextmanager
+newrc markgenerated
+newrc bindresultcolumntoexpression
+return newrc
+/**
+* consider any optimizations after the optimizer has chosen a plan.
+* optimizations include:
+*	o  min optimization for scalar aggregates
+*	o  max optimization for scalar aggregates
+*
+* @param selecthaspredicates true if select containing this
+*		vector/scalar aggregate has a restriction
+*
+* @exception standardexception	on error
+*/
+void considerpostoptimizeoptimizations boolean selecthaspredicates
+throws standardexception
+/* consider the optimization for min with asc index on that column or
+* max with desc index on that column:
+*	o  no group by
+*  o  one of:
+*		o  min/max(columnreference) is only aggregate && source is
+*		   ordered on the columnreference
+*		o  min/max(constantnode)
+* the optimization of the other way around (min with desc index or
+* max with asc index) has the same restrictions with the additional
+* temporary restriction of no qualifications at all (because
+* we don't have true backward scans).
+*/
+if  groupinglist    null
+if  aggregatevector size      1
+aggregatenode an    aggregatenode  aggregatevector elementat 0
+aggregatedefinition ad   an getaggregatedefinition
+if  ad instanceof maxminaggregatedefinition
+if  an getoperand   instanceof columnreference
+/* see if the underlying resultset tree
+* is ordered on the columnreference.
+*/
+columnreference crs   new columnreference
+crs    columnreference  an getoperand
+vector tablevector   new vector
+boolean minmaxoptimizationpossible   isorderedon crs  false  tablevector
+if  sanitymanager debug
+sanitymanager assert tablevector size   <  1    tablevector size
+if  minmaxoptimizationpossible
+boolean ascindex   true
+int colnum   crs getcolumnnumber
+/* check if we have an access path, this will be
+* null in a join case (see beetle 4423)
+*/
+accesspath accesspath  gettrulythebestaccesspath
+if  accesspath    null
+return
+indexdescriptor id   accesspath
+getconglomeratedescriptor
+getindexdescriptor
+int keycolumns   id basecolumnpositions
+boolean isascending   id isascending
+for  int i   0  i < keycolumns length  i
+/* in such a query: select min(c3) from
+* tab1 where c1 = 2 and c2 = 5, if prefix keys
+* have equality operator, then we can still use
+* the index.  the checking of equality operator
+* has been done in isstrictlyorderedon.
+*/
+if  colnum    keycolumns
+if    isascending
+ascindex   false
+break
+frombasetable fbt    frombasetable tablevector firstelement
+maxminaggregatedefinition temp    maxminaggregatedefinition ad
+/*  max   asc      nullable
+*  ----  ----------
+*  true  true      true/false  =  special last key scan (asc index last key with null skips)
+*  true  false     true/false  =  justdisablebulk(desc index 1st key with null skips)
+*  false true      true/false  = justdisablebulk(asc index 1st key)
+*  false false     true/false  = special last key scan(desc index last key)
+*/
+if     temp ismax       ascindex
+temp ismax        ascindex
+fbt disablebulkfetch
+singleinputrowoptimization   true
+/*
+** max optimization with asc index or min with
+** desc index is currently more
+** restrictive than otherwise.
+** we are getting the store to return the last
+** row from an index (for the time being, the
+** store cannot do real backward scans).  so
+** we cannot do this optimization if we have
+** any predicates at all.
+*/
+else if   selecthaspredicates
+temp ismax      ascindex
+temp ismax       ascindex
+fbt disablebulkfetch
+fbt dospecialmaxscan
+singleinputrowoptimization   true
+else if  an getoperand   instanceof constantnode
+singleinputrowoptimization   true

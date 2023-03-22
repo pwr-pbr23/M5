@@ -1,0 +1,766 @@
+/*
+derby - class org.apache.derby.impl.sql.execute.updateresultset
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl sql execute
+import java util hashtable
+import java util properties
+import org apache derby iapi db triggerexecutioncontext
+import org apache derby iapi error standardexception
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services io formatablebitset
+import org apache derby iapi services io streamstorable
+import org apache derby iapi services loader generatedmethod
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi sql activation
+import org apache derby iapi sql resultdescription
+import org apache derby iapi sql resultset
+import org apache derby iapi sql conn languageconnectioncontext
+import org apache derby iapi sql execute constantaction
+import org apache derby iapi sql execute cursorresultset
+import org apache derby iapi sql execute execrow
+import org apache derby iapi sql execute noputresultset
+import org apache derby iapi sql execute rowchanger
+import org apache derby iapi store access conglomeratecontroller
+import org apache derby iapi store access scancontroller
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi types booleandatavalue
+import org apache derby iapi types datavaluedescriptor
+import org apache derby iapi types rowlocation
+/**
+* update the rows from the specified
+* base table. this will cause constraints to be checked
+* and triggers to be executed based on the c's and t's
+* compiled into the update plan.
+*
+*/
+class updateresultset extends dmlwriteresultset
+private transactioncontroller 	tc
+private execrow					newbaserow
+private execrow 					row
+private execrow 					deferredsparserow
+updateconstantaction		constants
+private resultdescription 		resultdescription
+private noputresultset			source
+noputresultset			savedsource
+private rowchanger				rowchanger
+protected conglomeratecontroller	deferredbasecc
+protected long				deferreduniquecids
+protected boolean				deferreduniquecreated
+protected conglomeratecontroller	deferreduniquecc
+protected scancontroller		deferreduniquescans
+private	temporaryrowholderimpl	deletedrowholder
+private	temporaryrowholderimpl	insertedrowholder
+// cached
+private risetchecker			richecker
+private	triggerinfo				triggerinfo
+private triggereventactivator	triggeractivator
+private boolean					updatingreferencedkey
+private boolean					updatingforeignkey
+private	int						numopens
+private long					heapconglom
+private fkinfo				fkinfoarray
+private formatablebitset 				baserowreadlist
+private generatedmethod			checkgm
+private int						resultwidth
+private int						numberofbasecolumns
+private execrow					deferredtemprow
+private execrow					deferredbaserow
+private execrow					olddeletedrow
+private resultdescription		triggerresultdescription
+int lockmode
+boolean deferred
+boolean beforeupdatecopyrequired   false
+/**
+* returns the description of the updated rows.
+* revisit: do we want this to return null instead?
+*/
+public resultdescription getresultdescription
+return resultdescription
+/*
+* class interface
+*
+*/
+/**
+* @param source update rows come from source
+* @param checkgm	generated method for enforcing check constraints
+* @exception standardexception thrown on error
+*/
+updateresultset noputresultset source
+generatedmethod checkgm
+activation activation
+throws standardexception
+this source  checkgm   activation  activation getconstantaction   null
+/*
+* class interface
+*
+*/
+/**
+* @param source update rows come from source
+* @param checkgm	generated method for enforcing check constraints
+* @param activation activation
+* @param constantactionitem  id of the update constant action saved objec
+* @param rsditem  id of the result description saved object
+* @exception standardexception thrown on error
+*/
+updateresultset noputresultset source
+generatedmethod checkgm
+activation activation
+int constantactionitem
+int rsditem
+throws standardexception
+this source  checkgm   activation
+constantaction activation getpreparedstatement   getsavedobject constantactionitem
+resultdescription  activation getpreparedstatement   getsavedobject rsditem
+// in case of referential action update, we do a deferred updates
+deferred   true
+/*
+* class interface
+*
+*/
+/**
+* @param source update rows come from source
+* @param checkgm	generated method for enforcing check constraints
+* @exception standardexception thrown on error
+*/
+updateresultset noputresultset source
+generatedmethod checkgm
+activation activation
+constantaction passedinconstantaction
+resultdescription passedinrsd
+throws standardexception
+super activation  passedinconstantaction
+// get the current transaction controller
+tc   activation gettransactioncontroller
+this source   source
+this checkgm   checkgm
+constants    updateconstantaction  constantaction
+fkinfoarray   constants getfkinfo
+triggerinfo   constants gettriggerinfo
+heapconglom   constants conglomid
+baserowreadlist   constants getbaserowreadlist
+if passedinrsd   null
+resultdescription   source getresultdescription
+else
+resultdescription   passedinrsd
+/*
+** we need a result description when we are going to
+** to have to kick off a trigger.  in a replicated environment
+** we don't get a result description when we are replaying
+** source xacts on the target, which should never be the
+** case for an updateresultset.
+*/
+if  sanitymanager debug
+if  resultdescription    null
+sanitymanager assert triggerinfo    null
+if  fkinfoarray    null
+for  int i   0  i < fkinfoarray length  i
+if  fkinfoarray type    fkinfo referenced_key
+updatingreferencedkey   true
+if  sanitymanager debug
+sanitymanager assert constants deferred
+else
+updatingforeignkey   true
+/* get the # of columns in the resultset */
+resultwidth   resultdescription getcolumncount
+/*
+** calculate the # of columns in the base table.  the result set
+** contains the before columns, the after columns, and the rowlocation,
+** so the number of base columns is half of the number of result set
+** columns, after subtracting one for the row location column.
+*/
+numberofbasecolumns    resultwidth   1    2
+/* get the new base row */
+newbaserow   rowutil getemptyvaluerow numberofbasecolumns  lcc
+deferred   constants deferred
+//update can be marked for deferred mode because the scan is being done
+//using index. but it is not necesary  to keep the before copy
+//of the row in the temporary row holder (deletedrowholder) unless
+//there are ri constraint or triggers.(beetle:5301)
+if triggerinfo    null    fkinfoarray   null
+beforeupdatecopyrequired   true
+/**
+@exception standardexception standard derby error policy
+*/
+public void open   throws standardexception
+setup
+collectaffectedrows
+/*
+** if this is a deferred update, read the new rows and rowlocations
+** from the temporary conglomerate and update the base table using
+** the rowchanger.
+*/
+if  deferred
+runchecker true     check for only restrict referential action rule violations
+firebeforetriggers
+updatedeferredrows
+/* apply deferred inserts to unique indexes */
+rowchanger finish
+runchecker false     check for all  violations
+fireaftertriggers
+else
+/* apply deferred inserts to unique indexes */
+rowchanger finish
+cleanup
+/**
+@exception standardexception standard derby error policy
+*/
+void setup   throws standardexception
+super setup
+/* decode lock mode */
+lockmode   decodelockmode constants lockmode
+boolean firstopen    rowchanger    null
+rowcount   0
+/* cache query plan text for source, before it gets blown away */
+if  lcc getruntimestatisticsmode
+/* savedsource nulled after run time statistics generation */
+savedsource   source
+/* get or re-use the row changer.
+* note: we need to set ourself as the top result set
+* if this is not the 1st execution.  (done in constructor
+* for 1st execution.)
+*/
+if  firstopen
+rowchanger   lcc getlanguageconnectionfactory   getexecutionfactory
+getrowchanger  heapconglom
+constants heapscoci
+heapdcoci
+constants irgs
+constants indexcids
+constants indexscocis
+indexdcocis
+constants numcolumns
+tc
+constants changedcolumnids
+constants getbaserowreadlist
+constants getbaserowreadmap
+constants getstreamstorableheapcolids
+activation
+rowchanger setindexnames constants indexnames
+else
+lcc getstatementcontext   settopresultset this  subquerytrackingarray
+/* open the rowchanger before the source resultset so that
+* the store will see the rowchanger's lock as a covering lock
+* if it is a table lock.
+*/
+rowchanger open lockmode
+if  numopens      0
+source opencore
+else
+source reopencore
+/* the source does not know whether or not we are doing a
+* deferred mode update.  if we are, then we must clear the
+* index scan info from the activation so that the row changer
+* does not re-use that information (which won't be valid for
+* a deferred mode update).
+*/
+if  deferred
+activation clearindexscaninfo
+if  fkinfoarray    null
+if  richecker    null
+richecker   new risetchecker tc  fkinfoarray
+else
+richecker reopen
+if  deferred
+/* allocate the temporary rows and get result description
+* if this is the 1st time that we are executing.
+*/
+if  firstopen
+deferredtemprow   rowutil getemptyvaluerow numberofbasecolumns 1  lcc
+olddeletedrow   rowutil getemptyvaluerow numberofbasecolumns  lcc
+triggerresultdescription    resultdescription    null  ?
+resultdescription truncatecolumns numberofbasecolumns 1
+
+properties properties   new properties
+// get the properties on the heap
+rowchanger getheapconglomeratecontroller   getinternaltablepropertyset properties
+if beforeupdatecopyrequired
+deletedrowholder
+new temporaryrowholderimpl activation  properties
+triggerresultdescription
+insertedrowholder
+new temporaryrowholderimpl activation  properties
+triggerresultdescription
+rowchanger setrowholder insertedrowholder
+/* following 2 methods are for checking and make sure we don't have one un-objectified stream
+* to be inserted into 2 temp table rows for deferred update.  otherwise it would cause problem
+* when writing to disk using the stream a second time.  in other cases we don't want to
+* unnecessarily objectify the stream. beetle 4896.
+*/
+private formatablebitset checkstreamcols
+datavaluedescriptor cols   row getrowarray
+formatablebitset streamcols   null
+for  int i   0  i < numberofbasecolumns  i
+if  cols instanceof streamstorable     check new values
+if  streamcols    null  streamcols   new formatablebitset numberofbasecolumns
+streamcols set i
+return streamcols
+private void objectifystream execrow temprow  formatablebitset streamcols  throws standardexception
+datavaluedescriptor cols   temprow getrowarray
+for  int i   0  i < numberofbasecolumns  i
+if  cols    null    streamcols get i
+streamstorable cols  loadstream
+public boolean collectaffectedrows   throws standardexception
+boolean rowsfound   false
+row   getnextrowcore source
+if  row  null
+rowsfound   true
+else
+activation addwarning
+standardexception newwarning
+sqlstate lang_no_row_found
+//beetle 3865, update cursor use index.
+tablescanresultset tablescan    tablescanresultset  activation getforupdateindexscan
+boolean notifycursor     tablescan    null       tablescan sourcedrained
+boolean checkstream    deferred    rowsfound      constants singlerowsource
+formatablebitset streamcols    checkstream ? checkstreamcols     null
+checkstream    streamcols    null
+while   row    null
+/* by convention, the last column in the result set for an
+* update contains a sqlref containing the rowlocation of
+* the row to be updated.
+*/
+/*
+** if we're doing deferred update, write the new row and row
+** location to the temporary conglomerate.  if we're not doing
+** deferred update, update the permanent conglomerates now
+** using the rowchanger.
+*/
+if  deferred
+/*
+** if we have a before trigger, we must evaluate the
+** check constraint after we have executed the trigger.
+** note that we have compiled checkgm accordingly (to
+** handle the different row shape if we are evaluating
+** against the input result set or a temporary row holder
+** result set).
+*/
+if  triggerinfo    null
+evaluatecheckconstraints  checkgm  activation
+/*
+** we are going to only save off the updated
+** columns and the rid.  for a trigger, all columns
+** were marked as needed so we'll copy them all.
+*/
+rowutil copyrefcolumns deferredtemprow
+row
+numberofbasecolumns
+numberofbasecolumns   1
+if  checkstream
+objectifystream deferredtemprow  streamcols
+insertedrowholder insert deferredtemprow
+/*
+** grab a copy of the row to delete.  we are
+** going to use this for deferred ri checks.
+*/
+if beforeupdatecopyrequired
+rowutil copyrefcolumns olddeletedrow
+row
+numberofbasecolumns
+deletedrowholder insert olddeletedrow
+/*
+** if we haven't already, lets get a template to
+** use as a template for our rescan of the base table.
+** do this now while we have a real row to use
+** as a copy.
+**
+** there is one less column in the base row than
+** there is in source row, because the base row
+** doesn't contain the row location.
+*/
+if  deferredbaserow    null
+deferredbaserow   rowutil getemptyvaluerow numberofbasecolumns  lcc
+rowutil copyclonecolumns deferredbaserow  row
+numberofbasecolumns
+/*
+** while we're here, let's also create a sparse row for
+** fetching from the store.
+*/
+deferredsparserow   makedeferredsparserow deferredbaserow
+baserowreadlist
+lcc
+else
+evaluatecheckconstraints  checkgm  activation
+/* get the rowlocation to update
+* note - column #s in the row are 1 based.
+*/
+rowlocation baserowlocation    rowlocation
+row getcolumn resultwidth   getobject
+rowutil copyrefcolumns newbaserow
+row
+numberofbasecolumns
+numberofbasecolumns
+if  richecker    null
+/*
+** make sure all foreign keys in the new row
+** are maintained.  note that we don't bother
+** checking primary/unique keys that are referenced
+** here.  the reason is that if we are updating
+** a referenced key, we'll be updating in deferred
+** mode, so we wont get here.
+*/
+richecker dofkcheck newbaserow
+source updaterow newbaserow
+rowchanger updaterow row newbaserow baserowlocation
+//beetle 3865, update cursor use index.
+if  notifycursor
+notifyforupdatecursor row getrowarray   newbaserow getrowarray   baserowlocation
+tablescan
+rowcount
+// no need to do a next on a single row source
+if  constants singlerowsource
+row   null
+else
+row   getnextrowcore source
+return rowsfound
+/* beetle 3865, updateable cursor use index. if the row we are updating has new value that
+* falls into the direction of the index scan of the cursor, we save this rid into a hash table
+* (for fast search), so that when the cursor hits it again, it knows to skip it.  when we get
+* to a point that the hash table is full, we scan forward the cursor until one of two things
+* happen: (1) we hit a record whose rid is in the hash table (we went through it already, so
+* skip it), we remove it from hash table, so that we can continue to use hash table. or, (2) the scan
+* forward hit the end.  if (2) happens, we can de-reference the hash table to make it available
+* for garbage collection.  we save the future row id's in a virtual mem heap.  in any case,
+* next read will use a row id that we saved.
+*/
+private void notifyforupdatecursor datavaluedescriptor row  datavaluedescriptor newbaserow
+rowlocation rl  tablescanresultset tablescan
+throws standardexception
+int indexcols   tablescan indexcols
+int changedcols   constants changedcolumnids
+boolean placedforward   false  ascending  decided   false  overlap   false
+int basepos  k
+/* first of all, we see if there's overlap between changed column ids and index key
+* columns.  if so, we see if the new update value falls into the future range of the
+* index scan, if so, we need to save it in hash table.
+*/
+for  int i   0  i < indexcols length  i
+basepos   indexcols
+if  basepos > 0
+ascending   true
+else
+ascending   false
+basepos    basepos
+for  int j   0  j < changedcols length  j
+if  basepos    changedcols
+decided   true 		  we pretty much decided if new row falls in front
+//of the cursor or behind
+/* the row and newbaserow we get are compact base row that only have
+* referenced columns.  our "basepos" is index in sparse heap row, so
+* we need the baserowreadmap to map into the compact row.
+*/
+int map   constants getbaserowreadmap
+if  map    null
+k   basepos   1
+else
+k    map
+datavaluedescriptor key
+/* we need to compare with saved most-forward cursor scan key if we
+* are reading records from the saved rowlocation temp table (instead
+* of the old column value) because we only care if new update value
+* jumps forward the most-forward scan key.
+*/
+if  tablescan comparetolastkey
+key   tablescan lastcursorkey getcolumn i   1
+else
+key   row
+/* starting from the first index key column forward, we see if the direction
+* of the update change is consistent with the direction of index scan.
+* if so, we save it in hash table.
+*/
+if   ascending    key greaterthan newbaserow  key  equals true
+ascending    key lessthan newbaserow  key  equals true
+placedforward   true
+else if  key equals newbaserow  key  equals true
+decided   false
+overlap   true
+break
+if  decided      already decided if new row falls in front or behind
+break
+/* if index row gets updated but key value didn't actually change, we still
+* put it in hash table because it can either fall in front or behind.  this
+* can happen if the update explicitly sets a value, but same as old.
+*/
+if  overlap     decided
+placedforward   true
+if  placedforward 		   add it to hash table
+/* determining initial capacity of hash table from a few factors:
+* (1) user specified max_memory_per_table property, (2) min value 100
+* (3) optimizer estimated row count.  we want to avoid re-hashing if
+* possible, for performance reason, yet don't waste space.  if initial
+* capacity is greater than max size divided by load factor, no rehash
+* is ever needed.
+*/
+int maxcapacity   lcc getoptimizerfactory   getmaxmemorypertable     16
+if  maxcapacity < 100
+maxcapacity   100
+if  tablescan past2futuretbl    null
+double rowcount   tablescan getestimatedrowcount
+int initcapacity   32   1024
+if  rowcount > 0 0
+rowcount   rowcount   0 75   1 0 	   load factor
+if  rowcount < initcapacity
+initcapacity    int  rowcount
+if  maxcapacity < initcapacity
+initcapacity   maxcapacity
+tablescan past2futuretbl   new hashtable initcapacity
+hashtable past2futuretbl   tablescan past2futuretbl
+/* if hash table is not full, we add it in.  the key of the hash entry
+* is the string value of the rowlocation.  if the hash table is full,
+* as the comments above this function say, we scan forward.
+*
+* need to save a clone because when we get cached currentrow, "rl" shares the
+* same reference, so is changed at the same time.
+*/
+rowlocation updatedrl    rowlocation  rl getclone
+if  past2futuretbl size   < maxcapacity
+past2futuretbl put updatedrl  updatedrl
+else
+tablescan skipfuturerowholder   true
+execrow rlrow   new valuerow 1
+for
+execrow arow   tablescan getnextrowcore
+if  arow    null
+tablescan sourcedrained   true
+tablescan past2futuretbl   null 	   de reference for garbage coll
+break
+rowlocation rowloc    rowlocation  arow getcolumn arow ncolumns
+if  updatedrl equals rowloc      this row we are updating jumped forward
+savelastcusorkey tablescan  arow
+break 	   don't need to worry about adding this row to hash any more
+if  tablescan futureforupdaterows    null
+// virtual memory heap. in-memory part size 100. with the co-operation
+// of hash table and in-memory part of heap (hash table shrinks while
+// in-memory heap grows), hopefully we never spill temp table to disk.
+tablescan futureforupdaterows   new temporaryrowholderimpl
+activation  null  null  100  false  true
+rlrow setcolumn 1  rowloc
+tablescan futureforupdaterows insert rlrow
+if  past2futuretbl size   < maxcapacity    we got space in the hash table now  stop
+past2futuretbl put updatedrl  updatedrl
+savelastcusorkey tablescan  arow
+break
+tablescan skipfuturerowholder   false
+private void savelastcusorkey tablescanresultset tablescan  execrow arow  throws standardexception
+/* we save the most-forward cursor scan key where we are stopping, so
+* that next time when we decide if we need to put an updated row id into
+* hash table, we can compare with this key.  this is an optimization on
+* memory usage of the hash table, otherwise it may be "leaking".
+*/
+if  tablescan lastcursorkey    null
+tablescan lastcursorkey   new valuerow arow ncolumns     1
+for  int i   1  i <  tablescan lastcursorkey ncolumns    i
+datavaluedescriptor acol   arow getcolumn i
+if  acol    null
+tablescan lastcursorkey setcolumn i  acol getclone
+void firebeforetriggers   throws standardexception
+if  deferred
+if  triggerinfo    null
+if  triggeractivator    null
+triggeractivator   new triggereventactivator lcc
+tc
+constants targetuuid
+triggerinfo
+triggerexecutioncontext update_event
+activation  null
+else
+triggeractivator reopen
+// fire before trigger, do this before checking constraints
+triggeractivator notifyevent triggerevents before_update
+deletedrowholder getresultset
+insertedrowholder getresultset
+void fireaftertriggers   throws standardexception
+if  deferred
+if  triggeractivator    null
+triggeractivator notifyevent triggerevents after_update
+deletedrowholder getresultset
+insertedrowholder getresultset
+void updatedeferredrows   throws standardexception
+if  deferred
+// we already have everything locked
+deferredbasecc
+tc opencompiledconglomerate
+false
+tc openmode_forupdate tc openmode_secondary_locked
+lockmode
+transactioncontroller isolation_serializable
+constants heapscoci
+heapdcoci
+cursorresultset rs   insertedrowholder getresultset
+try
+/*
+** we need to do a fetch doing a partial row
+** read.  we need to shift our 1-based bit
+** set to a zero based bit set like the store
+** expects.
+*/
+formatablebitset readbitset   rowutil shift baserowreadlist  1
+execrow deferredtemprow2
+rs open
+while   deferredtemprow2   rs getnextrow       null
+/*
+** check the constraint now if we have triggers.
+** otherwise we evaluated them as we read the
+** rows in from the source.
+*/
+if  triggerinfo    null
+source setcurrentrow deferredtemprow
+evaluatecheckconstraints checkgm  activation
+/*
+** the last column is a ref, which contains a
+** rowlocation.
+*/
+datavaluedescriptor rlcolumn   deferredtemprow2 getcolumn numberofbasecolumns   1
+rowlocation baserowlocation
+rowlocation   rlcolumn  getobject
+/* get the base row at the given rowlocation */
+boolean row_exists
+deferredbasecc fetch
+baserowlocation  deferredsparserow getrowarray
+readbitset
+if  sanitymanager debug
+sanitymanager assert row_exists
+/*
+** copy the columns from the temp row to the base row.
+** the base row has fewer columns than the temp row,
+** because it doesn't contain the row location.
+*/
+rowutil copyrefcolumns newbaserow
+deferredtemprow2
+numberofbasecolumns
+rowchanger updaterow deferredbaserow
+newbaserow
+baserowlocation
+source updaterow newbaserow
+finally
+source clearcurrentrow
+rs close
+void runchecker boolean restrictcheckonly  throws standardexception
+/*
+** for a deferred update, make sure that there
+** aren't any primary keys that were removed which
+** are referenced.
+*/
+if  deferred    updatingreferencedkey
+execrow	deletedrow
+cursorresultset deletedrows
+/*
+** for each referenced key that was modified
+*/
+for  int i   0  i < fkinfoarray length  i
+if  fkinfoarray type    fkinfo foreign_key
+continue
+deletedrows   deletedrowholder getresultset
+try
+/*
+** for each delete row
+*/
+deletedrows open
+while   deletedrow   deletedrows getnextrow       null
+if   foundrow deletedrow
+fkinfoarray colarray
+insertedrowholder
+richecker doricheck i  deletedrow  restrictcheckonly
+finally
+deletedrows close
+/*
+** for a deferred update, make sure that there
+** aren't any foreign keys that were added that
+** aren't referenced.
+*/
+if  deferred    updatingforeignkey
+execrow	insertedrow
+cursorresultset insertedrows
+/*
+** for each foreign key that was modified
+*/
+for  int i   0  i < fkinfoarray length  i
+if  fkinfoarray type    fkinfo referenced_key
+continue
+insertedrows   insertedrowholder getresultset
+try
+/*
+** for each inserted row
+*/
+insertedrows open
+while   insertedrow   insertedrows getnextrow       null
+if   foundrow insertedrow
+fkinfoarray colarray
+deletedrowholder
+richecker doricheck i  insertedrow  restrictcheckonly
+finally
+insertedrows close
+public static boolean foundrow
+execrow					checkrow
+int					colstocheck
+temporaryrowholderimpl	rowholder
+throws standardexception
+execrow				scanrow
+boolean				foundmatch   false
+object 			checkrowarray   checkrow getrowarray
+datavaluedescriptor	checkcol
+datavaluedescriptor	scancol
+cursorresultset rs   rowholder getresultset
+try
+/*
+** for each inserted row
+*/
+rs open
+while   scanrow   rs getnextrow       null
+object scanrowarray   scanrow getrowarray
+int i
+for  i   0  i < colstocheck length  i
+checkcol    datavaluedescriptor checkrowarray 1]
+scancol    datavaluedescriptor scanrowarray 1]
+booleandatavalue result   checkcol equals
+scancol
+checkcol      result
+if   result getboolean
+break
+if  i    colstocheck length
+foundmatch   true
+break
+finally
+rs close
+return foundmatch
+/**
+* @see resultset#cleanup
+*
+* @exception standardexception		thrown on error
+*/
+public void	cleanup   throws standardexception
+numopens   0
+/* close down the source resultset tree */
+if  source    null
+source close
+// cache source across open()s
+if  triggeractivator    null
+triggeractivator cleanup
+// cache triggeractivator across open()s
+if  rowchanger    null
+rowchanger close
+if  deferredbasecc    null
+deferredbasecc close
+deferredbasecc   null
+if  insertedrowholder    null
+insertedrowholder close
+if  deletedrowholder    null
+deletedrowholder close
+if  richecker    null
+richecker close
+// cache richecker across open()s
+super close
+endtime   getcurrenttimemillis
+void rowchangerfinish   throws standardexception
+rowchanger finish

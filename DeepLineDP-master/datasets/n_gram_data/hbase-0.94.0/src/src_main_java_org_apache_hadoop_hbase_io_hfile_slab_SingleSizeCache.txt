@@ -1,0 +1,253 @@
+/**
+* copyright 2011 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase io hfile slab
+import java nio bytebuffer
+import java util list
+import java util concurrent concurrentmap
+import java util concurrent atomic atomiclong
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop hbase io heapsize
+import org apache hadoop hbase io hfile blockcache
+import org apache hadoop hbase io hfile blockcachecolumnfamilysummary
+import org apache hadoop hbase io hfile blockcachekey
+import org apache hadoop hbase io hfile cachestats
+import org apache hadoop hbase io hfile cacheable
+import org apache hadoop hbase io hfile cacheabledeserializer
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase util classsize
+import org apache hadoop util stringutils
+import com google common collect mapevictionlistener
+import com google common collect mapmaker
+/**
+* singlesizecache is a slab allocated cache that caches elements up to a single
+* size. it uses a slab allocator (slab.java) to divide a direct bytebuffer,
+* into evenly sized blocks. any cached data will take up exactly 1 block. an
+* exception will be thrown if the cached data cannot fit into the blocksize of
+* this singlesizecache.
+*
+* eviction and lruness is taken care of by guava's mapmaker, which creates a
+* concurrentlinkedhashmap.
+*
+**/
+public class singlesizecache implements blockcache  heapsize
+private final slab backingstore
+private final concurrentmap<blockcachekey  cacheablepair> backingmap
+private final int numblocks
+private final int blocksize
+private final cachestats stats
+private final slabitemactionwatcher actionwatcher
+private final atomiclong size
+private final atomiclong timesincelastaccess
+public final static long cache_fixed_overhead   classsize
+align  2   bytes sizeof_int     5   classsize reference
+classsize object
+static final log log   logfactory getlog singlesizecache class
+/**
+* default constructor. specify the size of the blocks, number of blocks, and
+* the slabcache this cache will be assigned to.
+*
+*
+* @param blocksize the size of each block, in bytes
+*
+* @param numblocks the number of blocks of blocksize this cache will hold.
+*
+* @param master the slabcache this singleslabcache is assigned to.
+*/
+public singlesizecache int blocksize  int numblocks
+slabitemactionwatcher master
+this blocksize   blocksize
+this numblocks   numblocks
+backingstore   new slab blocksize  numblocks
+this stats   new cachestats
+this actionwatcher   master
+this size   new atomiclong cache_fixed_overhead   backingstore heapsize
+this timesincelastaccess   new atomiclong
+// this evictionlistener is called whenever the cache automatically
+// evicts
+// something.
+mapevictionlistener<blockcachekey  cacheablepair> listener   new mapevictionlistener<blockcachekey  cacheablepair>
+@override
+public void oneviction blockcachekey key  cacheablepair value
+timesincelastaccess set system nanotime
+value recentlyaccessed get
+stats evict
+doeviction key  value
+backingmap   new mapmaker   maximumsize numblocks   1
+evictionlistener listener  makemap
+@override
+public void cacheblock blockcachekey blockname  cacheable tobecached
+bytebuffer storedblock
+try
+storedblock   backingstore alloc tobecached getserializedlength
+catch  interruptedexception e
+log warn
+log warn e
+return
+cacheablepair newentry   new cacheablepair tobecached getdeserializer
+storedblock
+tobecached serialize storedblock
+synchronized  this
+cacheablepair alreadycached   backingmap putifabsent blockname  newentry
+if  alreadycached    null
+backingstore free storedblock
+throw new runtimeexception     blockname
+if  actionwatcher    null
+actionwatcher oninsertion blockname  this
+newentry recentlyaccessed set system nanotime
+this size addandget newentry heapsize
+@override
+public cacheable getblock blockcachekey key  boolean caching
+cacheablepair contentblock   backingmap get key
+if  contentblock    null
+stats miss caching
+return null
+stats hit caching
+// if lock cannot be obtained, that means we're undergoing eviction.
+try
+contentblock recentlyaccessed set system nanotime
+synchronized  contentblock
+if  contentblock serializeddata    null
+// concurrently evicted
+log warn     key
+return null
+return contentblock deserializer
+deserialize contentblock serializeddata asreadonlybuffer
+catch  throwable t
+log error    t
+return null
+/**
+* evicts the block
+*
+* @param key the key of the entry we are going to evict
+* @return the evicted bytebuffer
+*/
+public boolean evictblock blockcachekey key
+stats evict
+cacheablepair evictedblock   backingmap remove key
+if  evictedblock    null
+doeviction key  evictedblock
+return evictedblock    null
+private void doeviction blockcachekey key  cacheablepair evictedblock
+long evictedheap   0
+synchronized  evictedblock
+if  evictedblock serializeddata    null
+// someone else already freed
+return
+evictedheap   evictedblock heapsize
+bytebuffer bb   evictedblock serializeddata
+evictedblock serializeddata   null
+backingstore free bb
+// we have to do this callback inside the synchronization here.
+// otherwise we can have the following interleaving:
+// thread a calls getblock():
+// slabcache directs call to this singlesizecache
+// it gets the cacheablepair object
+// thread b runs eviction
+// doeviction() is called and sets serializeddata = null, here.
+// thread a sees the null serializeddata, and returns null
+// thread a calls cacheblock on the same block, and gets
+// "already cached" since the block is still in backingstore
+if  actionwatcher    null
+actionwatcher oneviction key  this
+stats evicted
+size addandget  1   evictedheap
+public void logstats
+long milliseconds   this timesincelastaccess get     1000000
+log info     this blocksize
+this getoccupiedsize     this blocksize
+this numblocks
+stringutils humanreadableint this heapsize
+stringutils formattime milliseconds
+log info
+stats getrequestcount
+stats gethitcount
+stats gethitcount      0 ?      stringutils formatpercent
+stats gethitratio    2
+stats getrequestcachingcount
+stats gethitcachingcount
+stats gethitcachingcount      0 ?      stringutils formatpercent
+stats gethitcachingratio    2
+stats getevictioncount
+stats getevictedcount
+stats evictedpereviction
+public void shutdown
+backingstore shutdown
+public long heapsize
+return this size get     backingstore heapsize
+public long size
+return  long  this blocksize    long  this numblocks
+public long getfreesize
+return  long  backingstore getblocksremaining      long  blocksize
+public long getoccupiedsize
+return  long   numblocks   backingstore getblocksremaining       long  blocksize
+public long getevictedcount
+return stats getevictedcount
+public cachestats getstats
+return this stats
+@override
+public long getblockcount
+return numblocks   backingstore getblocksremaining
+/* since its offheap, it doesn't matter if its in memory or not */
+@override
+public void cacheblock blockcachekey cachekey  cacheable buf  boolean inmemory
+this cacheblock cachekey  buf
+/*
+* this is never called, as evictions are handled in the slabcache layer,
+* implemented in the event we want to use this as a standalone cache.
+*/
+@override
+public int evictblocksbyhfilename string hfilename
+int evictedcount   0
+for  blockcachekey e   backingmap keyset
+if  e gethfilename   equals hfilename
+this evictblock e
+return evictedcount
+@override
+public long getcurrentsize
+return 0
+/*
+* not implemented. extremely costly to do this from the off heap cache, you'd
+* need to copy every object on heap once
+*/
+@override
+public list<blockcachecolumnfamilysummary> getblockcachecolumnfamilysummaries
+configuration conf
+throw new unsupportedoperationexception
+/* just a pair class, holds a reference to the parent cacheable */
+private class cacheablepair implements heapsize
+final cacheabledeserializer<cacheable> deserializer
+bytebuffer serializeddata
+atomiclong recentlyaccessed
+private cacheablepair cacheabledeserializer<cacheable> deserializer
+bytebuffer serializeddata
+this recentlyaccessed   new atomiclong
+this deserializer   deserializer
+this serializeddata   serializeddata
+/*
+* heapsize overhead of this is the default object overhead, the heapsize of
+* the serialized object, and the cost of a reference to the bytebuffer,
+* which is already accounted for in singlesizecache
+*/
+@override
+public long heapsize
+return classsize align classsize object   classsize reference   3
+classsize atomic_long

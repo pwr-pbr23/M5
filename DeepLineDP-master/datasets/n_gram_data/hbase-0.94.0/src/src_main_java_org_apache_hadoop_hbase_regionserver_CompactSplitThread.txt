@@ -1,0 +1,214 @@
+/**
+* copyright 2010 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver
+import java util concurrent executors
+import java util concurrent priorityblockingqueue
+import java util concurrent rejectedexecutionexception
+import java util concurrent threadfactory
+import java util concurrent threadpoolexecutor
+import java util concurrent timeunit
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase htabledescriptor
+import org apache hadoop hbase regionserver compactions compactionrequest
+import com google common base preconditions
+/**
+* compact region on request and then run split if appropriate
+*/
+public class compactsplitthread implements compactionrequestor
+static final log log   logfactory getlog compactsplitthread class
+private final hregionserver server
+private final configuration conf
+private final threadpoolexecutor largecompactions
+private final threadpoolexecutor smallcompactions
+private final threadpoolexecutor splits
+private final long throttlesize
+/* the default priority for user-specified compaction requests.
+* the user gets top priority unless we have blocking compactions. (pri <= 0)
+*/
+public static final int priority_user   1
+public static final int no_priority   integer min_value
+/**
+* splitting should not take place if the total number of regions exceed this.
+* this is not a hard limit to the number of regions but it is a guideline to
+* stop splitting after number of online regions is greater than this.
+*/
+private int regionsplitlimit
+/** @param server */
+compactsplitthread hregionserver server
+super
+this server   server
+this conf   server getconfiguration
+this regionsplitlimit   conf getint
+integer max_value
+int largethreads   math max 1  conf getint
+1
+int smallthreads   conf getint
+1
+if  conf get       null
+throttlesize   conf getlong
+0
+else
+// we have a complicated default. see hbase-3877
+long flushsize   conf getlong hconstants hregion_memstore_flush_size
+htabledescriptor default_memstore_flush_size
+long splitsize   conf getlong hconstants hregion_max_filesize
+hconstants default_max_file_size
+throttlesize   math min flushsize   2  splitsize   2
+int splitthreads   conf getint    1
+// if we have throttle threads, make sure the user also specified size
+preconditions checkargument smallthreads    0    throttlesize > 0
+final string n   thread currentthread   getname
+this largecompactions   new threadpoolexecutor largethreads  largethreads
+60  timeunit seconds  new priorityblockingqueue<runnable>
+new threadfactory
+@override
+public thread newthread runnable r
+thread t   new thread r
+t setname n       system currenttimemillis
+return t
+this largecompactions
+setrejectedexecutionhandler new compactionrequest rejection
+if  smallthreads <  0
+this smallcompactions   null
+else
+this smallcompactions   new threadpoolexecutor smallthreads  smallthreads
+60  timeunit seconds  new priorityblockingqueue<runnable>
+new threadfactory
+@override
+public thread newthread runnable r
+thread t   new thread r
+t setname n       system currenttimemillis
+return t
+this smallcompactions
+setrejectedexecutionhandler new compactionrequest rejection
+this splits    threadpoolexecutor
+executors newfixedthreadpool splitthreads
+new threadfactory
+@override
+public thread newthread runnable r
+thread t   new thread r
+t setname n       system currenttimemillis
+return t
+@override
+public string tostring
+return
+smallcompactions    null ?
+largecompactions getqueue   size
+smallcompactions getqueue   size
+largecompactions getqueue   size
+splits getqueue   size
+public synchronized boolean requestsplit final hregion r
+// don't split regions that are blocking
+if  shouldsplitregion      r getcompactpriority   >  priority_user
+byte midkey   r checksplit
+if  midkey    null
+requestsplit r  midkey
+return true
+return false
+public synchronized void requestsplit final hregion r  byte midkey
+if  midkey    null
+log debug     r getregionnameasstring
+return
+try
+this splits execute new splitrequest r  midkey  this server
+if  log isdebugenabled
+log debug     r       this
+catch  rejectedexecutionexception ree
+log info     r  ree
+public synchronized void requestcompaction final hregion r
+final string why
+for store s   r getstores   values
+requestcompaction r  s  why  no_priority
+public synchronized void requestcompaction final hregion r  final store s
+final string why
+requestcompaction r  s  why  no_priority
+public synchronized void requestcompaction final hregion r  final string why
+int p
+for store s   r getstores   values
+requestcompaction r  s  why  p
+/**
+* @param r hregion store belongs to
+* @param s store to request compaction on
+* @param why why compaction requested -- used in debug messages
+* @param priority override the default priority (no_priority == decide)
+*/
+public synchronized void requestcompaction final hregion r  final store s
+final string why  int priority
+if  this server isstopped
+return
+compactionrequest cr   s requestcompaction
+if  cr    null
+cr setserver server
+if  priority    no_priority
+cr setpriority priority
+threadpoolexecutor pool   largecompactions
+if  smallcompactions    null    throttlesize > cr getsize
+// smallcompactions is like the 10 items or less line at walmart
+pool   smallcompactions
+pool execute cr
+if  log isdebugenabled
+string type
+if  smallcompactions    null
+type    pool    smallcompactions  ?
+log debug type       cr
+why    null     why isempty   ?     why
+this
+/**
+* only interrupt once it's done with a run through the work loop.
+*/
+void interruptifnecessary
+splits shutdown
+largecompactions shutdown
+if  smallcompactions    null
+smallcompactions shutdown
+private void waitfor threadpoolexecutor t  string name
+boolean done   false
+while   done
+try
+done   t awaittermination 60  timeunit seconds
+log debug     name
+catch  interruptedexception ie
+log debug     name
+void join
+waitfor splits
+waitfor largecompactions
+if  smallcompactions    null
+waitfor smallcompactions
+/**
+* returns the current size of the queue containing regions that are
+* processed.
+*
+* @return the current size of the regions queue.
+*/
+public int getcompactionqueuesize
+int size   largecompactions getqueue   size
+if  smallcompactions    null
+size    smallcompactions getqueue   size
+return size
+private boolean shouldsplitregion
+return  regionsplitlimit > server getnumberofonlineregions
+/**
+* @return the regionsplitlimit
+*/
+public int getregionsplitlimit
+return this regionsplitlimit

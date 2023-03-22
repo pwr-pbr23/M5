@@ -1,0 +1,371 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase catalog
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop hbase abortable
+import org apache hadoop hbase hregioninfo
+import org apache hadoop hbase servername
+import org apache hadoop hbase client adminprotocol
+import org apache hadoop hbase client hconnection
+import org apache hadoop hbase client hconnectionmanager
+import org apache hadoop hbase client htable
+import org apache hadoop hbase client retriesexhaustedexception
+import org apache hadoop hbase exceptions notallmetaregionsonlineexception
+import org apache hadoop hbase exceptions servernotrunningyetexception
+import org apache hadoop hbase protobuf protobufutil
+import org apache hadoop hbase util bytes
+import org apache hadoop hbase zookeeper metaregiontracker
+import org apache hadoop hbase zookeeper zookeeperwatcher
+import org apache hadoop ipc remoteexception
+import java io eofexception
+import java io ioexception
+import java net connectexception
+import java net noroutetohostexception
+import java net socketexception
+import java net sockettimeoutexception
+import java net unknownhostexception
+/**
+* tracks the availability of the catalog tables
+* <code>.meta.</code>.
+*
+* this class is "read-only" in that the locations of the catalog tables cannot
+* be explicitly set.  instead, zookeeper is used to learn of the availability
+* and location of <code>.meta.</code>.
+*
+* <p>call {@link #start()} to start up operation.  call {@link #stop()}} to
+* interrupt waits and close up shop.
+*/
+@interfaceaudience private
+public class catalogtracker
+// todo jdc 11/30 we don't even have root anymore, revisit
+// todo: this class needs a rethink.  the original intent was that it would be
+// the one-stop-shop for meta locations and that it would get this
+// info from reading and watching zk state.  the class was to be used by
+// servers when they needed to know of meta movement but also by
+// client-side (inside in htable) so rather than figure meta
+// locations on fault, the client would instead get notifications out of zk.
+//
+// but this original intent is frustrated by the fact that this class has to
+// read an hbase table, the -root- table, to figure out the .meta. region
+// location which means we depend on an hconnection.  hconnection will do
+// retrying but also, it has its own mechanism for finding root and meta
+// locations (and for 'verifying'; it tries the location and if it fails, does
+// new lookup, etc.).  so, at least for now, hconnection (or htable) can't
+// have a ct since ct needs a hconnection (even then, do want ht to have a ct?
+// for ht keep up a session with zk?  rather, shouldn't we do like asynchbase
+// where we'd open a connection to zk, read what we need then let the
+// connection go?).  the 'fix' is make it so both root and meta addresses
+// are wholey up in zk -- not in zk (root) -- and in an hbase table (meta).
+//
+// but even then, this class does 'verification' of the location and it does
+// this by making a call over an hconnection (which will do its own root
+// and meta lookups).  isn't this verification 'useless' since when we
+// return, whatever is dependent on the result of this call then needs to
+// use hconnection; what we have verified may change in meantime (hconnection
+// uses the ct primitives, the root and meta trackers finding root locations).
+//
+// when meta is moved to zk, this class may make more sense.  in the
+// meantime, it does not cohere.  it should just watch meta and root and not
+// not do verification -- let that be out in hconnection since its going to
+// be done there ultimately anyways.
+//
+// this class has spread throughout the codebase.  it needs to be reigned in.
+// this class should be used server-side only, even if we move meta location
+// up into zk.  currently its used over in the client package. its used in
+// metareader and metaeditor classes usually just to get the configuration
+// its using (it does this indirectly by asking its hconnection for its
+// configuration and even then this is just used to get an hconnection out on
+// the other end). i made https://issues.apache.org/jira/browse/hbase-4495 for
+// doing ct fixup. st.ack 09/30/2011.
+//
+// todo: timeouts have never been as advertised in here and its worse now
+// with retries; i.e. the hconnection retries and pause goes ahead whatever
+// the passed timeout is.  fix.
+private static final log log   logfactory getlog catalogtracker class
+private final hconnection connection
+private final zookeeperwatcher zookeeper
+private final metaregiontracker metaregiontracker
+private boolean instantiatedzkw   false
+private abortable abortable
+private boolean stopped   false
+static final byte  meta_region_name
+hregioninfo first_meta_regioninfo getregionname
+/**
+* constructs a catalog tracker. find current state of catalog tables.
+* begin active tracking by executing {@link #start()} post construction. does
+* not timeout.
+*
+* @param conf
+*          the {@link configuration} from which a {@link hconnection} will be
+*          obtained; if problem, this connections
+*          {@link hconnection#abort(string, throwable)} will be called.
+* @throws ioexception
+*/
+public catalogtracker final configuration conf  throws ioexception
+this null  conf  null
+/**
+* constructs the catalog tracker.  find current state of catalog tables.
+* begin active tracking by executing {@link #start()} post construction.
+* does not timeout.
+* @param zk if zk is null, we'll create an instance (and shut it down
+* when {@link #stop()} is called) else we'll use what is passed.
+* @param conf
+* @param abortable if fatal exception we'll call abort on this.  may be null.
+* if it is we'll use the connection associated with the passed
+* {@link configuration} as our abortable.
+* @throws ioexception
+*/
+public catalogtracker final zookeeperwatcher zk  final configuration conf
+abortable abortable
+throws ioexception
+this zk  conf  hconnectionmanager getconnection conf   abortable
+public catalogtracker final zookeeperwatcher zk  final configuration conf
+hconnection connection  abortable abortable
+throws ioexception
+this connection   connection
+if  abortable    null
+// a connection is abortable.
+this abortable   this connection
+abortable throwableaborter   new abortable
+@override
+public void abort string why  throwable e
+throw new runtimeexception why  e
+@override
+public boolean isaborted
+return true
+if  zk    null
+// create our own.  set flag so we tear it down on stop.
+this zookeeper
+new zookeeperwatcher conf      connection tostring
+abortable
+instantiatedzkw   true
+else
+this zookeeper   zk
+this metaregiontracker   new metaregiontracker zookeeper  throwableaborter
+/**
+* starts the catalog tracker.
+* determines current availability of catalog tables and ensures all further
+* transitions of either region are tracked.
+* @throws ioexception
+* @throws interruptedexception
+*/
+public void start   throws ioexception  interruptedexception
+log debug     this
+try
+this metaregiontracker start
+catch  runtimeexception e
+throwable t   e getcause
+this abortable abort e getmessage    t
+throw new ioexception    t
+/**
+* stop working.
+* interrupts any ongoing waits.
+*/
+public void stop
+if   this stopped
+log debug     this
+this stopped   true
+this metaregiontracker stop
+try
+if  this connection    null
+this connection close
+catch  ioexception e
+// although the {@link closeable} interface throws an {@link
+// ioexception}, in reality, the implementation would never do that.
+log error    e
+if  this instantiatedzkw
+this zookeeper close
+/**
+* gets the current location for <code>.meta.</code> or null if location is
+* not currently available.
+* @return {@link servername} for server hosting <code>.meta.</code> or null
+* if none available
+* @throws interruptedexception
+*/
+public servername getmetalocation   throws interruptedexception
+return this metaregiontracker getmetaregionlocation
+/**
+* gets the current location for <code>.meta.</code> if available and waits
+* for up to the specified timeout if not immediately available.  returns null
+* if the timeout elapses before root is available.
+* @param timeout maximum time to wait for root availability, in milliseconds
+* @return {@link servername} for server hosting <code>.meta.</code> or null
+* if none available
+* @throws interruptedexception if interrupted while waiting
+* @throws notallmetaregionsonlineexception if meta not available before
+* timeout
+*/
+public servername waitformeta final long timeout
+throws interruptedexception  notallmetaregionsonlineexception
+servername sn   metaregiontracker waitmetaregionlocation timeout
+if  sn    null
+throw new notallmetaregionsonlineexception     timeout
+return sn
+/**
+* gets a connection to the server hosting meta, as reported by zookeeper,
+* waiting up to the specified timeout for availability.
+* @param timeout how long to wait on meta location
+* @see #waitformeta for additional information
+* @return connection to server hosting meta
+* @throws interruptedexception
+* @throws notallmetaregionsonlineexception if timed out waiting
+* @throws ioexception
+* @deprecated use #getmetaserverconnection(long)
+*/
+public adminprotocol waitformetaserverconnection long timeout
+throws interruptedexception  notallmetaregionsonlineexception  ioexception
+return getmetaserverconnection timeout
+/**
+* gets a connection to the server hosting meta, as reported by zookeeper,
+* waiting up to the specified timeout for availability.
+* <p>warning: does not retry.  use an {@link htable} instead.
+* @param timeout how long to wait on meta location
+* @see #waitformeta for additional information
+* @return connection to server hosting meta
+* @throws interruptedexception
+* @throws notallmetaregionsonlineexception if timed out waiting
+* @throws ioexception
+*/
+adminprotocol getmetaserverconnection long timeout
+throws interruptedexception  notallmetaregionsonlineexception  ioexception
+return getcachedconnection waitformeta timeout
+/**
+* waits indefinitely for availability of <code>.meta.</code>.  used during
+* cluster startup.  does not verify meta, just that something has been
+* set up in zk.
+* @see #waitformeta(long)
+* @throws interruptedexception if interrupted while waiting
+*/
+public void waitformeta   throws interruptedexception
+while   this stopped
+try
+if  waitformeta 100     null  break
+catch  notallmetaregionsonlineexception e
+if  log istraceenabled
+log info
+e getmessage
+/**
+* @param sn servername to get a connection against.
+* @return the adminprotocol we got when we connected to <code>sn</code>
+* may have come from cache, may not be good, may have been setup by this
+* invocation, or may be null.
+* @throws ioexception
+*/
+private adminprotocol getcachedconnection servername sn
+throws ioexception
+if  sn    null
+return null
+adminprotocol protocol   null
+try
+protocol   connection getadmin sn
+catch  retriesexhaustedexception e
+if  e getcause      null    e getcause   instanceof connectexception
+// catch this; presume it means the cached connection has gone bad.
+else
+throw e
+catch  sockettimeoutexception e
+log debug     sn
+catch  noroutetohostexception e
+log debug     sn  e
+catch  socketexception e
+log debug     sn
+catch  unknownhostexception e
+log debug     sn
+catch  ioexception ioe
+throwable cause   ioe getcause
+if  ioe instanceof connectexception
+// catch. connect refused.
+else if  cause    null    cause instanceof eofexception
+// catch. other end disconnected us.
+else if  cause    null    cause getmessage      null
+cause getmessage   tolowercase   contains
+// catch. connection reset.
+else
+throw ioe
+return protocol
+/**
+* verify we can connect to <code>hostingserver</code> and that its carrying
+* <code>regionname</code>.
+* @param hostingserver interface to the server hosting <code>regionname</code>
+* @param address the servername that goes with the <code>metaserver</code>
+* interface.  used logging.
+* @param regionname the regionname we are interested in.
+* @return true if we were able to verify the region located at other side of
+* the interface.
+* @throws ioexception
+*/
+// todo: we should be able to get the servername from the adminprotocol
+// rather than have to pass it in.  its made awkward by the fact that the
+// hri is likely a proxy against remote server so the getservername needs
+// to be fixed to go to a local method or to a cache before we can do this.
+private boolean verifyregionlocation adminprotocol hostingserver
+final servername address  final byte  regionname
+throws ioexception
+if  hostingserver    null
+log info
+return false
+throwable t   null
+try
+// try and get regioninfo from the hosting server.
+return protobufutil getregioninfo hostingserver  regionname     null
+catch  connectexception e
+t   e
+catch  retriesexhaustedexception e
+t   e
+catch  remoteexception e
+ioexception ioe   e unwrapremoteexception
+t   ioe
+catch  ioexception e
+throwable cause   e getcause
+if  cause    null    cause instanceof eofexception
+t   cause
+else if  cause    null    cause getmessage      null
+cause getmessage   contains
+t   cause
+else
+t   e
+log info     bytes tostringbinary regionname
+address       t
+return false
+/**
+* verify <code>.meta.</code> is deployed and accessible.
+* @param timeout how long to wait on zk for meta address (passed through to
+* the internal call to {@link #waitformetaserverconnection(long)}.
+* @return true if the <code>.meta.</code> location is healthy.
+* @throws ioexception
+* @throws interruptedexception
+*/
+public boolean verifymetaregionlocation final long timeout
+throws interruptedexception  ioexception
+adminprotocol connection   null
+try
+connection   waitformetaserverconnection timeout
+catch  notallmetaregionsonlineexception e
+// pass
+catch  servernotrunningyetexception e
+// pass -- remote server is not up so can't be carrying root
+catch  unknownhostexception e
+// pass -- server name doesn't resolve so it can't be assigned anything.
+return  connection    null ? false
+verifyregionlocation connection
+this metaregiontracker getmetaregionlocation    meta_region_name
+public hconnection getconnection
+return this connection

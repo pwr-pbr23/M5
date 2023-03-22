@@ -1,0 +1,4491 @@
+package org apache lucene index
+/**
+* licensed to the apache software foundation (asf) under one or more
+* contributor license agreements.  see the notice file distributed with
+* this work for additional information regarding copyright ownership.
+* the asf licenses this file to you under the apache license, version 2.0
+* (the "license"); you may not use this file except in compliance with
+* the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+import org apache lucene analysis analyzer
+import org apache lucene document document
+import org apache lucene index documentswriter indexingchain
+import org apache lucene search similarity
+import org apache lucene search query
+import org apache lucene store directory
+import org apache lucene store fsdirectory
+import org apache lucene store lock
+import org apache lucene store lockobtainfailedexception
+import org apache lucene store alreadyclosedexception
+import org apache lucene store bufferedindexinput
+import org apache lucene util constants
+import java io file
+import java io ioexception
+import java io printstream
+import java util list
+import java util collection
+import java util arraylist
+import java util hashmap
+import java util set
+import java util hashset
+import java util linkedlist
+import java util iterator
+import java util map
+/**
+an <code>indexwriter</code> creates and maintains an index.
+<p>the <code>create</code> argument to the {@link
+#indexwriter(directory, analyzer, boolean) constructor} determines
+whether a new index is created, or whether an existing index is
+opened.  note that you can open an index with <code>create=true</code>
+even while readers are using the index.  the old readers will
+continue to search the "point in time" snapshot they had opened,
+and won't see the newly created index until they re-open.  there are
+also {@link #indexwriter(directory, analyzer) constructors}
+with no <code>create</code> argument which will create a new index
+if there is not already an index at the provided path and otherwise
+open the existing index.</p>
+<p>in either case, documents are added with {@link #adddocument(document)
+adddocument} and removed with {@link #deletedocuments(term)} or {@link
+#deletedocuments(query)}. a document can be updated with {@link
+#updatedocument(term, document) updatedocument} (which just deletes
+and then adds the entire document). when finished adding, deleting
+and updating documents, {@link #close() close} should be called.</p>
+<a name="flush"></a>
+<p>these changes are buffered in memory and periodically
+flushed to the {@link directory} (during the above method
+calls).  a flush is triggered when there are enough
+buffered deletes (see {@link #setmaxbuffereddeleteterms})
+or enough added documents since the last flush, whichever
+is sooner.  for the added documents, flushing is triggered
+either by ram usage of the documents (see {@link
+#setrambuffersizemb}) or the number of added documents.
+the default is to flush when ram usage hits 16 mb.  for
+best indexing speed you should flush by ram usage with a
+large ram buffer.  note that flushing just moves the
+internal buffered state in indexwriter into the index, but
+these changes are not visible to indexreader until either
+{@link #commit()} or {@link #close} is called.  a flush may
+also trigger one or more segment merges which by default
+run with a background thread so as not to block the
+adddocument calls (see <a href="#mergepolicy">below</a>
+for changing the {@link mergescheduler}).</p>
+<a name="autocommit"></a>
+<p>the optional <code>autocommit</code> argument to the {@link
+#indexwriter(directory, boolean, analyzer) constructors}
+controls visibility of the changes to {@link indexreader}
+instances reading the same index.  when this is
+<code>false</code>, changes are not visible until {@link
+#close()} or {@link #commit()} is called.  note that changes will still be
+flushed to the {@link directory} as new files, but are
+not committed (no new <code>segments_n</code> file is written
+referencing the new files, nor are the files sync'd to stable storage)
+until {@link #close()} or {@link #commit()} is called.  if something
+goes terribly wrong (for example the jvm crashes), then
+the index will reflect none of the changes made since the
+last commit, or the starting state if commit was not called.
+you can also call {@link #rollback()}, which closes the writer
+without committing any changes, and removes any index
+files that had been flushed but are now unreferenced.
+this mode is useful for preventing readers from refreshing
+at a bad time (for example after you've done all your
+deletes but before you've done your adds).  it can also be
+used to implement simple single-writer transactional
+semantics ("all or none").  you can do a two-phase commit
+by calling {@link #preparecommit()}
+followed by {@link #commit()}. this is necessary when
+lucene is working with an external resource (for example,
+a database) and both must either commit or rollback the
+transaction.</p>
+<p>when <code>autocommit</code> is <code>true</code> then
+the writer will periodically commit on its own.  [<b>deprecated</b>: note that in 3.0, indexwriter will
+no longer accept autocommit=true (it will be hardwired to
+false).  you can always call {@link #commit()} yourself
+when needed]. there is
+no guarantee when exactly an auto commit will occur (it
+used to be after every flush, but it is now after every
+completed merge, as of 2.4).  if you want to force a
+commit, call {@link #commit()}, or, close the writer.  once
+a commit has finished, newly opened {@link indexreader} instances will
+see the changes to the index as of that commit.  when
+running in this mode, be careful not to refresh your
+readers while optimize or segment merges are taking place
+as this can tie up substantial disk space.</p>
+<p>regardless of <code>autocommit</code>, an {@link
+indexreader} or {@link org.apache.lucene.search.indexsearcher} will only see the
+index as of the "point in time" that it was opened.  any
+changes committed to the index after the reader was opened
+are not visible until the reader is re-opened.</p>
+<p>if an index will not have more documents added for a while and optimal search
+performance is desired, then either the full {@link #optimize() optimize}
+method or partial {@link #optimize(int)} method should be
+called before the index is closed.</p>
+<p>opening an <code>indexwriter</code> creates a lock file for the directory in use. trying to open
+another <code>indexwriter</code> on the same directory will lead to a
+{@link lockobtainfailedexception}. the {@link lockobtainfailedexception}
+is also thrown if an indexreader on the same directory is used to delete documents
+from the index.</p>
+<a name="deletionpolicy"></a>
+<p>expert: <code>indexwriter</code> allows an optional
+{@link indexdeletionpolicy} implementation to be
+specified.  you can use this to control when prior commits
+are deleted from the index.  the default policy is {@link
+keeponlylastcommitdeletionpolicy} which removes all prior
+commits as soon as a new commit is done (this matches
+behavior before 2.2).  creating your own policy can allow
+you to explicitly keep previous "point in time" commits
+alive in the index for some time, to allow readers to
+refresh to the new commit without having the old commit
+deleted out from under them.  this is necessary on
+filesystems like nfs that do not support "delete on last
+close" semantics, which lucene's "point in time" search
+normally relies on. </p>
+<a name="mergepolicy"></a> <p>expert:
+<code>indexwriter</code> allows you to separately change
+the {@link mergepolicy} and the {@link mergescheduler}.
+the {@link mergepolicy} is invoked whenever there are
+changes to the segments in the index.  its role is to
+select which merges to do, if any, and return a {@link
+mergepolicy.mergespecification} describing the merges.  it
+also selects merges to do for optimize().  (the default is
+{@link logbytesizemergepolicy}.  then, the {@link
+mergescheduler} is invoked with the requested merges and
+it decides when and how to run the merges.  the default is
+{@link concurrentmergescheduler}. </p>
+<a name="oome"></a><p><b>note</b>: if you hit an
+outofmemoryerror then indexwriter will quietly record this
+fact and block all future segment commits.  this is a
+defensive measure in case any internal state (buffered
+documents and deletions) were corrupted.  any subsequent
+calls to {@link #commit()} will throw an
+illegalstateexception.  the only course of action is to
+call {@link #close()}, which internally will call {@link
+#rollback()}, to undo any changes to the index since the
+last commit.  if you opened the writer with autocommit
+false you can also just call {@link #rollback()}
+directly.</p>
+<a name="thread-safety"></a><p><b>note</b>: {@link
+<code>indexwriter</code>} instances are completely thread
+safe, meaning multiple threads can call any of its
+methods, concurrently.  if your application requires
+external synchronization, you should <b>not</b>
+synchronize on the <code>indexwriter</code> instance as
+this may cause deadlock; use your own (non-lucene) objects
+instead. </p>
+*/
+/*
+* clarification: check points (and commits)
+* being able to set autocommit=false allows indexwriter to flush and
+* write new index files to the directory without writing a new segments_n
+* file which references these new files. it also means that the state of
+* the in memory segmentinfos object is different than the most recent
+* segments_n file written to the directory.
+*
+* each time the segmentinfos is changed, and matches the (possibly
+* modified) directory files, we have a new "check point".
+* if the modified/new segmentinfos is written to disk - as a new
+* (generation of) segments_n file - this check point is also an
+* indexcommit.
+*
+* with autocommit=true, every checkpoint is also a commitpoint.
+* with autocommit=false, some checkpoints may not be commits.
+*
+* a new checkpoint always replaces the previous checkpoint and
+* becomes the new "front" of the index. this allows the indexfiledeleter
+* to delete files that are referenced only by stale checkpoints.
+* (files that were created since the last commit, but are no longer
+* referenced by the "front" of the index). for this, indexfiledeleter
+* keeps track of the last non commit checkpoint.
+*/
+public class indexwriter
+/**
+* default value for the write lock timeout (1,000).
+* @see #setdefaultwritelocktimeout
+*/
+public static long write_lock_timeout   1000
+private long writelocktimeout   write_lock_timeout
+/**
+* name of the write lock in the index.
+*/
+public static final string write_lock_name
+/**
+* @deprecated
+* @see logmergepolicy#default_merge_factor
+*/
+public final static int default_merge_factor   logmergepolicy default_merge_factor
+/**
+* value to denote a flush trigger is disabled
+*/
+public final static int disable_auto_flush    1
+/**
+* disabled by default (because indexwriter flushes by ram usage
+* by default). change using {@link #setmaxbuffereddocs(int)}.
+*/
+public final static int default_max_buffered_docs   disable_auto_flush
+/**
+* default value is 16 mb (which means flush when buffered
+* docs consume 16 mb ram).  change using {@link #setrambuffersizemb}.
+*/
+public final static double default_ram_buffer_size_mb   16 0
+/**
+* disabled by default (because indexwriter flushes by ram usage
+* by default). change using {@link #setmaxbuffereddeleteterms(int)}.
+*/
+public final static int default_max_buffered_delete_terms   disable_auto_flush
+/**
+* @deprecated
+* @see logdocmergepolicy#default_max_merge_docs
+*/
+public final static int default_max_merge_docs   logdocmergepolicy default_max_merge_docs
+/**
+* default value is 10,000. change using {@link #setmaxfieldlength(int)}.
+*/
+public final static int default_max_field_length   10000
+/**
+* default value is 128. change using {@link #settermindexinterval(int)}.
+*/
+public final static int default_term_index_interval   128
+/**
+* absolute hard maximum length for a term.  if a term
+* arrives from the analyzer longer than this length, it
+* is skipped and a message is printed to infostream, if
+* set (see {@link #setinfostream}).
+*/
+public final static int max_term_length   documentswriter max_term_length
+/**
+* default for {@link #getmaxsyncpauseseconds}.  on
+* windows this defaults to 10.0 seconds; elsewhere it's
+* 0.
+*/
+public final static double default_max_sync_pause_seconds
+static
+if  constants windows
+default_max_sync_pause_seconds   10 0
+else
+default_max_sync_pause_seconds   0 0
+// the normal read buffer size defaults to 1024, but
+// increasing this during merging seems to yield
+// performance gains.  however we don't want to increase
+// it too much because there are quite a few
+// bufferedindexinputs created during merging.  see
+// lucene-888 for details.
+private final static int merge_read_buffer_size   4096
+// used for printing messages
+private static object message_id_lock   new object
+private static int message_id   0
+private int messageid    1
+volatile private boolean hitoom
+private directory directory      where this index resides
+private analyzer analyzer        how to analyze text
+private similarity similarity   similarity getdefault       how to normalize
+private volatile long changecount     increments every time a change is completed
+private long lastcommitchangecount     last changecount that was committed
+private segmentinfos rollbacksegmentinfos          segmentinfos we will fallback to if the commit fails
+private hashmap rollbacksegments
+volatile segmentinfos pendingcommit                set when a commit is pending  after preparecommit     before commit
+volatile long pendingcommitchangecount
+private segmentinfos localrollbacksegmentinfos          segmentinfos we will fallback to if the commit fails
+private boolean localautocommit                    saved autocommit during local transaction
+private int localflusheddoccount                   saved docwriter getflusheddoccount during local transaction
+private boolean autocommit   true                  false if we should commit only on close
+private segmentinfos segmentinfos   new segmentinfos             the segments
+private documentswriter docwriter
+private indexfiledeleter deleter
+private set segmentstooptimize   new hashset                 used by optimize to note those needing optimization
+private lock writelock
+private int termindexinterval   default_term_index_interval
+private boolean closedir
+private boolean closed
+private boolean closing
+// holds all segmentinfo instances currently involved in
+// merges
+private hashset mergingsegments   new hashset
+private mergepolicy mergepolicy   new logbytesizemergepolicy this
+private mergescheduler mergescheduler   new concurrentmergescheduler
+private linkedlist pendingmerges   new linkedlist
+private set runningmerges   new hashset
+private list mergeexceptions   new arraylist
+private long mergegen
+private boolean stopmerges
+private int flushcount
+private int flushdeletescount
+private double maxsyncpauseseconds   default_max_sync_pause_seconds
+// used to only allow one addindexes to proceed at once
+// todo: use readwritelock once we are on 5.0
+private int readcount                              count of how many threads are holding read lock
+private thread writethread                         non null if any thread holds write lock
+final readerpool readerpool   new readerpool
+private int upgradecount
+// this is a "write once" variable (like the organic dye
+// on a dvd-r that may or may not be heated by a laser and
+// then cooled to permanently record the event): it's
+// false, until getreader() is called for the first time,
+// at which point it's switched to true and never changes
+// back to false.  once this is true, we hold open and
+// reuse segmentreader instances internally for applying
+// deletes, doing merges, and reopening near real-time
+// readers.
+private volatile boolean poolreaders
+/**
+* expert: returns a readonly reader containing all
+* current updates.  flush is called automatically.  this
+* provides "near real-time" searching, in that changes
+* made during an indexwriter session can be made
+* available for searching without closing the writer.
+*
+* <p>it's near real-time because there is no hard
+* guarantee on how quickly you can get a new reader after
+* making changes with indexwriter.  you'll have to
+* experiment in your situation to determine if it's
+* faster enough.  as this is a new and experimental
+* feature, please report back on your findings so we can
+* learn, improve and iterate.</p>
+*
+* <p>the resulting reader supports {@link
+* indexreader#reopen}, but that call will simply forward
+* back to this method (though this may change in the
+* future).</p>
+*
+* <p>the very first time this method is called, this
+* writer instance will make every effort to pool the
+* readers that it opens for doing merges, applying
+* deletes, etc.  this means additional resources (ram,
+* file descriptors, cpu time) will be consumed.</p>
+*
+* <p>for lower latency on reopening a reader, you may
+* want to call {@link #setmergedsegmentwarmer} to
+* pre-warm a newly merged segment before it's committed
+* to the index.</p>
+*
+* <p>if an addindexes* call is running in another thread,
+* then this reader will only search those segments from
+* the foreign index that have been successfully copied
+* over, so far</p>.
+*
+* <p><b>note</b>: once the writer is closed, any
+* outstanding readers may continue to be used.  however,
+* if you attempt to reopen any of those readers, you'll
+* hit an {@link alreadyclosedexception}.</p>
+*
+* <p><b>note:</b> this api is experimental and might
+* change in incompatible ways in the next release.</p>
+*
+* @return indexreader that covers entire index plus all
+* changes made so far by this indexwriter instance
+*
+* @throws ioexception
+*/
+public indexreader getreader   throws ioexception
+return getreader indexreader default_terms_index_divisor
+/** expert: like {@link #getreader}, except you can
+*  specify which terminfosindexdivisor should be used for
+*  any newly opened readers.
+* @param terminfosindexdivisor subsamples which indexed
+*  terms are loaded into ram. this has the same effect as {@link
+*  indexwriter#settermindexinterval} except that setting
+*  must be done at indexing time while this setting can be
+*  set per reader.  when set to n, then one in every
+*  n*termindexinterval terms in the index is loaded into
+*  memory.  by setting this to a value > 1 you can reduce
+*  memory usage, at the expense of higher latency when
+*  loading a terminfo.  the default value is 1.  set this
+*  to -1 to skip loading the terms index entirely. */
+public indexreader getreader int terminfosindexdivisor  throws ioexception
+if  infostream    null
+message
+// do this up front before flushing so that the readers
+// obtained during this flush are pooled, the first time
+// this method is called:
+poolreaders   true
+flush true  true  true
+// prevent segmentinfos from changing while opening the
+// reader; in theory we could do similar retry logic,
+// just like we do when loading segments_n
+synchronized this
+return new readonlydirectoryreader this  segmentinfos  terminfosindexdivisor
+/** holds shared segmentreader instances. indexwriter uses
+*  segmentreaders for 1) applying deletes, 2) doing
+*  merges, 3) handing out a real-time reader.  this pool
+*  reuses instances of the segmentreaders in all these
+*  places if it is in "near real-time mode" (getreader()
+*  has been called on this instance). */
+class readerpool
+private final map readermap   new hashmap
+/** forcefully clear changes for the specified segments,
+*  and remove from the pool.   this is called on successful merge. */
+synchronized void clear segmentinfos infos  throws ioexception
+if  infos    null
+iterator iter   readermap entryset   iterator
+while  iter hasnext
+map entry ent    map entry  iter next
+segmentreader  ent getvalue    haschanges   false
+else
+final int numsegments   infos size
+for int i 0 i<numsegments i
+final segmentinfo info   infos info i
+if  readermap containskey info
+segmentreader  readermap get info   haschanges   false
+// used only by asserts
+public synchronized boolean infoislive segmentinfo info
+int idx   segmentinfos indexof info
+assert idx     1
+assert segmentinfos get idx     info
+return true
+public synchronized segmentinfo maptolive segmentinfo info
+int idx   segmentinfos indexof info
+if  idx     1
+info    segmentinfo  segmentinfos get idx
+return info
+/**
+* release the segment reader (i.e. decref it and close if there
+* are no more references.
+* @param sr
+* @throws ioexception
+*/
+public synchronized void release segmentreader sr  throws ioexception
+release sr  false
+/**
+* release the segment reader (i.e. decref it and close if there
+* are no more references.
+* @param sr
+* @throws ioexception
+*/
+public synchronized void release segmentreader sr  boolean drop  throws ioexception
+final boolean pooled   readermap containskey sr getsegmentinfo
+assert  pooled   readermap get sr getsegmentinfo       sr
+// drop caller's ref
+sr decref
+if  pooled     drop      poolreaders    sr getrefcount      1
+// we are the last ref to this reader; since we're
+// not pooling readers, we release it:
+readermap remove sr getsegmentinfo
+// todo: java 5
+// assert !sr.haschanges || thread.holdslock(indexwriter.this);
+// drop our ref -- this will commit any pending
+// changes to the dir
+boolean success   false
+try
+sr close
+success   true
+finally
+if   success    sr haschanges
+// abandon the changes & retry closing:
+sr haschanges   false
+try
+sr close
+catch  throwable ignore
+// keep throwing original exception
+/** remove all our references to readers, and commits
+*  any pending changes. */
+synchronized void close   throws ioexception
+iterator iter   readermap entryset   iterator
+while  iter hasnext
+map entry ent    map entry  iter next
+segmentreader sr    segmentreader  ent getvalue
+if  sr haschanges
+assert infoislive sr getsegmentinfo
+sr startcommit
+boolean success   false
+try
+sr docommit null
+success   true
+finally
+if   success
+sr rollbackcommit
+iter remove
+// note: it is allowed that this decref does not
+// actually close the sr; this can happen when a
+// near real-time reader is kept open after the
+// indexwriter instance is closed
+sr decref
+/**
+* commit all segment reader in the pool.
+* @throws ioexception
+*/
+synchronized void commit   throws ioexception
+iterator iter   readermap entryset   iterator
+while  iter hasnext
+map entry ent    map entry  iter next
+segmentreader sr    segmentreader  ent getvalue
+if  sr haschanges
+assert infoislive sr getsegmentinfo
+sr startcommit
+boolean success   false
+try
+sr docommit null
+success   true
+finally
+if   success
+sr rollbackcommit
+/**
+* returns a ref to a clone.  note: this clone is not
+* enrolled in the pool, so you should simply close()
+* it when you're done (ie, do not call release()).
+*/
+public synchronized segmentreader getreadonlyclone segmentinfo info  boolean doopenstores  int terminfosindexdivisor  throws ioexception
+segmentreader sr   get info  doopenstores  bufferedindexinput buffer_size  terminfosindexdivisor
+try
+return  segmentreader  sr clone true
+finally
+sr decref
+/**
+* obtain a segmentreader from the readerpool.  the reader
+* must be returned by calling {@link #release(segmentreader)}
+* @see #release(segmentreader)
+* @param info
+* @param doopenstores
+* @throws ioexception
+*/
+public synchronized segmentreader get segmentinfo info  boolean doopenstores  throws ioexception
+return get info  doopenstores  bufferedindexinput buffer_size  indexreader default_terms_index_divisor
+/**
+* obtain a segmentreader from the readerpool.  the reader
+* must be returned by calling {@link #release(segmentreader)}
+*
+* @see #release(segmentreader)
+* @param info
+* @param doopenstores
+* @param readbuffersize
+* @param termsindexdivisor
+* @throws ioexception
+*/
+public synchronized segmentreader get segmentinfo info  boolean doopenstores  int readbuffersize  int termsindexdivisor  throws ioexception
+if  poolreaders
+readbuffersize   bufferedindexinput buffer_size
+segmentreader sr    segmentreader  readermap get info
+if  sr    null
+// todo: we may want to avoid doing this while
+// synchronized
+// returns a ref, which we xfer to readermap:
+sr   segmentreader get info  readbuffersize  doopenstores  termsindexdivisor
+readermap put info  sr
+else
+if  doopenstores
+sr opendocstores
+if  termsindexdivisor     1     sr termsindexloaded
+// if this reader was originally opened because we
+// needed to merge it, we didn't load the terms
+// index.  but now, if the caller wants the terms
+// index (eg because it's doing deletes, or an nrt
+// reader is being opened) we ask the reader to
+// load its terms index.
+sr loadtermsindex termsindexdivisor
+// return a ref to our caller
+sr incref
+return sr
+// returns a ref
+public synchronized segmentreader getifexists segmentinfo info  throws ioexception
+segmentreader sr    segmentreader  readermap get info
+if  sr    null
+sr incref
+return sr
+/**
+* obtain the number of deleted docs for a pooled reader.
+* if the reader isn't being pooled, the segmentinfo's
+* delcount is returned.
+*/
+public int numdeleteddocs segmentinfo info  throws ioexception
+segmentreader reader   readerpool getifexists info
+try
+if  reader    null
+return reader numdeleteddocs
+else
+return info getdelcount
+finally
+if  reader    null
+readerpool release reader
+synchronized void acquirewrite
+assert writethread    thread currentthread
+while writethread    null    readcount > 0
+dowait
+// we could have been closed while we were waiting:
+ensureopen
+writethread   thread currentthread
+synchronized void releasewrite
+assert thread currentthread      writethread
+writethread   null
+notifyall
+synchronized void acquireread
+final thread current   thread currentthread
+while writethread    null    writethread    current
+dowait
+readcount
+// allows one readlock to upgrade to a writelock even if
+// there are other readlocks as long as all other
+// readlocks are also blocked in this method:
+synchronized void upgradereadtowrite
+assert readcount > 0
+upgradecount
+while readcount > upgradecount    writethread    null
+dowait
+writethread   thread currentthread
+readcount
+upgradecount
+synchronized void releaseread
+readcount
+assert readcount >  0
+notifyall
+synchronized final boolean isopen boolean includependingclose
+return   closed     includependingclose    closing
+/**
+* used internally to throw an {@link
+* alreadyclosedexception} if this indexwriter has been
+* closed.
+* @throws alreadyclosedexception if this indexwriter is
+*/
+protected synchronized final void ensureopen boolean includependingclose  throws alreadyclosedexception
+if   isopen includependingclose
+throw new alreadyclosedexception
+protected synchronized final void ensureopen   throws alreadyclosedexception
+ensureopen true
+/**
+* prints a message to the infostream (if non-null),
+* prefixed with the identifying information for this
+* writer and the thread that's calling it.
+*/
+public void message string message
+if  infostream    null
+infostream println     messageid       thread currentthread   getname         message
+private synchronized void setmessageid printstream infostream
+if  infostream    null    messageid     1
+synchronized message_id_lock
+messageid   message_id
+this infostream   infostream
+/**
+* casts current mergepolicy to logmergepolicy, and throws
+* an exception if the mergepolicy is not a logmergepolicy.
+*/
+private logmergepolicy getlogmergepolicy
+if  mergepolicy instanceof logmergepolicy
+return  logmergepolicy  mergepolicy
+else
+throw new illegalargumentexception
+/** <p>get the current setting of whether newly flushed
+*  segments will use the compound file format.  note that
+*  this just returns the value previously set with
+*  setusecompoundfile(boolean), or the default value
+*  (true).  you cannot use this to query the status of
+*  previously flushed segments.</p>
+*
+*  <p>note that this method is a convenience method: it
+*  just calls mergepolicy.getusecompoundfile as long as
+*  mergepolicy is an instance of {@link logmergepolicy}.
+*  otherwise an illegalargumentexception is thrown.</p>
+*
+*  @see #setusecompoundfile(boolean)
+*/
+public boolean getusecompoundfile
+return getlogmergepolicy   getusecompoundfile
+/** <p>setting to turn on usage of a compound file. when on,
+*  multiple files for each segment are merged into a
+*  single file when a new segment is flushed.</p>
+*
+*  <p>note that this method is a convenience method: it
+*  just calls mergepolicy.setusecompoundfile as long as
+*  mergepolicy is an instance of {@link logmergepolicy}.
+*  otherwise an illegalargumentexception is thrown.</p>
+*/
+public void setusecompoundfile boolean value
+getlogmergepolicy   setusecompoundfile value
+getlogmergepolicy   setusecompounddocstore value
+/** expert: set the similarity implementation used by this indexwriter.
+*
+* @see similarity#setdefault(similarity)
+*/
+public void setsimilarity similarity similarity
+ensureopen
+this similarity   similarity
+docwriter setsimilarity similarity
+/** expert: return the similarity implementation used by this indexwriter.
+*
+* <p>this defaults to the current value of {@link similarity#getdefault()}.
+*/
+public similarity getsimilarity
+ensureopen
+return this similarity
+/** expert: set the interval between indexed terms.  large values cause less
+* memory to be used by indexreader, but slow random-access to terms.  small
+* values cause more memory to be used by an indexreader, and speed
+* random-access to terms.
+*
+* this parameter determines the amount of computation required per query
+* term, regardless of the number of documents that contain that term.  in
+* particular, it is the maximum number of other terms that must be
+* scanned before a term is located and its frequency and position information
+* may be processed.  in a large index with user-entered query terms, query
+* processing time is likely to be dominated not by term lookup but rather
+* by the processing of frequency and positional data.  in a small index
+* or when many uncommon query terms are generated (e.g., by wildcard
+* queries) term lookup may become a dominant cost.
+*
+* in particular, <code>numuniqueterms/interval</code> terms are read into
+* memory by an indexreader, and, on average, <code>interval/2</code> terms
+* must be scanned for each random term access.
+*
+* @see #default_term_index_interval
+*/
+public void settermindexinterval int interval
+ensureopen
+this termindexinterval   interval
+/** expert: return the interval between indexed terms.
+*
+* @see #settermindexinterval(int)
+*/
+public int gettermindexinterval
+// we pass false because this method is called by segmentmerger while we are in the process of closing
+ensureopen false
+return termindexinterval
+/**
+* constructs an indexwriter for the index in <code>path</code>.
+* text will be analyzed with <code>a</code>.  if <code>create</code>
+* is true, then a new, empty index will be created in
+* <code>path</code>, replacing the index already there,
+* if any.
+*
+* <p><b>note</b>: autocommit (see <a
+* href="#autocommit">above</a>) is set to false with this
+* constructor.
+*
+* @param path the path to the index directory
+* @param a the analyzer to use
+* @param create <code>true</code> to create the index or overwrite
+*  the existing one; <code>false</code> to append to the existing
+*  index
+* @param mfl maximum field length in number of tokens/terms: limited, unlimited, or user-specified
+*   via the maxfieldlength constructor.
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be read/written to, or
+*  if it does not exist and <code>create</code> is
+*  <code>false</code> or if there is any other low-level
+*  io error
+* @deprecated use {@link #indexwriter(directory, analyzer,
+* boolean, maxfieldlength)}
+*/
+public indexwriter string path  analyzer a  boolean create  maxfieldlength mfl
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init fsdirectory getdirectory path   a  create  true  null  false  mfl getlimit    null  null
+/**
+* constructs an indexwriter for the index in <code>path</code>.
+* text will be analyzed with <code>a</code>.  if <code>create</code>
+* is true, then a new, empty index will be created in
+* <code>path</code>, replacing the index already there, if any.
+*
+* @param path the path to the index directory
+* @param a the analyzer to use
+* @param create <code>true</code> to create the index or overwrite
+*  the existing one; <code>false</code> to append to the existing
+*  index
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be read/written to, or
+*  if it does not exist and <code>create</code> is
+*  <code>false</code> or if there is any other low-level
+*  io error
+* @deprecated this constructor will be removed in the 3.0 release.
+*  use {@link
+*  #indexwriter(directory,analyzer,boolean,maxfieldlength)}
+*  instead, and call {@link #commit()} when needed.
+*/
+public indexwriter string path  analyzer a  boolean create
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init fsdirectory getdirectory path   a  create  true  null  true  default_max_field_length  null  null
+/**
+* constructs an indexwriter for the index in <code>path</code>.
+* text will be analyzed with <code>a</code>.  if <code>create</code>
+* is true, then a new, empty index will be created in
+* <code>path</code>, replacing the index already there, if any.
+*
+* <p><b>note</b>: autocommit (see <a
+* href="#autocommit">above</a>) is set to false with this
+* constructor.
+*
+* @param path the path to the index directory
+* @param a the analyzer to use
+* @param create <code>true</code> to create the index or overwrite
+*  the existing one; <code>false</code> to append to the existing
+*  index
+* @param mfl maximum field length in number of terms/tokens: limited, unlimited, or user-specified
+*   via the maxfieldlength constructor.
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be read/written to, or
+*  if it does not exist and <code>create</code> is
+*  <code>false</code> or if there is any other low-level
+*  io error
+* @deprecated use {@link #indexwriter(directory,
+* analyzer, boolean, maxfieldlength)}
+*/
+public indexwriter file path  analyzer a  boolean create  maxfieldlength mfl
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init fsdirectory getdirectory path   a  create  true  null  false  mfl getlimit    null  null
+/**
+* constructs an indexwriter for the index in <code>path</code>.
+* text will be analyzed with <code>a</code>.  if <code>create</code>
+* is true, then a new, empty index will be created in
+* <code>path</code>, replacing the index already there, if any.
+*
+* @param path the path to the index directory
+* @param a the analyzer to use
+* @param create <code>true</code> to create the index or overwrite
+*  the existing one; <code>false</code> to append to the existing
+*  index
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be read/written to, or
+*  if it does not exist and <code>create</code> is
+*  <code>false</code> or if there is any other low-level
+*  io error
+* @deprecated this constructor will be removed in the 3.0 release.
+*  use {@link
+*  #indexwriter(directory,analyzer,boolean,maxfieldlength)}
+*  instead, and call {@link #commit()} when needed.
+*/
+public indexwriter file path  analyzer a  boolean create
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init fsdirectory getdirectory path   a  create  true  null  true  default_max_field_length  null  null
+/**
+* constructs an indexwriter for the index in <code>d</code>.
+* text will be analyzed with <code>a</code>.  if <code>create</code>
+* is true, then a new, empty index will be created in
+* <code>d</code>, replacing the index already there, if any.
+*
+* <p><b>note</b>: autocommit (see <a
+* href="#autocommit">above</a>) is set to false with this
+* constructor.
+*
+* @param d the index directory
+* @param a the analyzer to use
+* @param create <code>true</code> to create the index or overwrite
+*  the existing one; <code>false</code> to append to the existing
+*  index
+* @param mfl maximum field length in number of terms/tokens: limited, unlimited, or user-specified
+*   via the maxfieldlength constructor.
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be read/written to, or
+*  if it does not exist and <code>create</code> is
+*  <code>false</code> or if there is any other low-level
+*  io error
+*/
+public indexwriter directory d  analyzer a  boolean create  maxfieldlength mfl
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init d  a  create  false  null  false  mfl getlimit    null  null
+/**
+* constructs an indexwriter for the index in <code>d</code>.
+* text will be analyzed with <code>a</code>.  if <code>create</code>
+* is true, then a new, empty index will be created in
+* <code>d</code>, replacing the index already there, if any.
+*
+* @param d the index directory
+* @param a the analyzer to use
+* @param create <code>true</code> to create the index or overwrite
+*  the existing one; <code>false</code> to append to the existing
+*  index
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be read/written to, or
+*  if it does not exist and <code>create</code> is
+*  <code>false</code> or if there is any other low-level
+*  io error
+* @deprecated this constructor will be removed in the 3.0
+*  release, and call {@link #commit()} when needed.
+*  use {@link #indexwriter(directory,analyzer,boolean,maxfieldlength)} instead.
+*/
+public indexwriter directory d  analyzer a  boolean create
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init d  a  create  false  null  true  default_max_field_length  null  null
+/**
+* constructs an indexwriter for the index in
+* <code>path</code>, first creating it if it does not
+* already exist.  text will be analyzed with
+* <code>a</code>.
+*
+* <p><b>note</b>: autocommit (see <a
+* href="#autocommit">above</a>) is set to false with this
+* constructor.
+*
+* @param path the path to the index directory
+* @param a the analyzer to use
+* @param mfl maximum field length in number of terms/tokens: limited, unlimited, or user-specified
+*   via the maxfieldlength constructor.
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be
+*  read/written to or if there is any other low-level
+*  io error
+* @deprecated use {@link #indexwriter(directory, analyzer, maxfieldlength)}
+*/
+public indexwriter string path  analyzer a  maxfieldlength mfl
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init fsdirectory getdirectory path   a  true  null  false  mfl getlimit    null  null
+/**
+* constructs an indexwriter for the index in
+* <code>path</code>, first creating it if it does not
+* already exist.  text will be analyzed with
+* <code>a</code>.
+*
+* @param path the path to the index directory
+* @param a the analyzer to use
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be
+*  read/written to or if there is any other low-level
+*  io error
+* @deprecated this constructor will be removed in the 3.0
+*  release, and call {@link #commit()} when needed.
+*  use {@link #indexwriter(directory,analyzer,maxfieldlength)} instead.
+*/
+public indexwriter string path  analyzer a
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init fsdirectory getdirectory path   a  true  null  true  default_max_field_length  null  null
+/**
+* constructs an indexwriter for the index in
+* <code>path</code>, first creating it if it does not
+* already exist.  text will be analyzed with
+* <code>a</code>.
+*
+* <p><b>note</b>: autocommit (see <a
+* href="#autocommit">above</a>) is set to false with this
+* constructor.
+*
+* @param path the path to the index directory
+* @param a the analyzer to use
+* @param mfl maximum field length in number of terms/tokens: limited, unlimited, or user-specified
+*   via the maxfieldlength constructor.
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be
+*  read/written to or if there is any other low-level
+*  io error
+* @deprecated use {@link #indexwriter(directory,
+* analyzer, maxfieldlength)}
+*/
+public indexwriter file path  analyzer a  maxfieldlength mfl
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init fsdirectory getdirectory path   a  true  null  false  mfl getlimit    null  null
+/**
+* constructs an indexwriter for the index in
+* <code>path</code>, first creating it if it does not
+* already exist.  text will be analyzed with
+* <code>a</code>.
+*
+* @param path the path to the index directory
+* @param a the analyzer to use
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be
+*  read/written to or if there is any other low-level
+*  io error
+* @deprecated this constructor will be removed in the 3.0 release.
+*  use {@link #indexwriter(directory,analyzer,maxfieldlength)}
+*  instead, and call {@link #commit()} when needed.
+*/
+public indexwriter file path  analyzer a
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init fsdirectory getdirectory path   a  true  null  true  default_max_field_length  null  null
+/**
+* constructs an indexwriter for the index in
+* <code>d</code>, first creating it if it does not
+* already exist.  text will be analyzed with
+* <code>a</code>.
+*
+* <p><b>note</b>: autocommit (see <a
+* href="#autocommit">above</a>) is set to false with this
+* constructor.
+*
+* @param d the index directory
+* @param a the analyzer to use
+* @param mfl maximum field length in number of terms/tokens: limited, unlimited, or user-specified
+*   via the maxfieldlength constructor.
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be
+*  read/written to or if there is any other low-level
+*  io error
+*/
+public indexwriter directory d  analyzer a  maxfieldlength mfl
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init d  a  false  null  false  mfl getlimit    null  null
+/**
+* constructs an indexwriter for the index in
+* <code>d</code>, first creating it if it does not
+* already exist.  text will be analyzed with
+* <code>a</code>.
+*
+* @param d the index directory
+* @param a the analyzer to use
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be
+*  read/written to or if there is any other low-level
+*  io error
+* @deprecated this constructor will be removed in the 3.0 release.
+*  use {@link
+*  #indexwriter(directory,analyzer,maxfieldlength)}
+*  instead, and call {@link #commit()} when needed.
+*/
+public indexwriter directory d  analyzer a
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init d  a  false  null  true  default_max_field_length  null  null
+/**
+* constructs an indexwriter for the index in
+* <code>d</code>, first creating it if it does not
+* already exist.  text will be analyzed with
+* <code>a</code>.
+*
+* @param d the index directory
+* @param autocommit see <a href="#autocommit">above</a>
+* @param a the analyzer to use
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be
+*  read/written to or if there is any other low-level
+*  io error
+* @deprecated this constructor will be removed in the 3.0 release.
+*  use {@link
+*  #indexwriter(directory,analyzer,maxfieldlength)}
+*  instead, and call {@link #commit()} when needed.
+*/
+public indexwriter directory d  boolean autocommit  analyzer a
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init d  a  false  null  autocommit  default_max_field_length  null  null
+/**
+* constructs an indexwriter for the index in <code>d</code>.
+* text will be analyzed with <code>a</code>.  if <code>create</code>
+* is true, then a new, empty index will be created in
+* <code>d</code>, replacing the index already there, if any.
+*
+* @param d the index directory
+* @param autocommit see <a href="#autocommit">above</a>
+* @param a the analyzer to use
+* @param create <code>true</code> to create the index or overwrite
+*  the existing one; <code>false</code> to append to the existing
+*  index
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be read/written to, or
+*  if it does not exist and <code>create</code> is
+*  <code>false</code> or if there is any other low-level
+*  io error
+* @deprecated this constructor will be removed in the 3.0 release.
+*  use {@link
+*  #indexwriter(directory,analyzer,boolean,maxfieldlength)}
+*  instead, and call {@link #commit()} when needed.
+*/
+public indexwriter directory d  boolean autocommit  analyzer a  boolean create
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init d  a  create  false  null  autocommit  default_max_field_length  null  null
+/**
+* expert: constructs an indexwriter with a custom {@link
+* indexdeletionpolicy}, for the index in <code>d</code>,
+* first creating it if it does not already exist.  text
+* will be analyzed with <code>a</code>.
+*
+* <p><b>note</b>: autocommit (see <a
+* href="#autocommit">above</a>) is set to false with this
+* constructor.
+*
+* @param d the index directory
+* @param a the analyzer to use
+* @param deletionpolicy see <a href="#deletionpolicy">above</a>
+* @param mfl whether or not to limit field lengths
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be
+*  read/written to or if there is any other low-level
+*  io error
+*/
+public indexwriter directory d  analyzer a  indexdeletionpolicy deletionpolicy  maxfieldlength mfl
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init d  a  false  deletionpolicy  false  mfl getlimit    null  null
+/**
+* expert: constructs an indexwriter with a custom {@link
+* indexdeletionpolicy}, for the index in <code>d</code>,
+* first creating it if it does not already exist.  text
+* will be analyzed with <code>a</code>.
+*
+* @param d the index directory
+* @param autocommit see <a href="#autocommit">above</a>
+* @param a the analyzer to use
+* @param deletionpolicy see <a href="#deletionpolicy">above</a>
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be
+*  read/written to or if there is any other low-level
+*  io error
+* @deprecated this constructor will be removed in the 3.0 release.
+*  use {@link
+*  #indexwriter(directory,analyzer,indexdeletionpolicy,maxfieldlength)}
+*  instead, and call {@link #commit()} when needed.
+*/
+public indexwriter directory d  boolean autocommit  analyzer a  indexdeletionpolicy deletionpolicy
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init d  a  false  deletionpolicy  autocommit  default_max_field_length  null  null
+/**
+* expert: constructs an indexwriter with a custom {@link
+* indexdeletionpolicy}, for the index in <code>d</code>.
+* text will be analyzed with <code>a</code>.  if
+* <code>create</code> is true, then a new, empty index
+* will be created in <code>d</code>, replacing the index
+* already there, if any.
+*
+* <p><b>note</b>: autocommit (see <a
+* href="#autocommit">above</a>) is set to false with this
+* constructor.
+*
+* @param d the index directory
+* @param a the analyzer to use
+* @param create <code>true</code> to create the index or overwrite
+*  the existing one; <code>false</code> to append to the existing
+*  index
+* @param deletionpolicy see <a href="#deletionpolicy">above</a>
+* @param mfl {@link org.apache.lucene.index.indexwriter.maxfieldlength}, whether or not to limit field lengths.  value is in number of terms/tokens
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be read/written to, or
+*  if it does not exist and <code>create</code> is
+*  <code>false</code> or if there is any other low-level
+*  io error
+*/
+public indexwriter directory d  analyzer a  boolean create  indexdeletionpolicy deletionpolicy  maxfieldlength mfl
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init d  a  create  false  deletionpolicy  false  mfl getlimit    null  null
+/**
+* expert: constructs an indexwriter with a custom {@link
+* indexdeletionpolicy} and {@link indexingchain},
+* for the index in <code>d</code>.
+* text will be analyzed with <code>a</code>.  if
+* <code>create</code> is true, then a new, empty index
+* will be created in <code>d</code>, replacing the index
+* already there, if any.
+*
+* <p><b>note</b>: autocommit (see <a
+* href="#autocommit">above</a>) is set to false with this
+* constructor.
+*
+* @param d the index directory
+* @param a the analyzer to use
+* @param create <code>true</code> to create the index or overwrite
+*  the existing one; <code>false</code> to append to the existing
+*  index
+* @param deletionpolicy see <a href="#deletionpolicy">above</a>
+* @param mfl whether or not to limit field lengths, value is in number of terms/tokens.  see {@link org.apache.lucene.index.indexwriter.maxfieldlength}.
+* @param indexingchain the {@link docconsumer} chain to be used to
+*  process documents
+* @param commit which commit to open
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be read/written to, or
+*  if it does not exist and <code>create</code> is
+*  <code>false</code> or if there is any other low-level
+*  io error
+*/
+indexwriter directory d  analyzer a  boolean create  indexdeletionpolicy deletionpolicy  maxfieldlength mfl  indexingchain indexingchain  indexcommit commit
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init d  a  create  false  deletionpolicy  false  mfl getlimit    indexingchain  commit
+/**
+* expert: constructs an indexwriter with a custom {@link
+* indexdeletionpolicy}, for the index in <code>d</code>.
+* text will be analyzed with <code>a</code>.  if
+* <code>create</code> is true, then a new, empty index
+* will be created in <code>d</code>, replacing the index
+* already there, if any.
+*
+* @param d the index directory
+* @param autocommit see <a href="#autocommit">above</a>
+* @param a the analyzer to use
+* @param create <code>true</code> to create the index or overwrite
+*  the existing one; <code>false</code> to append to the existing
+*  index
+* @param deletionpolicy see <a href="#deletionpolicy">above</a>
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be read/written to, or
+*  if it does not exist and <code>create</code> is
+*  <code>false</code> or if there is any other low-level
+*  io error
+* @deprecated this constructor will be removed in the 3.0 release.
+*  use {@link
+*  #indexwriter(directory,analyzer,boolean,indexdeletionpolicy,maxfieldlength)}
+*  instead, and call {@link #commit()} when needed.
+*/
+public indexwriter directory d  boolean autocommit  analyzer a  boolean create  indexdeletionpolicy deletionpolicy
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init d  a  create  false  deletionpolicy  autocommit  default_max_field_length  null  null
+/**
+* expert: constructs an indexwriter on specific commit
+* point, with a custom {@link indexdeletionpolicy}, for
+* the index in <code>d</code>.  text will be analyzed
+* with <code>a</code>.
+*
+* <p> this is only meaningful if you've used a {@link
+* indexdeletionpolicy} in that past that keeps more than
+* just the last commit.
+*
+* <p>this operation is similar to {@link #rollback()},
+* except that method can only rollback what's been done
+* with the current instance of indexwriter since its last
+* commit, whereas this method can rollback to an
+* arbitrary commit point from the past, assuming the
+* {@link indexdeletionpolicy} has preserved past
+* commits.
+*
+* <p><b>note</b>: autocommit (see <a
+* href="#autocommit">above</a>) is set to false with this
+* constructor.
+*
+* @param d the index directory
+* @param a the analyzer to use
+* @param deletionpolicy see <a href="#deletionpolicy">above</a>
+* @param mfl whether or not to limit field lengths, value is in number of terms/tokens.  see {@link org.apache.lucene.index.indexwriter.maxfieldlength}.
+* @param commit which commit to open
+* @throws corruptindexexception if the index is corrupt
+* @throws lockobtainfailedexception if another writer
+*  has this index open (<code>write.lock</code> could not
+*  be obtained)
+* @throws ioexception if the directory cannot be read/written to, or
+*  if it does not exist and <code>create</code> is
+*  <code>false</code> or if there is any other low-level
+*  io error
+*/
+public indexwriter directory d  analyzer a  indexdeletionpolicy deletionpolicy  maxfieldlength mfl  indexcommit commit
+throws corruptindexexception  lockobtainfailedexception  ioexception
+init d  a  false  false  deletionpolicy  false  mfl getlimit    null  commit
+private void init directory d  analyzer a  boolean closedir  indexdeletionpolicy deletionpolicy
+boolean autocommit  int maxfieldlength  indexingchain indexingchain  indexcommit commit
+throws corruptindexexception  lockobtainfailedexception  ioexception
+if  indexreader indexexists d
+init d  a  false  closedir  deletionpolicy  autocommit  maxfieldlength  indexingchain  commit
+else
+init d  a  true  closedir  deletionpolicy  autocommit  maxfieldlength  indexingchain  commit
+private void init directory d  analyzer a  final boolean create  boolean closedir
+indexdeletionpolicy deletionpolicy  boolean autocommit  int maxfieldlength
+indexingchain indexingchain  indexcommit commit
+throws corruptindexexception  lockobtainfailedexception  ioexception
+this closedir   closedir
+directory   d
+analyzer   a
+setmessageid defaultinfostream
+this maxfieldlength   maxfieldlength
+if  indexingchain    null
+indexingchain   documentswriter defaultindexingchain
+if  create
+// clear the write lock in case it's leftover:
+directory clearlock write_lock_name
+lock writelock   directory makelock write_lock_name
+if   writelock obtain writelocktimeout      obtain write lock
+throw new lockobtainfailedexception     writelock
+this writelock   writelock                       save it
+try
+if  create
+// try to read first.  this is to allow create
+// against an index that's currently open for
+// searching.  in this case we write the next
+// segments_n file with no segments:
+boolean docommit
+try
+segmentinfos read directory
+segmentinfos clear
+docommit   false
+catch  ioexception e
+// likely this means it's a fresh directory
+docommit   true
+if  autocommit    docommit
+// always commit if autocommit=true, else only
+// commit if there is no segments file in this dir
+// already.
+segmentinfos commit directory
+synced addall segmentinfos files directory  true
+else
+// record that we have a change (zero out all
+// segments) pending:
+changecount
+else
+segmentinfos read directory
+if  commit    null
+// swap out all segments, but, keep metadata in
+// segmentinfos, like version & generation, to
+// preserve write-once.  this is important if
+// readers are open against the future commit
+// points.
+if  commit getdirectory      directory
+throw new illegalargumentexception
+segmentinfos oldinfos   new segmentinfos
+oldinfos read directory  commit getsegmentsfilename
+segmentinfos replace oldinfos
+changecount
+if  infostream    null
+message
+// we assume that this segments_n was previously
+// properly sync'd:
+synced addall segmentinfos files directory  true
+this autocommit   autocommit
+setrollbacksegmentinfos segmentinfos
+docwriter   new documentswriter directory  this  indexingchain
+docwriter setinfostream infostream
+docwriter setmaxfieldlength maxfieldlength
+// default deleter (for backwards compatibility) is
+// keeponlylastcommitdeleter:
+deleter   new indexfiledeleter directory
+deletionpolicy    null ? new keeponlylastcommitdeletionpolicy     deletionpolicy
+segmentinfos  infostream  docwriter
+if  deleter startingcommitdeleted
+// deletion policy deleted the "head" commit point.
+// we have to mark ourself as changed so that if we
+// are closed w/o any further changes we write a new
+// segments_n file.
+changecount
+pushmaxbuffereddocs
+if  infostream    null
+message     create
+messagestate
+catch  ioexception e
+this writelock release
+this writelock   null
+throw e
+private synchronized void setrollbacksegmentinfos segmentinfos infos
+rollbacksegmentinfos    segmentinfos  infos clone
+assert  rollbacksegmentinfos hasexternalsegments directory
+rollbacksegments   new hashmap
+final int size   rollbacksegmentinfos size
+for int i 0 i<size i
+rollbacksegments put rollbacksegmentinfos info i   new integer i
+/**
+* expert: set the merge policy used by this writer.
+*/
+public void setmergepolicy mergepolicy mp
+ensureopen
+if  mp    null
+throw new nullpointerexception
+if  mergepolicy    mp
+mergepolicy close
+mergepolicy   mp
+pushmaxbuffereddocs
+if  infostream    null
+message     mp
+/**
+* expert: returns the current mergepolicy in use by this writer.
+* @see #setmergepolicy
+*/
+public mergepolicy getmergepolicy
+ensureopen
+return mergepolicy
+/**
+* expert: set the merge scheduler used by this writer.
+*/
+synchronized public void setmergescheduler mergescheduler mergescheduler  throws corruptindexexception  ioexception
+ensureopen
+if  mergescheduler    null
+throw new nullpointerexception
+if  this mergescheduler    mergescheduler
+finishmerges true
+this mergescheduler close
+this mergescheduler   mergescheduler
+if  infostream    null
+message     mergescheduler
+/**
+* expert: returns the current mergepolicy in use by this
+* writer.
+* @see #setmergepolicy
+*/
+public mergescheduler getmergescheduler
+ensureopen
+return mergescheduler
+/** <p>determines the largest segment (measured by
+* document count) that may be merged with other segments.
+* small values (e.g., less than 10,000) are best for
+* interactive indexing, as this limits the length of
+* pauses while indexing to a few seconds.  larger values
+* are best for batched indexing and speedier
+* searches.</p>
+*
+* <p>the default value is {@link integer#max_value}.</p>
+*
+* <p>note that this method is a convenience method: it
+* just calls mergepolicy.setmaxmergedocs as long as
+* mergepolicy is an instance of {@link logmergepolicy}.
+* otherwise an illegalargumentexception is thrown.</p>
+*
+* <p>the default merge policy ({@link
+* logbytesizemergepolicy}) also allows you to set this
+* limit by net size (in mb) of the segment, using {@link
+* logbytesizemergepolicy#setmaxmergemb}.</p>
+*/
+public void setmaxmergedocs int maxmergedocs
+getlogmergepolicy   setmaxmergedocs maxmergedocs
+/**
+* <p>returns the largest segment (measured by document
+* count) that may be merged with other segments.</p>
+*
+* <p>note that this method is a convenience method: it
+* just calls mergepolicy.getmaxmergedocs as long as
+* mergepolicy is an instance of {@link logmergepolicy}.
+* otherwise an illegalargumentexception is thrown.</p>
+*
+* @see #setmaxmergedocs
+*/
+public int getmaxmergedocs
+return getlogmergepolicy   getmaxmergedocs
+/**
+* the maximum number of terms that will be indexed for a single field in a
+* document.  this limits the amount of memory required for indexing, so that
+* collections with very large files will not crash the indexing process by
+* running out of memory.  this setting refers to the number of running terms,
+* not to the number of different terms.<p/>
+* <strong>note:</strong> this silently truncates large documents, excluding from the
+* index all terms that occur further in the document.  if you know your source
+* documents are large, be sure to set this value high enough to accomodate
+* the expected size.  if you set it to integer.max_value, then the only limit
+* is your memory, but you should anticipate an outofmemoryerror.<p/>
+* by default, no more than {@link #default_max_field_length} terms
+* will be indexed for a field.
+*/
+public void setmaxfieldlength int maxfieldlength
+ensureopen
+this maxfieldlength   maxfieldlength
+docwriter setmaxfieldlength maxfieldlength
+if  infostream    null
+message     maxfieldlength
+/**
+* returns the maximum number of terms that will be
+* indexed for a single field in a document.
+* @see #setmaxfieldlength
+*/
+public int getmaxfieldlength
+ensureopen
+return maxfieldlength
+/** determines the minimal number of documents required
+* before the buffered in-memory documents are flushed as
+* a new segment.  large values generally gives faster
+* indexing.
+*
+* <p>when this is set, the writer will flush every
+* maxbuffereddocs added documents.  pass in {@link
+* #disable_auto_flush} to prevent triggering a flush due
+* to number of buffered documents.  note that if flushing
+* by ram usage is also enabled, then the flush will be
+* triggered by whichever comes first.</p>
+*
+* <p>disabled by default (writer flushes by ram usage).</p>
+*
+* @throws illegalargumentexception if maxbuffereddocs is
+* enabled but smaller than 2, or it disables maxbuffereddocs
+* when rambuffersize is already disabled
+* @see #setrambuffersizemb
+*/
+public void setmaxbuffereddocs int maxbuffereddocs
+ensureopen
+if  maxbuffereddocs    disable_auto_flush    maxbuffereddocs < 2
+throw new illegalargumentexception
+if  maxbuffereddocs    disable_auto_flush
+getrambuffersizemb      disable_auto_flush
+throw new illegalargumentexception
+docwriter setmaxbuffereddocs maxbuffereddocs
+pushmaxbuffereddocs
+if  infostream    null
+message     maxbuffereddocs
+/**
+* if we are flushing by doc count (not by ram usage), and
+* using logdocmergepolicy then push maxbuffereddocs down
+* as its minmergedocs, to keep backwards compatibility.
+*/
+private void pushmaxbuffereddocs
+if  docwriter getmaxbuffereddocs      disable_auto_flush
+final mergepolicy mp   mergepolicy
+if  mp instanceof logdocmergepolicy
+logdocmergepolicy lmp    logdocmergepolicy  mp
+final int maxbuffereddocs   docwriter getmaxbuffereddocs
+if  lmp getminmergedocs      maxbuffereddocs
+if  infostream    null
+message     maxbuffereddocs
+lmp setminmergedocs maxbuffereddocs
+/**
+* returns the number of buffered added documents that will
+* trigger a flush if enabled.
+* @see #setmaxbuffereddocs
+*/
+public int getmaxbuffereddocs
+ensureopen
+return docwriter getmaxbuffereddocs
+/** determines the amount of ram that may be used for
+* buffering added documents and deletions before they are
+* flushed to the directory.  generally for faster
+* indexing performance it's best to flush by ram usage
+* instead of document count and use as large a ram buffer
+* as you can.
+*
+* <p>when this is set, the writer will flush whenever
+* buffered documents and deletions use this much ram.
+* pass in {@link #disable_auto_flush} to prevent
+* triggering a flush due to ram usage.  note that if
+* flushing by document count is also enabled, then the
+* flush will be triggered by whichever comes first.</p>
+*
+* <p> <b>note</b>: the account of ram usage for pending
+* deletions is only approximate.  specifically, if you
+* delete by query, lucene currently has no way to measure
+* the ram usage if individual queries so the accounting
+* will under-estimate and you should compensate by either
+* calling commit() periodically yourself, or by using
+* {@link #setmaxbuffereddeleteterms} to flush by count
+* instead of ram usage (each buffered delete query counts
+* as one).
+*
+* <p> the default value is {@link #default_ram_buffer_size_mb}.</p>
+*
+* @throws illegalargumentexception if rambuffersize is
+* enabled but non-positive, or it disables rambuffersize
+* when maxbuffereddocs is already disabled
+*/
+public void setrambuffersizemb double mb
+if  mb    disable_auto_flush    mb <  0 0
+throw new illegalargumentexception
+if  mb    disable_auto_flush    getmaxbuffereddocs      disable_auto_flush
+throw new illegalargumentexception
+docwriter setrambuffersizemb mb
+if  infostream    null
+message     mb
+/**
+* returns the value set by {@link #setrambuffersizemb} if enabled.
+*/
+public double getrambuffersizemb
+return docwriter getrambuffersizemb
+/**
+* <p>determines the minimal number of delete terms required before the buffered
+* in-memory delete terms are applied and flushed. if there are documents
+* buffered in memory at the time, they are merged and a new segment is
+* created.</p>
+* <p>disabled by default (writer flushes by ram usage).</p>
+*
+* @throws illegalargumentexception if maxbuffereddeleteterms
+* is enabled but smaller than 1
+* @see #setrambuffersizemb
+*/
+public void setmaxbuffereddeleteterms int maxbuffereddeleteterms
+ensureopen
+if  maxbuffereddeleteterms    disable_auto_flush
+maxbuffereddeleteterms < 1
+throw new illegalargumentexception
+docwriter setmaxbuffereddeleteterms maxbuffereddeleteterms
+if  infostream    null
+message     maxbuffereddeleteterms
+/**
+* returns the number of buffered deleted terms that will
+* trigger a flush if enabled.
+* @see #setmaxbuffereddeleteterms
+*/
+public int getmaxbuffereddeleteterms
+ensureopen
+return docwriter getmaxbuffereddeleteterms
+/** determines how often segment indices are merged by adddocument().  with
+* smaller values, less ram is used while indexing, and searches on
+* unoptimized indices are faster, but indexing speed is slower.  with larger
+* values, more ram is used during indexing, and while searches on unoptimized
+* indices are slower, indexing is faster.  thus larger values (> 10) are best
+* for batch index creation, and smaller values (< 10) for indices that are
+* interactively maintained.
+*
+* <p>note that this method is a convenience method: it
+* just calls mergepolicy.setmergefactor as long as
+* mergepolicy is an instance of {@link logmergepolicy}.
+* otherwise an illegalargumentexception is thrown.</p>
+*
+* <p>this must never be less than 2.  the default value is 10.
+*/
+public void setmergefactor int mergefactor
+getlogmergepolicy   setmergefactor mergefactor
+/**
+* <p>returns the number of segments that are merged at
+* once and also controls the total number of segments
+* allowed to accumulate in the index.</p>
+*
+* <p>note that this method is a convenience method: it
+* just calls mergepolicy.getmergefactor as long as
+* mergepolicy is an instance of {@link logmergepolicy}.
+* otherwise an illegalargumentexception is thrown.</p>
+*
+* @see #setmergefactor
+*/
+public int getmergefactor
+return getlogmergepolicy   getmergefactor
+/**
+* expert: returns max delay inserted before syncing a
+* commit point.  on windows, at least, pausing before
+* syncing can increase net indexing throughput.  the
+* delay is variable based on size of the segment's files,
+* and is only inserted when using
+* concurrentmergescheduler for merges.
+* @deprecated this will be removed in 3.0, when
+* autocommit=true is removed from indexwriter.
+*/
+public double getmaxsyncpauseseconds
+return maxsyncpauseseconds
+/**
+* expert: sets the max delay before syncing a commit
+* point.
+* @see #getmaxsyncpauseseconds
+* @deprecated this will be removed in 3.0, when
+* autocommit=true is removed from indexwriter.
+*/
+public void setmaxsyncpauseseconds double seconds
+maxsyncpauseseconds   seconds
+/** if non-null, this will be the default infostream used
+* by a newly instantiated indexwriter.
+* @see #setinfostream
+*/
+public static void setdefaultinfostream printstream infostream
+indexwriter defaultinfostream   infostream
+/**
+* returns the current default infostream for newly
+* instantiated indexwriters.
+* @see #setdefaultinfostream
+*/
+public static printstream getdefaultinfostream
+return indexwriter defaultinfostream
+/** if non-null, information about merges, deletes and a
+* message when maxfieldlength is reached will be printed
+* to this.
+*/
+public void setinfostream printstream infostream
+ensureopen
+setmessageid infostream
+docwriter setinfostream infostream
+deleter setinfostream infostream
+if  infostream    null
+messagestate
+private void messagestate
+message     directory
+autocommit
+mergepolicy
+mergescheduler
+docwriter getrambuffersizemb
+docwriter getmaxbuffereddocs
+docwriter getmaxbuffereddeleteterms
+maxfieldlength
+segstring
+/**
+* returns the current infostream in use by this writer.
+* @see #setinfostream
+*/
+public printstream getinfostream
+ensureopen
+return infostream
+/** returns true if verbosing is enabled (i.e., infostream != null). */
+public boolean verbose
+return infostream    null
+/**
+* sets the maximum time to wait for a write lock (in milliseconds) for this instance of indexwriter.  @see
+* @see #setdefaultwritelocktimeout to change the default value for all instances of indexwriter.
+*/
+public void setwritelocktimeout long writelocktimeout
+ensureopen
+this writelocktimeout   writelocktimeout
+/**
+* returns allowed timeout when acquiring the write lock.
+* @see #setwritelocktimeout
+*/
+public long getwritelocktimeout
+ensureopen
+return writelocktimeout
+/**
+* sets the default (for any instance of indexwriter) maximum time to wait for a write lock (in
+* milliseconds).
+*/
+public static void setdefaultwritelocktimeout long writelocktimeout
+indexwriter write_lock_timeout   writelocktimeout
+/**
+* returns default write lock timeout for newly
+* instantiated indexwriters.
+* @see #setdefaultwritelocktimeout
+*/
+public static long getdefaultwritelocktimeout
+return indexwriter write_lock_timeout
+/**
+* commits all changes to an index and closes all
+* associated files.  note that this may be a costly
+* operation, so, try to re-use a single writer instead of
+* closing and opening a new one.  see {@link #commit()} for
+* caveats about write caching done by some io devices.
+*
+* <p> if an exception is hit during close, eg due to disk
+* full or some other reason, then both the on-disk index
+* and the internal state of the indexwriter instance will
+* be consistent.  however, the close will not be complete
+* even though part of it (flushing buffered documents)
+* may have succeeded, so the write lock will still be
+* held.</p>
+*
+* <p> if you can correct the underlying cause (eg free up
+* some disk space) then you can call close() again.
+* failing that, if you want to force the write lock to be
+* released (dangerous, because you may then lose buffered
+* docs in the indexwriter instance) then you can do
+* something like this:</p>
+*
+* <pre>
+* try {
+*   writer.close();
+* } finally {
+*   if (indexwriter.islocked(directory)) {
+*     indexwriter.unlock(directory);
+*   }
+* }
+* </pre>
+*
+* after which, you must be certain not to use the writer
+* instance anymore.</p>
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer, again.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public void close   throws corruptindexexception  ioexception
+close true
+/**
+* closes the index with or without waiting for currently
+* running merges to finish.  this is only meaningful when
+* using a mergescheduler that runs merges in background
+* threads.
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer, again.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* <p><b>note</b>: it is dangerous to always call
+* close(false), especially when indexwriter is not open
+* for very long, because this can result in "merge
+* starvation" whereby long merges will never have a
+* chance to finish.  this will cause too many segments in
+* your index over time.</p>
+*
+* @param waitformerges if true, this call will block
+* until all merges complete; else, it will ask all
+* running merges to abort, wait until those merges have
+* finished (which should be at most a few seconds), and
+* then return.
+*/
+public void close boolean waitformerges  throws corruptindexexception  ioexception
+// ensure that only one thread actually gets to do the closing:
+if  shouldclose
+// if any methods have hit outofmemoryerror, then abort
+// on close, in case the internal state of indexwriter
+// or documentswriter is corrupt
+if  hitoom
+rollbackinternal
+else
+closeinternal waitformerges
+// returns true if this thread should attempt to close, or
+// false if indexwriter is now closed; else, waits until
+// another thread finishes closing
+synchronized private boolean shouldclose
+while true
+if   closed
+if   closing
+closing   true
+return true
+else
+// another thread is presently trying to close;
+// wait until it finishes one way (closes
+// successfully) or another (fails to close)
+dowait
+else
+return false
+private void closeinternal boolean waitformerges  throws corruptindexexception  ioexception
+docwriter pauseallthreads
+try
+if  infostream    null
+message
+docwriter close
+// only allow a new merge to be triggered if we are
+// going to wait for merges:
+if   hitoom
+flush waitformerges  true  true
+if  waitformerges
+// give merge scheduler last chance to run, in case
+// any pending merges are waiting:
+mergescheduler merge this
+mergepolicy close
+finishmerges waitformerges
+stopmerges   true
+mergescheduler close
+if  infostream    null
+message
+if   hitoom
+commit 0
+if  infostream    null
+message     segstring
+synchronized this
+readerpool close
+docwriter   null
+deleter close
+if  closedir
+directory close
+if  writelock    null
+writelock release                                release write lock
+writelock   null
+synchronized this
+closed   true
+catch  outofmemoryerror oom
+handleoom oom
+finally
+synchronized this
+closing   false
+notifyall
+if   closed
+if  docwriter    null
+docwriter resumeallthreads
+if  infostream    null
+message
+/** tells the docwriter to close its currently open shared
+*  doc stores (stored fields & vectors files).
+*  return value specifices whether new doc store files are compound or not.
+*/
+private synchronized boolean flushdocstores   throws ioexception
+boolean usecompounddocstore   false
+string docstoresegment
+boolean success   false
+try
+docstoresegment   docwriter closedocstore
+success   true
+finally
+if   success    infostream    null
+message
+usecompounddocstore   mergepolicy usecompounddocstore segmentinfos
+if  usecompounddocstore    docstoresegment    null    docwriter closedfiles   size      0
+// now build compound doc store file
+if  infostream    null
+message     docstoresegment       indexfilenames compound_file_store_extension
+success   false
+final int numsegments   segmentinfos size
+final string compoundfilename   docstoresegment       indexfilenames compound_file_store_extension
+try
+compoundfilewriter cfswriter   new compoundfilewriter directory  compoundfilename
+final iterator it   docwriter closedfiles   iterator
+while it hasnext
+cfswriter addfile  string  it next
+// perform the merge
+cfswriter close
+success   true
+finally
+if   success
+if  infostream    null
+message     docstoresegment
+deleter deletefile compoundfilename
+for int i 0 i<numsegments i
+segmentinfo si   segmentinfos info i
+if  si getdocstoreoffset       1
+si getdocstoresegment   equals docstoresegment
+si setdocstoreiscompoundfile true
+checkpoint
+// in case the files we just merged into a cfs were
+// not previously checkpointed:
+deleter deletenewfiles docwriter closedfiles
+return usecompounddocstore
+/** returns the directory used by this index. */
+public directory getdirectory
+// pass false because the flush during closing calls getdirectory
+ensureopen false
+return directory
+/** returns the analyzer used by this index. */
+public analyzer getanalyzer
+ensureopen
+return analyzer
+/** returns the number of documents currently in this
+*  index, not counting deletions.
+* @deprecated please use {@link #maxdoc()} (same as this
+* method) or {@link #numdocs()} (also takes deletions
+* into account), instead. */
+public synchronized int doccount
+ensureopen
+return maxdoc
+/** returns total number of docs in this index, including
+*  docs not yet flushed (still in the ram buffer),
+*  not counting deletions.
+*  @see #numdocs */
+public synchronized int maxdoc
+int count
+if  docwriter    null
+count   docwriter getnumdocsinram
+else
+count   0
+for  int i   0  i < segmentinfos size    i
+count    segmentinfos info i  doccount
+return count
+/** returns total number of docs in this index, including
+*  docs not yet flushed (still in the ram buffer), and
+*  including deletions.  <b>note:</b> buffered deletions
+*  are not counted.  if you really need these to be
+*  counted you should call {@link #commit()} first.
+*  @see #numdocs */
+public synchronized int numdocs   throws ioexception
+int count
+if  docwriter    null
+count   docwriter getnumdocsinram
+else
+count   0
+for  int i   0  i < segmentinfos size    i
+final segmentinfo info   segmentinfos info i
+count    info doccount   info getdelcount
+return count
+public synchronized boolean hasdeletions   throws ioexception
+ensureopen
+if  docwriter hasdeletes
+return true
+for  int i   0  i < segmentinfos size    i
+if  segmentinfos info i  hasdeletions
+return true
+return false
+/**
+* the maximum number of terms that will be indexed for a single field in a
+* document.  this limits the amount of memory required for indexing, so that
+* collections with very large files will not crash the indexing process by
+* running out of memory.<p/>
+* note that this effectively truncates large documents, excluding from the
+* index terms that occur further in the document.  if you know your source
+* documents are large, be sure to set this value high enough to accommodate
+* the expected size.  if you set it to integer.max_value, then the only limit
+* is your memory, but you should anticipate an outofmemoryerror.<p/>
+* by default, no more than 10,000 terms will be indexed for a field.
+*
+* @see maxfieldlength
+*/
+private int maxfieldlength
+/**
+* adds a document to this index.  if the document contains more than
+* {@link #setmaxfieldlength(int)} terms for a given field, the remainder are
+* discarded.
+*
+* <p> note that if an exception is hit (for example disk full)
+* then the index will be consistent, but this document
+* may not have been added.  furthermore, it's possible
+* the index will have one segment in non-compound format
+* even when using compound files (when a merge has
+* partially succeeded).</p>
+*
+* <p> this method periodically flushes pending documents
+* to the directory (see <a href="#flush">above</a>), and
+* also periodically triggers segment merges in the index
+* according to the {@link mergepolicy} in use.</p>
+*
+* <p>merges temporarily consume space in the
+* directory. the amount of space required is up to 1x the
+* size of all segments being merged, when no
+* readers/searchers are open against the index, and up to
+* 2x the size of all segments being merged when
+* readers/searchers are open against the index (see
+* {@link #optimize()} for details). the sequence of
+* primitive merge operations performed is governed by the
+* merge policy.
+*
+* <p>note that each term in the document can be no longer
+* than 16383 characters, otherwise an
+* illegalargumentexception will be thrown.</p>
+*
+* <p>note that it's possible to create an invalid unicode
+* string in java if a utf16 surrogate pair is malformed.
+* in this case, the invalid characters are silently
+* replaced with the unicode replacement character
+* u+fffd.</p>
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public void adddocument document doc  throws corruptindexexception  ioexception
+adddocument doc  analyzer
+/**
+* adds a document to this index, using the provided analyzer instead of the
+* value of {@link #getanalyzer()}.  if the document contains more than
+* {@link #setmaxfieldlength(int)} terms for a given field, the remainder are
+* discarded.
+*
+* <p>see {@link #adddocument(document)} for details on
+* index and indexwriter state after an exception, and
+* flushing/merging temporary free space requirements.</p>
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public void adddocument document doc  analyzer analyzer  throws corruptindexexception  ioexception
+ensureopen
+boolean doflush   false
+boolean success   false
+try
+try
+doflush   docwriter adddocument doc  analyzer
+success   true
+finally
+if   success
+if  infostream    null
+message
+synchronized  this
+// if docwriter has some aborted files that were
+// never incref'd, then we clean them up here
+if  docwriter    null
+final collection files   docwriter abortedfiles
+if  files    null
+deleter deletenewfiles files
+if  doflush
+flush true  false  false
+catch  outofmemoryerror oom
+handleoom oom
+/**
+* deletes the document(s) containing <code>term</code>.
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @param term the term to identify the documents to be deleted
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public void deletedocuments term term  throws corruptindexexception  ioexception
+ensureopen
+try
+boolean doflush   docwriter bufferdeleteterm term
+if  doflush
+flush true  false  false
+catch  outofmemoryerror oom
+handleoom oom
+/**
+* deletes the document(s) containing any of the
+* terms. all deletes are flushed at the same time.
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @param terms array of terms to identify the documents
+* to be deleted
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public void deletedocuments term terms  throws corruptindexexception  ioexception
+ensureopen
+try
+boolean doflush   docwriter bufferdeleteterms terms
+if  doflush
+flush true  false  false
+catch  outofmemoryerror oom
+handleoom oom
+/**
+* deletes the document(s) matching the provided query.
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @param query the query to identify the documents to be deleted
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public void deletedocuments query query  throws corruptindexexception  ioexception
+ensureopen
+boolean doflush   docwriter bufferdeletequery query
+if  doflush
+flush true  false  false
+/**
+* deletes the document(s) matching any of the provided queries.
+* all deletes are flushed at the same time.
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @param queries array of queries to identify the documents
+* to be deleted
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public void deletedocuments query queries  throws corruptindexexception  ioexception
+ensureopen
+boolean doflush   docwriter bufferdeletequeries queries
+if  doflush
+flush true  false  false
+/**
+* updates a document by first deleting the document(s)
+* containing <code>term</code> and then adding the new
+* document.  the delete and then add are atomic as seen
+* by a reader on the same index (flush may happen only after
+* the add).
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @param term the term to identify the document(s) to be
+* deleted
+* @param doc the document to be added
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public void updatedocument term term  document doc  throws corruptindexexception  ioexception
+ensureopen
+updatedocument term  doc  getanalyzer
+/**
+* updates a document by first deleting the document(s)
+* containing <code>term</code> and then adding the new
+* document.  the delete and then add are atomic as seen
+* by a reader on the same index (flush may happen only after
+* the add).
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @param term the term to identify the document(s) to be
+* deleted
+* @param doc the document to be added
+* @param analyzer the analyzer to use when analyzing the document
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public void updatedocument term term  document doc  analyzer analyzer
+throws corruptindexexception  ioexception
+ensureopen
+try
+boolean doflush   false
+boolean success   false
+try
+doflush   docwriter updatedocument term  doc  analyzer
+success   true
+finally
+if   success
+if  infostream    null
+message
+synchronized  this
+// if docwriter has some aborted files that were
+// never incref'd, then we clean them up here
+final collection files   docwriter abortedfiles
+if  files    null
+deleter deletenewfiles files
+if  doflush
+flush true  false  false
+catch  outofmemoryerror oom
+handleoom oom
+// for test purpose
+final synchronized int getsegmentcount
+return segmentinfos size
+// for test purpose
+final synchronized int getnumbuffereddocuments
+return docwriter getnumdocsinram
+// for test purpose
+final synchronized int getdoccount int i
+if  i >  0    i < segmentinfos size
+return segmentinfos info i  doccount
+else
+return  1
+// for test purpose
+final synchronized int getflushcount
+return flushcount
+// for test purpose
+final synchronized int getflushdeletescount
+return flushdeletescount
+final string newsegmentname
+// cannot synchronize on indexwriter because that causes
+// deadlock
+synchronized segmentinfos
+// important to increment changecount so that the
+// segmentinfos is written on close.  otherwise we
+// could close, re-open and re-return the same segment
+// name that was previously returned which can cause
+// problems at least with concurrentmergescheduler.
+changecount
+return     integer tostring segmentinfos counter    character max_radix
+/** if non-null, information about merges will be printed to this.
+*/
+private printstream infostream   null
+private static printstream defaultinfostream   null
+/**
+* requests an "optimize" operation on an index, priming the index
+* for the fastest available search. traditionally this has meant
+* merging all segments into a single segment as is done in the
+* default merge policy, but individual merge policies may implement
+* optimize in different ways.
+*
+* <p>it is recommended that this method be called upon completion of indexing.  in
+* environments with frequent updates, optimize is best done during low volume times, if at all.
+*
+* </p>
+* <p>see http://www.gossamer-threads.com/lists/lucene/java-dev/47895 for more discussion. </p>
+*
+* <p>note that optimize requires 2x the index size free
+* space in your directory.  for example, if your index
+* size is 10 mb then you need 20 mb free for optimize to
+* complete.</p>
+*
+* <p>if some but not all readers re-open while an
+* optimize is underway, this will cause > 2x temporary
+* space to be consumed as those new readers will then
+* hold open the partially optimized segments at that
+* time.  it is best not to re-open readers while optimize
+* is running.</p>
+*
+* <p>the actual temporary usage could be much less than
+* these figures (it depends on many factors).</p>
+*
+* <p>in general, once the optimize completes, the total size of the
+* index will be less than the size of the starting index.
+* it could be quite a bit smaller (if there were many
+* pending deletes) or just slightly smaller.</p>
+*
+* <p>if an exception is hit during optimize(), for example
+* due to disk full, the index will not be corrupt and no
+* documents will have been lost.  however, it may have
+* been partially optimized (some segments were merged but
+* not all), and it's possible that one of the segments in
+* the index will be in non-compound format even when
+* using compound file format.  this will occur when the
+* exception is hit during conversion of the segment into
+* compound format.</p>
+*
+* <p>this call will optimize those segments present in
+* the index when the call started.  if other threads are
+* still adding documents and flushing segments, those
+* newly created segments will not be optimized unless you
+* call optimize again.</p>
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+* @see logmergepolicy#findmergesforoptimize
+*/
+public void optimize   throws corruptindexexception  ioexception
+optimize true
+/**
+* optimize the index down to <= maxnumsegments.  if
+* maxnumsegments==1 then this is the same as {@link
+* #optimize()}.
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @param maxnumsegments maximum number of segments left
+* in the index after optimization finishes
+*/
+public void optimize int maxnumsegments  throws corruptindexexception  ioexception
+optimize maxnumsegments  true
+/** just like {@link #optimize()}, except you can specify
+*  whether the call should block until the optimize
+*  completes.  this is only meaningful with a
+*  {@link mergescheduler} that is able to run merges in
+*  background threads.
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*/
+public void optimize boolean dowait  throws corruptindexexception  ioexception
+optimize 1  dowait
+/** just like {@link #optimize(int)}, except you can
+*  specify whether the call should block until the
+*  optimize completes.  this is only meaningful with a
+*  {@link mergescheduler} that is able to run merges in
+*  background threads.
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*/
+public void optimize int maxnumsegments  boolean dowait  throws corruptindexexception  ioexception
+ensureopen
+if  maxnumsegments < 1
+throw new illegalargumentexception     maxnumsegments
+if  infostream    null
+message     segstring
+flush true  false  true
+synchronized this
+resetmergeexceptions
+segmentstooptimize   new hashset
+final int numsegments   segmentinfos size
+for int i 0 i<numsegments i
+segmentstooptimize add segmentinfos info i
+// now mark all pending & running merges as optimize
+// merge:
+iterator it   pendingmerges iterator
+while it hasnext
+final mergepolicy onemerge merge    mergepolicy onemerge  it next
+merge optimize   true
+merge maxnumsegmentsoptimize   maxnumsegments
+it   runningmerges iterator
+while it hasnext
+final mergepolicy onemerge merge    mergepolicy onemerge  it next
+merge optimize   true
+merge maxnumsegmentsoptimize   maxnumsegments
+maybemerge maxnumsegments  true
+if  dowait
+synchronized this
+while true
+if  hitoom
+throw new illegalstateexception
+if  mergeexceptions size   > 0
+// forward any exceptions in background merge
+// threads to the current thread:
+final int size   mergeexceptions size
+for int i 0 i<size i
+final mergepolicy onemerge merge    mergepolicy onemerge  mergeexceptions get 0
+if  merge optimize
+ioexception err   new ioexception     merge segstring directory
+final throwable t   merge getexception
+if  t    null
+err initcause t
+throw err
+if  optimizemergespending
+dowait
+else
+break
+// if close is called while we are still
+// running, throw an exception so the calling
+// thread will know the optimize did not
+// complete
+ensureopen
+// note: in the concurrentmergescheduler case, when
+// dowait is false, we can return immediately while
+// background threads accomplish the optimization
+/** returns true if any merges in pendingmerges or
+*  runningmerges are optimization merges. */
+private synchronized boolean optimizemergespending
+iterator it   pendingmerges iterator
+while it hasnext
+if    mergepolicy onemerge  it next    optimize
+return true
+it   runningmerges iterator
+while it hasnext
+if    mergepolicy onemerge  it next    optimize
+return true
+return false
+/** just like {@link #expungedeletes()}, except you can
+*  specify whether the call should block until the
+*  operation completes.  this is only meaningful with a
+*  {@link mergescheduler} that is able to run merges in
+*  background threads.
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*/
+public void expungedeletes boolean dowait
+throws corruptindexexception  ioexception
+ensureopen
+if  infostream    null
+message     segstring
+mergepolicy mergespecification spec
+synchronized this
+spec   mergepolicy findmergestoexpungedeletes segmentinfos
+if  spec    null
+final int nummerges   spec merges size
+for int i 0 i<nummerges i
+registermerge  mergepolicy onemerge  spec merges get i
+mergescheduler merge this
+if  spec    null    dowait
+final int nummerges   spec merges size
+synchronized this
+boolean running   true
+while running
+if  hitoom
+throw new illegalstateexception
+// check each merge that mergepolicy asked us to
+// do, to see if any of them are still running and
+// if any of them have hit an exception.
+running   false
+for int i 0 i<nummerges i
+final mergepolicy onemerge merge    mergepolicy onemerge  spec merges get i
+if  pendingmerges contains merge     runningmerges contains merge
+running   true
+throwable t   merge getexception
+if  t    null
+ioexception ioe   new ioexception     merge segstring directory
+ioe initcause t
+throw ioe
+// if any of our merges are still running, wait:
+if  running
+dowait
+// note: in the concurrentmergescheduler case, when
+// dowait is false, we can return immediately while
+// background threads accomplish the optimization
+/** expunges all deletes from the index.  when an index
+*  has many document deletions (or updates to existing
+*  documents), it's best to either call optimize or
+*  expungedeletes to remove all unused data in the index
+*  associated with the deleted documents.  to see how
+*  many deletions you have pending in your index, call
+*  {@link indexreader#numdeleteddocs}
+*  this saves disk space and memory usage while
+*  searching.  expungedeletes should be somewhat faster
+*  than optimize since it does not insist on reducing the
+*  index to a single segment (though, this depends on the
+*  {@link mergepolicy}; see {@link
+*  mergepolicy#findmergestoexpungedeletes}.). note that
+*  this call does not first commit any buffered
+*  documents, so you must do so yourself if necessary.
+*  see also {@link #expungedeletes(boolean)}
+*
+*  <p><b>note</b>: if this method hits an outofmemoryerror
+*  you should immediately close the writer.  see <a
+*  href="#oome">above</a> for details.</p>
+*/
+public void expungedeletes   throws corruptindexexception  ioexception
+expungedeletes true
+/**
+* expert: asks the mergepolicy whether any merges are
+* necessary now and if so, runs the requested merges and
+* then iterate (test again if merges are needed) until no
+* more merges are returned by the mergepolicy.
+*
+* explicit calls to maybemerge() are usually not
+* necessary. the most common case is when merge policy
+* parameters have changed.
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*/
+public final void maybemerge   throws corruptindexexception  ioexception
+maybemerge false
+private final void maybemerge boolean optimize  throws corruptindexexception  ioexception
+maybemerge 1  optimize
+private final void maybemerge int maxnumsegmentsoptimize  boolean optimize  throws corruptindexexception  ioexception
+updatependingmerges maxnumsegmentsoptimize  optimize
+mergescheduler merge this
+private synchronized void updatependingmerges int maxnumsegmentsoptimize  boolean optimize
+throws corruptindexexception  ioexception
+assert  optimize    maxnumsegmentsoptimize > 0
+if  stopmerges
+return
+// do not start new merges if we've hit oome
+if  hitoom
+return
+final mergepolicy mergespecification spec
+if  optimize
+spec   mergepolicy findmergesforoptimize segmentinfos  maxnumsegmentsoptimize  segmentstooptimize
+if  spec    null
+final int nummerges   spec merges size
+for int i 0 i<nummerges i
+final mergepolicy onemerge merge     mergepolicy onemerge  spec merges get i
+merge optimize   true
+merge maxnumsegmentsoptimize   maxnumsegmentsoptimize
+else
+spec   mergepolicy findmerges segmentinfos
+if  spec    null
+final int nummerges   spec merges size
+for int i 0 i<nummerges i
+registermerge  mergepolicy onemerge  spec merges get i
+/** expert: the {@link mergescheduler} calls this method
+*  to retrieve the next merge requested by the
+*  mergepolicy */
+synchronized mergepolicy onemerge getnextmerge
+if  pendingmerges size      0
+return null
+else
+// advance the merge from pending to running
+mergepolicy onemerge merge    mergepolicy onemerge  pendingmerges removefirst
+runningmerges add merge
+return merge
+/** like getnextmerge() except only returns a merge if it's
+*  external. */
+private synchronized mergepolicy onemerge getnextexternalmerge
+if  pendingmerges size      0
+return null
+else
+iterator it   pendingmerges iterator
+while it hasnext
+mergepolicy onemerge merge    mergepolicy onemerge  it next
+if  merge isexternal
+// advance the merge from pending to running
+it remove
+runningmerges add merge
+return merge
+// all existing merges do not involve external segments
+return null
+/*
+* begin a transaction.  during a transaction, any segment
+* merges that happen (or ram segments flushed) will not
+* write a new segments file and will not remove any files
+* that were present at the start of the transaction.  you
+* must make a matched (try/finally) call to
+* committransaction() or rollbacktransaction() to finish
+* the transaction.
+*
+* note that buffered documents and delete terms are not handled
+* within the transactions, so they must be flushed before the
+* transaction is started.
+*/
+private synchronized void starttransaction boolean havereadlock  throws ioexception
+boolean success   false
+try
+if  infostream    null
+message
+assert docwriter getnumbuffereddeleteterms      0
+docwriter getnumbuffereddeleteterms
+assert docwriter getnumdocsinram      0
+docwriter getnumdocsinram
+ensureopen
+// if a transaction is trying to roll back (because
+// addindexes hit an exception) then wait here until
+// that's done:
+synchronized this
+while stopmerges
+dowait
+success   true
+finally
+// release the write lock if our caller held it, on
+// hitting an exception
+if   success    havereadlock
+releaseread
+if  havereadlock
+upgradereadtowrite
+else
+acquirewrite
+success   false
+try
+localrollbacksegmentinfos    segmentinfos  segmentinfos clone
+assert  hasexternalsegments
+localautocommit   autocommit
+localflusheddoccount   docwriter getflusheddoccount
+if  localautocommit
+if  infostream    null
+message
+flush true  false  false
+// turn off auto-commit during our local transaction:
+autocommit   false
+else
+// we must "protect" our files at this point from
+// deletion in case we need to rollback:
+deleter incref segmentinfos  false
+success   true
+finally
+if   success
+finishaddindexes
+/*
+* rolls back the transaction and restores state to where
+* we were at the start.
+*/
+private synchronized void rollbacktransaction   throws ioexception
+if  infostream    null
+message
+// first restore autocommit in case we hit an exception below:
+autocommit   localautocommit
+if  docwriter    null
+docwriter setflusheddoccount localflusheddoccount
+// must finish merges before rolling back segmentinfos
+// so merges don't hit exceptions on trying to commit
+// themselves, don't get files deleted out from under
+// them, etc:
+finishmerges false
+// keep the same segmentinfos instance but replace all
+// of its segmentinfo instances.  this is so the next
+// attempt to commit using this instance of indexwriter
+// will always write to a new generation ("write once").
+segmentinfos clear
+segmentinfos addall localrollbacksegmentinfos
+localrollbacksegmentinfos   null
+// this must come after we rollback segmentinfos, so
+// that if a commit() kicks off it does not see the
+// segmentinfos with external segments
+finishaddindexes
+// ask deleter to locate unreferenced files we had
+// created & remove them:
+deleter checkpoint segmentinfos  false
+if   autocommit
+// remove the incref we did in starttransaction:
+deleter decref segmentinfos
+// also ask deleter to remove any newly created files
+// that were never incref'd; this "garbage" is created
+// when a merge kicks off but aborts part way through
+// before it had a chance to incref the files it had
+// partially created
+deleter refresh
+notifyall
+assert  hasexternalsegments
+/*
+* commits the transaction.  this will write the new
+* segments file and remove and pending deletions we have
+* accumulated during the transaction
+*/
+private synchronized void committransaction   throws ioexception
+if  infostream    null
+message
+// first restore autocommit in case we hit an exception below:
+autocommit   localautocommit
+// give deleter a chance to remove files now:
+checkpoint
+if  autocommit
+boolean success   false
+try
+commit 0
+success   true
+finally
+if   success
+if  infostream    null
+message
+rollbacktransaction
+else
+// remove the incref we did in starttransaction.
+deleter decref localrollbacksegmentinfos
+localrollbacksegmentinfos   null
+assert  hasexternalsegments
+finishaddindexes
+/**
+* @deprecated please use {@link #rollback} instead.
+*/
+public void abort   throws ioexception
+rollback
+/**
+* close the <code>indexwriter</code> without committing
+* any changes that have occurred since the last commit
+* (or since it was opened, if commit hasn't been called).
+* this removes any temporary files that had been created,
+* after which the state of the index will be the same as
+* it was when commit() was last called or when this
+* writer was first opened.  this can only be called when
+* this indexwriter was opened with
+* <code>autocommit=false</code>.  this also clears a
+* previous call to {@link #preparecommit}.
+* @throws illegalstateexception if this is called when
+*  the writer was opened with <code>autocommit=true</code>.
+* @throws ioexception if there is a low-level io error
+*/
+public void rollback   throws ioexception
+ensureopen
+if  autocommit
+throw new illegalstateexception
+// ensure that only one thread actually gets to do the closing:
+if  shouldclose
+rollbackinternal
+private void rollbackinternal   throws ioexception
+boolean success   false
+docwriter pauseallthreads
+try
+finishmerges false
+// must pre-close these two, in case they increment
+// changecount so that we can then set it to false
+// before calling closeinternal
+mergepolicy close
+mergescheduler close
+synchronized this
+if  pendingcommit    null
+pendingcommit rollbackcommit directory
+deleter decref pendingcommit
+pendingcommit   null
+notifyall
+// keep the same segmentinfos instance but replace all
+// of its segmentinfo instances.  this is so the next
+// attempt to commit using this instance of indexwriter
+// will always write to a new generation ("write
+// once").
+segmentinfos clear
+segmentinfos addall rollbacksegmentinfos
+assert  hasexternalsegments
+docwriter abort
+assert testpoint
+// ask deleter to locate unreferenced files & remove
+// them:
+deleter checkpoint segmentinfos  false
+deleter refresh
+// don't bother saving any changes in our segmentinfos
+readerpool clear null
+lastcommitchangecount   changecount
+success   true
+catch  outofmemoryerror oom
+handleoom oom
+finally
+synchronized this
+if   success
+docwriter resumeallthreads
+closing   false
+notifyall
+if  infostream    null
+message
+closeinternal false
+/**
+* delete all documents in the index.
+*
+* <p>this method will drop all buffered documents and will
+*    remove all segments from the index. this change will not be
+*    visible until a {@link #commit()} has been called. this method
+*    can be rolled back using {@link #rollback()}.</p>
+*
+* <p>note: this method is much faster than using deletedocuments( new matchalldocsquery() ).</p>
+*
+* <p>note: this method will forcefully abort all merges
+*    in progress.  if other threads are running {@link
+*    #optimize()} or any of the addindexes methods, they
+*    will receive {@link mergepolicy.mergeabortedexception}s.
+*/
+public synchronized void deleteall   throws ioexception
+docwriter pauseallthreads
+try
+// abort any running merges
+finishmerges false
+// remove any buffered docs
+docwriter abort
+docwriter setflusheddoccount 0
+// remove all segments
+segmentinfos clear
+// ask deleter to locate unreferenced files & remove them:
+deleter checkpoint segmentinfos  false
+deleter refresh
+// don't bother saving any changes in our segmentinfos
+readerpool clear null
+// mark that the index has changed
+changecount
+catch  outofmemoryerror oom
+handleoom oom
+finally
+docwriter resumeallthreads
+if  infostream    null
+message
+private synchronized void finishmerges boolean waitformerges  throws ioexception
+if   waitformerges
+stopmerges   true
+// abort all pending & running merges:
+iterator it   pendingmerges iterator
+while it hasnext
+final mergepolicy onemerge merge    mergepolicy onemerge  it next
+if  infostream    null
+message     merge segstring directory
+merge abort
+mergefinish merge
+pendingmerges clear
+it   runningmerges iterator
+while it hasnext
+final mergepolicy onemerge merge    mergepolicy onemerge  it next
+if  infostream    null
+message     merge segstring directory
+merge abort
+// ensure any running addindexes finishes.  it's fine
+// if a new one attempts to start because its merges
+// will quickly see the stopmerges == true and abort.
+acquireread
+releaseread
+// these merges periodically check whether they have
+// been aborted, and stop if so.  we wait here to make
+// sure they all stop.  it should not take very long
+// because the merge threads periodically check if
+// they are aborted.
+while runningmerges size   > 0
+if  infostream    null
+message     runningmerges size
+dowait
+stopmerges   false
+notifyall
+assert 0    mergingsegments size
+if  infostream    null
+message
+else
+// waitformerges() will ensure any running addindexes finishes.
+// it's fine if a new one attempts to start because from our
+// caller above the call will see that we are in the
+// process of closing, and will throw an
+// alreadyclosedexception.
+waitformerges
+/**
+* wait for any currently outstanding merges to finish.
+*
+* <p>it is guaranteed that any merges started prior to calling this method
+*    will have completed once this method completes.</p>
+*/
+public synchronized void waitformerges
+// ensure any running addindexes finishes.
+acquireread
+releaseread
+while pendingmerges size   > 0    runningmerges size   > 0
+dowait
+// sanity check
+assert 0    mergingsegments size
+/*
+* called whenever the segmentinfos has been updated and
+* the index files referenced exist (correctly) in the
+* index directory.
+*/
+private synchronized void checkpoint   throws ioexception
+changecount
+deleter checkpoint segmentinfos  false
+private void finishaddindexes
+releasewrite
+private void blockaddindexes boolean includependingclose
+acquireread
+boolean success   false
+try
+// make sure we are still open since we could have
+// waited quite a while for last addindexes to finish
+ensureopen includependingclose
+success   true
+finally
+if   success
+releaseread
+private void resumeaddindexes
+releaseread
+/** merges all segments from an array of indexes into this index.
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @deprecated use {@link #addindexesnooptimize} instead,
+* then separately call {@link #optimize} afterwards if
+* you need to.
+*
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public void addindexes directory dirs
+throws corruptindexexception  ioexception
+ensureopen
+nodupdirs dirs
+// do not allow add docs or deletes while we are running:
+docwriter pauseallthreads
+try
+if  infostream    null
+message
+flush true  false  true
+boolean success   false
+starttransaction false
+try
+int doccount   0
+synchronized this
+ensureopen
+for  int i   0  i < dirs length  i
+segmentinfos sis   new segmentinfos   	     read infos from dir
+sis read dirs
+for  int j   0  j < sis size    j
+final segmentinfo info   sis info j
+doccount    info doccount
+assert  segmentinfos contains info
+segmentinfos add info  	     add each info
+// notify documentswriter that the flushed count just increased
+docwriter updateflusheddoccount doccount
+optimize
+success   true
+finally
+if  success
+committransaction
+else
+rollbacktransaction
+catch  outofmemoryerror oom
+handleoom oom
+finally
+if  docwriter    null
+docwriter resumeallthreads
+private synchronized void resetmergeexceptions
+mergeexceptions   new arraylist
+mergegen
+private void nodupdirs directory dirs
+hashset dups   new hashset
+for int i 0 i<dirs length i
+if  dups contains dirs
+throw new illegalargumentexception     dirs
+if  dirs    directory
+throw new illegalargumentexception
+dups add dirs
+/**
+* merges all segments from an array of indexes into this
+* index.
+*
+* <p>this may be used to parallelize batch indexing.  a large document
+* collection can be broken into sub-collections.  each sub-collection can be
+* indexed in parallel, on a different thread, process or machine.  the
+* complete index can then be created by merging sub-collection indexes
+* with this method.
+*
+* <p><b>note:</b> the index in each directory must not be
+* changed (opened by a writer) while this method is
+* running.  this method does not acquire a write lock in
+* each input directory, so it is up to the caller to
+* enforce this.
+*
+* <p><b>note:</b> while this is running, any attempts to
+* add or delete documents (with another thread) will be
+* paused until this method completes.
+*
+* <p>this method is transactional in how exceptions are
+* handled: it does not commit a new segments_n file until
+* all indexes are added.  this means if an exception
+* occurs (for example disk full), then either no indexes
+* will have been added or they all will have been.</p>
+*
+* <p>note that this requires temporary free space in the
+* directory up to 2x the sum of all input indexes
+* (including the starting index).  if readers/searchers
+* are open against the starting index, then temporary
+* free space required will be higher by the size of the
+* starting index (see {@link #optimize()} for details).
+* </p>
+*
+* <p>once this completes, the final size of the index
+* will be less than the sum of all input index sizes
+* (including the starting index).  it could be quite a
+* bit smaller (if there were many pending deletes) or
+* just slightly smaller.</p>
+*
+* <p>
+* this requires this index not be among those to be added.
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public void addindexesnooptimize directory dirs
+throws corruptindexexception  ioexception
+ensureopen
+nodupdirs dirs
+// do not allow add docs or deletes while we are running:
+docwriter pauseallthreads
+try
+if  infostream    null
+message
+flush true  false  true
+boolean success   false
+starttransaction false
+try
+int doccount   0
+synchronized this
+ensureopen
+for  int i   0  i < dirs length  i
+if  directory    dirs
+// cannot add this index: segments may be deleted in merge before added
+throw new illegalargumentexception
+segmentinfos sis   new segmentinfos       read infos from dir
+sis read dirs
+for  int j   0  j < sis size    j
+segmentinfo info   sis info j
+assert  segmentinfos contains info       info dir       info name
+doccount    info doccount
+segmentinfos add info      add each info
+// notify documentswriter that the flushed count just increased
+docwriter updateflusheddoccount doccount
+maybemerge
+ensureopen
+// if after merging there remain segments in the index
+// that are in a different directory, just copy these
+// over into our index.  this is necessary (before
+// finishing the transaction) to avoid leaving the
+// index in an unusable (inconsistent) state.
+resolveexternalsegments
+ensureopen
+success   true
+finally
+if  success
+committransaction
+else
+rollbacktransaction
+catch  outofmemoryerror oom
+handleoom oom
+finally
+if  docwriter    null
+docwriter resumeallthreads
+private boolean hasexternalsegments
+return segmentinfos hasexternalsegments directory
+/* if any of our segments are using a directory != ours
+* then we have to either copy them over one by one, merge
+* them (if merge policy has chosen to) or wait until
+* currently running merges (in the background) complete.
+* we don't return until the segmentinfos has no more
+* external segments.  currently this is only used by
+* addindexesnooptimize(). */
+private void resolveexternalsegments   throws corruptindexexception  ioexception
+boolean any   false
+boolean done   false
+while  done
+segmentinfo info   null
+mergepolicy onemerge merge   null
+synchronized this
+if  stopmerges
+throw new mergepolicy mergeabortedexception
+final int numsegments   segmentinfos size
+done   true
+for int i 0 i<numsegments i
+info   segmentinfos info i
+if  info dir    directory
+done   false
+final mergepolicy onemerge newmerge   new mergepolicy onemerge segmentinfos range i  1 i   mergepolicy instanceof logmergepolicy    getusecompoundfile
+// returns true if no running merge conflicts
+// with this one (and, records this merge as
+// pending), ie, this segment is not currently
+// being merged:
+if  registermerge newmerge
+merge   newmerge
+// if this segment is not currently being
+// merged, then advance it to running & run
+// the merge ourself (below):
+pendingmerges remove merge
+runningmerges add merge
+break
+if   done    merge    null
+// we are not yet done (external segments still
+// exist in segmentinfos), yet, all such segments
+// are currently "covered" by a pending or running
+// merge.  we now try to grab any pending merge
+// that involves external segments:
+merge   getnextexternalmerge
+if   done    merge    null
+// we are not yet done, and, all external segments
+// fall under merges that the merge scheduler is
+// currently running.  so, we now wait and check
+// back to see if the merge has completed.
+dowait
+if  merge    null
+any   true
+merge merge
+if  any
+// sometimes, on copying an external segment over,
+// more merges may become necessary:
+mergescheduler merge this
+/** merges the provided indexes into this index.
+* <p>after this completes, the index is optimized. </p>
+* <p>the provided indexreaders are not closed.</p>
+*
+* <p><b>note:</b> while this is running, any attempts to
+* add or delete documents (with another thread) will be
+* paused until this method completes.
+*
+* <p>see {@link #addindexesnooptimize(directory[])} for
+* details on transactional semantics, temporary free
+* space required in the directory, and non-cfs segments
+* on an exception.</p>
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public void addindexes indexreader readers
+throws corruptindexexception  ioexception
+ensureopen
+// do not allow add docs or deletes while we are running:
+docwriter pauseallthreads
+// we must pre-acquire a read lock here (and upgrade to
+// write lock in starttransaction below) so that no
+// other addindexes is allowed to start up after we have
+// flushed & optimized but before we then start our
+// transaction.  this is because the merging below
+// requires that only one segment is present in the
+// index:
+acquireread
+try
+segmentinfo info   null
+string mergedname   null
+segmentmerger merger   null
+boolean success   false
+try
+flush true  false  true
+optimize   					     start with zero or 1 seg
+success   true
+finally
+// take care to release the read lock if we hit an
+// exception before starting the transaction
+if   success
+releaseread
+// true means we already have a read lock; if this
+// call hits an exception it will release the write
+// lock:
+starttransaction true
+try
+mergedname   newsegmentname
+merger   new segmentmerger this  mergedname  null
+segmentreader sreader   null
+synchronized this
+if  segmentinfos size      1       add existing index  if any
+sreader   readerpool get segmentinfos info 0   true  bufferedindexinput buffer_size   1
+success   false
+try
+if  sreader    null
+merger add sreader
+for  int i   0  i < readers length  i            add new indexes
+merger add readers
+int doccount   merger merge                      merge 'em
+synchronized this
+segmentinfos clear                            pop old infos   add new
+info   new segmentinfo mergedname  doccount  directory  false  true
+1  null  false  merger hasprox
+setdiagnostics info
+segmentinfos add info
+// notify documentswriter that the flushed count just increased
+docwriter updateflusheddoccount doccount
+success   true
+finally
+if  sreader    null
+readerpool release sreader
+finally
+if   success
+if  infostream    null
+message
+rollbacktransaction
+else
+committransaction
+if  mergepolicy instanceof logmergepolicy    getusecompoundfile
+list files   null
+synchronized this
+// must incref our files so that if another thread
+// is running merge/optimize, it doesn't delete our
+// segment's files before we have a change to
+// finish making the compound file.
+if  segmentinfos contains info
+files   info files
+deleter incref files
+if  files    null
+success   false
+starttransaction false
+try
+merger createcompoundfile mergedname
+synchronized this
+info setusecompoundfile true
+success   true
+finally
+deleter decref files
+if   success
+if  infostream    null
+message
+rollbacktransaction
+else
+committransaction
+catch  outofmemoryerror oom
+handleoom oom
+finally
+if  docwriter    null
+docwriter resumeallthreads
+// this is called after pending added and deleted
+// documents have been flushed to the directory but before
+// the change is committed (new segments_n file written).
+void doafterflush
+throws ioexception
+/**
+* flush all in-memory buffered updates (adds and deletes)
+* to the directory.
+* <p>note: while this will force buffered docs to be
+* pushed into the index, it will not make these docs
+* visible to a reader.  use {@link #commit()} instead
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @deprecated please call {@link #commit()}) instead
+*
+* @throws corruptindexexception if the index is corrupt
+* @throws ioexception if there is a low-level io error
+*/
+public final void flush   throws corruptindexexception  ioexception
+if  hitoom
+throw new illegalstateexception
+flush true  false  true
+/** expert: prepare for commit.
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @see #preparecommit(map) */
+public final void preparecommit   throws corruptindexexception  ioexception
+ensureopen
+preparecommit null
+/** <p>expert: prepare for commit, specifying
+*  commituserdata map (string -> string).  this does the
+*  first phase of 2-phase commit.  you can only call this
+*  when autocommit is false.  this method does all steps
+*  necessary to commit changes since this writer was
+*  opened: flushes pending added and deleted docs, syncs
+*  the index files, writes most of next segments_n file.
+*  after calling this you must call either {@link
+*  #commit()} to finish the commit, or {@link
+*  #rollback()} to revert the commit and undo all changes
+*  done since the writer was opened.</p>
+*
+*  you can also just call {@link #commit(map)} directly
+*  without preparecommit first in which case that method
+*  will internally call preparecommit.
+*
+*  <p><b>note</b>: if this method hits an outofmemoryerror
+*  you should immediately close the writer.  see <a
+*  href="#oome">above</a> for details.</p>
+*
+*  @param commituserdata opaque map (string->string)
+*  that's recorded into the segments file in the index,
+*  and retrievable by {@link
+*  indexreader#getcommituserdata}.  note that when
+*  indexwriter commits itself, for example if open with
+*  autocommit=true, or, during {@link #close}, the
+*  commituserdata is unchanged (just carried over from
+*  the prior commit).  if this is null then the previous
+*  commituserdata is kept.  also, the commituserdata will
+*  only "stick" if there are actually changes in the
+*  index to commit.  therefore it's best to use this
+*  feature only when autocommit is false.
+*/
+public final void preparecommit map commituserdata  throws corruptindexexception  ioexception
+preparecommit commituserdata  false
+private final void preparecommit map commituserdata  boolean internal  throws corruptindexexception  ioexception
+if  hitoom
+throw new illegalstateexception
+if  autocommit     internal
+throw new illegalstateexception
+if   autocommit    pendingcommit    null
+throw new illegalstateexception
+if  infostream    null
+message
+flush true  true  true
+startcommit 0  commituserdata
+private void commit long sizeinbytes  throws ioexception
+startcommit sizeinbytes  null
+finishcommit
+/**
+* <p>commits all pending changes (added & deleted
+* documents, optimizations, segment merges, added
+* indexes, etc.) to the index, and syncs all referenced
+* index files, such that a reader will see the changes
+* and the index updates will survive an os or machine
+* crash or power loss.  note that this does not wait for
+* any running background merges to finish.  this may be a
+* costly operation, so you should test the cost in your
+* application and do it only when really necessary.</p>
+*
+* <p> note that this operation calls directory.sync on
+* the index files.  that call should not return until the
+* file contents & metadata are on stable storage.  for
+* fsdirectory, this calls the os's fsync.  but, beware:
+* some hardware devices may in fact cache writes even
+* during fsync, and return before the bits are actually
+* on stable storage, to give the appearance of faster
+* performance.  if you have such a device, and it does
+* not have a battery backup (for example) then on power
+* loss it may still lose data.  lucene cannot guarantee
+* consistency on such devices.  </p>
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*
+* @see #preparecommit
+* @see #commit(map)
+*/
+public final void commit   throws corruptindexexception  ioexception
+commit null
+/** commits all changes to the index, specifying a
+*  commituserdata map (string -> string).  this just
+*  calls {@link #preparecommit(map)} (if you didn't
+*  already call it) and then {@link #finishcommit}.
+*
+* <p><b>note</b>: if this method hits an outofmemoryerror
+* you should immediately close the writer.  see <a
+* href="#oome">above</a> for details.</p>
+*/
+public final void commit map commituserdata  throws corruptindexexception  ioexception
+ensureopen
+if  infostream    null
+message
+if  autocommit    pendingcommit    null
+if  infostream    null
+message
+preparecommit commituserdata  true
+else if  infostream    null
+message
+finishcommit
+private synchronized final void finishcommit   throws corruptindexexception  ioexception
+if  pendingcommit    null
+try
+if  infostream    null
+message
+pendingcommit finishcommit directory
+if  infostream    null
+message
+lastcommitchangecount   pendingcommitchangecount
+segmentinfos updategeneration pendingcommit
+segmentinfos setuserdata pendingcommit getuserdata
+setrollbacksegmentinfos pendingcommit
+deleter checkpoint pendingcommit  true
+finally
+deleter decref pendingcommit
+pendingcommit   null
+notifyall
+else if  infostream    null
+message
+if  infostream    null
+message
+/**
+* flush all in-memory buffered udpates (adds and deletes)
+* to the directory.
+* @param triggermerge if true, we may merge segments (if
+*  deletes or docs were flushed) if necessary
+* @param flushdocstores if false we are allowed to keep
+*  doc stores open to share with the next segment
+* @param flushdeletes whether pending deletes should also
+*  be flushed
+*/
+protected final void flush boolean triggermerge  boolean flushdocstores  boolean flushdeletes  throws corruptindexexception  ioexception
+// we can be called during close, when closing==true, so we must pass false to ensureopen:
+ensureopen false
+if  doflush flushdocstores  flushdeletes     triggermerge
+maybemerge
+// todo: this method should not have to be entirely
+// synchronized, ie, merges should be allowed to commit
+// even while a flush is happening
+private synchronized final boolean doflush boolean flushdocstores  boolean flushdeletes  throws corruptindexexception  ioexception
+try
+return doflushinternal flushdocstores  flushdeletes
+finally
+docwriter clearflushpending
+// todo: this method should not have to be entirely
+// synchronized, ie, merges should be allowed to commit
+// even while a flush is happening
+private synchronized final boolean doflushinternal boolean flushdocstores  boolean flushdeletes  throws corruptindexexception  ioexception
+if  hitoom
+throw new illegalstateexception
+ensureopen false
+assert testpoint
+flushcount
+// if we are flushing because too many deletes
+// accumulated, then we should apply the deletes to free
+// ram:
+flushdeletes    docwriter doapplydeletes
+// when autocommit=true we must always flush deletes
+// when flushing a segment; otherwise deletes may become
+// visible before their corresponding added document
+// from an updatedocument call
+flushdeletes    autocommit
+// make sure no threads are actively adding a document.
+// returns true if docwriter is currently aborting, in
+// which case we skip flushing this segment
+if  docwriter pauseallthreads
+docwriter resumeallthreads
+return false
+try
+segmentinfo newsegment   null
+final int numdocs   docwriter getnumdocsinram
+// always flush docs if there are any
+boolean flushdocs   numdocs > 0
+// with autocommit=true we always must flush the doc
+// stores when we flush
+flushdocstores    autocommit
+string docstoresegment   docwriter getdocstoresegment
+assert docstoresegment    null    numdocs    0
+if  docstoresegment    null
+flushdocstores   false
+int docstoreoffset   docwriter getdocstoreoffset
+// docstoreoffset should only be non-zero when
+// autocommit == false
+assert  autocommit    0    docstoreoffset
+boolean docstoreiscompoundfile   false
+if  infostream    null
+message     docwriter getsegment
+docwriter getdocstoresegment
+docstoreoffset
+flushdocs
+flushdeletes
+flushdocstores
+numdocs
+docwriter getnumbuffereddeleteterms
+message     segstring
+// check if the doc stores must be separately flushed
+// because other segments, besides the one we are about
+// to flush, reference it
+if  flushdocstores      flushdocs     docwriter getsegment   equals docwriter getdocstoresegment
+// we must separately flush the doc store
+if  infostream    null
+message     docstoresegment
+docstoreiscompoundfile   flushdocstores
+flushdocstores   false
+string segment   docwriter getsegment
+// if we are flushing docs, segment must not be null:
+assert segment    null     flushdocs
+if  flushdocs
+boolean success   false
+final int flusheddoccount
+try
+flusheddoccount   docwriter flush flushdocstores
+success   true
+finally
+if   success
+if  infostream    null
+message     segment
+deleter refresh segment
+if  0    docstoreoffset    flushdocstores
+// this means we are flushing private doc stores
+// with this segment, so it will not be shared
+// with other segments
+assert docstoresegment    null
+assert docstoresegment equals segment
+docstoreoffset    1
+docstoreiscompoundfile   false
+docstoresegment   null
+// create new segmentinfo, but do not add to our
+// segmentinfos until deletes are flushed
+// successfully.
+newsegment   new segmentinfo segment
+flusheddoccount
+directory  false  true
+docstoreoffset  docstoresegment
+docstoreiscompoundfile
+docwriter hasprox
+setdiagnostics newsegment
+docwriter pushdeletes
+if  flushdocs
+segmentinfos add newsegment
+checkpoint
+if  flushdocs    mergepolicy usecompoundfile segmentinfos  newsegment
+// now build compound file
+boolean success   false
+try
+docwriter createcompoundfile segment
+success   true
+finally
+if   success
+if  infostream    null
+message     segment
+deleter deletefile segment       indexfilenames compound_file_extension
+newsegment setusecompoundfile true
+checkpoint
+if  flushdeletes
+flushdeletescount
+applydeletes
+if  flushdocs
+checkpoint
+doafterflush
+return flushdocs
+catch  outofmemoryerror oom
+handleoom oom
+// never hit
+return false
+finally
+docwriter resumeallthreads
+/** expert:  return the total size of all index files currently cached in memory.
+* useful for size management with flushramdocs()
+*/
+public final long ramsizeinbytes
+ensureopen
+return docwriter getramused
+/** expert:  return the number of documents currently
+*  buffered in ram. */
+public final synchronized int numramdocs
+ensureopen
+return docwriter getnumdocsinram
+private int ensurecontiguousmerge mergepolicy onemerge merge
+int first   segmentinfos indexof merge segments info 0
+if  first     1
+throw new mergepolicy mergeexception     merge segments info 0  name       segstring    directory
+final int numsegments   segmentinfos size
+final int numsegmentstomerge   merge segments size
+for int i 0 i<numsegmentstomerge i
+final segmentinfo info   merge segments info i
+if  first   i >  numsegments     segmentinfos info first i  equals info
+if  segmentinfos indexof info      1
+throw new mergepolicy mergeexception     info name       segstring    directory
+else
+throw new mergepolicy mergeexception     merge segstring directory        segstring
+directory
+return first
+/** carefully merges deletes for the segments we just
+*  merged.  this is tricky because, although merging will
+*  clear all deletes (compacts the documents), new
+*  deletes may have been flushed to the segments since
+*  the merge was started.  this method "carries over"
+*  such new deletes onto the newly merged segment, and
+*  saves the resulting deletes file (incrementing the
+*  delete generation for merge.info).  if no deletes were
+*  flushed, no new deletes file is saved. */
+synchronized private void commitmergeddeletes mergepolicy onemerge merge  segmentreader mergereader  throws ioexception
+assert testpoint
+final segmentinfos sourcesegments   merge segments
+if  infostream    null
+message     merge segstring directory
+// carefully merge deletes that occurred after we
+// started merging:
+int docupto   0
+int delcount   0
+for int i 0  i < sourcesegments size    i
+segmentinfo info   sourcesegments info i
+int doccount   info doccount
+segmentreader previousreader   merge readersclone
+segmentreader currentreader   merge readers
+if  previousreader hasdeletions
+// there were deletes on this segment when the merge
+// started.  the merge has collapsed away those
+// deletes, but, if new deletes were flushed since
+// the merge started, we must now carefully keep any
+// newly flushed deletes but mapping them to the new
+// docids.
+if  currentreader numdeleteddocs   > previousreader numdeleteddocs
+// this means this segment has had new deletes
+// committed since we started the merge, so we
+// must merge them:
+for int j 0 j<doccount j
+if  previousreader isdeleted j
+assert currentreader isdeleted j
+else
+if  currentreader isdeleted j
+mergereader dodelete docupto
+delcount
+docupto
+else
+docupto    doccount   previousreader numdeleteddocs
+else if  currentreader hasdeletions
+// this segment had no deletes before but now it
+// does:
+for int j 0  j<doccount  j
+if  currentreader isdeleted j
+mergereader dodelete docupto
+delcount
+docupto
+else
+// no deletes before or after
+docupto    info doccount
+assert mergereader numdeleteddocs      delcount
+mergereader haschanges   delcount >  0
+/* fixme if we want to support non-contiguous segment merges */
+synchronized private boolean commitmerge mergepolicy onemerge merge  segmentmerger merger  int mergeddoccount  segmentreader mergedreader  throws ioexception
+assert testpoint
+if  hitoom
+throw new illegalstateexception
+if  infostream    null
+message     merge segstring directory        segstring
+assert merge registerdone
+// if merge was explicitly aborted, or, if rollback() or
+// rollbacktransaction() had been called since our merge
+// started (which results in an unqualified
+// deleter.refresh() call that will remove any index
+// file that current segments does not reference), we
+// abort this merge
+if  merge isaborted
+if  infostream    null
+message     merge segstring directory
+deleter refresh merge info name
+return false
+final int start   ensurecontiguousmerge merge
+commitmergeddeletes merge  mergedreader
+docwriter remapdeletes segmentinfos  merger getdocmaps    merger getdelcounts    merge  mergeddoccount
+// simple optimization: if the doc store we are using
+// has been closed and is in now compound format (but
+// wasn't when we started), then we will switch to the
+// compound format as well:
+final string mergedocstoresegment   merge info getdocstoresegment
+if  mergedocstoresegment    null     merge info getdocstoreiscompoundfile
+final int size   segmentinfos size
+for int i 0 i<size i
+final segmentinfo info   segmentinfos info i
+final string docstoresegment   info getdocstoresegment
+if  docstoresegment    null
+docstoresegment equals mergedocstoresegment
+info getdocstoreiscompoundfile
+merge info setdocstoreiscompoundfile true
+break
+merge info sethasprox merger hasprox
+segmentinfos sublist start  start   merge segments size    clear
+assert  segmentinfos contains merge info
+segmentinfos add start  merge info
+// must note the change to segmentinfos so any commits
+// in-flight don't lose it:
+changecount
+// if the merged segments had pending changes, clear
+// them so that they don't bother writing them to
+// disk, updating segmentinfo, etc.:
+readerpool clear merge segments
+if  merge optimize
+segmentstooptimize add merge info
+return true
+private synchronized void decrefmergesegments mergepolicy onemerge merge  throws ioexception
+assert merge increfdone
+merge increfdone   false
+final private void handlemergeexception throwable t  mergepolicy onemerge merge  throws ioexception
+if  infostream    null
+message     merge segstring directory        t
+// set the exception on the merge, so if
+// optimize() is waiting on us it sees the root
+// cause exception:
+merge setexception t
+addmergeexception merge
+if  t instanceof mergepolicy mergeabortedexception
+// we can ignore this exception (it happens when
+// close(false) or rollback is called), unless the
+// merge involves segments from external directories,
+// in which case we must throw it so, for example, the
+// rollbacktransaction code in addindexes* is
+// executed.
+if  merge isexternal
+throw  mergepolicy mergeabortedexception  t
+else if  t instanceof ioexception
+throw  ioexception  t
+else if  t instanceof runtimeexception
+throw  runtimeexception  t
+else if  t instanceof error
+throw  error  t
+else
+// should not get here
+throw new runtimeexception t
+/**
+* merges the indicated segments, replacing them in the stack with a
+* single segment.
+*/
+final void merge mergepolicy onemerge merge
+throws corruptindexexception  ioexception
+boolean success   false
+try
+try
+try
+mergeinit merge
+if  infostream    null
+message     merge segstring directory        merge       segstring
+mergemiddle merge
+mergesuccess merge
+success   true
+catch  throwable t
+handlemergeexception t  merge
+finally
+synchronized this
+mergefinish merge
+if   success
+if  infostream    null
+message
+if  merge info    null     segmentinfos contains merge info
+deleter refresh merge info name
+// this merge (and, generally, any change to the
+// segments) may now enable new merges, so we call
+// merge policy & update pending merges.
+if  success     merge isaborted       closed     closing
+updatependingmerges merge maxnumsegmentsoptimize  merge optimize
+catch  outofmemoryerror oom
+handleoom oom
+/** hook that's called when the specified merge is complete. */
+void mergesuccess mergepolicy onemerge merge
+/** checks whether this merge involves any segments
+*  already participating in a merge.  if not, this merge
+*  is "registered", meaning we record that its segments
+*  are now participating in a merge, and true is
+*  returned.  else (the merge conflicts) false is
+*  returned. */
+final synchronized boolean registermerge mergepolicy onemerge merge  throws mergepolicy mergeabortedexception
+if  merge registerdone
+return true
+if  stopmerges
+merge abort
+throw new mergepolicy mergeabortedexception     merge segstring directory
+final int count   merge segments size
+boolean isexternal   false
+for int i 0 i<count i
+final segmentinfo info   merge segments info i
+if  mergingsegments contains info
+return false
+if  segmentinfos indexof info      1
+return false
+if  info dir    directory
+isexternal   true
+ensurecontiguousmerge merge
+pendingmerges add merge
+if  infostream    null
+message     merge segstring directory        pendingmerges size
+merge mergegen   mergegen
+merge isexternal   isexternal
+// ok it does not conflict; now record that this merge
+// is running (while synchronized) to avoid race
+// condition where two conflicting merges from different
+// threads, start
+for int i 0 i<count i
+mergingsegments add merge segments info i
+// merge is now registered
+merge registerdone   true
+return true
+/** does initial setup for a merge, which is fast but holds
+*  the synchronized lock on indexwriter instance.  */
+final synchronized void mergeinit mergepolicy onemerge merge  throws ioexception
+boolean success   false
+try
+_mergeinit merge
+success   true
+finally
+if   success
+mergefinish merge
+final synchronized private void _mergeinit mergepolicy onemerge merge  throws ioexception
+assert testpoint
+assert merge registerdone
+assert  merge optimize    merge maxnumsegmentsoptimize > 0
+if  hitoom
+throw new illegalstateexception
+if  merge info    null
+// mergeinit already done
+return
+if  merge isaborted
+return
+boolean changed   applydeletes
+// if autocommit == true then all deletes should have
+// been flushed when we flushed the last segment
+assert  changed     autocommit
+final segmentinfos sourcesegments   merge segments
+final int end   sourcesegments size
+// check whether this merge will allow us to skip
+// merging the doc stores (stored field & vectors).
+// this is a very substantial optimization (saves tons
+// of io) that can only be applied with
+// autocommit=false.
+directory lastdir   directory
+string lastdocstoresegment   null
+int next    1
+boolean mergedocstores   false
+boolean doflushdocstore   false
+final string currentdocstoresegment   docwriter getdocstoresegment
+// test each segment to be merged: check if we need to
+// flush/merge doc stores
+for  int i   0  i < end  i
+segmentinfo si   sourcesegments info i
+// if it has deletions we must merge the doc stores
+if  si hasdeletions
+mergedocstores   true
+// if it has its own (private) doc stores we must
+// merge the doc stores
+if   1    si getdocstoreoffset
+mergedocstores   true
+// if it has a different doc store segment than
+// previous segments, we must merge the doc stores
+string docstoresegment   si getdocstoresegment
+if  docstoresegment    null
+mergedocstores   true
+else if  lastdocstoresegment    null
+lastdocstoresegment   docstoresegment
+else if   lastdocstoresegment equals docstoresegment
+mergedocstores   true
+// segments' docscoreoffsets must be in-order,
+// contiguous.  for the default merge policy now
+// this will always be the case but for an arbitrary
+// merge policy this may not be the case
+if   1    next
+next   si getdocstoreoffset     si doccount
+else if  next    si getdocstoreoffset
+mergedocstores   true
+else
+next   si getdocstoreoffset     si doccount
+// if the segment comes from a different directory
+// we must merge
+if  lastdir    si dir
+mergedocstores   true
+// if the segment is referencing the current "live"
+// doc store outputs then we must merge
+if  si getdocstoreoffset       1    currentdocstoresegment    null    si getdocstoresegment   equals currentdocstoresegment
+doflushdocstore   true
+final int docstoreoffset
+final string docstoresegment
+final boolean docstoreiscompoundfile
+if  mergedocstores
+docstoreoffset    1
+docstoresegment   null
+docstoreiscompoundfile   false
+else
+segmentinfo si   sourcesegments info 0
+docstoreoffset   si getdocstoreoffset
+docstoresegment   si getdocstoresegment
+docstoreiscompoundfile   si getdocstoreiscompoundfile
+if  mergedocstores    doflushdocstore
+// segmentmerger intends to merge the doc stores
+// (stored fields, vectors), and at least one of the
+// segments to be merged refers to the currently
+// live doc stores.
+// todo: if we know we are about to merge away these
+// newly flushed doc store files then we should not
+// make compound file out of them...
+if  infostream    null
+message
+doflush true  false
+merge increfdone   true
+merge mergedocstores   mergedocstores
+// bind a new segment name here so even with
+// concurrentmergepolicy we keep deterministic segment
+// names.
+merge info   new segmentinfo newsegmentname    0
+directory  false  true
+docstoreoffset
+docstoresegment
+docstoreiscompoundfile
+false
+map details   new hashmap
+details put    merge optimize
+details put    end
+details put    mergedocstores
+setdiagnostics merge info     details
+// also enroll the merged segment into mergingsegments;
+// this prevents it from getting selected for a merge
+// after our merge is done but while we are building the
+// cfs:
+mergingsegments add merge info
+private void setdiagnostics segmentinfo info  string source
+setdiagnostics info  source  null
+private void setdiagnostics segmentinfo info  string source  map details
+map diagnostics   new hashmap
+diagnostics put    source
+diagnostics put    constants lucene_version
+diagnostics put    constants os_name
+diagnostics put    constants os_arch
+diagnostics put    constants os_version
+diagnostics put    constants java_version
+diagnostics put    constants java_vendor
+if  details    null
+diagnostics putall details
+info setdiagnostics diagnostics
+/** this is called after merging a segment and before
+*  building its cfs.  return true if the files should be
+*  sync'd.  if you return false, then the source segment
+*  files that were merged cannot be deleted until the cfs
+*  file is built & sync'd.  so, returning false consumes
+*  more transient disk space, but saves performance of
+*  not having to sync files which will shortly be deleted
+*  anyway.
+* @deprecated -- this will be removed in 3.0 when
+* autocommit is hardwired to false */
+private synchronized boolean docommitbeforemergecfs mergepolicy onemerge merge  throws ioexception
+long freeablebytes   0
+final int size   merge segments size
+for int i 0 i<size i
+final segmentinfo info   merge segments info i
+// it's only important to sync if the most recent
+// commit actually references this segment, because if
+// it doesn't, even without syncing we will free up
+// the disk space:
+integer loc    integer  rollbacksegments get info
+if  loc    null
+final segmentinfo oldinfo   rollbacksegmentinfos info loc intvalue
+if  oldinfo getusecompoundfile      info getusecompoundfile
+freeablebytes    info sizeinbytes
+// if we would free up more than 1/3rd of the index by
+// committing now, then do so:
+long totalbytes   0
+final int numsegments   segmentinfos size
+for int i 0 i<numsegments i
+totalbytes    segmentinfos info i  sizeinbytes
+if  3 freeablebytes > totalbytes
+return true
+else
+return false
+/** does fininishing for a merge, which is fast but holds
+*  the synchronized lock on indexwriter instance. */
+final synchronized void mergefinish mergepolicy onemerge merge  throws ioexception
+// optimize, addindexes or finishmerges may be waiting
+// on merges to finish.
+notifyall
+if  merge increfdone
+decrefmergesegments merge
+// it's possible we are called twice, eg if there was an
+// exception inside mergeinit
+if  merge registerdone
+final segmentinfos sourcesegments   merge segments
+final int end   sourcesegments size
+for int i 0 i<end i
+mergingsegments remove sourcesegments info i
+mergingsegments remove merge info
+merge registerdone   false
+runningmerges remove merge
+/** does the actual (time-consuming) work of the merge,
+*  but without holding synchronized lock on indexwriter
+*  instance */
+final private int mergemiddle mergepolicy onemerge merge
+throws corruptindexexception  ioexception
+merge checkaborted directory
+final string mergedname   merge info name
+segmentmerger merger   null
+int mergeddoccount   0
+segmentinfos sourcesegments   merge segments
+final int numsegments   sourcesegments size
+if  infostream    null
+message     merge segstring directory
+merger   new segmentmerger this  mergedname  merge
+merge readers   new segmentreader
+merge readersclone   new segmentreader
+boolean mergedocstores   false
+final set dss   new hashset
+// this is try/finally to make sure merger's readers are
+// closed:
+boolean success   false
+try
+int totdoccount   0
+for  int i   0  i < numsegments  i
+final segmentinfo info   sourcesegments info i
+// hold onto the "live" reader; we will use this to
+// commit merged deletes
+segmentreader reader   merge readers   readerpool get info  merge mergedocstores
+merge_read_buffer_size
+1
+// we clone the segment readers because other
+// deletes may come in while we're merging so we
+// need readers that will not change
+segmentreader clone   merge readersclone    segmentreader  reader clone true
+merger add clone
+if  clone hasdeletions
+mergedocstores   true
+if  info getdocstoreoffset       1
+dss add info getdocstoresegment
+totdoccount    clone numdocs
+if  infostream    null
+message   totdoccount
+merge checkaborted directory
+// if deletions have arrived and it has now become
+// necessary to merge doc stores, go and open them:
+if  mergedocstores     merge mergedocstores
+merge mergedocstores   true
+synchronized this
+if  dss contains docwriter getdocstoresegment
+if  infostream    null
+message
+doflush true  false
+for int i 0 i<numsegments i
+merge readersclone opendocstores
+// clear dss
+synchronized this
+merge info setdocstore  1  null  false
+// this is where all the work happens:
+mergeddoccount   merge info doccount   merger merge merge mergedocstores
+assert mergeddoccount    totdoccount
+// todo: in the non-realtime case, we may want to only
+// keep deletes (it's costly to open entire reader
+// when we just need deletes)
+final segmentreader mergedreader   readerpool get merge info  false  bufferedindexinput buffer_size   1
+try
+if  poolreaders    mergedsegmentwarmer    null
+mergedsegmentwarmer warm mergedreader
+if   commitmerge merge  merger  mergeddoccount  mergedreader
+// commitmerge will return false if this merge was aborted
+return 0
+finally
+synchronized this
+readerpool release mergedreader
+success   true
+finally
+synchronized this
+if   success
+// suppress any new exceptions so we throw the
+// original cause
+for  int i 0 i<numsegments i
+if  merge readers    null
+try
+readerpool release merge readers  true
+catch  throwable t
+if  merge readersclone    null
+try
+merge readersclone close
+catch  throwable t
+// this was a private clone and we had the only reference
+assert merge readersclone getrefcount      0
+else
+for  int i 0 i<numsegments i
+if  merge readers    null
+readerpool release merge readers  true
+if  merge readersclone    null
+merge readersclone close
+// this was a private clone and we had the only reference
+assert merge readersclone getrefcount      0
+// must checkpoint before decrefing so any newly
+// referenced files in the new merge.info are incref'd
+// first:
+synchronized this
+deleter checkpoint segmentinfos  false
+decrefmergesegments merge
+if  merge usecompoundfile
+// maybe force a sync here to allow reclaiming of the
+// disk space used by the segments we just merged:
+if  autocommit    docommitbeforemergecfs merge
+final long size
+synchronized this
+size   merge info sizeinbytes
+commit size
+success   false
+final string compoundfilename   mergedname       indexfilenames compound_file_extension
+try
+merger createcompoundfile compoundfilename
+success   true
+catch  ioexception ioe
+synchronized this
+if  merge isaborted
+// this can happen if rollback or close(false)
+// is called -- fall through to logic below to
+// remove the partially created cfs:
+success   true
+else
+handlemergeexception ioe  merge
+catch  throwable t
+handlemergeexception t  merge
+finally
+if   success
+if  infostream    null
+message
+synchronized this
+deleter deletefile compoundfilename
+if  merge isaborted
+if  infostream    null
+message
+deleter deletefile compoundfilename
+return 0
+synchronized this
+if  segmentinfos indexof merge info      1    merge isaborted
+// our segment (committed in non-compound
+// format) got merged away while we were
+// building the compound format.
+deleter deletefile compoundfilename
+else
+merge info setusecompoundfile true
+checkpoint
+// force a sync after commiting the merge.  once this
+// sync completes then all index files referenced by the
+// current segmentinfos are on stable storage so if the
+// os/machine crashes, or power cord is yanked, the
+// index will be intact.  note that this is just one
+// (somewhat arbitrary) policy; we could try other
+// policies like only sync if it's been > x minutes or
+// more than y bytes have been written, etc.
+if  autocommit
+final long size
+synchronized this
+size   merge info sizeinbytes
+commit size
+return mergeddoccount
+synchronized void addmergeexception mergepolicy onemerge merge
+assert merge getexception      null
+if   mergeexceptions contains merge     mergegen    merge mergegen
+mergeexceptions add merge
+// apply buffered deletes to all segments.
+private final synchronized boolean applydeletes   throws corruptindexexception  ioexception
+assert testpoint
+segmentinfos rollback    segmentinfos  segmentinfos clone
+boolean success   false
+boolean changed
+try
+changed   docwriter applydeletes segmentinfos
+success   true
+finally
+if   success
+if  infostream    null
+message
+// carefully remove any partially written .del
+// files
+final int size   rollback size
+for int i 0 i<size i
+final string newdelfilename   segmentinfos info i  getdelfilename
+final string delfilename   rollback info i  getdelfilename
+if  newdelfilename    null     newdelfilename equals delfilename
+deleter deletefile newdelfilename
+// fully replace the segmentinfos since flushed
+// deletes could have changed any of the
+// segmentinfo instances:
+segmentinfos clear
+segmentinfos addall rollback
+if  changed
+checkpoint
+return changed
+// for test purposes.
+final synchronized int getbuffereddeletetermssize
+return docwriter getbuffereddeleteterms   size
+// for test purposes.
+final synchronized int getnumbuffereddeleteterms
+return docwriter getnumbuffereddeleteterms
+// utility routines for tests
+segmentinfo newestsegment
+return segmentinfos info segmentinfos size   1
+public synchronized string segstring
+return segstring segmentinfos
+private synchronized string segstring segmentinfos infos
+stringbuffer buffer   new stringbuffer
+final int count   infos size
+for int i   0  i < count  i
+if  i > 0
+buffer append
+final segmentinfo info   infos info i
+buffer append info segstring directory
+if  info dir    directory
+buffer append
+return buffer tostring
+// files that have been sync'd already
+private hashset synced   new hashset
+// files that are now being sync'd
+private hashset syncing   new hashset
+private boolean startsync string filename  collection pending
+synchronized synced
+if   synced contains filename
+if   syncing contains filename
+syncing add filename
+return true
+else
+pending add filename
+return false
+else
+return false
+private void finishsync string filename  boolean success
+synchronized synced
+assert syncing contains filename
+syncing remove filename
+if  success
+synced add filename
+synced notifyall
+/** blocks until all files in syncing are sync'd */
+private boolean waitforallsynced collection syncing  throws ioexception
+synchronized synced
+iterator it   syncing iterator
+while it hasnext
+final string filename    string  it next
+while  synced contains filename
+if   syncing contains filename
+// there was an error because a file that was
+// previously syncing failed to appear in synced
+return false
+else
+try
+synced wait
+catch  interruptedexception ie
+// in 3.0 we will change this to throw
+// interruptedexception instead
+thread currentthread   interrupt
+throw new runtimeexception ie
+return true
+/** pauses before syncing.  on windows, at least, it's
+*  best (performance-wise) to pause in order to let os
+*  flush writes to disk on its own, before forcing a
+*  sync.
+* @deprecated -- this will be removed in 3.0 when
+* autocommit is hardwired to false */
+private void syncpause long sizeinbytes
+if  mergescheduler instanceof concurrentmergescheduler    maxsyncpauseseconds > 0
+// rough heuristic: for every 10 mb, we pause for 1
+// second, up until the max
+long pausetime    long   1000 sizeinbytes 10 1024 1024
+final long maxpausetime    long   maxsyncpauseseconds 1000
+if  pausetime > maxpausetime
+pausetime   maxpausetime
+final int sleepcount    int   pausetime   100
+for int i 0 i<sleepcount i
+synchronized this
+if  stopmerges    closing
+break
+try
+thread sleep 100
+catch  interruptedexception ie
+// in 3.0 we will change this to throw
+// interruptedexception instead
+thread currentthread   interrupt
+throw new runtimeexception ie
+private synchronized void dowait
+// note: the callers of this method should in theory
+// be able to do simply wait(), but, as a defense
+// against thread timing hazards where notifyall()
+// falls to be called, we wait for at most 1 second
+// and then return so caller can check if wait
+// conditions are satisfied:
+try
+wait 1000
+catch  interruptedexception ie
+// in 3.0 we will change this to throw
+// interruptedexception instead
+thread currentthread   interrupt
+throw new runtimeexception ie
+/** walk through all files referenced by the current
+*  segmentinfos and ask the directory to sync each file,
+*  if it wasn't already.  if that succeeds, then we
+*  prepare a new segments_n file but do not fully commit
+*  it. */
+private void startcommit long sizeinbytes  map commituserdata  throws ioexception
+assert testpoint
+if  hitoom
+throw new illegalstateexception
+try
+if  infostream    null
+message     sizeinbytes
+if  sizeinbytes > 0
+syncpause sizeinbytes
+segmentinfos tosync   null
+final long mychangecount
+synchronized this
+// sizeinbytes > 0 means this is an autocommit at
+// the end of a merge.  if at this point stopmerges
+// is true (which means a rollback() or
+// rollbacktransaction() is waiting for us to
+// finish), we skip the commit to avoid deadlock
+if  sizeinbytes > 0    stopmerges
+return
+// wait for any running addindexes to complete
+// first, then block any from running until we've
+// copied the segmentinfos we intend to sync:
+blockaddindexes false
+// on commit the segmentinfos must never
+// reference a segment in another directory:
+assert  hasexternalsegments
+try
+assert lastcommitchangecount <  changecount
+if  changecount    lastcommitchangecount
+if  infostream    null
+message
+return
+// first, we clone & incref the segmentinfos we intend
+// to sync, then, without locking, we sync() each file
+// referenced by tosync, in the background.  multiple
+// threads can be doing this at once, if say a large
+// merge and a small merge finish at the same time:
+if  infostream    null
+message     segstring segmentinfos        changecount
+readerpool commit
+tosync    segmentinfos  segmentinfos clone
+if  commituserdata    null
+tosync setuserdata commituserdata
+deleter incref tosync  false
+mychangecount   changecount
+iterator it   tosync files directory  false  iterator
+while it hasnext
+string filename    string  it next
+assert directory fileexists filename       filename
+finally
+resumeaddindexes
+assert testpoint
+boolean setpending   false
+try
+// loop until all files tosync references are sync'd:
+while true
+final collection pending   new arraylist
+iterator it   tosync files directory  false  iterator
+while it hasnext
+final string filename    string  it next
+if  startsync filename  pending
+boolean success   false
+try
+// because we incref'd this commit point, above,
+// the file had better exist:
+assert directory fileexists filename       filename       directory
+if  infostream    null
+message     filename
+directory sync filename
+success   true
+finally
+finishsync filename  success
+// all files that i require are either synced or being
+// synced by other threads.  if they are being synced,
+// we must at this point block until they are done.
+// if this returns false, that means an error in
+// another thread resulted in failing to actually
+// sync one of our files, so we repeat:
+if  waitforallsynced pending
+break
+assert testpoint
+synchronized this
+// if someone saved a newer version of segments file
+// since i first started syncing my version, i can
+// safely skip saving myself since i've been
+// superseded:
+while true
+if  mychangecount <  lastcommitchangecount
+if  infostream    null
+message
+break
+else if  pendingcommit    null
+// my turn to commit
+if  segmentinfos getgeneration   > tosync getgeneration
+tosync updategeneration segmentinfos
+boolean success   false
+try
+// exception here means nothing is prepared
+// (this method unwinds everything it did on
+// an exception)
+try
+tosync preparecommit directory
+finally
+// have our master segmentinfos record the
+// generations we just prepared.  we do this
+// on error or success so we don't
+// double-write a segments_n file.
+segmentinfos updategeneration tosync
+assert pendingcommit    null
+setpending   true
+pendingcommit   tosync
+pendingcommitchangecount   mychangecount
+success   true
+finally
+if   success    infostream    null
+message
+break
+else
+// must wait for other commit to complete
+dowait
+if  infostream    null
+message
+assert testpoint
+finally
+synchronized this
+if   setpending
+deleter decref tosync
+catch  outofmemoryerror oom
+handleoom oom
+assert testpoint
+/**
+* returns <code>true</code> iff the index in the named directory is
+* currently locked.
+* @param directory the directory to check for a lock
+* @throws ioexception if there is a low-level io error
+*/
+public static boolean islocked directory directory  throws ioexception
+return directory makelock write_lock_name  islocked
+/**
+* returns <code>true</code> iff the index in the named directory is
+* currently locked.
+* @param directory the directory to check for a lock
+* @throws ioexception if there is a low-level io error
+* @deprecated use {@link #islocked(directory)}
+*/
+public static boolean islocked string directory  throws ioexception
+directory dir   fsdirectory getdirectory directory
+try
+return islocked dir
+finally
+dir close
+/**
+* forcibly unlocks the index in the named directory.
+* <p>
+* caution: this should only be used by failure recovery code,
+* when it is known that no other process nor thread is in fact
+* currently accessing this index.
+*/
+public static void unlock directory directory  throws ioexception
+directory makelock indexwriter write_lock_name  release
+/**
+* specifies maximum field length (in number of tokens/terms) in {@link indexwriter} constructors.
+* {@link #setmaxfieldlength(int)} overrides the value set by
+* the constructor.
+*/
+public static final class maxfieldlength
+private int limit
+private string name
+/**
+* private type-safe-enum-pattern constructor.
+*
+* @param name instance name
+* @param limit maximum field length
+*/
+private maxfieldlength string name  int limit
+this name   name
+this limit   limit
+/**
+* public constructor to allow users to specify the maximum field size limit.
+*
+* @param limit the maximum field length
+*/
+public maxfieldlength int limit
+this    limit
+public int getlimit
+return limit
+public string tostring
+return name       limit
+/** sets the maximum field length to {@link integer#max_value}. */
+public static final maxfieldlength unlimited
+new maxfieldlength    integer max_value
+/**
+*  sets the maximum field length to
+* {@link #default_max_field_length}
+* */
+public static final maxfieldlength limited
+new maxfieldlength    default_max_field_length
+/** if {@link #getreader} has been called (ie, this writer
+*  is in near real-time mode), then after a merge
+*  completes, this class can be invoked to warm the
+*  reader on the newly merged segment, before the merge
+*  commits.  this is not required for near real-time
+*  search, but will reduce search latency on opening a
+*  new near real-time reader after a merge completes.
+*
+* <p><b>note:</b> this api is experimental and might
+* change in incompatible ways in the next release.</p>
+*
+* <p><b>note</b>: warm is called before any deletes have
+* been carried over to the merged segment. */
+public static abstract class indexreaderwarmer
+public abstract void warm indexreader reader  throws ioexception
+private indexreaderwarmer mergedsegmentwarmer
+/** set the merged segment warmer.  see {@link
+*  indexreaderwarmer}. */
+public void setmergedsegmentwarmer indexreaderwarmer warmer
+mergedsegmentwarmer   warmer
+/** returns the current merged segment warmer.  see {@link
+*  indexreaderwarmer}. */
+public indexreaderwarmer getmergedsegmentwarmer
+return mergedsegmentwarmer
+private void handleoom outofmemoryerror oom  string location
+if  infostream    null
+message     location
+hitoom   true
+throw oom
+// deprecated
+private boolean allowminus1position
+/** deprecated: emulates indexwriter's buggy behavior when
+*  first token(s) have positionincrement==0 (ie, prior to
+*  fixing lucene-1542) */
+public void setallowminus1position
+allowminus1position   true
+docwriter setallowminus1position
+// deprecated
+boolean getallowminus1position
+return allowminus1position
+// used only by assert for testing.  current points:
+//   startdoflush
+//   startcommitmerge
+//   startstartcommit
+//   midstartcommit
+//   midstartcommit2
+//   midstartcommitsuccess
+//   finishstartcommit
+//   startcommitmergedeletes
+//   startmergeinit
+//   startapplydeletes
+//   documentswriter.threadstate.init start
+boolean testpoint string name
+return true

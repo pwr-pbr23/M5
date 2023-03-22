@@ -1,0 +1,463 @@
+/*
+derby - class org.apache.derby.impl.sql.compile.hashjoinstrategy
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl sql compile
+import org apache derby iapi sql compile costestimate
+import org apache derby iapi sql compile expressionclassbuilderinterface
+import org apache derby iapi sql compile joinstrategy
+import org apache derby iapi sql compile optimizable
+import org apache derby iapi sql compile optimizer
+import org apache derby iapi sql compile optimizablepredicate
+import org apache derby iapi sql compile optimizablepredicatelist
+import org apache derby iapi sql dictionary datadictionary
+import org apache derby iapi sql dictionary conglomeratedescriptor
+import org apache derby iapi store access storecostcontroller
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi services compiler methodbuilder
+import org apache derby impl sql compile expressionclassbuilder
+import org apache derby impl sql compile projectrestrictnode
+import org apache derby impl sql compile predicate
+import org apache derby iapi error standardexception
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services cache classsize
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services io formatablearrayholder
+import org apache derby iapi services io formatableintholder
+import org apache derby iapi util jbitset
+import java util vector
+public class hashjoinstrategy extends basejoinstrategy
+public hashjoinstrategy
+/**
+* @see joinstrategy#feasible
+*
+* @exception standardexception		thrown on error
+*/
+public boolean feasible optimizable innertable
+optimizablepredicatelist predlist
+optimizer optimizer
+throws standardexception
+int hashkeycolumns   null
+conglomeratedescriptor cd   null
+/* if the innertable is a vti, then we
+* must check to see if there are any
+* join columns in the vti's parameters.
+* if so, then hash join is not feasible.
+*/
+if    innertable ismaterializable
+optimizer trace optimizer hj_skip_not_materializable  0  0  0 0
+
+return false
+/* don't consider hash join on the target table of an update/delete.
+* resolve - this is a temporary restriction.  problem is that we
+* do not put rids into the row in the hash table when scanning
+* the heap and we need them for a target table.
+*/
+if  innertable istargettable
+return false
+/* if the predicate given by the user _directly_ references
+* any of the base tables _beneath_ this node, then we
+* cannot safely use the predicate for a hash because the
+* predicate correlates two nodes at different nesting levels.
+* if we did a hash join in this case, materialization of
+* innertable could lead to incorrect results--and in particular,
+* results that are missing rows.  we can check for this by
+* looking at the predicates' reference maps, which are set based
+* on the initial query (as part of pre-processing).  note that
+* by the time we get here, it's possible that a predicate's
+* reference map holds table numbers that do not agree with the
+* table numbers of the column references used by the predicate.
+* that's okay--this occurs as a result of "remapping" predicates
+* that have been pushed down the query tree.  and in fact
+* it's a good thing because, by looking at the column reference's
+* own table numbers instead of the predicate's referenced map,
+* we are more readily able to find equijoin predicates that
+* we otherwise would not have found.
+*
+* note: do not perform this check if innertable is a frombasetable
+* because a base table does not have a "subtree" to speak of.
+*/
+if   predlist    null      predlist size   > 0
+innertable instanceof frombasetable
+fromtable ft    fromtable innertable
+// first get a list of all of the base tables in the subtree
+// below innertable.
+jbitset tnums   new jbitset ft getreferencedtablemap   size
+basetablenumbersvisitor btnvis   new basetablenumbersvisitor tnums
+ft accept btnvis
+// now get a list of all table numbers referenced by the
+// join predicates that we'll be searching.
+jbitset pnums   new jbitset tnums size
+predicate pred   null
+for  int i   0  i < predlist size    i
+pred    predicate predlist getoptpredicate i
+if  pred isjoinpredicate
+pnums or pred getreferencedset
+// if tnums and pnums have anything in common, then at
+// least one predicate in the list refers directly to
+// a base table beneath this node (as opposed to referring
+// just to this node), which means it's not safe to do a
+// hash join.
+tnums and pnums
+if  tnums getfirstsetbit       1
+return false
+if  innertable isbasetable
+/* must have an equijoin on a column in the conglomerate */
+cd   innertable getcurrentaccesspath   getconglomeratedescriptor
+/* look for equijoins in the predicate list */
+hashkeycolumns   findhashkeycolumns
+innertable
+cd
+predlist
+if  sanitymanager debug
+if  hashkeycolumns    null
+optimizer trace optimizer hj_skip_no_join_columns  0  0  0 0  null
+else
+optimizer trace optimizer hj_hash_key_columns  0  0  0 0  hashkeycolumns
+if  hashkeycolumns    null
+return false
+return true
+/** @see joinstrategy#ignorebulkfetch */
+public boolean ignorebulkfetch
+return true
+/** @see joinstrategy#multiplybasecostbyouterrows */
+public boolean multiplybasecostbyouterrows
+return false
+/**
+* @see joinstrategy#getbasepredicates
+*
+* @exception standardexception		thrown on error
+*/
+public optimizablepredicatelist getbasepredicates
+optimizablepredicatelist predlist
+optimizablepredicatelist basepredicates
+optimizable innertable
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert basepredicates size      0
+for  int i   predlist size     1  i >  0  i
+optimizablepredicate pred   predlist getoptpredicate i
+if  innertable getreferencedtablemap   contains pred getreferencedmap
+basepredicates addoptpredicate pred
+predlist removeoptpredicate i
+basepredicates classify
+innertable
+innertable getcurrentaccesspath   getconglomeratedescriptor
+return basepredicates
+/** @see joinstrategy#nonbasepredicateselectivity */
+public double nonbasepredicateselectivity
+optimizable innertable
+optimizablepredicatelist predlist
+throws standardexception
+double retval   1 0
+if  predlist    null
+for  int i   0  i < predlist size    i
+// don't include redundant join predicates in selectivity calculations
+if  predlist isredundantpredicate i
+continue
+retval    predlist getoptpredicate i  selectivity innertable
+return retval
+/**
+* @see joinstrategy#putbasepredicates
+*
+* @exception standardexception		thrown on error
+*/
+public void putbasepredicates optimizablepredicatelist predlist
+optimizablepredicatelist basepredicates
+throws standardexception
+for  int i   basepredicates size     1  i >  0  i
+optimizablepredicate pred   basepredicates getoptpredicate i
+predlist addoptpredicate pred
+basepredicates removeoptpredicate i
+/** @see joinstrategy#estimatecost */
+public void estimatecost optimizable innertable
+optimizablepredicatelist predlist
+conglomeratedescriptor cd
+costestimate outercost
+optimizer optimizer
+costestimate costestimate
+/*
+** the cost of a hash join is the cost of building the hash table.
+** there is no extra cost per outer row, so don't do anything here.
+*/
+/** @see joinstrategy#maxcapacity */
+public int maxcapacity  int userspecifiedcapacity
+int maxmemorypertable
+double perrowusage
+if  userspecifiedcapacity >  0
+return userspecifiedcapacity
+perrowusage    classsize estimatehashentrysize
+if  perrowusage <  1
+return maxmemorypertable
+return  int  maxmemorypertable perrowusage
+/** @see joinstrategy#getname */
+public string getname
+return
+/** @see joinstrategy#scancosttype */
+public int scancosttype
+return storecostcontroller storecost_scan_set
+/** @see joinstrategy#resultsetmethodname */
+public string resultsetmethodname boolean bulkfetch
+return
+/** @see joinstrategy#joinresultsetmethodname */
+public string joinresultsetmethodname
+return
+/** @see joinstrategy#halfouterjoinresultsetmethodname */
+public string halfouterjoinresultsetmethodname
+return
+/**
+* @see joinstrategy#getscanargs
+*
+* @exception standardexception		thrown on error
+*/
+public int getscanargs
+transactioncontroller tc
+methodbuilder mb
+optimizable innertable
+optimizablepredicatelist storerestrictionlist
+optimizablepredicatelist nonstorerestrictionlist
+expressionclassbuilderinterface acbi
+int bulkfetch
+methodbuilder resultrowallocator
+int colrefitem
+int indexcolitem
+int lockmode
+boolean tablelocked
+int isolationlevel
+int maxmemorypertable
+throws standardexception
+expressionclassbuilder acb    expressionclassbuilder  acbi
+fillinscanargs1 tc
+mb
+innertable
+storerestrictionlist
+acb
+resultrowallocator
+nonstorerestrictionlist generatequalifiers acb 	mb  innertable  true
+mb push innertable initialcapacity
+mb push innertable loadfactor
+mb push innertable maxcapacity   joinstrategy  this  maxmemorypertable
+/* get the hash key columns and wrap them in a formattable */
+int hashkeycolumns   innertable hashkeycolumns
+formatableintholder fiharray
+formatableintholder getformatableintholders hashkeycolumns
+formatablearrayholder hashkeyholder   new formatablearrayholder fiharray
+int hashkeyitem   acb additem hashkeyholder
+mb push hashkeyitem
+fillinscanargs2 mb
+innertable
+bulkfetch
+colrefitem
+indexcolitem
+lockmode
+tablelocked
+isolationlevel
+return 28
+/**
+* @see joinstrategy#divideuppredicatelists
+*
+* @exception standardexception		thrown on error
+*/
+public void divideuppredicatelists
+optimizable				 innertable
+optimizablepredicatelist originalrestrictionlist
+optimizablepredicatelist storerestrictionlist
+optimizablepredicatelist nonstorerestrictionlist
+optimizablepredicatelist requalificationrestrictionlist
+datadictionary			 dd
+throws standardexception
+/*
+** if we are walking a non-covering index, then all predicates that
+** get evaluated in the hashscanresultset, whether during the building
+** or probing of the hash table, need to be evaluated at both the
+** indexrowtobaserowresultset and the hashscanresultset to ensure
+** that the rows materialized into the hash table still qualify when
+** we go to read the row from the heap.  this also includes predicates
+** that are not qualifier/start/stop keys (hence not in store/non-store
+** list).
+*/
+originalrestrictionlist copypredicatestootherlist
+requalificationrestrictionlist
+conglomeratedescriptor cd
+innertable gettrulythebestaccesspath   getconglomeratedescriptor
+/* for the inner table of a hash join, then divide up the predicates:
+*
+*	o restrictionlist	- predicates that get applied when creating
+*						  the hash table (single table clauses)
+*
+*  o nonbasetablerestrictionlist
+*						- those that get applied when probing into the
+*						  hash table (equijoin clauses on key columns,
+*						  ordered by key column position first, followed
+*						  by any other join predicates. (all predicates
+*						  in this list are qualifiers which can be
+*						  evaluated in the store).
+*
+*  o basetablerl		- only applicable if this is not a covering
+*                        index.  in that case, we will need to
+*                        requalify the data page.  thus, this list
+*                        will include all predicates.
+*/
+// build the list to be applied when creating the hash table
+originalrestrictionlist transferpredicates
+storerestrictionlist
+innertable getreferencedtablemap
+innertable
+/*
+* eliminate any non-qualifiers that may have been pushed, but
+* are redundant and not useful for hash join.
+*
+* for instance "in" (or other non-qualifier) was pushed down for
+* start/stop key, * but for hash join, it may no longer be because
+* previous key column may have been disqualified (eg., correlation).
+* we simply remove
+* such non-qualifier ("in") because we left it as residual predicate
+* anyway.  it's easier/safer to filter it out here than detect it
+* ealier (and not push it down). beetle 4316.
+*
+* can't filter out or list, as it is not a residual predicate,
+*/
+for  int i   storerestrictionlist size     1  i >  0  i
+predicate p1    predicate  storerestrictionlist getoptpredicate i
+if   p1 isstorequalifier       p1 isstartkey       p1 isstopkey
+storerestrictionlist removeoptpredicate i
+for  int i   originalrestrictionlist size     1  i >  0  i
+predicate p1
+predicate  originalrestrictionlist getoptpredicate i
+if   p1 isstorequalifier
+originalrestrictionlist removeoptpredicate i
+/* copy the rest of the predicates to the non-store list */
+originalrestrictionlist copypredicatestootherlist
+nonstorerestrictionlist
+/* if innertable is projectrestrictnode, we need to use its child
+* to find hash key columns, this is because projectrestrictnode may
+* not have underlying node's every result column as result column,
+* and the predicate's column reference was bound to the underlying
+* node's column position.  also we have to pass in the
+* projectrestrictnode rather than the underlying node to this method
+* because a predicate's referencedtablemap references the table number
+* of the projectrestrictivenode.  and we need this info to see if
+* a predicate is in storerestrictionlist that can be pushed down.
+* beetle 3458.
+*/
+optimizable hashtablefor   innertable
+if  innertable instanceof projectrestrictnode
+projectrestrictnode prn    projectrestrictnode  innertable
+if  prn getchildresult   instanceof optimizable
+hashtablefor    optimizable   prn getchildresult
+int hashkeycolumns   findhashkeycolumns hashtablefor
+cd
+nonstorerestrictionlist
+if  hashkeycolumns    null
+innertable sethashkeycolumns hashkeycolumns
+else
+string name
+if  cd    null    cd isindex
+name   cd getconglomeratename
+else
+name   innertable getbasetablename
+throw standardexception newexception sqlstate lang_hash_no_equijoin_found
+name
+innertable getbasetablename
+// mark all of the predicates in the probe list as qualifiers
+nonstorerestrictionlist markallpredicatesqualifiers
+int conglomcolumn   new int
+if  cd    null    cd isindex
+/*
+** if the conglomerate is an index, get the column numbers of the
+** hash keys in the base heap.
+*/
+for  int index   0  index < hashkeycolumns length  index
+conglomcolumn
+cd getindexdescriptor   basecolumnpositions  ]
+else
+/*
+** if the conglomerate is a heap, the column numbers of the hash
+** key are the column numbers returned by findhashkeycolumns().
+**
+** note: must switch from zero-based to one-based
+*/
+for  int index   0  index < hashkeycolumns length  index
+conglomcolumn   hashkeycolumns   1
+/* put the equality predicates on the key columns for the hash first.
+* (column # is columns[colctr] from above.)
+*/
+for  int index   hashkeycolumns length   1  index >  0  index
+nonstorerestrictionlist putoptimizableequalitypredicatefirst
+innertable
+conglomcolumn
+/**
+* @see joinstrategy#ishashjoin
+*/
+public boolean ishashjoin
+return true
+/**
+* @see joinstrategy#doesmaterialization
+*/
+public boolean doesmaterialization
+return true
+/**
+* find the hash key columns, if any, to use with this join.
+*
+* @param innertable	the inner table of the join
+* @param cd			the conglomerate descriptor to use on inner table
+* @param predlist		the predicate list to look for the equijoin in
+*
+* @return	the numbers of the hash key columns, or null if no hash key column
+*
+* @exception standardexception		thrown on error
+*/
+private int findhashkeycolumns optimizable innertable
+conglomeratedescriptor cd
+optimizablepredicatelist predlist
+throws standardexception
+if  predlist    null
+return  int  null
+/* find the column to use as the hash key.
+* (there must be an equijoin condition on this column.)
+* if cd is null, then optimizable is not a scan.
+* for indexes, we start at the first column in the key
+* and walk the key columns until we find the first one with
+* an equijoin condition on it.  we do essentially the same
+* for heaps.  (from column 1 through column n.)
+*/
+int columns   null
+if  cd    null
+columns   new int
+for  int j   0  j < columns length  j
+columns   j   1
+else if  cd isindex
+columns   cd getindexdescriptor   basecolumnpositions
+else
+columns
+new int
+for  int j   0  j < columns length  j
+columns   j   1
+// build a vector of all the hash key columns
+int colctr
+vector hashkeyvector   new vector
+for  colctr   0  colctr < columns length  colctr
+// is there an equijoin condition on this column?
+if  predlist hasoptimizableequijoin innertable  columns
+hashkeyvector addelement new integer colctr
+// convert the vector into an int[], if there are hash key columns
+if  hashkeyvector size   > 0
+int keycols   new int
+for  int index   0  index < keycols length  index
+keycols     integer  hashkeyvector elementat index   intvalue
+return keycols
+else
+return  int  null
+public string tostring
+return getname

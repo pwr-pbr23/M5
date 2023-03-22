@@ -1,0 +1,430 @@
+/*
+derby - class org.apache.derby.impl.services.daemon.basicdaemon
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl services daemon
+import org apache derby iapi services context contextservice
+import org apache derby iapi services context contextmanager
+import org apache derby iapi services daemon daemonservice
+import org apache derby iapi services daemon serviceable
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services monitor modulefactory
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import java util vector
+import java util list
+/**
+a basicdaemon is a background worker thread which does asynchronous i/o and
+general clean up.  it should not be used as a general worker thread for
+parallel execution.
+one cannot count on the order of request or count on when the daemon will
+wake up, even with servicenow requests.  request are not persistent and not
+recoverable, they are all lost when the system crashes or is shutdown.
+system shutdown, even orderly ones, do not wait for daemons to finish its
+work or empty its queue.  furthermore, any serviceable subscriptions,
+including ondemandonly, must tolerate spurious services.  the basicdaemon
+will setup a context manager with no context on it.  the serviceable
+object's performwork must provide useful context on the context manager to
+do its work.  the basicdaemon will wrap performwork call with try / catch
+block and will use the contextmanager's error handling to clean up any
+error.  the basicdaemon will guarentee servicenow request will not be lost
+as long as the jbms does not crash - however, if n servicenow requests are
+made by the same client, it may only be serviced once, not n times.
+many serviceable object will subscribe to the same basicdaemon.  their
+performwork method should be well behaved - in other words, it should not
+take too long or hog too many resources or deadlock with anyone else.  and
+it cannot (should not) error out.
+the basicdaemon implementation manages the daemonservice's data structure,
+handles subscriptions and enqueues requests, and determine the service
+schedule for its serviceable objects.  the basicdaemon keeps an array
+(vector) of serviceable subscriptions it also keeps 2 queues for clients
+that uses it for one time service - the 1st queue is for a servicenow
+enqueue request, the 2nd queue is for non servicenow enqueue request.
+this basicdaemon services its clients in the following order:
+1. any subscribed client that have made a servicenow request that has not
+been fulfilled
+2. serviceable clients on the 1st queue
+3. all subscribed clients that are not ondemandonly
+4. serviceable clients 2nd queue
+*/
+public class basicdaemon implements daemonservice  runnable
+private int numclients 		   number of clients that needs services
+private static final int optimal_queue_size   100
+private final vector subscription
+// the context this daemon should run with
+protected final contextservice contextservice
+protected final contextmanager contextmgr
+/**
+queues for the work to be done.
+these are synchronized by this object.
+*/
+private final list highpq 		   high priority queue
+private final list normpq 		   normal priority queue
+/**
+which subscribed clients to service next?
+only accessed by daemon thread
+*/
+private int nextservice
+/*
+** state for the sleep/wakeup routines.
+*/
+private boolean awakened 			   a wake up call has been issued
+// mt - synchronized on this
+/**
+true if i'm waiting, if this is false then i am running and a notify is not required.
+*/
+private boolean waiting
+private boolean inpause 			   if true  don't do anything
+private boolean running 			   i am running now
+private boolean stoprequested 		   thread is requested to die
+private boolean stopped 			   we have stopped
+private long lastservicetime     when did i last wake up on a timer
+private int earlywakeupcount 		   if i am waken up a couple of times  check
+// that lastservicetime to make sure work
+// scheduled on a timer gets done once in a
+// while
+/**
+make a basicdaemon
+*/
+public basicdaemon contextservice contextservice
+this contextservice   contextservice
+this contextmgr   contextservice newcontextmanager
+subscription   new vector 1  1
+highpq   new java util linkedlist
+normpq   new java util linkedlist
+lastservicetime   system currenttimemillis
+public int subscribe serviceable newclient  boolean ondemandonly
+int clientnumber
+servicerecord clientrecord
+synchronized this
+clientnumber   numclients
+clientrecord   new servicerecord newclient  ondemandonly  true
+subscription insertelementat clientrecord  clientnumber
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+clientnumber
+clientrecord
+return clientnumber
+/**
+* removes a client from the list of subscribed clients. the call does not
+* wait for the daemon to finish the work it is currently performing.
+* therefore, the client must tolerate that its <code>performwork()</code>
+* method could be invoked even after the call to
+* <code>unsubscribe()</code> has returned (but not more than once).
+*
+* @param clientnumber client identifier
+*/
+public void unsubscribe int clientnumber
+if  clientnumber < 0    clientnumber > subscription size
+return
+// client number is never reused.  just null out the vector entry.
+subscription setelementat null  clientnumber
+public void servicenow int clientnumber
+if  clientnumber < 0    clientnumber > subscription size
+return
+servicerecord clientrecord    servicerecord subscription elementat clientnumber
+if  clientrecord    null
+return
+clientrecord called
+wakeup
+public boolean enqueue serviceable newclient  boolean servicenow
+servicerecord clientrecord   new servicerecord newclient  false  false
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+servicenow       newclient
+list queue   servicenow ? highpq   normpq
+int highpqsize
+synchronized  this
+queue add clientrecord
+highpqsize   highpq size
+if  sanitymanager debug
+if  sanitymanager debug_on
+if  highpqsize >  optimal_queue_size   2
+system out println     highpqsize
+if  servicenow     awakened
+wakeup
+if  servicenow
+return highpqsize > optimal_queue_size
+return false
+/**
+get rid of all queued up serviceable tasks.
+*/
+public synchronized void clear
+normpq clear
+highpq clear
+/*
+* class specific methods
+*/
+protected servicerecord nextassignment boolean urgent
+// first goes thru the subscription list, then goes thru highpq;
+servicerecord clientrecord
+while  nextservice < subscription size
+clientrecord    servicerecord subscription elementat nextservice
+if  clientrecord    null     clientrecord needimmediateservice        urgent    clientrecord needservice
+return clientrecord
+clientrecord   null
+synchronized this
+if   highpq isempty
+clientrecord    servicerecord  highpq remove 0
+if  urgent    clientrecord    null
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+clientrecord    null ?
+clientrecord
+return clientrecord
+clientrecord   null
+synchronized this
+if   normpq isempty
+clientrecord    servicerecord normpq remove 0
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+clientrecord
+// else no more work
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+if  clientrecord    null
+sanitymanager debug daemonservice daemontrace
+return clientrecord
+protected void serviceclient servicerecord clientrecord
+clientrecord serviced
+serviceable client   clientrecord client
+// client may have unsubscribed while it had items queued
+if  client    null
+return
+contextmanager cm   contextmgr
+if  sanitymanager debug
+sanitymanager assert cm    null
+sanitymanager assert client    null
+try
+int status   client performwork cm
+if  clientrecord subscriber
+return
+if  status    serviceable requeue
+list queue   client serviceasap   ? highpq   normpq
+synchronized  this
+queue add clientrecord
+if  sanitymanager debug
+if  sanitymanager debug_on
+if  queue size   >  optimal_queue_size   2
+system out println     queue size
+return
+catch  throwable e
+if  sanitymanager debug
+sanitymanager showtrace e
+cm cleanuponerror e
+/*
+* runnable methods
+*/
+public void run
+contextservice setcurrentcontextmanager contextmgr
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemonoff
+sanitymanager debug daemonservice daemontrace
+return
+sanitymanager debug daemonservice daemontrace
+// infinite loop of rest and work
+while true
+if  stoprequested
+break
+// if someone wake me up, only service the urgent requests.
+// if i wake up by my regular schedule, service all clients
+boolean urgentonly   rest
+if  stoprequested
+break
+if   inpause
+work urgentonly
+synchronized this
+running   false
+stopped   true
+contextmgr cleanuponerror standardexception normalclose
+contextservice resetcurrentcontextmanager contextmgr
+/*
+* daemon service method
+*/
+/*
+* pause the daemon.  wait till it is no running before it returns
+*/
+public void pause
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+synchronized this
+inpause   true
+while running
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+try
+wait
+catch  interruptedexception ie
+// someone interrrupt us, done running
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+public void resume
+synchronized this
+inpause   false
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+/**
+finish what we are doing and at the next convenient moment, get rid of
+the thread and make the daemon object goes away if possible.
+remember we are calling from another thread
+*/
+public void stop
+if  stopped 			   already stopped
+return
+synchronized this
+stoprequested   true
+notifyall       get sleeper to wake up and stop asap
+pause       finish doing what we are doing first
+/*
+**wait until the work in the high priority queue is done.
+**note: used by tests only to make sure all the work
+**assigned to the daemon is completed.
+**/
+public void waituntilqueueisempty
+while true
+synchronized this
+boolean nosubscriptionrequests   true
+for  int urgentserviced   0  urgentserviced < subscription size    urgentserviced
+servicerecord clientrecord    servicerecord subscription elementat urgentserviced
+if  clientrecord    null   	clientrecord needservice
+nosubscriptionrequests   false
+break
+if  highpq isempty      nosubscriptionrequests    running
+return
+else
+notifyall      wake up the the daemon thread
+//wait for the raw store daemon to wakeus up
+//when it finihes work.
+try
+wait
+catch  interruptedexception ie
+// someone interrupt us, see what's going on
+private synchronized boolean stoprequested
+return stoprequested
+private synchronized boolean inpause
+return inpause
+/*
+* basicdaemon method
+*/
+protected synchronized void wakeup
+if   awakened
+awakened   true 	   i am being awakened for urgent work
+if  waiting
+notifyall
+/**
+returns true if awakened by some notification, false if wake up by timer
+*/
+private boolean rest
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+boolean urgentonly
+boolean checkwallclock   false
+synchronized this
+try
+if   awakened
+waiting   true
+wait daemonservice timer_delay
+waiting   false
+catch  interruptedexception ie
+// someone interrupt us, see what's going on
+nextservice   0
+urgentonly   awakened
+if  urgentonly 	   check wall clock
+// take a guess that each early request is services every 500ms.
+if  earlywakeupcount   >  daemonservice timer_delay   500
+earlywakeupcount   0
+checkwallclock   true
+awakened   false 			   reset this for next time
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+urgentonly ?
+if  checkwallclock
+long currenttime   system currenttimemillis
+if   currenttime   lastservicetime  > daemonservice timer_delay
+lastservicetime   currenttime
+urgentonly   false
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+return urgentonly
+private void work boolean urgentonly
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+servicerecord work
+// while i am working, all servicenow requests that comes in now will
+// be taken care of when we get the next assignment.
+int servicecount   0
+int yieldfactor   10
+if  urgentonly     highpq size   > optimal_queue_size
+yieldfactor   2
+int yieldcount   optimal_queue_size   yieldfactor
+for  work   nextassignment urgentonly
+work    null
+work   nextassignment urgentonly
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+work
+synchronized this
+if  inpause    stoprequested
+break 			   don't do anything more
+running   true
+// do work
+try
+serviceclient work
+servicecount
+finally
+// catch run time exceptions
+synchronized this
+running   false
+notifyall
+if  inpause    stoprequested
+break 	   don't do anything more
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+work
+// ensure the subscribed clients get a look in once in a while
+// when the queues are large.
+if   servicecount %  optimal_queue_size   2      0
+nextservice   0
+if   servicecount % yieldcount     0
+yield
+if  sanitymanager debug
+if  sanitymanager debug_on daemonservice daemontrace
+sanitymanager debug daemonservice daemontrace
+/* let everybody else run first */
+private void yield
+thread currentthread   thread currentthread
+int oldpriority   currentthread getpriority
+if  oldpriority <  thread min_priority
+currentthread yield
+else
+modulefactory mf   monitor getmonitor
+if  mf    null
+mf setthreadpriority thread min_priority
+currentthread yield
+if  mf    null
+mf setthreadpriority oldpriority

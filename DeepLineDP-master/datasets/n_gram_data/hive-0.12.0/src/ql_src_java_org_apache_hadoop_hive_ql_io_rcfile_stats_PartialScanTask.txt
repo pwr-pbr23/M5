@@ -1,0 +1,281 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql io rcfile stats
+import java io ioexception
+import java io serializable
+import java util arraylist
+import java util collections
+import java util enumeration
+import java util list
+import org apache commons lang stringutils
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive ql context
+import org apache hadoop hive ql drivercontext
+import org apache hadoop hive ql errormsg
+import org apache hadoop hive ql queryplan
+import org apache hadoop hive ql exec task
+import org apache hadoop hive ql exec utilities
+import org apache hadoop hive ql exec mr hadoopjobexechelper
+import org apache hadoop hive ql exec mr hadoopjobexechook
+import org apache hadoop hive ql exec mr throttle
+import org apache hadoop hive ql io combinehiveinputformat
+import org apache hadoop hive ql io hiveoutputformatimpl
+import org apache hadoop hive ql metadata hiveexception
+import org apache hadoop hive ql plan mapredwork
+import org apache hadoop hive ql plan api stagetype
+import org apache hadoop hive ql session sessionstate
+import org apache hadoop hive ql session sessionstate loghelper
+import org apache hadoop hive ql stats statsfactory
+import org apache hadoop hive ql stats statspublisher
+import org apache hadoop hive shims shimloader
+import org apache hadoop io nullwritable
+import org apache hadoop mapred counters
+import org apache hadoop mapred fileinputformat
+import org apache hadoop mapred inputformat
+import org apache hadoop mapred jobclient
+import org apache hadoop mapred jobconf
+import org apache hadoop mapred runningjob
+import org apache log4j appender
+import org apache log4j fileappender
+import org apache log4j logmanager
+/**
+* partialscantask.
+* this task handles rcfile statics calculation via partial scan.
+* instead of reading all bytes, it reads block header and aggregates result.
+* https://issues.apache.org/jira/browse/hive-3958
+*/
+@suppresswarnings
+public class partialscantask extends task<partialscanwork> implements
+serializable  hadoopjobexechook
+private static final long serialversionuid   1l
+protected transient jobconf job
+protected hadoopjobexechelper jobexechelper
+@override
+public void initialize hiveconf conf  queryplan queryplan
+drivercontext drivercontext
+super initialize conf  queryplan  drivercontext
+job   new jobconf conf  partialscantask class
+jobexechelper   new hadoopjobexechelper job  this console  this  this
+@override
+public boolean requirelock
+return true
+boolean success   true
+@override
+/**
+* start a new map-reduce job to do partial scan to calculate stats,
+* almost the same as blockmergetask or execdriver.
+*/
+public int execute drivercontext drivercontext
+hiveconf setvar job  hiveconf confvars hiveinputformat
+combinehiveinputformat class getname
+success   true
+shimloader gethadoopshims   preparejoboutput job
+job setoutputformat hiveoutputformatimpl class
+job setmapperclass work getmapperclass
+context ctx   drivercontext getctx
+boolean ctxcreated   false
+try
+if  ctx    null
+ctx   new context job
+ctxcreated   true
+catch  ioexception e
+e printstacktrace
+console printerror
+org apache hadoop util stringutils stringifyexception e
+return 5
+job setmapoutputkeyclass nullwritable class
+job setmapoutputvalueclass nullwritable class
+if work getnummaptasks      null
+job setnummaptasks work getnummaptasks
+// zero reducers
+job setnumreducetasks 0
+if  work getminsplitsize      null
+hiveconf setlongvar job  hiveconf confvars mapredminsplitsize  work
+getminsplitsize   longvalue
+if  work getinputformat      null
+hiveconf setvar job  hiveconf confvars hiveinputformat  work
+getinputformat
+string inpformat   hiveconf getvar job  hiveconf confvars hiveinputformat
+if   inpformat    null       stringutils isnotblank inpformat
+inpformat   shimloader gethadoopshims   getinputformatclassname
+log info     inpformat
+try
+job setinputformat  class<? extends inputformat>   class
+forname inpformat
+catch  classnotfoundexception e
+throw new runtimeexception e getmessage
+job setoutputkeyclass nullwritable class
+job setoutputvalueclass nullwritable class
+int returnval   0
+runningjob rj   null
+boolean noname   stringutils isempty hiveconf getvar job
+hiveconf confvars hadoopjobname
+string jobname   null
+if  noname    this getqueryplan      null
+int maxlen   conf getintvar hiveconf confvars hivejobnamelength
+jobname   utilities abbreviate this getqueryplan   getquerystr
+maxlen   6
+if  noname
+// this is for a special case to ensure unit tests pass
+hiveconf setvar job  hiveconf confvars hadoopjobname
+jobname    null ? jobname       utilities randgen nextint
+// pass aggregation key to mapper
+hiveconf setvar job
+hiveconf confvars hive_stats_key_prefix
+work getaggkey
+try
+addinputpaths job  work
+mapredwork mrwork   new mapredwork
+mrwork setmapwork work
+utilities setmapredwork job  mrwork  ctx getmrtmpfileuri
+// remove the pwd from conf file so that job tracker doesn't show this
+// logs
+string pwd   hiveconf getvar job  hiveconf confvars metastorepwd
+if  pwd    null
+hiveconf setvar job  hiveconf confvars metastorepwd
+jobclient jc   new jobclient job
+string addedjars   utilities getresourcefiles job  sessionstate resourcetype jar
+if   addedjars isempty
+job set    addedjars
+// make this client wait if job trcker is not behaving well.
+throttle checkjobtracker job  log
+if  work isgatheringstats
+// initialize stats publishing table
+statspublisher statspublisher
+string statsimplementationclass   hiveconf getvar job  hiveconf confvars hivestatsdbclass
+if  statsfactory setimplementation statsimplementationclass  job
+statspublisher   statsfactory getstatspublisher
+if   statspublisher init job        creating stats table if not exists
+if  hiveconf getboolvar job  hiveconf confvars hive_stats_reliable
+throw
+new hiveexception errormsg statspublisher_initialization_error geterrorcodedmsg
+// finally submit the job!
+rj   jc submitjob job
+returnval   jobexechelper progress rj  jc
+success    returnval    0
+catch  exception e
+e printstacktrace
+string mesg       utilities getnamemessage e
+if  rj    null
+mesg       rj getjobid     mesg
+else
+mesg       mesg
+// has to use full name to make sure it does not conflict with
+// org.apache.commons.lang.stringutils
+console printerror mesg
+org apache hadoop util stringutils stringifyexception e
+success   false
+returnval   1
+finally
+try
+if  ctxcreated
+ctx clear
+if  rj    null
+if  returnval    0
+rj killjob
+hadoopjobexechelper runningjobkilluris remove rj getjobid
+jobid   rj getid   tostring
+catch  exception e
+return  returnval
+private void addinputpaths jobconf job  partialscanwork work
+for  string path   work getinputpaths
+fileinputformat addinputpath job  new path path
+@override
+public string getname
+return
+public static string input_seperator
+public static void main string args
+string inputpathstr   null
+string outputdir   null
+string jobconffilename   null
+try
+for  int i   0  i < args length  i
+if  args equals
+inputpathstr   args
+else if  args equals
+jobconffilename   args
+else if  args equals
+outputdir   args
+catch  indexoutofboundsexception e
+system err println
+printusage
+if  inputpathstr    null    outputdir    null
+outputdir trim   equals
+printusage
+list<string> inputpaths   new arraylist<string>
+string paths   inputpathstr split input_seperator
+if  paths    null    paths length    0
+printusage
+filesystem fs   null
+jobconf conf   new jobconf partialscantask class
+for  string path   paths
+try
+path pathobj   new path path
+if  fs    null
+fs   filesystem get pathobj touri    conf
+filestatus fstatus   fs getfilestatus pathobj
+if  fstatus isdir
+filestatus filestatus   fs liststatus pathobj
+for  filestatus st   filestatus
+inputpaths add st getpath   tostring
+else
+inputpaths add fstatus getpath   tostring
+catch  ioexception e
+e printstacktrace system err
+if  jobconffilename    null
+conf addresource new path jobconffilename
+hiveconf hiveconf   new hiveconf conf  partialscantask class
+log log   logfactory getlog partialscantask class getname
+boolean issilent   hiveconf getboolvar conf
+hiveconf confvars hivesessionsilent
+loghelper console   new loghelper log  issilent
+// print out the location of the log file for the user so
+// that it's easy to find reason for local mode execution failures
+for  appender appender   collections
+list  enumeration<appender>  logmanager getrootlogger
+getallappenders
+if  appender instanceof fileappender
+console printinfo
+fileappender  appender  getfile
+partialscanwork mergework   new partialscanwork inputpaths
+drivercontext drivercxt   new drivercontext
+partialscantask taskexec   new partialscantask
+taskexec initialize hiveconf  null  drivercxt
+taskexec setwork mergework
+int ret   taskexec execute drivercxt
+if  ret    0
+system exit 2
+private static void printusage
+system exit 1
+@override
+public stagetype gettype
+return stagetype mapred
+@override
+public boolean checkfatalerrors counters ctrs  stringbuilder errmsg
+return false
+@override
+public void logplanprogress sessionstate ss  throws ioexception
+// no op
+@override
+public void updatecounters counters ctrs  runningjob rj  throws ioexception
+// no op

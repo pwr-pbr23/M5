@@ -1,0 +1,236 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql optimizer physical
+import java io bytearrayinputstream
+import java io inputstream
+import java io serializable
+import java util arraylist
+import java util hashmap
+import java util hashset
+import java util list
+import java util map
+import java util stack
+import org apache hadoop fs contentsummary
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive ql context
+import org apache hadoop hive ql exec conditionaltask
+import org apache hadoop hive ql exec joinoperator
+import org apache hadoop hive ql exec mapredtask
+import org apache hadoop hive ql exec operator
+import org apache hadoop hive ql exec task
+import org apache hadoop hive ql exec taskfactory
+import org apache hadoop hive ql exec utilities
+import org apache hadoop hive ql lib dispatcher
+import org apache hadoop hive ql lib node
+import org apache hadoop hive ql lib taskgraphwalker
+import org apache hadoop hive ql lib taskgraphwalker taskgraphwalkercontext
+import org apache hadoop hive ql optimizer mapjoinprocessor
+import org apache hadoop hive ql parse parsecontext
+import org apache hadoop hive ql parse qbjointree
+import org apache hadoop hive ql parse semanticexception
+import org apache hadoop hive ql plan conditionalresolvercommonjoin
+import org apache hadoop hive ql plan conditionalwork
+import org apache hadoop hive ql plan joindesc
+import org apache hadoop hive ql plan mapredwork
+import org apache hadoop hive ql plan conditionalresolvercommonjoin conditionalresolvercommonjoinctx
+public class commonjoinresolver implements physicalplanresolver
+@override
+public physicalcontext resolve physicalcontext pctx  throws semanticexception
+// create dispatcher and graph walker
+dispatcher disp   new commonjointaskdispatcher pctx
+taskgraphwalker ogw   new taskgraphwalker disp
+// get all the tasks nodes from root task
+arraylist<node> topnodes   new arraylist<node>
+topnodes addall pctx roottasks
+// begin to walk through the task tree.
+ogw startwalking topnodes  null
+return pctx
+/**
+* iterator each tasks. if this task has a local work,create a new task for this local work, named
+* mapredlocaltask. then make this new generated task depends on current task's parent task, and
+* make current task depends on this new generated task
+*/
+class commonjointaskdispatcher implements dispatcher
+private final physicalcontext physicalcontext
+public commonjointaskdispatcher physicalcontext context
+super
+physicalcontext   context
+private conditionaltask processcurrenttask mapredtask currtask
+conditionaltask conditionaltask  context context
+throws semanticexception
+// whether it contains common join op; if contains, return this common join op
+joinoperator joinop   getjoinop currtask
+if  joinop    null
+return null
+currtask settasktag task common_join
+mapredwork currwork   currtask getwork
+// create conditional work list and task list
+list<serializable> listworks   new arraylist<serializable>
+list<task<? extends serializable>> listtasks   new arraylist<task<? extends serializable>>
+// create alias to task mapping and alias to input file mapping for resolver
+hashmap<string  task<? extends serializable>> aliastotask   new hashmap<string  task<? extends serializable>>
+hashmap<string  arraylist<string>> pathtoaliases   currtask getwork   getpathtoaliases
+// get parsectx for this join operator
+parsecontext parsectx   physicalcontext getparsecontext
+qbjointree jointree   parsectx getjoincontext   get joinop
+// start to generate multiple map join tasks
+joindesc joindesc   joinop getconf
+byte order   joindesc gettagorder
+int numaliases   order length
+long aliastotalknowninputsize   0
+hashmap<string  long> aliastosize   new hashmap<string  long>
+try
+// go over all the input paths, and calculate a known total size, known
+// size for each input alias.
+utilities getinputsummary context  currwork  null  getlength
+// set alias to size mapping, this can be used to determine if one table
+// is choosen as big table, what's the total size of left tables, which
+// are going to be small tables.
+for  map entry<string  arraylist<string>> entry   pathtoaliases entryset
+string path   entry getkey
+list<string> aliaslist   entry getvalue
+contentsummary cs   context getcs path
+if  cs    null
+long size   cs getlength
+for  string alias   aliaslist
+aliastotalknowninputsize    size
+long es   aliastosize get alias
+if es    null
+es   new long 0
+es    size
+aliastosize put alias  es
+hashset<integer> bigtablecandidates   mapjoinprocessor getbigtablecandidates joindesc getconds
+// no table could be the big table; there is no need to convert
+if  bigtablecandidates    null
+return null
+currwork setopparsectxmap parsectx getopparsectx
+currwork setjointree jointree
+string xml   currwork toxml
+string bigtablealias   null
+long thresholdofsmalltblsizesum   hiveconf getlongvar context getconf
+hiveconf confvars hivesmalltablesfilesize
+for  int i   0  i < numaliases  i
+// this table cannot be big table
+if   bigtablecandidates contains i
+continue
+// create map join task and set big table as i
+// deep copy a new mapred work from xml
+inputstream in   new bytearrayinputstream xml getbytes
+mapredwork newwork   utilities deserializemapredwork in  physicalcontext getconf
+// create a mapred task for this work
+mapredtask newtask    mapredtask  taskfactory get newwork  physicalcontext
+getparsecontext   getconf
+joinoperator newjoinop   getjoinop newtask
+// optimize this newwork and assume big table position is i
+bigtablealias   mapjoinprocessor genmapjoinopandlocalwork newwork  newjoinop  i
+long aliasknownsize   aliastosize get bigtablealias
+if  aliasknownsize    null    aliasknownsize longvalue   > 0
+long smalltbltotalknownsize   aliastotalknowninputsize
+aliasknownsize longvalue
+if smalltbltotalknownsize > thresholdofsmalltblsizesum
+//this table is not good to be a big table.
+continue
+// add into conditional task
+listworks add newwork
+listtasks add newtask
+newtask settasktag task converted_mapjoin
+//set up backup task
+newtask setbackuptask currtask
+newtask setbackupchildrentasks currtask getchildtasks
+// put the mapping alias to task
+aliastotask put bigtablealias  newtask
+catch  exception e
+e printstacktrace
+throw new semanticexception     e getmessage
+// insert current common join task to conditional task
+listworks add currtask getwork
+listtasks add currtask
+// clear jointree and op parse context
+currwork setopparsectxmap null
+currwork setjointree null
+// create conditional task and insert conditional task into task tree
+conditionalwork cndwork   new conditionalwork listworks
+conditionaltask cndtsk    conditionaltask  taskfactory get cndwork  parsectx getconf
+cndtsk setlisttasks listtasks
+// set resolver and resolver context
+cndtsk setresolver new conditionalresolvercommonjoin
+conditionalresolvercommonjoinctx resolverctx   new conditionalresolvercommonjoinctx
+resolverctx setpathtoaliases pathtoaliases
+resolverctx setaliastoknownsize aliastosize
+resolverctx setaliastotask aliastotask
+resolverctx setcommonjointask currtask
+resolverctx setlocaltmpdir context getlocalscratchdir false
+resolverctx sethdfstmpdir context getmrscratchdir
+cndtsk setresolverctx resolverctx
+//replace the current task with the new generated conditional task
+this replacetaskwithconditionaltask currtask  cndtsk  physicalcontext
+return cndtsk
+private void replacetaskwithconditionaltask
+task<? extends serializable> currtask  conditionaltask cndtsk
+physicalcontext physicalcontext
+// add this task into task tree
+// set all parent tasks
+list<task<? extends serializable>> parenttasks   currtask getparenttasks
+currtask setparenttasks null
+if  parenttasks    null
+for  task<? extends serializable> tsk   parenttasks
+// make new generated task depends on all the parent tasks of current task.
+tsk adddependenttask cndtsk
+// remove the current task from its original parent task's dependent task
+tsk removedependenttask currtask
+else
+// remove from current root task and add conditional task to root tasks
+physicalcontext removefromroottask currtask
+physicalcontext addtoroottask cndtsk
+// set all child tasks
+list<task<? extends serializable>> oldchildtasks   currtask getchildtasks
+if  oldchildtasks    null
+for  task<? extends serializable> tsk   cndtsk getlisttasks
+if  tsk equals currtask
+continue
+for  task<? extends serializable> oldchild   oldchildtasks
+tsk adddependenttask oldchild
+@override
+public object dispatch node nd  stack<node> stack  object    nodeoutputs
+throws semanticexception
+if  nodeoutputs    null    nodeoutputs length    0
+throw new semanticexception
+taskgraphwalkercontext walkerctx    taskgraphwalkercontext  nodeoutputs
+task<? extends serializable> currtask    task<? extends serializable>  nd
+// not map reduce task or not conditional task, just skip
+if  currtask ismapredtask
+if  currtask instanceof conditionaltask
+// get the list of task
+list<task<? extends serializable>> tasklist     conditionaltask  currtask  getlisttasks
+for  task<? extends serializable> tsk   tasklist
+if  tsk ismapredtask
+conditionaltask cndtask   this processcurrenttask  mapredtask  tsk
+conditionaltask  currtask   physicalcontext getcontext
+walkerctx addtodispatchlist cndtask
+else
+conditionaltask cndtask   this processcurrenttask  mapredtask  currtask  null  physicalcontext getcontext
+walkerctx addtodispatchlist cndtask
+return null
+private joinoperator getjoinop mapredtask task  throws semanticexception
+if  task getwork      null
+return null
+operator<? extends serializable> reducerop   task getwork   getreducer
+if  reducerop instanceof joinoperator
+return  joinoperator  reducerop
+else
+return null

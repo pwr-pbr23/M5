@@ -1,0 +1,511 @@
+/*
+derby - class org.apache.derby.impl.sql.conn.genericstatementcontext
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl sql conn
+import org apache derby iapi services context context
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services timer timerfactory
+import org apache derby iapi error standardexception
+import org apache derby iapi sql conn languageconnectioncontext
+import org apache derby iapi sql conn statementcontext
+import org apache derby iapi sql depend dependency
+import org apache derby iapi sql depend dependencymanager
+import org apache derby iapi sql execute noputresultset
+import org apache derby iapi sql resultset
+import org apache derby iapi sql parametervalueset
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi services context contextimpl
+import org apache derby iapi error exceptionseverity
+import org apache derby iapi reference sqlstate
+import java util arraylist
+import java util iterator
+import java util timer
+import java util timertask
+import java sql sqlexception
+/**
+* genericstatementcontext is pushed/popped around a statement prepare and execute
+* so that any statement specific clean up can be performed.
+*
+*
+*/
+final class genericstatementcontext
+extends contextimpl implements statementcontext
+private boolean		setsavepoint
+private string		internalsavepointname
+private resultset	topresultset
+private arraylist		dependencies
+private noputresultset subquerytrackingarray
+private noputresultset materializedsubqueries
+private	final languageconnectioncontext lcc
+private boolean		inuse   true
+// this flag satisfies all the conditions
+// for using volatile instead of synchronized.
+// (source: doug lea, concurrent programming in java, second edition,
+// section 2.2.7.4, page 97)
+// true if statement has been cancelled
+private volatile boolean cancellationflag   false
+// reference to the timertask that will time out this statement.
+// needed for stopping the task when execution completes before timeout.
+private cancelquerytask canceltask   null
+private	boolean		parentintrigger 	   whetherparent started with a trigger on stack
+private	boolean		isforreadonly   false
+private	boolean		isatomic
+private boolean		issystemcode
+private boolean		rollbackparentcontext
+private	string		stmttext
+private	parametervalueset			pvs
+/**
+set to one of routinealiasinfo.{modifies_sql_data, reads_sql_data, contains_sql, no_sql}
+*/
+private short			sqlallowed    1
+/*
+constructor
+@param tc transaction
+*/
+genericstatementcontext languageconnectioncontext lcc
+super lcc getcontextmanager    org apache derby iapi reference contextid lang_statement
+this lcc   lcc
+internalsavepointname       hashcode
+if  sanitymanager debug
+sanitymanager assert  lcc    null
+/**
+* this is a timertask that is responsible for timing out statements,
+* typically when an application has called statement.setquerytimeout().
+*
+* when the application invokes execute() on a statement object, or
+* fetches data on a resultset, a statementcontext object is allocated
+* for the duration of the execution in the engine (until control is
+* returned to the application).
+*
+* when the statementcontext object is assigned with setinuse(),
+* a cancelquerytask is scheduled if a timeout > 0 has been set.
+*/
+private static class cancelquerytask
+extends
+timertask
+/**
+* reference to the statementcontext for the executing statement
+* which might time out.
+*/
+private statementcontext statementcontext
+/**
+* initializes a new task for timing out a statement's execution.
+* this does not schedule it for execution, the caller is
+* responsible for calling timer.schedule() with this object
+* as parameter.
+*/
+public cancelquerytask statementcontext ctx
+statementcontext   ctx
+/**
+* invoked by a timer class to cancel an executing statement.
+* this method just sets a volatile flag in the associated
+* statementcontext object by calling statementcontext.cancel();
+* it is the responsibility of the thread executing the statement
+* to check this flag regularly.
+*/
+public void run
+synchronized  this
+if  statementcontext    null
+statementcontext cancel
+/**
+* stops this task and prevents it from cancelling a statement.
+* guarantees that after this method returns, the associated
+* statementcontext object will not be tampered with by this task.
+* thus, the statementcontext object may safely be allocated to
+* other executing statements.
+*/
+public void forgetcontext
+boolean maystillrun    cancel
+if  maystillrun
+synchronized  this
+statementcontext   null
+// statementcontext interface
+public void setinuse
+boolean parentintrigger
+boolean isatomic
+boolean isforreadonly
+string stmttext
+parametervalueset pvs
+long timeoutmillis
+inuse   true
+this parentintrigger   parentintrigger
+this isforreadonly   isforreadonly
+this isatomic   isatomic
+this stmttext   stmttext
+this pvs   pvs
+rollbackparentcontext   false
+if  timeoutmillis > 0
+timerfactory factory   monitor getmonitor   gettimerfactory
+timer timer   factory getcancellationtimer
+canceltask   new cancelquerytask this
+timer schedule canceltask  timeoutmillis
+public void clearinuse
+/* we must clear out the current top resultset to prepare for
+* reusing a statementcontext.
+*/
+stufftopresultset  null  null
+inuse   false
+parentintrigger   false
+isatomic   false
+isforreadonly   false
+this stmttext   null
+sqlallowed    1
+issystemcode   false
+rollbackparentcontext   false
+if  canceltask    null
+canceltask forgetcontext
+canceltask   null
+cancellationflag   false
+/**
+* @see statementcontext#setsavepoint
+* @exception standardexception thrown on error
+*/
+public void setsavepoint   throws standardexception
+if  sanitymanager debug
+if  sanitymanager debug_on
+sanitymanager debug_print
+internalsavepointname
+pleasebeonstack
+lcc gettransactionexecute   setsavepoint internalsavepointname  null
+setsavepoint   true
+/**
+* resets the savepoint to the current spot if it is
+* set, otherwise, noop.  used when a commit is
+* done on a nested connection.
+*
+* @see statementcontext#resetsavepoint
+* @exception standardexception thrown on error
+*/
+public void resetsavepoint   throws standardexception
+if  sanitymanager debug
+if  sanitymanager debug_on
+sanitymanager debug_print
+internalsavepointname
+if  inuse    setsavepoint
+// resolve plugin ???. for the plugin, there will be no transaction controller
+lcc gettransactionexecute   setsavepoint internalsavepointname  null
+// stage buffer management
+/**
+* @see statementcontext#clearsavepoint
+* @exception standardexception thrown on error
+*/
+public void clearsavepoint   throws standardexception
+if  sanitymanager debug
+if  sanitymanager debug_on
+sanitymanager debug_print
+internalsavepointname
+pleasebeonstack
+if  sanitymanager debug
+sanitymanager assert setsavepoint
+// resolve plugin ???. for the plugin, there will be no transaction controller
+lcc gettransactionexecute   releasesavepoint internalsavepointname  null
+setsavepoint   false
+/**
+* set the top resultset in the resultset tree for close down on
+* an error.
+*
+* @exception standardexception thrown on error.
+*/
+public void settopresultset resultset topresultset
+noputresultset subquerytrackingarray
+throws standardexception
+pleasebeonstack
+/* we have to handle both materialize and non-materialized subqueries.
+* materialized subqueries are attached before the top result set is
+* set.  if there are any, then we must copy them into the new
+* subquerytrackingarray.
+*/
+if  materializedsubqueries    null
+// do the merging into the passed in array.
+if  subquerytrackingarray    null
+if  sanitymanager debug
+if  this materializedsubqueries length    subquerytrackingarray length
+sanitymanager throwassert
+this materializedsubqueries length
+subquerytrackingarray length
+for  int index   0  index < subquerytrackingarray length  index
+if  this subquerytrackingarray    null
+subquerytrackingarray   this materializedsubqueries
+else
+subquerytrackingarray   this materializedsubqueries
+materializedsubqueries   null
+stufftopresultset  topresultset  subquerytrackingarray
+/**
+*	private minion of settopresultset() and clearinuse()
+*
+*	@param	topresultset	make this the top result set
+*	@param	subquerytrackingarray	where to keep track of subqueries in this statement
+*/
+private	void	stufftopresultset resultset topresultset
+noputresultset subquerytrackingarray
+this topresultset   topresultset
+this subquerytrackingarray   subquerytrackingarray
+dependencies   null
+/**
+* set the appropriate entry in the subquery tracking array for
+* the specified subquery.
+* useful for closing down open subqueries on an exception.
+*
+* @param subquerynumber	the subquery # for this subquery
+* @param subqueryresultset	the resultset at the top of the subquery
+* @param numsubqueries		the total # of subqueries in the entire query
+*
+* @exception standardexception thrown on error.
+*/
+public void setsubqueryresultset int subquerynumber
+noputresultset subqueryresultset
+int numsubqueries
+throws standardexception
+pleasebeonstack
+/* note: in degenerate cases, it is possible that there is no top
+* result set.  for example:
+*		call (select 1 from systables).valueof('111');
+* in that case, we allocate our own subquery tracking array on
+* each call. (gross!)
+* (trust me, this is only done in degenerate cases.  the tests passed,
+* except for the degenerate cases, before making this change, so we
+* know that the top result set and array reuse is working for
+* the non-degenerate cases.)
+*/
+if  subquerytrackingarray    null
+if  topresultset    null
+subquerytrackingarray   new noputresultset
+materializedsubqueries   new noputresultset
+else
+subquerytrackingarray
+topresultset getsubquerytrackingarray numsubqueries
+subquerytrackingarray   subqueryresultset
+if  materializedsubqueries    null
+materializedsubqueries   subqueryresultset
+/**
+* get the subquery tracking array for this query.
+* (useful for runtime statistics.)
+*
+* @return noputresultset[]	the	(sparse) array of tops of subquery resultset trees
+* @exception standardexception thrown on error.
+*/
+public noputresultset getsubquerytrackingarray
+throws standardexception
+pleasebeonstack
+return subquerytrackingarray
+/**
+* track a dependency within this statementcontext.
+* (we need to clear any dependencies added within this
+* context on an error.
+*
+* @param dy	the dependency to track.
+*
+* @exception standardexception thrown on error.
+*/
+public void adddependency dependency dy
+throws standardexception
+pleasebeonstack
+if  dependencies    null
+dependencies   new arraylist
+dependencies add dy
+/**
+* returns whether we started from within the context of a trigger
+* or not.
+*
+* @return	true if we are in a trigger context
+*/
+public	boolean	intrigger
+return	parentintrigger
+//
+// context interface
+//
+/**
+* close down the top resultset, if relevant, and rollback to the
+* internal savepoint, if one was set.
+*
+* @exception standardexception thrown on error. revisit: don't want
+* cleanuponerror's to throw exceptions.
+*/
+public void cleanuponerror throwable error  throws standardexception
+if  sanitymanager debug
+if  sanitymanager debug_on
+sanitymanager debug_print
+string valueof  hashcode
+/*
+** if it isn't a standardexception, then assume
+** session severity.  it is probably an unexpected
+** java error somewhere in the language.
+** store layer treats jvm error as session severity,
+** hence to be consistent and to avoid getting rawstore
+** protocol violation errors, we treat java errors here
+** to be of session severity.
+*/
+int severity    error instanceof standardexception  ?
+standardexception  error  getseverity
+exceptionseverity session_severity
+/**
+* don't clean up this statement context if it's not in use.
+* this can happen if you get an error while calling one of
+* the jdbc getxxxx() methods on a resultset, since no statement
+* context is pushed when those calls occur.
+*/
+if    inuse
+return
+/* clean up the resultset, if one exists */
+if  topresultset    null
+topresultset cleanup
+/* close down any open subqueries */
+if  subquerytrackingarray    null
+for  int index   0  index < subquerytrackingarray length  index
+/* remember, the array is sparse, so only check
+* non-null entries.
+*/
+if  subquerytrackingarray    null
+subquerytrackingarray cleanup
+/* clean up any dependencies */
+if  dependencies    null
+dependencymanager dmgr   lcc getdatadictionary   getdependencymanager
+for  iterator iterator   dependencies iterator    iterator hasnext
+dependency dy    dependency  iterator next
+dmgr clearinmemorydependency dy
+dependencies   null
+if  severity <  exceptionseverity statement_severity
+setsavepoint
+if  sanitymanager debug
+if  sanitymanager debug_on
+sanitymanager debug_print
+internalsavepointname
+lcc internalrollbacktosavepoint  internalsavepointname  false  null
+clearsavepoint
+if  severity >  exceptionseverity transaction_severity
+// transaction severity errors roll back the transaction.
+/*
+** we call clearsavepoint() above only for statement errors.
+** we don't call clearsavepoint() for transaction errors because
+** the savepoint will be rolled back anyway.  so in this case,
+** we need to indicate that the savepoint is not set.
+*/
+setsavepoint   false
+/* pop the context */
+lcc popstatementcontext this  error
+/**
+* @see context#islasthandler
+*/
+public boolean islasthandler int severity
+// for jvm errors, severity gets mapped to
+// exceptionseverity.no_applicable_severity
+// in contextmanager.cleanuponerror. it is necessary to
+// let outer contexts take corrective action for jvm errors, so
+// return false as this will not be the last handler for such
+// errors.
+return inuse     rollbackparentcontext
+severity    exceptionseverity statement_severity
+/**
+*	reports whether this statementcontext is on the context stack.
+*
+*	@return	true if this statementcontext is on the context stack. false otherwise.
+*/
+public	boolean	onstack     return inuse
+/**
+* indicates whether the statement needs to be executed atomically
+* or not, i.e., whether a commit/rollback is permitted by a
+* connection nested in this statement.
+*
+* @return true if needs to be atomic
+*/
+public boolean isatomic
+return isatomic
+/**
+* return the text of the current statement.
+* note that this may be null.  it is currently
+* not set up correctly for resultsets that aren't
+* single row result sets (e.g select), replication,
+* and setxxxx/getxxxx jdbc methods.
+*
+* @return the statement text
+*/
+public string getstatementtext
+return stmttext
+//
+// class implementation
+//
+/**
+*	raise an exception if this context is not in use, that is, on the
+* context stack.
+*
+* @exception standardexception thrown on error.
+*/
+private	void	pleasebeonstack   throws standardexception
+if    inuse     throw standardexception newexception sqlstate lang_dead_statement
+public boolean inuse
+return inuse
+public boolean isforreadonly
+return isforreadonly
+/**
+* tests whether the statement which has allocated this statementcontext
+* object has been cancelled. this method is typically called from the
+* thread which is executing the statement, to test whether execution
+* should continue or stop.
+*
+* @return whether the statement which has allocated this statementcontext
+*  object has been cancelled.
+*/
+public boolean iscancelled
+return cancellationflag
+/**
+* cancels the statement which has allocated this statementcontext object.
+* this is done by setting a flag in the statementcontext object. for
+* this to have any effect, it is the responsibility of the executing
+* statement to check this flag regularly.
+*/
+public void cancel
+cancellationflag   true
+public void setsqlallowed short allow  boolean force
+// cannot override a stricter setting.
+// -1 is no routine restriction in place
+// 0 is least restrictive
+// 4 is most
+if  force     allow > sqlallowed
+sqlallowed   allow
+public short getsqlallowed
+if   inuse
+return org apache derby catalog types routinealiasinfo no_sql
+return sqlallowed
+/**
+* indicate that, in the event of a statement-level exception,
+* this context is not the last one that needs to be rolled
+* back--rather, it is nested within some other statement
+* context, and that other context needs to be rolled back,
+* too.
+*/
+public void setparentrollback
+rollbackparentcontext   true
+/**
+set to indicate statement is system code.
+for example a system procedure, view, function etc.
+*/
+public void setsystemcode
+issystemcode   true
+/**
+return true if this statement is system code.
+*/
+public boolean getsystemcode
+return issystemcode
+public stringbuffer appenderrorinfo
+stringbuffer sb     contextimpl  lcc  appenderrorinfo
+if  sb    null
+sb append
+sb append getstatementtext
+if   pvs    null     pvs getparametercount   > 0
+string pvsstring       pvs getparametercount
+pvs tostring
+sb append pvsstring
+return sb

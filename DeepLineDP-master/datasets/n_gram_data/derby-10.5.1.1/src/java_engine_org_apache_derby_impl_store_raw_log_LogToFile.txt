@@ -1,0 +1,3884 @@
+/*
+derby - class org.apache.derby.impl.store.raw.log.logtofile
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store raw log
+import org apache derby iapi services diag performance
+import org apache derby impl store raw log checkpointoperation
+import org apache derby impl store raw log logcounter
+import org apache derby impl store raw log logrecord
+import org apache derby impl store raw log streamlogscan
+// need this to print nested exception that corrupts the database
+import org apache derby iapi services info productgenusnames
+import org apache derby iapi services info productversionholder
+import org apache derby iapi reference messageid
+import org apache derby iapi reference property
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services daemon daemonservice
+import org apache derby iapi services daemon serviceable
+import org apache derby iapi services context contextmanager
+import org apache derby iapi services context contextservice
+import org apache derby iapi services monitor monitor
+import org apache derby iapi services monitor modulecontrol
+import org apache derby iapi services monitor modulesupportable
+import org apache derby iapi services monitor persistentservice
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi services io formatable
+import org apache derby iapi services io typedformat
+import org apache derby iapi services io formatidutil
+import org apache derby iapi services io storedformatids
+import org apache derby iapi services stream headerprintwriter
+import org apache derby iapi services stream printwritergetheader
+import org apache derby iapi services stream infostreams
+import org apache derby iapi error errorstringbuilder
+import org apache derby iapi error shutdownexception
+import org apache derby iapi error standardexception
+import org apache derby iapi services i18n messageservice
+import org apache derby iapi store access accessfactory
+import org apache derby iapi store access accessfactoryglobals
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi store raw loggable
+import org apache derby iapi store raw rawstorefactory
+import org apache derby iapi store raw scanhandle
+import org apache derby iapi store raw log logfactory
+import org apache derby iapi store raw log logger
+import org apache derby iapi store raw log loginstant
+import org apache derby iapi store raw log logscan
+import org apache derby iapi store raw transaction
+import org apache derby iapi store raw xact rawtransaction
+import org apache derby iapi store raw xact transactionfactory
+import org apache derby iapi store raw data datafactory
+import org apache derby iapi services property persistentset
+//for replication
+import org apache derby iapi store replication master masterfactory
+import org apache derby iapi store replication slave slavefactory
+import org apache derby iapi services io arrayinputstream
+import org apache derby iapi store access databaseinstant
+import org apache derby catalog uuid
+import org apache derby iapi services uuid uuidfactory
+import org apache derby iapi services property propertyutil
+import org apache derby iapi reference attribute
+import org apache derby iapi services io fileutil
+import org apache derby iapi util reusefactory
+import org apache derby io storagefactory
+import org apache derby io writablestoragefactory
+import org apache derby io storagefile
+import org apache derby io storagerandomaccessfile
+import java io file     plain files are used for backups
+import java io ioexception
+import java io syncfailedexception
+import java io bytearrayoutputstream
+import java io dataoutputstream
+import java io bytearrayinputstream
+import java io datainputstream
+import java io filenotfoundexception
+import java net malformedurlexception
+import java net url
+import java util properties
+import java util vector
+import java util zip crc32
+/**
+this is an implementation of the log using a non-circular file system file.
+no support for incremental log backup or media recovery.
+only crash recovery is supported.
+<p>
+the 'log' is a stream of log records.  the 'log' is implemented as
+a series of numbered log files.  these numbered log files are logically
+continuous so a transaction can have log records that span multiple log files.
+a single log record cannot span more then one log file.  the log file number
+is monotonically increasing.
+<p>
+the log belongs to a log factory of a rawstore.  in the current implementation,
+each rawstore only has one log factory, so each rawstore only has one log
+(which composed of multiple log files).
+at any given time, a log factory only writes new log records to one log file,
+this log file is called the 'current log file'.
+<p>
+a log file is named log<em>lognumber</em>.dat
+<p>
+everytime a checkpoint is taken, a new log file is created and all subsequent
+log records will go to the new log file.  after a checkpoint is taken, old
+and useless log files will be deleted.
+<p>
+rawstore exposes a checkpoint method which clients can call, or a checkpoint is
+taken automatically by the rawstore when
+<ol>
+<li> the log file grows beyond a certain size (configurable, default 100k bytes)
+<li> rawstore is shutdown and a checkpoint hasn't been done "for a while"
+<li> rawstore is recovered and a checkpoint hasn't been done "for a while"
+</ol>
+<p>
+this logfactory is responsible for the formats of 2 kinds of file: the log
+file and the log control file.  and it is responsible for the format of the
+log record wrapper.
+<p> <pre>
+format of log control file
+@format_id	file_stream_log_file
+@purpose	the log control file contains information about which log files
+are present and where the last checkpoint log record is located.
+@upgrade
+@disk_layout
+(pre-v15)
+int format id
+int log file version
+long the log instant (logcounter) of the last completed checkpoint
+(v15 onward)
+int format id
+int obsolete log file version
+long the log instant (logcounter) of the last completed checkpoint
+int jbms version
+int checkpoint interval
+long spare (value set to 0)
+long spare (value set to 0)
+long spare (value set to 0)
+@end_format
+</pre>
+<hr width="100%">
+<pre>
+format of the log file
+@format_id	file_stream_log_file
+@purpose	the log file contains log record which record all the changes
+to the database.  the complete transaction log is composed of a series of
+log files.
+@upgrade
+@disk_layout
+int format id - 	the format id of this log file
+int obsolete log file version - not used
+long log file number - this number orders the log files in a
+series to form the complete transaction log
+long prevlogrecord - log instant of the previous log record, in the
+previous log file.
+[log record wrapper]* one or more log records with wrapper
+int endmarker - value of zero.  the beginning of a log record wrapper
+is the length of the log record, therefore it is never zero
+[int fuzzy end]* zero or more int's of value 0, in case this log file
+has been recovered and any incomplete log record set to zero.
+@end_format
+</pre>
+<hr width="100%">
+<pre>
+format of the log record wrapper
+@format_id none.  the format is implied by the file_stream_log_file
+@purpose	the log record wrapper provides information for the log scan.
+@upgrade
+@disk_layout
+length(int) length of the log record (for forward scan)
+instant(long) loginstant of the log record
+logrecord(byte[length]) byte array that is written by the filelogger
+length(int) length of the log record (for backward scan)
+@end_format
+</pre>
+<p>multithreading considerations:<br>
+log factory must be mt-safe.
+<p>
+class is final as it has methods with privilege blocks
+and implements privilegedexceptionaction.
+*/
+public final class logtofile implements logfactory  modulecontrol  modulesupportable
+serviceable  java security privilegedexceptionaction
+private static int fid   storedformatids file_stream_log_file
+// format id must fit in 4 bytes
+/**
+return my format identifier.
+*/
+public int gettypeformatid
+return storedformatids file_stream_log_file
+// at the beginning of every log file is the following information:
+// the log file formatid
+// the log file version (int)
+// the log file number (long)
+// the log instant at the end of the last log record in the previous file (long)
+public static final int log_file_header_size   24
+protected static final int log_file_header_previous_log_instant_offset   log_file_header_size 8
+// number of bytes overhead of each log record.
+// 4 bytes of length at the beginning, 8 bytes of log instant,
+// and 4 bytes of length at the end
+public static final int log_record_overhead   4 8 4
+public static final string dbg_flag   sanitymanager debug ?     null
+public static final string dump_log_only   sanitymanager debug ?     null
+public static final string dump_log_from_log_file
+sanitymanager debug ?     null
+protected static final string log_sync_statistics
+// if you change this number, then jbms 1.1x and 1.2x will give a really
+// horrendous error message when booting against a db created by you.  when
+// we decided that we don't need to worry about people mis-using the
+// product that way, then we can change this.  just remember, before we do,
+// all existing database will have the number 9 in there.
+private static final int obsolete_log_version_number   9
+/* how big the log file should be before checkpoint or log switch is taken */
+private static final int default_log_switch_interval   1024 1024
+private static final int log_switch_interval_min       100000
+private static final int log_switch_interval_max       128 1024 1024
+private static final int checkpoint_interval_min       100000
+private static final int checkpoint_interval_max       128 1024 1024
+private static final int default_checkpoint_interval   10 1024 1024
+//log buffer size values
+private static final int default_log_buffer_size   32768    32k
+private static final int log_buffer_size_min   8192    8k
+private static final int log_buffer_size_max   log_switch_interval_max
+private int logbuffersize   default_log_buffer_size
+/* log control file flags. */
+private static final byte is_beta_flag   0x1
+/**
+* when the derby.system.durability property is set to 'test', the store
+* system will not force sync calls in the following cases
+* - for the log file at each commit
+* - for the log file before data page is forced to disk
+* - for page allocation when file is grown
+* - for data writes during checkpoint
+* this means it is possible that the recovery system may not work properly,
+* committed transactions may be lost, and/or database may not
+* be in a consistent state.
+* in order that we recognize this case that the database was previously
+* at any time booted in this mode, this value is written out
+* into the log control file. this will help prevent us from
+* wasting time to resolve issues in such cases.
+* @see org.apache.derby.iapi.reference.property#durability_property
+* this value is written as part of the log control file flags byte.
+*/
+private static final byte is_durability_testmode_no_sync_flag   0x2
+/**
+* keeps track of if the database was booted previously at any time with
+* derby.system.durability=test
+*/
+private static boolean wasdbindurabilitytestmodenosync   false
+/* to err on the conservative side, unless otherwise set, assume log
+*	archive is on
+*/
+private static final string default_log_archive_directory
+private int     logswitchinterval     default_log_switch_interval
+private int     checkpointinterval    default_checkpoint_interval
+string datadirectory  					   where files are stored
+private writablestoragefactory logstoragefactory
+private boolean logbeingflushed     is the log in the middle of a flush
+// (access of the variable should sync on this)
+protected logaccessfile logout 		   an output stream to the log file
+// (access of the variable should sync on this)
+private   storagerandomaccessfile firstlog   null
+protected long		     endposition    1     end position of the current log file
+long					 lastflush   0 	   the position in the current log
+// file that has been flushed to disk
+// logfilenumber and boottimelogfilenumber:
+// ----------------------------------------
+// there are three usages of the log file number in this class:
+//
+//  1 recover uses the log file number determined at boot-time to
+//    find which log file the redo pass should start to read.
+//  2 if the database is booted in slave replication mode, a slave
+//    thread will apply log records to the tail of the log.
+//    switchlogfile() allocates new log files when the current log
+//    file is full. logfilenumber needs to point to the log file
+//    with the highest number for switchlogfile() to work
+//    correctly.
+//  3 after the database has been fully booted, i.e. after boot()
+//    and recover(), and users are allowed to connect to the
+//    database, logfilenumber is used by switchlogfile() to
+//    allocate new log files when the current is full.
+//
+// usage 2 and 3 are very similar. the only difference is that 1
+// and 2 are performed concurrently, whereas 3 is performed afterwards.
+// because usage 1 and 2 are required in concurrent threads (when
+// booted in slave replication mode) that must not interfere, two
+// versions of the log file number are required:
+//
+// boottimelogfilenumber: set to point to the log file with the
+//   latest checkpoint during boot(). this is done before the
+//   slave replication thread has started to apply log records
+//   received from the master. used by recover() during the time
+//   interval in which slave replication mode may be active, i.e.
+//   during the redo pass. after the redo pass has completed,
+//   recover starts using logfilenumber (which will point to the
+//   highest log file when recovery has completed).
+// logfilenumber: used by recovery after the redo pass, and by
+//   switchlogfile (both in slave replication mode and after the
+//   database has been fully booted) when a new log file is
+//   allocated.
+long					 logfilenumber    1     current log file number
+// other than during boot and recovery time,
+// and during initializereplicationslaverole if in
+// slave replication mode,
+// logfilenumber is only changed by
+// switchlogfile, which is synchronized.
+//
+// mt - anyone accessing this number should
+// synchronized on this if the current log file
+// must not be changed. if not synchronized,
+// the log file may have been switched.
+// initially set to point to the log file with the latest
+// checkpoint (in boot()). only used by recovery() after that
+long                     boottimelogfilenumber    1
+long					 firstlogfilenumber    1
+// first log file that makes up the active
+// portion (with active transactions) of the
+// log.
+//
+// mt - this value is set during recovery or
+// during log truncation.  in the former single
+// thread is assumed.  in the latter
+// must be synchronized with this to access
+// or change.
+private long              maxlogfilenumber   logcounter max_logfile_number
+private checkpointoperation		 currentcheckpoint
+// last checkpoint successfully taken
+//
+// mt - only changed or access in recovery or
+// checkpoint, both are single thread access
+long					 checkpointinstant
+// log instant of te curerntcheckpoint
+private daemonservice	 checkpointdaemon 	   the background worker thread who is going to
+// do checkpoints for this log factory.
+private	int			myclientnumber
+// use this number to talk to checkpoint daemon
+private volatile boolean checkpointdaemoncalled
+// checkpoint daemon called already - it is not
+// important that this value is correct, the
+// daemon just need to be called once in a
+// while.  deamon can handle multiple posts.
+private long logwrittenfromlastcheckpoint   0
+// keeps track of the amout of log written between checkpoints
+private rawstorefactory rawstorefactory
+// use this only when in slave mode or after recovery is finished
+protected datafactory datafactory
+// use this only after revocery is finished
+protected boolean	readonlydb 	   true if this db is read only  i e  cannot
+// append log records
+// <start used by replication>
+// initialized if this derby has the master role for this database
+private masterfactory masterfactory
+private boolean inreplicationmastermode   false
+// initialized if this derby has the slave role for this database
+private boolean inreplicationslavemode   false
+/** if this exception is set while in replication slave mode, the
+* exception will be thrown by the thread doing recovery will.
+* effectively, this whill shut down the database */
+private volatile standardexception replicationslaveexception   null
+/** true if the database has been booted in replication slave pre
+* mode, effectively turning off writes to the log file.
+* @see slavefactory */
+private boolean inreplicationslavepremode   false
+private object slaverecoverymonitor     for synchronization in slave mode
+// the highest log file number the recovery thread is allowed to
+// read while in slave replication mode. remains -1 until the
+// first time switchlogfile is called. this call will only happen
+// when the slave replication thread has applied log records
+// received from the master, which happens after slave replication
+// has been initialized. from that point on, it will have a value
+// of one less than logfilenumber.
+private long allowedtoreadfilenumber    1
+// <stop used by replication>
+// debug debug - do not truncate log files
+private boolean keepalllogs
+// if database is encrypted, the content of the log files are encrypted
+private boolean databaseencrypted
+// the following booleans are used to put the log factory into various
+// states
+private boolean			 recoveryneeded   true     log needs to be recovered
+private boolean			 incheckpoint   false  	   in the middle of a checkpoint
+private boolean			 inredo   false            in the middle of redo loop
+private boolean          inlogswitch   false
+// make sure we don't do anything after the log factory has been stopped
+private boolean			 stopped   false
+// if log is to go to another device, this variable is set.  if null, then
+// log goes to the log subdirectory underneath the data directory
+string logdevice
+// disable syncing of log file when running in derby.system.durability=test
+private boolean lognotsynced   false
+private volatile boolean logarchived   false
+private boolean logswitchrequired   false
+/** debug test only */
+int test_logwritten   0
+int test_numrecordtofilllog    1
+private int mon_flushcalls
+private int mon_synccalls
+private int mon_numlogflushwaits
+private boolean mon_logsyncstatistics
+private int mon_numbytestolog
+/**
+if not null then something is corrupt in the raw store and this represents the original error.
+*/
+protected volatile standardexception corrupt
+/**
+if frozen, don't allow anything on disk to change.
+*/
+private boolean isfrozen
+/**
+product version information. invarient after boot.
+*/
+productversionholder jbmsversion
+/**
+on disk database version information. when running in soft upgrade this version
+may be different to jbmsversion.
+*/
+private int ondiskmajorversion
+private int ondiskminorversion
+private boolean ondiskbeta
+private crc32 checksum   new crc32       holder for the checksum
+/**
+* note: why logging system support file sync and write sync ?
+* note : the reason to support file and write sync of logs is
+* there was no support to do write sync until jdk1.4 and then
+* there was write sync jvm bug in jdk1.4.1, only in jdk1.4.2 write
+* sync(rws and rwd modes) mechanism can be used correctly.
+* default in jvms >= jdk1.4.2 is write sync(see the boot method for jvm checks).
+*
+* write sync mechanism support is added  for performance reasons.
+* on commits, logging system has to make sure the log for committed
+* transaction is on disk. with out write  sync , log is written to the
+* disk and then fsync() is used on commits to make log is written to the
+* disk for sure. on most of the os , fsync() calls are expensive.
+* on heavey commit oriented systems , file sync make the system run slow.
+* this problem is solved by using write sync on preallocated log file.
+* write sync is much faster than doing write and file sync to a file.
+* file should be preallocated for write syncs to perform better than
+* the file sync method. whenever a new log file is created,
+* logswitchinterval size is preallocated by writing zeros after file after the header.
+*/
+/*if set to true , write sync will be used to do log write other file
+* level sync is used.
+*/
+private boolean iswritesynced   false
+/**
+* status for whether the check on the sync error on some jvms has been
+* done or not. see the checkjvmsyncerror method for details.
+*/
+private boolean jvmsyncerrorchecked   false
+// log file that is yet to be copied to backup, updates to this variable
+// needs to visible  checkpoint thread.
+private volatile long logfiletobackup
+// it is set to true when  online backup is in progress,  updates to
+// this variable needs to visible to checkpoint thread.
+private volatile boolean backupinprogress   false
+/**
+mt- not needed for constructor
+*/
+public logtofile
+keepalllogs   propertyutil getsystemboolean rawstorefactory keep_transaction_log
+if  performance measure
+mon_logsyncstatistics   propertyutil getsystemboolean log_sync_statistics
+/*
+** methods of corruptable
+*/
+/**
+once the log factory is makred as corrupt then the raw sto
+*/
+public standardexception markcorrupt standardexception originalerror
+boolean firsttime   false
+synchronized  this
+if  corrupt    null    originalerror    null
+corrupt   originalerror
+firsttime   true
+// only print the first error
+if  corrupt    originalerror
+logerrmsg corrupt
+// this is the first time someone detects error, shutdown the
+// system as much as possible without further damaging it
+if  firsttime
+synchronized this
+stopped   true
+if  logout    null
+try
+logout corrupt       get rid of open file descriptor
+catch  ioexception ioe
+// don't worry about it, just trying to clean up
+// nullpointerexception is preferred over corrupting the database
+logout   null
+if  datafactory    null
+datafactory markcorrupt null
+return originalerror
+private void checkcorrupt   throws standardexception
+synchronized  this
+if  corrupt    null
+throw standardexception newexception
+sqlstate log_store_corrupt  corrupt
+/*
+** methods of logfactory
+*/
+/**
+mt- not needed
+*/
+public logger getlogger
+if  readonlydb
+return null
+else
+return new filelogger this
+/**
+make log factory aware of which raw store factory it belongs to
+*/
+public void setrawstorefactory rawstorefactory rsf
+rawstorefactory   rsf
+/**
+recover the rawstore to a consistent state using the log.
+<p>
+in this implementation, the log is a stream of log records stored in
+one or more flat files.  recovery is done in 2 passes: redo and undo.
+<br> <b>redo pass</b>
+<br> in the redo pass, reconstruct the state of the rawstore by
+repeating exactly what happened before as recorded in the log.
+<br><b>undo pass</b>
+<br> in the undo pass, all incomplete transactions are rolled back in
+the order from the most recently started to the oldest.
+<p>mt - synchronization provided by caller - rawstore boot.
+this method is guaranteed to be the only method being called and can
+assume single thread access on all fields.
+@see loggable#needsredo
+@see filelogger#redo
+@exception standardexception standard derby error policy
+*/
+public void recover
+datafactory         df
+transactionfactory  tf
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert df    null
+checkcorrupt
+datafactory       df
+// initialize the log writer only after the rawstorefactory is available,
+// log writer requires encryption block size info from rawstore factory
+// to encrypt checksum log records.
+if  firstlog    null
+logout   new logaccessfile this  firstlog  logbuffersize
+// if booted in slave mode, the recovery thread is not allowed
+// to do any recovery work until the slavefactory tells the
+// thread it may do so. effectively, the recovery thread is blocked
+// here until allowedtoreadfilenumber != -1. we cannot rely on the
+// inreplicationslavemode block in getlogfileatbeginning
+// because that method is used to open consecutive log files,
+// but not the first one. while the recovery thread waits
+// here, the slave replication thread can perform necessary
+// initialization without causing serialization conflicts.
+if  inreplicationslavemode
+synchronized  slaverecoverymonitor
+// recheck inreplicationslavemode==true every time
+// because slave replication may have been stopped
+// while this thread waited on the monitor
+while  inreplicationslavemode
+allowedtoreadfilenumber<boottimelogfilenumber
+// wait until the first log file can be read.
+if  replicationslaveexception    null
+throw replicationslaveexception
+try
+slaverecoverymonitor wait
+catch  interruptedexception ie
+// do nothing
+// we don't want to set readonlydb before recovery has a chance to look
+// at the latest checkpoint and determine that the database is shutdown
+// cleanly.  if the medium is read only but there are logs that need
+// to be redone or in flight transactions, we are hosed.  the logs that
+// are redone will leave dirty pages in the cache.
+if  recoveryneeded
+try
+/////////////////////////////////////////////////////////////
+//
+// during boot time, the log control file is accessed and
+// boottimelogfilenumber is determined.  logout is not set up.
+// boottimelogfilenumber is the log file the latest checkpoint
+// lives in,
+// or 1.  it may not be the latest log file (the system may have
+// crashed between the time a new log was generated and the
+// checkpoint log written), that can only be determined at the
+// end of recovery redo.
+//
+/////////////////////////////////////////////////////////////
+filelogger logger    filelogger getlogger
+/////////////////////////////////////////////////////////////
+//
+// try to find the most recent checkpoint
+//
+/////////////////////////////////////////////////////////////
+if  checkpointinstant    logcounter invalid_log_instant
+currentcheckpoint
+findcheckpoint checkpointinstant  logger
+// if we are only interested in dumping the log, start from the
+// beginning of the first log file
+if  sanitymanager debug
+if  sanitymanager debug_on dump_log_only
+currentcheckpoint   null
+system out println
+// unless otherwise specified, 1st log file starts at 1
+string beginlogfilenumber
+propertyutil getsystemproperty
+dump_log_from_log_file
+if  beginlogfilenumber    null
+boottimelogfilenumber
+long valueof beginlogfilenumber  longvalue
+else
+boottimelogfilenumber   1
+if  sanitymanager debug
+if  sanitymanager debug_on
+currentcheckpoint   null
+system out println
+// unless otherwise specified, 1st log file starts at 1
+string checkpointstartlogstr
+propertyutil getsystemproperty
+string checkpointstartoffsetstr
+propertyutil getsystemproperty
+if   checkpointstartlogstr    null
+checkpointstartoffsetstr    null
+checkpointinstant
+logcounter makeloginstantaslong
+long valueof checkpointstartlogstr  longvalue
+long valueof checkpointstartoffsetstr  longvalue
+else
+sanitymanager throwassert
+currentcheckpoint
+findcheckpoint checkpointinstant  logger
+long redolwm       logcounter invalid_log_instant
+long undolwm       logcounter invalid_log_instant
+long ttabinstant   logcounter invalid_log_instant
+streamlogscan redoscan   null
+if  currentcheckpoint    null
+formatable transactiontable   null
+// resolve: sku
+// currentcheckpoint.gettransactiontable();
+// need to set the transaction table before the undo
+tf usetransactiontable transactiontable
+redolwm   currentcheckpoint redolwm
+undolwm   currentcheckpoint undolwm
+if  transactiontable    null
+ttabinstant   checkpointinstant
+if  sanitymanager debug
+if  sanitymanager debug_on dbg_flag
+sanitymanager debug dbg_flag
+logcounter todebugstring checkpointinstant
+currentcheckpoint tostring
+firstlogfilenumber   logcounter getlogfilenumber redolwm
+// figure out where the first interesting log file is.
+if  logcounter getlogfilenumber undolwm  <
+firstlogfilenumber
+firstlogfilenumber
+logcounter getlogfilenumber undolwm
+// if the checkpoint record doesn't have a transaction
+// table, we need to rebuild it by scanning the log from
+// the undolwm.  if it does have a transaction table, we
+// only need to scan the log from the redolwm
+redoscan    streamlogscan
+openforwardsscan undolwm   loginstant null
+else
+// no checkpoint
+tf usetransactiontable  formatable null
+long start
+logcounter makeloginstantaslong
+boottimelogfilenumber  log_file_header_size
+// no checkpoint, start redo from the beginning of the
+// file - assume this is the first log file
+firstlogfilenumber   boottimelogfilenumber
+redoscan    streamlogscan
+openforwardsscan start   loginstant null
+// open a transaction that is used for redo and rollback
+rawtransaction recoverytransaction
+tf starttransaction
+rawstorefactory
+contextservice getfactory   getcurrentcontextmanager
+accessfactoryglobals user_trans_name
+// make this transaction aware that it is a recovery transaction
+// and don't spew forth post commit work while replaying the log
+recoverytransaction recoverytransaction
+/////////////////////////////////////////////////////////////
+//
+//  redo loop - in filelogger
+//
+/////////////////////////////////////////////////////////////
+//
+// set log factory state to inredo so that if redo caused any
+// dirty page to be written from the cache, it won't flush the
+// log since the end of the log has not been determined and we
+// know the log record that caused the page to change has
+// already been written to the log.  we need the page write to
+// go thru the log factory because if the redo has a problem,
+// the log factory is corrupt and the only way we know not to
+// write out the page in a checkpoint is if it check with the
+// log factory, and that is done via a flush - we use the wal
+// protocol to stop corrupt pages from writing to the disk.
+//
+inredo   true
+long logend
+logger redo
+recoverytransaction  tf  redoscan  redolwm
+ttabinstant
+inredo   false
+// replication slave: when recovery has completed the
+// redo pass, the database is no longer in replication
+// slave mode and only the recover thread will access
+// this object until recover has complete. we
+// therefore do not need two versions of the log file
+// number anymore. from this point on, logfilenumber
+// is used for all references to the current log file
+// number; boottimelogfilenumber is no longer used.
+logfilenumber   boottimelogfilenumber
+// if we are only interested in dumping the log, don't alter
+// the database and prevent anyone from using the log
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dump_log_only
+monitor logmessage
+monitor logmessage
+monitor logmessage
+// just in case, it has not been set anyway
+logout   null
+return
+/////////////////////////////////////////////////////////////
+//
+// determine where the log ends
+//
+/////////////////////////////////////////////////////////////
+storagerandomaccessfile thelog   null
+// if logend == logcounter.invalid_log_scan, that means there
+// is no log record in the log - most likely it is corrupted in
+// some way ...
+if  logend    logcounter invalid_log_instant
+monitor logtextmessage messageid log_log_not_found
+storagefile logfile   getlogfilename logfilenumber
+if  privexists logfile
+// if we can delete this strange corrupted file, do so,
+// otherwise, skip it
+if   privdelete logfile
+logfile   getlogfilename   logfilenumber
+ioexception accessexception   null
+try
+thelog     privrandomaccessfile logfile
+catch  ioexception ioe
+thelog   null
+accessexception   ioe
+if  thelog    null     privcanwrite logfile
+if  thelog    null
+thelog close
+thelog   null
+monitor logtextmessage messageid log_changed_db_to_read_only
+if  accessexception    null
+monitor logthrowable accessexception
+readonlydb   true
+else
+try
+// no previous log file or previous log position
+if   initlogfile
+thelog  logfilenumber
+logcounter invalid_log_instant
+throw markcorrupt
+standardexception newexception
+sqlstate log_segment_not_exist
+logfile getpath
+catch  ioexception ioe
+throw markcorrupt
+standardexception newexception
+sqlstate log_io_error  ioe
+// successfully init'd the log file - set up markers,
+// and position at the end of the log.
+endposition   thelog getfilepointer
+lastflush     endposition
+//if write sync is true , prellocate the log file
+//and reopen the file in rwd mode.
+if iswritesynced
+//extend the file by wring zeros to it
+preallocatenewlogfile thelog
+thelog close
+thelog   openlogfileinwritemode logfile
+//postion the log at the current end postion
+thelog seek endposition
+if  sanitymanager debug
+sanitymanager assert
+endposition    log_file_header_size
+//because we already incrementing the log number
+//here, no special log switch required for
+//backup recoveries.
+logswitchrequired   false
+else
+// logend is the instant of the next log record in the log
+// it is used to determine the last known good position of
+// the log
+logfilenumber   logcounter getlogfilenumber logend
+readonlydb   df isreadonly
+storagefile logfile   getlogfilename logfilenumber
+if   readonlydb
+// if datafactory doesn't think it is readonly, we can
+// do some futher test of our own
+ioexception accessexception   null
+try
+if iswritesynced
+thelog   openlogfileinwritemode logfile
+else
+thelog   privrandomaccessfile logfile
+catch  ioexception ioe
+thelog   null
+accessexception   ioe
+if  thelog    null     privcanwrite logfile
+if  thelog    null
+thelog close
+thelog   null
+monitor logtextmessage messageid log_changed_db_to_read_only
+if  accessexception    null
+monitor logthrowable accessexception
+readonlydb   true
+if   readonlydb
+endposition   logcounter getlogfileposition logend
+//
+// the end of the log is at endposition.  which is where
+// the next log should be appending.
+//
+// if the last log record ends before the end of the
+// log file, then this log file has a fuzzy end.
+// zap all the bytes to between endposition to eof to 0.
+//
+// the end log marker is 4 bytes (of zeros)
+//
+// if endposition + 4 == logout.length, we have a
+// properly terminated log file
+//
+// if endposition + 4 is > logout.length, there are 0,
+// 1, 2, or 3 bytes of 'fuzz' at the end of the log. we
+// can ignore that because it is guaranteed to be
+// overwritten by the next log record.
+//
+// if endposition + 4 is < logout.length, we have a
+// partial log record at the end of the log.
+//
+// we need to overwrite all of the incomplete log
+// record, because if we start logging but cannot
+// 'consume' all the bad log, then the log will truly
+// be corrupted if the next 4 bytes (the length of the
+// log record) after that is small enough that the next
+// time the database is recovered, it will be
+// interpreted that the whole log record is in the log
+// and will try to objectify, only to get classnotfound
+// error or worse.
+//
+//find out if log had incomplete log records at the end.
+if  redoscan islogendfuzzy
+thelog seek endposition
+long eof   thelog length
+monitor logtextmessage messageid log_incomplete_log_record
+logfile  new long endposition   new long eof
+/* write zeros from incomplete log record to end of file */
+long nwrites    eof   endposition  logbuffersize
+int rbytes    int   eof   endposition  % logbuffersize
+byte zerobuf  new byte
+//write the zeros to file
+while nwrites   > 0
+thelog write zerobuf
+if rbytes   0
+thelog write zerobuf  0  rbytes
+if  iswritesynced
+syncfile thelog
+if  sanitymanager debug
+if  thelog length      endposition
+sanitymanager assert
+thelog length   > endposition
+// set the log to the true end position,
+// and not the end of the file
+lastflush   endposition
+thelog seek endposition
+if  thelog    null
+logout   new logaccessfile this  thelog  logbuffersize
+if logswitchrequired
+switchlogfile
+boolean noinflighttransactions   tf noactiveupdatetransaction
+if  readonlydb
+// in the unlikely event that someone detects we are
+// dealing with a read only db, check to make sure the
+// database is quiesce when it was copied with no unflushed
+// dirty buffer
+if   noinflighttransactions
+throw standardexception newexception
+sqlstate log_read_only_db_needs_undo
+/////////////////////////////////////////////////////////////
+//
+// undo loop - in transaction factory.  it just gets one
+// transaction at a time from the transaction table and calls
+// undo, no different from runtime.
+//
+/////////////////////////////////////////////////////////////
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+tf gettransactiontable
+if   noinflighttransactions
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+tf rollbackalltransactions recoverytransaction  rawstorefactory
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+logtofile dbg_flag
+else
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+/////////////////////////////////////////////////////////////
+//
+// xa prepared xact loop - in transaction factory.  at this
+// point only prepared transactions should be left in the
+// transaction table, all others should have been aborted or
+// committed and removed from the transaction table.  it just
+// gets one transaction at a time from the transaction table,
+// creates a real context and transaction, reclaims locks,
+// and leaves the new xact in the transaction table.
+//
+/////////////////////////////////////////////////////////////
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+tf gettransactiontable
+tf handlepreparedxacts rawstorefactory
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+tf gettransactiontable
+/////////////////////////////////////////////////////////////
+//
+// end of recovery.
+//
+/////////////////////////////////////////////////////////////
+// recovery is finished.  close the transaction
+recoverytransaction close
+// notify the datafactory that recovery is completed,
+// but before the checkpoint is written.
+datafactory postrecovery
+//////////////////////////////////////////////////////////////
+// set the transaction factory short id, we have seen all the
+// trasactions in the log, and at the minimum, the checkpoint
+// transaction will be there.  set the shortid to the next
+// value.
+//////////////////////////////////////////////////////////////
+tf resettranid
+// do a checkpoint (will flush the log) if there is any rollback
+// if can't checkpoint for some reasons, flush log and carry on
+if   readonlydb
+boolean needcheckpoint   true
+// if we can figure out there there is very little in the
+// log (less than 1000 bytes), we haven't done any
+// rollbacks, then don't checkpoint. otherwise checkpoint.
+if  currentcheckpoint    null    noinflighttransactions
+redolwm    logcounter invalid_log_instant
+undolwm    logcounter invalid_log_instant
+if   logfilenumber    logcounter getlogfilenumber redolwm
+logfilenumber    logcounter getlogfilenumber undolwm
+endposition <  logcounter getlogfileposition redolwm    1000
+needcheckpoint   false
+if  needcheckpoint     checkpoint rawstorefactory  df  tf  false
+flush logfilenumber  endposition
+logger close
+recoveryneeded   false
+catch  ioexception ioe
+if  sanitymanager debug
+ioe printstacktrace
+throw markcorrupt
+standardexception newexception sqlstate log_io_error  ioe
+catch  classnotfoundexception cnfe
+throw markcorrupt
+standardexception newexception
+sqlstate log_corrupted  cnfe
+catch  standardexception se
+throw markcorrupt se
+catch  throwable th
+if  sanitymanager debug
+sanitymanager showtrace th
+th printstacktrace
+throw markcorrupt
+standardexception newexception
+sqlstate log_recovery_failed  th
+else
+tf usetransactiontable  formatable null
+// set the transaction factory short id
+tf resettranid
+// done with recovery
+/////////////////////////////////////////////////////////////
+// setup checkpoint daemon and cache cleaner
+/////////////////////////////////////////////////////////////
+checkpointdaemon   rawstorefactory getdaemon
+if  checkpointdaemon    null
+myclientnumber
+checkpointdaemon subscribe this  true   ondemandonly
+// use the same daemon for the cache cleaner
+datafactory setupcachecleaner checkpointdaemon
+/**
+checkpoint the rawstore.
+<p> mt- only one checkpoint is to be taking place at any given time.
+<p> the steps of a checkpoint are
+<ol>
+<li> switch to a new log file if possible
+<pre>
+freeze the log (for the transition to a new log file)
+flush current log file
+create and flush the new log file (with file number 1 higher
+than the previous log file). the new log file becomes the
+current log file.
+unfreeze the log
+</pre>
+<li> start checkpoint transaction
+<li> gather interesting information about the rawstore:
+the current log instant (redolwm)
+the earliest active transaction begin tran log record
+instant (undolwm), all the truncation lwm set by clients
+of raw store (replication)
+<li> clean the buffer cache
+<li> log the next checkpoint log record, which contains
+(reppoint, undolwm, redolwm) and commit checkpoint transaction.
+<li> synchronously write the control file containing the next checkpoint
+log record log instant
+<li> the new checkpoint becomes the current checkpoint.
+somewhere near the beginning of each log file should be a
+checkpoint log record (not guarenteed to be there)
+<li> see if the log can be truncated
+<p>
+the earliest useful log record is determined by the reppoint and the
+undolwm, whichever is earlier.
+<p>
+every log file whose log file number is smaller than the earliest
+useful log record's log file number can be deleted.
+<p><pre>
+transactions can be at the following states w/r to a checkpoint -
+consider the log as a continous stream and not as series of log
+files for the sake of clarity.
+|(bt)-------(et)| marks the begin and end of a transaction.
+.                          checkpoint started
+.       |__undolwm          |
+.       v                   |___redolwm
+.                           |___truncationlwm
+.                           |
+.                           v
+1 |-----------------|
+2       |--------------------------------|
+3           |-------|
+4               |--------------------------------------(end of log)
+5                                       |-^-|
+.                                   checkpoint log record
+---a--->|<-------b--------->|<-------------c-----------
+</pre>
+<p>
+there are only 3 periods of interest : <br>
+a) before undolwm,  b) between undo and redo lwm, c) after redolwm.
+<p>
+transaction 1 started in a and terminates in b.<br>
+during redo, we should only see log records and endxact from this
+transaction in the first phase (between undolwm and redolwm).  no
+beginxact log record for this transaction will be seen.
+<p>
+transaction 2 started in b (right on the undolwm) and terminated in c.<br>
+any transaction that terminates in c must have a beginxact at or
+after undolwm.  in other words, no transaction can span a, b and c.
+during redo, we will see beginxact, other log records and endxact
+for this transaction.
+<p>
+transaction 3 started in b and ended in b.<br>
+during redo, we will see beginxact, other log records and endxact
+for this transaction.
+<p>
+transaction 4 begins in b and never ends.<br>
+during redo, we will see beginxact, other log records.
+in undo, this loser transaction will be rolled back.
+<p>
+transaction 5 is the transaction taking the checkpoint.<br>
+the checkpoint action started way back in time but the checkpoint
+log record is only written after the buffer cache has been flushed.
+<p>
+note that if any time elapse between taking the undolwm and the
+redolwm, then it will create a 4th period of interest.
+@exception standardexception - encounter exception while doing
+checkpoint.
+*/
+public boolean checkpoint rawstorefactory rsf
+datafactory df
+transactionfactory tf
+boolean wait
+throws standardexception
+if  inreplicationslavepremode
+// writing a checkpoing updates the log files and the log.ctrl
+// file. this cannot be allowed in slave pre mode because the slave
+// and master log files need to be equal when the database is
+// booted in slave mode (the next phase of the start slave command).
+return true
+// call checkpoint with no pre-started transaction
+boolean done   checkpointwithtran null  rsf  df  tf
+//above checpoint call will return 'false'  without
+//performing the checkpoint if some other  thread is doing checkpoint.
+//in  cases like backup it is necesary to wait for the
+//checkpoint to complete before copying the files. 'wait' flag get passed
+//in as 'true' by  such cases.
+//when wait flag is true, we will wait here until the other thread which
+//is actually doing the the checkpoint completes.
+if  done    wait
+synchronized this
+//wait until the thread that is doing the checkpoint completes it.
+while incheckpoint
+try
+wait
+catch  interruptedexception ie
+throw standardexception interrupt ie
+done   true
+return done
+/**
+checkpoint with pre-start transaction
+@exception standardexception derby standard error policy
+*/
+protected boolean checkpointwithtran rawtransaction cptran
+rawstorefactory rsf
+datafactory df
+transactionfactory tf
+throws standardexception
+boolean proceed   true
+loginstant redolwm
+// we may be called to stop the database after a bad error, make sure
+// logout is set
+if  logout    null
+return false
+long approxloglength
+synchronized  this
+// has someone else found a problem in the raw store?
+if  corrupt    null
+throw standardexception newexception sqlstate log_store_corrupt  corrupt
+// if another checkpoint is in progress, don't do anything
+if  incheckpoint    true
+proceed   false
+else
+incheckpoint   true
+approxloglength   endposition     current end position
+// don't return from inside of a sync block
+if   proceed
+return false
+// needcptran == true if we are not supplied with a pre-started transaction
+boolean needcptran    cptran    null
+if  sanitymanager debug
+if  logswitchinterval    0
+sanitymanager throwassert
+approxloglength
+try
+if  approxloglength > logswitchinterval
+switchlogfile
+//log switch is occuring in conjuction with the
+//checkpoint, set the amount of log written from last checkpoint to zero.
+logwrittenfromlastcheckpoint   0
+else
+//checkpoint is happening without the log switch,
+//in the middle of a log file. amount of log written already for
+//the current log file should not be included in caluculation
+//of when next check point is due. by assigning the negative
+//value of amount of log writtent for this file. later it will
+//be subtracted when we switch the log file or while calculating whether
+//we are due a for checkpoint a flush time.
+logwrittenfromlastcheckpoint    endposition
+if  sanitymanager debug
+// if this debug flag is set on, just switch log file
+if  sanitymanager debug_on test_log_switch_log
+return false
+// start a checkpoint transaction
+if  needcptran
+cptran   tf startinternaltransaction rsf
+contextservice getfactory   getcurrentcontextmanager
+/////////////////////////////////////////////////////
+// gather a snapshot of the various interesting points of the log
+/////////////////////////////////////////////////////
+long undolwm_long
+long redolwm_long
+synchronized this 	   we could synchronized on something else  it
+// doesn't matter as long as loganddo sync on
+// the same thing
+// the redo lwm is the current log instant.  we are going to
+// clean the cache shortly, any log record before this point
+// will not ever need to be redone.
+redolwm_long   currentinstant
+redolwm   new logcounter redolwm_long
+// the undo lwm is what we need to rollback all transactions.
+// synchronize this with the starting of a new transaction so
+// that the transaction factory can have a consistent view
+// see filelogger.loganddo
+logcounter undolwm    logcounter  tf firstupdateinstant
+if  undolwm    null
+undolwm_long   redolwm_long     no active transaction
+else
+undolwm_long   undolwm getvalueaslong
+/////////////////////////////////////////////////////
+// clean the buffer cache
+/////////////////////////////////////////////////////
+df checkpoint
+/////////////////////////////////////////////////////
+// write out the checkpoint log record
+/////////////////////////////////////////////////////
+// send the checkpoint record to the log
+formatable transactiontable   tf gettransactiontable
+checkpointoperation nextcheckpoint
+new checkpointoperation
+redolwm_long  undolwm_long  transactiontable
+cptran loganddo nextcheckpoint
+logcounter checkpointinstant
+logcounter  cptran getlastloginstant
+if  checkpointinstant    null
+// since checkpoint is an internal transaction, i need to
+// flush it to make sure it actually goes to the log
+flush checkpointinstant
+else
+throw standardexception newexception
+sqlstate log_cannot_log_checkpoint
+cptran commit
+if  needcptran
+cptran close   	   if we started it  we will close it
+cptran   null
+/////////////////////////////////////////////////////
+// write out the log control file which contains the last
+// successful checkpoint log record
+/////////////////////////////////////////////////////
+if   writecontrolfile getcontrolfilename
+checkpointinstant getvalueaslong
+throw standardexception newexception
+sqlstate log_control_file  getcontrolfilename
+// next checkpoint becomes the current checkpoint
+currentcheckpoint   nextcheckpoint
+////////////////////////////////////////////////////
+// see if we can reclaim some log space
+////////////////////////////////////////////////////
+if   logarchived
+truncatelog currentcheckpoint
+// delete the committted container drop stubs
+// that are no longer required during recovery.
+// if a backup is in progress don't delete the stubs until
+// it is done. backup needs to copy all the stubs that
+// are needed to recover from the backup checkpoint on restore.
+if  backupinprogress
+df removedroppedcontainerfilestubs redolwm
+catch  ioexception ioe
+throw markcorrupt
+standardexception newexception sqlstate log_io_error  ioe
+finally
+synchronized this
+incheckpoint   false
+notifyall
+if  cptran    null    needcptran
+try
+cptran commit
+cptran close
+catch  standardexception se
+throw markcorrupt standardexception newexception
+sqlstate log_corrupted  se
+return true
+/**
+flush all unwritten log record up to the log instance indicated to disk
+and sync.
+also check to see if database is frozen or corrupt.
+<p>mt - not needed, wrapper method
+@param where flush log up to here
+@exception standardexception standard derby error policy
+*/
+public void flush loginstant where  throws standardexception
+long filenumber
+long whereposition
+if  where    null
+// don't flush, just use this to check if database is frozen or
+// corrupt
+filenumber   0
+whereposition   logcounter invalid_log_instant
+else
+logcounter wherec    logcounter  where
+filenumber   wherec getlogfilenumber
+whereposition   wherec getlogfileposition
+flush filenumber  whereposition
+/**
+flush all unwritten log record to disk and sync.
+also check to see if database is frozen or corrupt.
+<p>mt - not needed, wrapper method
+@exception standardexception standard derby error policy
+*/
+public void flushall   throws standardexception
+long fnum
+long whereto
+synchronized this
+fnum   logfilenumber
+whereto   endposition
+flush fnum  whereto
+/*
+* private methods that helps to implement methods of logfactory
+*/
+/**
+verify that we the log file is of the right format and of the right
+version and log file number.
+<p>mt - not needed, no global variables used
+@param logfilename the name of the log file
+@param number the log file number
+@return true if the log file is of the current version and of the
+correct format
+@exception standardexception standard derby error policy
+*/
+private boolean verifylogformat storagefile logfilename  long number
+throws standardexception
+boolean ret   false
+try
+storagerandomaccessfile log   privrandomaccessfile logfilename
+ret   verifylogformat log  number
+log close
+catch  ioexception ioe
+return ret
+/**
+verify that we the log file is of the right format and of the right
+version and log file number.  the log file position is set to the
+beginning.
+<p>mt - mt-unsafe, caller must synchronize
+@param log the log file
+@param number the log file number
+@return true if the log file is of the current version and of the
+correct format
+@exception standardexception standard derby error policy
+*/
+private boolean verifylogformat storagerandomaccessfile log  long number
+throws standardexception
+try
+log seek 0
+int logfid   log readint
+int obsoletelogversion   log readint       this value is useless  for
+// backwards compatibility
+long lognumber   log readlong
+if  logfid    fid    lognumber    number
+throw standardexception newexception
+sqlstate log_incompatible_format  datadirectory
+catch  ioexception ioe
+throw standardexception newexception
+sqlstate log_cannot_verify_log_format  ioe  datadirectory
+return true
+/**
+initialize the log to the correct format with the given version and
+log file number.  the new log file must be empty.  after initializing,
+the file is synchronously written to disk.
+<p>mt - synchornization provided by caller
+@param newlog the new log file to be initialized
+@param number the log file number
+@param prevlogrecordendinstant the end position of the  previous log record
+@return true if the log file is empty, else false.
+@exception ioexception if new log file cannot be accessed or initialized
+*/
+private boolean initlogfile storagerandomaccessfile newlog  long number
+long prevlogrecordendinstant
+throws ioexception  standardexception
+if  newlog length      0
+return false
+if  sanitymanager debug
+if   sanitymanager debug_on test_log_full
+testlogfull
+if  sanitymanager debug
+if  sanitymanager debug_on test_switch_log_fail1
+throw new ioexception
+newlog seek 0
+newlog writeint fid
+newlog writeint obsolete_log_version_number      for silly backwards compatibility reason
+newlog writelong number
+newlog writelong prevlogrecordendinstant
+syncfile newlog
+return true
+/**
+switch to the next log file if possible.
+<p>mt - log factory is single threaded thru a log file switch, the log
+is frozen for the duration of the switch
+*/
+public void switchlogfile   throws standardexception
+boolean switchedover   false
+/////////////////////////////////////////////////////
+// freeze the log for the switch over to a new log file.
+// this blocks out any other threads from sending log
+// record to the log stream.
+//
+// the switching of the log file and checkpoint are really
+// independent events, they are tied together just because a
+// checkpoint is the natural place to switch the log and vice
+// versa.  this could happen before the cache is flushed or
+// after the checkpoint log record is written.
+/////////////////////////////////////////////////////
+synchronized  this
+// make sure that this thread of control is guaranteed to complete
+// it's work of switching the log file without having to give up
+// the semaphore to a backup or another flusher.  do this by looping
+// until we have the semaphore, the log is not being flushed, and
+// the log is not frozen for backup.  track (2985).
+while logbeingflushed   isfrozen
+try
+wait
+catch  interruptedexception ie
+throw standardexception interrupt ie
+// we have an empty log file here, refuse to switch.
+if  endposition    log_file_header_size
+if  sanitymanager debug
+monitor logmessage
+logfilenumber
+return
+// log file isn't being flushed right now and logout is not being
+// used.
+storagefile newlogfile   getlogfilename logfilenumber 1
+if  logfilenumber 1 >  maxlogfilenumber
+throw standardexception newexception
+sqlstate log_exceed_max_log_file_number
+new long maxlogfilenumber
+storagerandomaccessfile newlog   null 	   the new log file
+try
+// if the log file exist and cannot be deleted, cannot
+// switch log right now
+if  privexists newlogfile      privdelete newlogfile
+logerrmsg messageservice gettextmessage
+messageid log_new_logfile_exist
+newlogfile getpath
+return
+try
+newlog     privrandomaccessfile newlogfile
+catch  ioexception ioe
+newlog   null
+if  newlog    null     privcanwrite newlogfile
+if  newlog    null
+newlog close
+newlog   null
+return
+if  initlogfile newlog  logfilenumber 1
+logcounter makeloginstantaslong logfilenumber  endposition
+// new log file init ok, close the old one and
+// switch over, after this point, need to shutdown the
+// database if any error crops up
+switchedover   true
+// write out an extra 0 at the end to mark the end of the log
+// file.
+logout writeendmarker 0
+endposition    4
+//set that we are in log switch to prevent flusher
+//not requesting  to switch log again
+inlogswitch   true
+// flush everything including the int we just wrote
+flush logfilenumber  endposition
+// simulate out of log error after the switch over
+if  sanitymanager debug
+if  sanitymanager debug_on test_switch_log_fail2
+throw new ioexception
+logout close   		   close the old log file
+logwrittenfromlastcheckpoint    endposition
+endposition   newlog getfilepointer
+lastflush   endposition
+if iswritesynced
+//extend the file by wring zeros to it
+preallocatenewlogfile newlog
+newlog close
+newlog   openlogfileinwritemode newlogfile
+newlog seek endposition
+logout   new logaccessfile this  newlog  logbuffersize
+newlog   null
+if  sanitymanager debug
+if  endposition    log_file_header_size
+sanitymanager throwassert
+endposition
+logfilenumber
+if  sanitymanager debug
+sanitymanager assert endposition    log_file_header_size
+else	   something went wrong  delete the half baked file
+newlog close
+newlog   null
+if  privexists newlogfile
+privdelete newlogfile
+newlogfile   null
+logerrmsg messageservice gettextmessage
+messageid log_cannot_create_new
+newlogfile getpath
+catch  ioexception ioe
+inlogswitch   false
+// switching log file is an optional operation and there is no direct user
+// control.  just sends a warning message to whomever, if any,
+// system adminstrator there may be
+logerrmsg messageservice gettextmessage
+messageid log_cannot_create_new_dueto
+newlogfile getpath
+ioe tostring
+try
+if  newlog    null
+newlog close
+newlog   null
+catch  ioexception ioe2
+if  newlogfile    null    privexists newlogfile
+privdelete newlogfile
+newlogfile   null
+if  switchedover 	   error occur after old log file has been closed
+logout   null     limit any damage
+throw markcorrupt
+standardexception newexception
+sqlstate log_io_error  ioe
+// replication slave: recovery thread should be allowed to
+// read the previous log file
+if  inreplicationslavemode
+allowedtoreadfilenumber   logfilenumber 1
+synchronized  slaverecoverymonitor
+slaverecoverymonitor notify
+inlogswitch   false
+// unfreezes the log
+/**
+flush all unwritten log record up to the log instance indicated to disk
+without syncing.
+<p>mt - not needed, wrapper method
+@param whereposition flush log up to here
+@exception ioexception failed to flush to the log
+*/
+private void flushbuffer long filenumber  long whereposition
+throws ioexception  standardexception
+synchronized  this
+if  filenumber < logfilenumber 	   history
+return
+// a log instant indicates the start of a log record
+// but not how long it is. thus the amount of data in
+// the logout buffer is irrelevant. we can only
+// not flush the buffer if the real synced flush
+// included this required log instant. this is because
+// we never flush & sync partial log records.
+if  whereposition < lastflush     already flushed
+return
+// we don't update lastflush here because lastflush
+// is the last position in the log file that has been
+// flushed *and* synced to disk. here we only flush.
+// ie. lastflush should be renamed lastsync.
+//
+// we could have another variable indicating to which
+// point the log has been flushed which this routine
+// could take advantage of. this would only help rollbacks though.
+logout flushlogaccessfile
+/** get rid of old and unnecessary log files
+<p> mt- only one truncate log is allowed to be taking place at any
+given time.  synchronized on this.
+*/
+private void truncatelog checkpointoperation checkpoint
+long firstlogneeded
+if   firstlogneeded   getfirstlogneeded checkpoint     1
+return
+truncatelog firstlogneeded
+/** get rid of old and unnecessary log files
+* @param firstlogneeded the log file number of the oldest log file
+* needed for recovery.
+*/
+private void truncatelog long firstlogneeded
+long oldfirstlog
+if  keepalllogs
+return
+// when  backup is in progress, log files that are yet to
+// be copied to the backup should not be deleted,  even
+// if they are not required  for crash recovery.
+if backupinprogress
+long logfileneededforbackup   logfiletobackup
+// check if the log file number is yet to be copied
+// to the backup is less than the log file required
+// for crash recovery, if it is then make the first
+// log file that should not be deleted is the log file
+// that is yet to  be copied to the backup.
+if  logfileneededforbackup < firstlogneeded
+firstlogneeded   logfileneededforbackup
+oldfirstlog   firstlogfilenumber
+firstlogfilenumber   firstlogneeded
+while oldfirstlog < firstlogneeded
+storagefile uselesslogfile   null
+try
+uselesslogfile   getlogfilename oldfirstlog
+if  privdelete uselesslogfile
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug dbg_flag      uselesslogfile getpath
+else
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug dbg_flag      uselesslogfile getpath
+catch  standardexception se
+if  sanitymanager debug
+sanitymanager throwassert
+uselesslogfile getpath    se
+// if insane, just leave it be
+oldfirstlog
+/**
+* return the "oldest" log file still needed by recovery.
+* <p>
+* returns the log file that contains the undolwm, ie. the oldest
+* log record of all uncommitted transactions in the given checkpoint.
+*
+* if no checkpoint is given then returns -1, indicating all log records
+* may be necessary.
+*
+**/
+private long getfirstlogneeded checkpointoperation checkpoint
+long firstlogneeded
+// one truncation at a time
+synchronized  this
+firstlogneeded
+checkpoint    null ?
+logcounter getlogfilenumber checkpoint undolwm       1
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug dbg_flag
+firstlogneeded
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug dbg_flag
+firstlogneeded
+sanitymanager debug dbg_flag
+firstlogfilenumber
+return firstlogneeded
+/**
+carefully write out this value to the control file.
+we do safe write of this data by writing the data
+into two files every time we write the control data.
+we write checksum at the end of the file, so if by
+chance system crashes while writing into the file,
+using the checksum we find that the control file
+is hosed then we  use the mirror file, which will have
+the condrol data written at last check point.
+see comment at beginning of file for log control file format.
+<p> mt- synchronized by caller
+*/
+boolean writecontrolfile storagefile logcontrolfilename  long value
+throws ioexception  standardexception
+storagerandomaccessfile logcontrolfile   null
+bytearrayoutputstream baos   new bytearrayoutputstream 64
+dataoutputstream daos   new dataoutputstream baos
+daos writeint fid
+// so that when this db is booted by 1.1x and 1.2x jbms, a ioexception
+// stack trace rather than some error message that tells
+// the user to delete the database will show up.
+daos writeint obsolete_log_version_number
+daos writelong value
+if  ondiskmajorversion    0
+ondiskmajorversion   jbmsversion getmajorversion
+ondiskminorversion   jbmsversion getminorversion
+ondiskbeta   jbmsversion isbeta
+// previous to 1.3, that's all we wrote.
+// from 1.3 and onward, also write out the jbmsversion
+daos writeint ondiskmajorversion
+daos writeint ondiskminorversion
+// for 2.0 beta we added the build number and the isbeta indication.
+// (5 bytes from our first spare long)
+daos writeint jbmsversion getbuildnumberasint
+byte flags   0
+if  ondiskbeta
+flags    is_beta_flag
+// when database is booted with derby.system.durability=test,
+// this mode does not guarantee that
+// - database will recover
+// - committed transactions will not be lost
+// - database will be in a consistent state
+// hence necessary to keep track of this state so we don't
+// waste time resolving issues in such cases.
+// wasdbindurabilitytestmodenosync has information if database was
+// previously booted at any time in this mode
+if  lognotsynced    wasdbindurabilitytestmodenosync
+flags    is_durability_testmode_no_sync_flag
+daos writebyte flags
+//
+// write some spare bytes after 2.0 we have 3 + 2(8) spare bytes.
+long spare   0
+daos writebyte 0
+daos writebyte 0
+daos writebyte 0
+daos writelong spare
+daos flush
+// write the checksum for the control data written
+checksum reset
+checksum update baos tobytearray    0  baos size
+daos writelong checksum getvalue
+daos flush
+try
+checkcorrupt
+try
+logcontrolfile   privrandomaccessfile logcontrolfilename
+catch  ioexception ioe
+logcontrolfile   null
+return false
+if   privcanwrite logcontrolfilename
+return false
+if  sanitymanager debug
+if  sanitymanager debug_on test_log_full
+testlogfull
+logcontrolfile seek 0
+logcontrolfile write baos tobytearray
+syncfile logcontrolfile
+logcontrolfile close
+// write the same data to mirror control file
+try
+logcontrolfile
+privrandomaccessfile getmirrorcontrolfilename
+catch  ioexception ioe
+logcontrolfile   null
+return false
+logcontrolfile seek 0
+logcontrolfile write baos tobytearray
+syncfile logcontrolfile
+finally
+if  logcontrolfile    null
+logcontrolfile close
+return true
+/*
+carefully read the content of the control file.
+<p> mt- read only
+*/
+private long readcontrolfile storagefile logcontrolfilename  properties startparams
+throws ioexception  standardexception
+storagerandomaccessfile logcontrolfile   null
+bytearrayinputstream bais   null
+datainputstream dais   null
+logcontrolfile    privrandomaccessfile logcontrolfilename
+boolean upgradeneeded   false
+long value   logcounter invalid_log_instant
+long ondiskchecksum   0
+long controlfilelength   logcontrolfile length
+byte barray   null
+try
+// the length of the file is less than the minimum in any version
+// it is possibly hosed , no point in reading data from this file
+// skip reading checksum  control file is before 1.5
+if  controlfilelength < 16
+ondiskchecksum    1
+else if  controlfilelength    16
+barray   new byte
+logcontrolfile readfully barray
+else if  controlfilelength > 16
+barray   new byte
+logcontrolfile readfully barray
+ondiskchecksum   logcontrolfile readlong
+if  ondiskchecksum   0
+checksum reset
+checksum update barray  0  barray length
+if   ondiskchecksum    checksum getvalue      ondiskchecksum   0
+bais   new bytearrayinputstream barray
+dais   new datainputstream bais
+if  dais readint      fid
+throw standardexception newexception
+sqlstate log_incompatible_format  datadirectory
+int obsoleteversion   dais readint
+value   dais readlong
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+logcounter todebugstring value
+// from version 1.5 onward, we added an int for storing jbms
+// version and an int for storing checkpoint interval
+// and log switch interval
+ondiskmajorversion   dais readint
+ondiskminorversion   dais readint
+int dbbuildnumber   dais readint
+int flags   dais readbyte
+// check if the database was booted previously at any time with
+// derby.system.durability=test mode
+// if yes, then on a boot error we report that this setting is
+// probably the cause for the error and also log a warning
+// in the derby.log that this mode was set previously
+wasdbindurabilitytestmodenosync
+flags   is_durability_testmode_no_sync_flag     0
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag
+wasdbindurabilitytestmodenosync
+ondiskbeta    flags   is_beta_flag     0
+if  ondiskbeta
+// if is beta, can only be booted by exactly the same
+// version
+if   jbmsversion isbeta
+ondiskmajorversion    jbmsversion getmajorversion
+ondiskminorversion    jbmsversion getminorversion
+boolean forcebetaupgrade   false
+if  sanitymanager debug
+// give ourselves an out for this beta check for debugging purposes
+if  sanitymanager debug_on
+monitor logmessage
+forcebetaupgrade  true
+if   forcebetaupgrade
+throw standardexception newexception
+sqlstate log_cannot_upgrade_beta
+datadirectory
+productversionholder simpleversionstring ondiskmajorversion  ondiskminorversion  ondiskbeta
+// jbms_version must be numbered in a way so that it is ever
+// increasing.  we are backwards compatible but not forwards
+// compatible
+//
+if  ondiskmajorversion > jbmsversion getmajorversion
+ondiskmajorversion    jbmsversion getmajorversion
+ondiskminorversion > jbmsversion getminorversion
+// don't need to worry about point release, no format
+// upgrade is allowed.
+throw standardexception newexception
+sqlstate log_incompatible_version
+datadirectory
+productversionholder simpleversionstring ondiskmajorversion  ondiskminorversion  ondiskbeta
+// ensure that upgrade has been requested for a major or minor upgrade
+// maintaince (point) versions should not require an upgrade.
+if   ondiskmajorversion    jbmsversion getmajorversion
+ondiskminorversion    jbmsversion getminorversion
+upgradeneeded   true
+// if checksum is zeros in  version > 3.5 file is hosed
+// except incase of upgrade from versions <= 3.5
+if  ondiskchecksum    0
+ondiskmajorversion <  3    ondiskminorversion < 5
+ondiskmajorversion    0
+value   logcounter invalid_log_instant
+finally
+if  logcontrolfile    null
+logcontrolfile close
+if  bais    null
+bais close
+if  dais    null
+dais close
+if  upgradeneeded
+if  monitor isfullupgrade startparams
+productversionholder simpleversionstring ondiskmajorversion  ondiskminorversion  ondiskbeta
+ondiskmajorversion   jbmsversion getmajorversion
+ondiskminorversion   jbmsversion getminorversion
+ondiskbeta   jbmsversion isbeta
+// write out the new log control file with the new
+// version, the database has been upgraded
+if   writecontrolfile logcontrolfilename  value
+throw standardexception newexception
+sqlstate log_control_file  logcontrolfilename
+return value
+/**
+* create the directory where transaction log should go.
+* @exception standardexception standard error policy
+*/
+private void createlogdirectory   throws standardexception
+storagefile logdir
+logstoragefactory newstoragefile logfactory log_directory_name
+if  privexists logdir
+// make sure log directory is empty.
+string logfiles   privlist logdir
+if  logfiles    null
+if logfiles length    0
+throw standardexception newexception
+sqlstate log_segment_exist  logdir getpath
+else
+// create the log directory.
+if   privmkdirs logdir
+throw standardexception newexception
+sqlstate log_segment_not_exist  logdir getpath
+/*
+return the directory the log should go.
+<p> mt- read only
+@exception standardexception derby standard error policy
+*/
+public storagefile getlogdirectory   throws standardexception
+storagefile logdir   null
+logdir   logstoragefactory newstoragefile  logfactory log_directory_name
+if   privexists logdir
+throw standardexception newexception
+sqlstate log_segment_not_exist  logdir getpath
+return logdir
+public string getcanonicallogpath
+if  logdevice    null
+return null
+else
+try
+return logstoragefactory getcanonicalname
+catch  ioexception ioe
+return null
+// file not found
+/**
+return the control file name
+<p> mt- read only
+*/
+private storagefile getcontrolfilename   throws standardexception
+return logstoragefactory newstoragefile  getlogdirectory
+/**
+return the mirror control file name
+<p> mt- read only
+*/
+private storagefile getmirrorcontrolfilename   throws standardexception
+return logstoragefactory newstoragefile  getlogdirectory
+/**
+given a log file number, return its file name
+<p> mt- read only
+*/
+private storagefile getlogfilename long filenumber  throws standardexception
+return logstoragefactory newstoragefile  getlogdirectory        filenumber
+/*
+find a checkpoint log record at the checkpointinstant
+<p> mt- read only
+*/
+private checkpointoperation findcheckpoint long checkpointinstant  filelogger logger
+throws ioexception  standardexception  classnotfoundexception
+streamlogscan scan    streamlogscan
+openforwardsscan checkpointinstant   loginstant null
+// estimated size of a checkpoint log record, which contains 3 longs
+// and assorted other log record overhead
+loggable lop   logger readlogrecord scan  100
+scan close
+if  lop instanceof checkpointoperation
+return  checkpointoperation lop
+else
+return null
+/*
+* functions to help the logger open a log scan on the log.
+*/
+/**
+scan backward from start position.
+<p> mt- read only
+@exception ioexception cannot access the log
+@exception standardexception standard derby error policy
+*/
+protected logscan openbackwardsscan long startat  loginstant stopat
+throws ioexception  standardexception
+checkcorrupt
+// backward from end of log
+if  startat    logcounter invalid_log_instant
+return openbackwardsscan stopat
+// ensure any buffered data is written to the actual file
+flushbuffer logcounter getlogfilenumber startat
+logcounter getlogfileposition startat
+return new scan this  startat  stopat  scan backward
+/**
+scan backward from end of log.
+<p> mt- read only
+@exception ioexception cannot access the log
+@exception standardexception standard derby error policy
+*/
+protected logscan openbackwardsscan loginstant stopat
+throws ioexception  standardexception
+checkcorrupt
+// current instant log instant of the next log record to be
+// written out, which is at the end of the log
+// ensure any buffered data is written to the actual file
+long startat
+synchronized  this
+// flush the whole buffer to ensure the complete
+// end of log is in the file.
+logout flushlogaccessfile
+startat   currentinstant
+return new scan this  startat  stopat  scan backward_from_log_end
+/**
+@see logfactory#openflushedscan
+@exception standardexception ooops.
+*/
+public scanhandle openflushedscan databaseinstant start int groupsiwant
+throws standardexception
+return new flushedscanhandle this start groupsiwant
+/**
+scan forward from start position.
+<p> mt- read only
+@param startat - if startat == invalid_log_instant,
+start from the beginning of the log. otherwise, start scan from startat.
+@param stopat - if not null, stop at this log instant (inclusive).
+otherwise, stop at the end of the log
+@exception ioexception cannot access the log
+@exception standardexception standard derby error policy
+*/
+protected logscan openforwardsscan long startat  loginstant stopat
+throws ioexception  standardexception
+checkcorrupt
+if  startat    logcounter invalid_log_instant
+startat   firstloginstant
+// ensure any buffered data is written to the actual file
+if  stopat    null
+logcounter stopcounter    logcounter  stopat
+flushbuffer stopcounter getlogfilenumber
+stopcounter getlogfileposition
+else
+synchronized  this
+if  logout    null
+// flush to the end of the log
+logout flushlogaccessfile
+return new scan this  startat  stopat  scan forward
+/*
+* methods to help a log scan switch from one log file to the next
+*/
+/**
+open a log file and position the file at the beginning.
+used by scan to switch to the next log file
+<p> mt- read only </p>
+<p> when the database is in slave replication mode only:
+assumes that only recover() will call this method after
+initializereplicationslaverole() has been called, and until slave
+replication has ended. if this changes, the current
+implementation will fail.</p>
+@exception standardexception standard derby error policy
+@exception ioexception cannot access the log at the new position.
+*/
+protected storagerandomaccessfile getlogfileatbeginning long filenumber
+throws ioexception  standardexception
+// <slave replication code>
+//
+// when in slave replication mode, the recovery processing
+// will not start until after the first call to
+// switchlogrecord, at which time allowedtoreadfilenumber will
+// be set to one less than the current log file number. the
+// call to switchlogrecord comes as a result of the
+// slavecontroller appending log records received from the
+// master. this implies that the initialization steps (boot
+// and initializereplicationslaverole) have completed.
+//
+// before recovery processing is started, log scans will be
+// allowed unrestricted access to the log files through this
+// method. this is needed because boot() and
+// initializereplicationslaverole() use this method to find
+// the log end. once the recovery thread is allowed to start
+// processing (i.e., allowedtoreadfilenumber != -1), it will
+// use this method to read log files. from this point on, this
+// method will not return until allowedtoreadfilenumber =>
+// filenumber. in other words, while in replication slave
+// mode, the method is blocking until allowedtoreadfilenumber
+// is high enough to read the requested log file.
+//
+// currently, only recover() uses this method (through
+// openforwardsscan) up to the point where the database has
+// been fully recovered. the database cannot fully recover
+// until it is no longer in slave mode. if this changes (i.e.
+// another thread also needs access to the log files while in
+// slave mode), this code will not work.
+if  inreplicationslavemode     allowedtoreadfilenumber     1
+synchronized  slaverecoverymonitor
+// recheck inreplicationslavemode == true because it
+// may have changed while the thread was waiting.
+while  inreplicationslavemode
+filenumber > allowedtoreadfilenumber
+if  replicationslaveexception    null
+throw replicationslaveexception
+try
+slaverecoverymonitor wait
+catch  interruptedexception ie
+// do nothing
+// </slave replication code>
+long instant   logcounter makeloginstantaslong filenumber
+log_file_header_size
+return getlogfileatposition instant
+/**
+get a read-only handle to the log file positioned at the stated position
+<p> mt- read only
+@return null if file does not exist or of the wrong format
+@exception ioexception cannot access the log at the new position.
+@exception standardexception standard derby error policy
+*/
+protected storagerandomaccessfile getlogfileatposition long loginstant
+throws ioexception  standardexception
+checkcorrupt
+long filenum   logcounter getlogfilenumber loginstant
+long filepos   logcounter getlogfileposition loginstant
+storagefile filename   getlogfilename filenum
+if   privexists filename
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag  filename getpath
+return null
+storagerandomaccessfile log   null
+try
+log   privrandomaccessfile filename
+// verify that the log file is of the right format
+if   verifylogformat log  filenum
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug logtofile dbg_flag  filename getpath
+log close
+log   null
+else
+log seek filepos
+catch  ioexception ioe
+try
+if  log    null
+log close
+log   null
+if  sanitymanager debug
+sanitymanager throwassert     filepos
+filename getpath    ioe
+catch  ioexception ioe2
+throw ioe
+return log
+/*
+** methods of modulecontrol
+*/
+public boolean cansupport properties startparams
+string runtimelogattributes   startparams getproperty logfactory runtime_attributes
+if  runtimelogattributes    null
+if  runtimelogattributes equals logfactory rt_readonly
+return false
+return	true
+/**
+boot up the log factory.
+<p> mt- caller provide synchronization
+@exception standardexception log factory cannot start up
+*/
+public void	boot boolean create  properties startparams  throws standardexception
+// is the database booted in replication slave mode?
+string mode   startparams getproperty slavefactory replication_mode
+if  mode    null    mode equals slavefactory slave_mode
+inreplicationslavemode   true
+slaverecoverymonitor   new object
+else if  mode    null    mode equals slavefactory slave_pre_mode
+inreplicationslavepremode   true
+datadirectory   startparams getproperty persistentservice root
+logdevice   startparams getproperty attribute log_device
+if  logdevice    null
+// in case the user specifies logdevice in url form
+string logdeviceurl   null
+try
+url url   new url logdevice
+logdeviceurl   url getfile
+catch  malformedurlexception ex
+if  logdeviceurl    null
+logdevice   logdeviceurl
+if create
+getlogstoragefactory
+createlogdirectory
+else
+// check if the database is being restored from the backup,
+// if it is then restore the logs.
+if   restorelogs startparams
+// set the log storage factory.
+getlogstoragefactory
+if  logdevice    null
+// make sure we find the log, do not assume
+// it is ok that the log is not there because
+// it could be a user typo(like when users edit
+// service.properties to change the log device
+// while restoring from backups using os copy.
+storagefile checklogdir
+logstoragefactory newstoragefile
+logfactory log_directory_name
+if   privexists checklogdir
+throw
+standardexception newexception
+sqlstate log_file_not_found  checklogdir getpath
+//if user does not set the right value for the log buffer size,
+//default value is used instead.
+logbuffersize    propertyutil getsystemint org apache derby iapi reference property log_buffer_size
+log_buffer_size_min
+log_buffer_size_max
+default_log_buffer_size
+jbmsversion   monitor getmonitor   getengineversion
+string logarchivemode
+startparams getproperty property log_archive_mode
+logarchived   boolean valueof logarchivemode  booleanvalue
+//get log factorty properties if any set in derby.properties
+getlogfactoryproperties null
+/* check if the storage factory supports write sync (rws and rwd). if
+* so, use it unless derby.storage.filesynctransactionlog property is
+* set true by user.
+*/
+if  logstoragefactory supportswritesync
+//write sync can be used in the jvm that database is running on.
+//disable write sync if derby.storage.filesynctransactionlog is true
+iswritesynced
+propertyutil getsystemboolean property filesync_transaction_log
+else
+iswritesynced   false
+// if derby.system.durability=test is set,then set flag to
+// disable sync of log records at commit and log file before
+// data page makes it to disk
+if  property durability_testmode_no_sync equalsignorecase
+propertyutil getsystemproperty property durability_property
+// disable syncing of log.
+lognotsynced   true
+//if log not being synced;files shouldn't be open in write sync mode
+iswritesynced   false
+else if  performance measure
+// development build only feature, must by hand set the
+// performance.measure variable and rebuild.  useful during
+// development to compare/contrast effect of syncing, release
+// users can use the above relaxed durability option to disable
+// all syncing.
+lognotsynced
+propertyutil getsystemboolean
+property storage_log_not_synced
+if  lognotsynced
+iswritesynced   false
+monitor logmessage
+// try to access the log
+// if it doesn't exist, create it.
+// if it does exist, run recovery
+boolean createnewlog   create
+if  sanitymanager debug
+sanitymanager assert fid     1
+checkpointinstant   logcounter invalid_log_instant
+try
+storagefile logcontrolfilename   getcontrolfilename
+storagefile logfile
+if   createnewlog
+if  privexists logcontrolfilename
+checkpointinstant
+readcontrolfile logcontrolfilename  startparams
+// in case system was running previously with
+// derby.system.durability=test then print a message
+// to the derby log
+if  wasdbindurabilitytestmodenosync
+// print message stating that the database was
+// previously atleast at one time running with
+// derby.system.durability=test mode
+monitor logmessage messageservice gettextmessage
+messageid log_was_in_durability_testmode_no_sync
+property durability_property
+property durability_testmode_no_sync
+if  checkpointinstant    logcounter invalid_log_instant
+privexists getmirrorcontrolfilename
+checkpointinstant
+readcontrolfile
+getmirrorcontrolfilename    startparams
+else if  logdevice    null
+// do not throw this error if logdevice is null because
+// in a read only configuration, it is acceptable
+// to not have a log directory.  but clearly, if the
+// logdevice property is set, then it should be there.
+throw standardexception newexception
+sqlstate log_file_not_found
+logcontrolfilename getpath
+if  checkpointinstant    logcounter invalid_log_instant
+logfilenumber   logcounter getlogfilenumber checkpointinstant
+else
+logfilenumber   1
+logfile   getlogfilename logfilenumber
+// if log file is not there or if it is of the wrong format, create a
+// brand new log file and do not attempt to recover the database
+if   privexists logfile
+if  logdevice    null
+throw standardexception newexception
+sqlstate log_file_not_found
+logcontrolfilename getpath
+logerrmsg messageservice gettextmessage
+messageid log_maybe_inconsistent
+logfile getpath
+createnewlog   true
+else if   verifylogformat logfile  logfilenumber
+monitor logtextmessage messageid log_delete_incompatible_file  logfile
+// blow away the log file if possible
+if   privdelete logfile     logfilenumber    1
+logerrmsgfordurabilitytestmodenosync
+throw standardexception newexception
+sqlstate log_incompatible_format  datadirectory
+// if logfilenumber > 1, we are not going to write that
+// file just yet.  just leave it be and carry on.  maybe
+// when we get there it can be deleted.
+createnewlog   true
+if  createnewlog
+// brand new log.  start from log file number 1.
+// create or overwrite the log control file with an invalid
+// checkpoint instant since there is no checkpoint yet
+if  writecontrolfile logcontrolfilename
+logcounter invalid_log_instant
+firstlogfilenumber   1
+logfilenumber   1
+if  sanitymanager debug
+if  sanitymanager debug_on test_max_logfile_number
+// set the value to be two less than max possible
+// log number, test case will perform some ops to
+// hit the max number case.
+firstlogfilenumber
+logcounter max_logfile_number  2
+logfilenumber   logcounter max_logfile_number  2
+logfile   getlogfilename logfilenumber
+if  privexists logfile
+// this log file maybe there because the system may have
+// crashed right after a log switch but did not write
+// out any log record
+monitor logtextmessage
+messageid log_delete_old_file  logfile
+if   privdelete logfile
+logerrmsgfordurabilitytestmodenosync
+throw standardexception newexception
+sqlstate log_incompatible_format
+datadirectory
+// don't need to try to delete it, we know it isn't there
+firstlog   privrandomaccessfile logfile
+if   initlogfile firstlog  logfilenumber  logcounter invalid_log_instant
+throw standardexception newexception
+sqlstate log_segment_not_exist  logfile getpath
+endposition   firstlog getfilepointer
+lastflush   firstlog getfilepointer
+//if write sync is true , prellocate the log file
+//and reopen the file in rwd mode.
+if iswritesynced
+//extend the file by wring zeros to it
+preallocatenewlogfile firstlog
+firstlog close
+firstlog   openlogfileinwritemode logfile
+//postion the log at the current log end postion
+firstlog seek endposition
+if  sanitymanager debug
+sanitymanager assert
+endposition    log_file_header_size
+else
+monitor logtextmessage messageid log_changed_db_to_read_only
+monitor logthrowable new exception
+// read only database
+readonlydb   true
+logout   null
+firstlog   null
+recoveryneeded   false
+else
+// log file exist, need to run recovery
+recoveryneeded   true
+catch  ioexception ioe
+throw monitor exceptionstartingmodule ioe
+// number of the log file that can be created in derby is increased from
+// 2^22 -1 to 2^31 -1 in version 10.1. but if the database is running on
+// engines 10.1 or above on a  softupgrade  from versions 10.0 or
+// before, the max log file number  that can be created is
+// still limited to 2^22 -1, because users can revert back to older  versions
+// which does not have logic to handle a log file number greater than
+// 2^22-1.
+// set max possible log file number to derby 10.0 limit, if the database is not
+// fully upgraded to or created in version 10.1 or above.
+if   checkversion rawstorefactory derby_store_major_version_10
+rawstorefactory derby_store_minor_version_1
+maxlogfilenumber   logcounter derby_10_0_max_logfile_number
+boottimelogfilenumber   logfilenumber
+end of boot
+private void getlogstoragefactory   throws standardexception
+if  logdevice    null
+datafactory df    datafactory  monitor findservicemodule  this  datafactory module
+logstoragefactory    writablestoragefactory  df getstoragefactory
+else
+try
+persistentservice ps   monitor getmonitor   getservicetype this
+logstoragefactory    writablestoragefactory  ps getstoragefactoryinstance  false  logdevice  null  null
+catch  ioexception ioe
+if  sanitymanager debug
+sanitymanager notreached
+throw standardexception newexception  sqlstate log_file_not_found  ioe  logdevice
+end of getlogstoragefactory
+/**
+stop the log factory
+<p> mt- caller provide synchronization
+(resolve: this should be called after datafactory and transfactory are
+stopped)
+*/
+public  void stop
+// stop our checkpoint
+if  checkpointdaemon    null
+checkpointdaemon unsubscribe myclientnumber
+checkpointdaemon stop
+synchronized this
+stopped   true
+if  logout    null
+try
+logout flushlogaccessfile
+logout close
+catch  ioexception ioe
+catch standardexception se
+logout   null
+if  sanitymanager debug
+performance measure
+mon_logsyncstatistics
+monitor logmessage
+mon_numlogflushwaits
+mon_flushcalls
+mon_synccalls
+logaccessfile mon_numbytestolog
+logaccessfile mon_numwritestolog
+// delete obsolete log files,left around by earlier crashes
+if corrupt    null      logarchived       keepalllogs     readonlydb
+deleteobsoletelogfiles
+if  logdevice    null
+logstoragefactory shutdown
+logstoragefactory   null
+/* delete the log files, that might have been left around if we crashed
+* immediately after the checkpoint before truncations of logs completed.
+* see bug no: 3519 , for more details.
+*/
+private void deleteobsoletelogfiles
+storagefile logdir
+//find the first  log file number that is  useful
+long firstlogneeded   getfirstlogneeded currentcheckpoint
+if  firstlogneeded     1
+return
+// when  backup is in progress, log files that are yet to
+// be copied to the backup should not be deleted,  even
+// if they are not required  for crash recovery.
+if backupinprogress
+long logfileneededforbackup   logfiletobackup
+// check if the log file number is yet to be copied
+// to the backup is less than the log file required
+// for crash recovery, if it is then make the first
+// log file that should not be deleted is the log file
+// that is yet to  be copied to the backup.
+if  logfileneededforbackup < firstlogneeded
+firstlogneeded   logfileneededforbackup
+try
+logdir   getlogdirectory
+catch  standardexception se
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug dbg_flag
+return
+string logfiles   privlist logdir
+if  logfiles    null
+storagefile uselesslogfile   null
+long filenumber
+for int i 0   i < logfiles length  i
+// delete the log files that are not needed any more
+if logfiles startswith       logfiles endswith
+filenumber   long parselong logfiles substring 3   logfiles length    4
+if filenumber < firstlogneeded
+uselesslogfile   logstoragefactory newstoragefile logdir  logfiles
+if  privdelete uselesslogfile
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug dbg_flag      uselesslogfile getpath
+else
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug dbg_flag      uselesslogfile getpath
+/*
+* serviceable methods
+*/
+public boolean serviceasap
+return false
+// @return true, if this work needs to be done on a user thread immediately
+public boolean serviceimmediately
+return false
+public void getlogfactoryproperties persistentset set
+throws standardexception
+string lsinterval
+string cpinterval
+if set    null
+lsinterval propertyutil getsystemproperty org apache derby iapi reference property log_switch_interval
+cpinterval propertyutil getsystemproperty org apache derby iapi reference property checkpoint_interval
+else
+lsinterval   propertyutil getserviceproperty set  org apache derby iapi reference property log_switch_interval
+cpinterval   propertyutil getserviceproperty set  org apache derby iapi reference property checkpoint_interval
+/* log switch interval */
+if  lsinterval    null
+logswitchinterval   integer parseint lsinterval
+// make sure checkpoint and log switch interval are within range
+if  logswitchinterval < log_switch_interval_min
+logswitchinterval   log_switch_interval_min
+else if  logswitchinterval > log_switch_interval_max
+logswitchinterval   log_switch_interval_max
+/* checkpoint interval */
+if  cpinterval    null
+checkpointinterval   integer parseint cpinterval
+if  checkpointinterval < checkpoint_interval_min
+checkpointinterval   checkpoint_interval_min
+else if checkpointinterval  > checkpoint_interval_max
+checkpointinterval   checkpoint_interval_max
+public int performwork contextmanager context
+synchronized this
+if  corrupt    null
+return serviceable done     don't do this again
+// check to see if checkpointinterval and logswitchinterval has changed
+accessfactory af
+accessfactory monitor getservicemodule this  accessfactory module
+try
+if  af    null
+transactioncontroller tc   null
+try
+tc   af getandnametransaction
+context  accessfactoryglobals sys_trans_name
+getlogfactoryproperties tc
+finally
+if  tc    null
+tc commit
+// checkpoint will start its own internal transaction on the current
+// context.
+rawstorefactory checkpoint
+catch  standardexception se
+monitor logtextmessage messageid log_checkpoint_exception
+logerrmsg se
+catch  shutdownexception shutdown
+// if we are shutting down, just ignore the error and let the
+// system go down without printing errors to the log.
+checkpointdaemoncalled   false
+return serviceable done
+/*
+** implementation specific methods
+*/
+/**
+append length bytes of data to the log prepended by a long log instant
+and followed by 4 bytes of length information.
+<p>
+this method is synchronized to ensure log records are added sequentially
+to the end of the log.
+<p>mt- single threaded through this log factory.  log records are
+appended one at a time.
+@exception standardexception log full.
+*/
+public long appendlogrecord byte data  int offset  int length
+byte optionaldata  int optionaldataoffset  int optionaldatalength
+throws standardexception
+if  inreplicationslavepremode
+// return the *current* end of log without adding the log
+// record to the log file. effectively, this call to
+// appendlogrecord does not do anything
+return logcounter makeloginstantaslong logfilenumber  endposition
+long instant
+boolean testincompletelogwrite   false
+if  readonlydb
+throw standardexception newexception
+sqlstate log_read_only_db_update
+if  length <  0
+throw standardexception newexception
+sqlstate log_zero_length_log_record
+// resolve: calculate checksum here
+if  sanitymanager debug
+if  sanitymanager debug_on test_log_incomplete_log_write
+/// /// /// /// /// /// /// /// /// ///
+//
+// go into this alternate route instead
+//
+/// /// /// /// /// /// /// /// /// ///
+return logtest_appendpartiallogrecord data  offset  length
+optionaldata
+optionaldataoffset
+optionaldatalength
+try
+if  sanitymanager debug
+if  sanitymanager debug_on test_log_full
+testlogfull   	   if log is   this routine will throw an
+// exception
+synchronized  this
+// has someone else found a problem in the raw store?
+if  corrupt    null
+throw standardexception newexception
+sqlstate log_store_corrupt  corrupt
+if  logout    null
+throw standardexception newexception sqlstate log_null
+/*
+* note!!
+*
+* subclass which logs special record to the stream depends on
+* the exact byte sequence of the following segment of code.
+* if you change this, not only will you need to write upgrade
+* code for this class, you also need to find all the subclass
+* which write log record to log stream directly to make sure
+* they are ok
+*/
+// see if the log file is too big, if it is, switch to the next
+// log file
+if   endposition   log_record_overhead   length  >
+logcounter max_logfile_size
+switchlogfile
+// still too big??  giant log record?
+if   endposition   log_record_overhead   length  >
+logcounter max_logfile_size
+throw standardexception newexception
+sqlstate log_exceed_max_log_file_size
+new long logfilenumber
+new long endposition
+new long length
+new long logcounter max_logfile_size
+//reserve the space for the checksum log record
+endposition    logout reservespaceforchecksum length  logfilenumber endposition
+// don't call currentinstant since we are already in a
+// synchronzied block
+instant
+logcounter makeloginstantaslong logfilenumber  endposition
+logout writelogrecord
+length  instant  data  offset
+optionaldata  optionaldataoffset  optionaldatalength
+if  optionaldatalength    0
+if  sanitymanager debug
+if  optionaldata    null
+sanitymanager throwassert
+optionaldatalength
+if  optionaldata length <
+optionaldataoffset optionaldatalength
+sanitymanager throwassert
+optionaldatalength
+optionaldataoffset
+optionaldata length
+endposition     length   log_record_overhead
+catch  ioexception ioe
+throw markcorrupt standardexception newexception
+sqlstate log_full  ioe
+return instant
+/*
+* misc private functions to access the log
+*/
+/**
+get the current log instant - this is the log instant of the next log
+record to be written out
+<p> mt - this method is synchronized to ensure that it always points to
+the end of a log record, not the middle of one.
+*/
+protected synchronized long currentinstant
+return logcounter makeloginstantaslong logfilenumber  endposition
+protected synchronized long endposition
+return endposition
+/**
+return the current log file number.
+<p> mt - this method is synchronized so that
+it is not in the middle of being changed by swithlogfile
+*/
+private synchronized long getlogfilenumber
+return logfilenumber
+/**
+get the first valid log instant - this is the beginning of the first
+log file
+<p>mt- synchronized on this
+*/
+private synchronized long firstloginstant
+return logcounter makeloginstantaslong firstlogfilenumber  log_file_header_size
+/**
+flush the log such that the log record written with the instant
+whereposition is guaranteed to be on disk.
+<p>mt - only one flush is allowed to be taking place at any given time
+(resolve: right now it single thread thru the log factory while the log
+is frozen)
+@exception standardexception cannot sync log file
+*/
+protected void flush long filenumber  long whereposition  throws standardexception
+long potentiallastflush   0
+synchronized  this
+if  performance measure
+mon_flushcalls
+try
+boolean waited
+do
+// this corrupt check must be first, before any check that
+// sees if the log has already been flushed to this
+// point. this is based upon the assumption that every
+// dirty page in the cache must call flush() before it is
+// written out.  has someone else found a problem in the
+// raw store?
+if  corrupt    null
+throw standardexception newexception
+sqlstate log_store_corrupt  corrupt
+// now check if database is frozen
+while  isfrozen
+try
+wait
+catch  interruptedexception ie
+throw standardexception interrupt ie
+// if we are just testing to see to see the database is
+// frozen or corrupt (whereposition == invalid_log_instant)
+// then we can return now.
+// if the log file is already flushed up to where we are
+// interested in, just return.
+if  whereposition    logcounter invalid_log_instant
+filenumber < logfilenumber
+whereposition < lastflush
+return
+// in non-replicated databases, if we are not
+// corrupt and we are in the middle of redo, we
+// know the log record has already been flushed
+// since we haven't written any log yet. if in
+// slave replication mode, however, log records
+// received from the master may have been
+// written to the log.
+if  recoveryneeded    inredo     inreplicationslavemode
+return
+if  sanitymanager debug
+if  filenumber > getlogfilenumber
+sanitymanager throwassert
+filenumber       logfilenumber
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug
+dbg_flag      whereposition
+// there could be multiple threads who wants to flush the
+// log file, see if i can be the one.
+if  logbeingflushed
+waited   true
+try
+if  performance measure
+mon_numlogflushwaits
+wait   	   release log semaphore to let non flushing
+// threads log stuff while all the flushing
+// threads wait.
+// now we continue back to see if the sync
+// we waited for, flushed the portion
+// of log we are interested in.
+catch  interruptedexception ie
+throw standardexception interrupt ie
+else
+waited   false
+// logbeingflushed is false, i am flushing the log now.
+if  iswritesynced
+// flush any data from the buffered log
+logout flushlogaccessfile
+else
+//add active buffers to dirty buffer list
+//to flush to the disk.
+logout switchlogbuffer
+potentiallastflush   endposition     we will flush to to the end
+// once logbeingflushed is set, need to release
+// the logbeingflushed flag in finally block.
+logbeingflushed   true
+// if in replication master mode - notify the
+// masterfactory that log has been flushed to
+// disk. at this point, we know that this is a
+// "real" flush, not just a call to check
+// whether the database is frozen/corrupted
+// (i.e., whereposition ==
+// logcounter.invalid_log_instant has already
+// been checked)
+if  inreplicationmastermode
+masterfactory flushedto logcounter
+makeloginstantaslong filenumber
+whereposition
+while  waited
+// if i have waited, go down do loop again - hopefully,
+// someone else have already flushed it for me already.
+catch  ioexception ioe
+throw markcorrupt standardexception newexception
+sqlstate log_cannot_flush
+ioe
+getlogfilename logfilenumber  getpath
+unfreeze log manager to accept more log records
+boolean syncsuceed   false
+try
+if  sanitymanager debug
+sanitymanager assert logbeingflushed
+sanitymanager assert potentiallastflush > 0
+if  sanitymanager debug_on test_log_full
+testlogfull
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug dbg_flag
+if  performance measure
+mon_synccalls
+if  iswritesynced
+//logaccessfile.flushdirtybuffers() will allow only one write
+//sync at a time, flush requests will get queued
+logout flushdirtybuffers
+else
+if   lognotsynced
+logout synclogaccessfile
+syncsuceed   true
+if  sanitymanager debug
+if  sanitymanager debug_on logtofile dbg_flag
+sanitymanager debug dbg_flag
+catch  syncfailedexception sfe
+throw markcorrupt standardexception newexception
+sqlstate log_cannot_flush
+sfe
+getlogfilename logfilenumber  getpath
+catch  ioexception ioe
+throw markcorrupt standardexception newexception
+sqlstate log_cannot_flush
+ioe
+getlogfilename logfilenumber  getpath
+finally
+synchronized this
+logbeingflushed   false     done flushing
+// update lastflush under synchronized this instead of synchronized(logout)
+if  syncsuceed
+lastflush   potentiallastflush
+// we may actually have flushed more than that because someone
+// may have done a logout.flushbuffer right before the sync
+// call. but this is guarenteed to be flushed.
+notifyall
+// get checkpoint daemon to work
+if   logwrittenfromlastcheckpoint   potentiallastflush  > checkpointinterval
+checkpointdaemon    null   	 checkpointdaemoncalled     inlogswitch
+// following synchronized block is required to make
+// sure only one checkpoint request get scheduled.
+synchronized this
+// recheck if checkpoint is still required, it is possible some other
+// thread might have already scheduled a checkpoint and completed it.
+if   logwrittenfromlastcheckpoint   potentiallastflush  > checkpointinterval
+checkpointdaemon    null   	 checkpointdaemoncalled     inlogswitch
+checkpointdaemoncalled   true
+checkpointdaemon servicenow myclientnumber
+else
+// switch the log if required, this case will occur
+// if log switch interval is less than the checkpoint interval
+// other wise , checkpoint daemon would be doing log switches along
+// with the checkpoints.
+if  potentiallastflush > logswitchinterval
+checkpointdaemoncalled     inlogswitch
+// following synchronized block is required to make sure only
+// one thread switches the log file at a time.
+synchronized this
+// recheck if log switch is still required, it is possible some other
+// thread might have already switched the log file.
+if  potentiallastflush > logswitchinterval
+checkpointdaemoncalled     inlogswitch
+inlogswitch   true
+switchlogfile
+/**
+* utility routine to call sync() on the input file descriptor.
+* <p>
+*/
+private void syncfile  storagerandomaccessfile raf
+throws standardexception
+for  int i 0
+// 3311: jvm sync call sometimes fails under high load against nfs
+// mounted disk.  we re-try to do this 20 times.
+try
+raf sync  false
+// the sync succeed, so return
+break
+catch  ioexception ioe
+i
+try
+// wait for .2 of a second, hopefully i/o is done by now
+// we wait a max of 4 seconds before we give up
+thread sleep 200
+catch  interruptedexception ie
+//does not matter weather i get interrupted or not
+if  i > 20
+throw standardexception newexception
+sqlstate log_full  ioe
+/**
+open a forward scan of the transaction log.
+<p> mt- read only
+@exception standardexception  standard derby exception policy
+*/
+public logscan openforwardsflushedscan loginstant startat
+throws standardexception
+checkcorrupt
+// no need to flush the buffer as it's a flushed scan
+return new flushedscan this   logcounter startat  getvalueaslong
+/**
+get a forwards scan
+@exception standardexception standard derby error policy
+*/
+public logscan openforwardsscan loginstant startat loginstant stopat
+throws standardexception
+try
+long startlong
+if  startat    null
+startlong   logcounter invalid_log_instant
+else
+startlong     logcounter startat  getvalueaslong
+return openforwardsscan startlong  stopat
+catch  ioexception ioe
+throw markcorrupt standardexception newexception
+sqlstate log_io_error  ioe
+public final boolean databaseencrypted
+return databaseencrypted
+/*
+* set that the database is encrypted , all the transaction log has
+* to be encrypted, and flush the log if requesed. log needs to
+* be flushed  first, if this is  being set during (re) encryption
+* of an existing  database.
+*
+* @param flushlog  true, if log needs to be flushed,
+*                  otherwise false.
+*/
+public  void setdatabaseencrypted boolean flushlog
+throws standardexception
+if  flushlog
+flushall
+databaseencrypted   true
+/*
+* set up a new log file to start writing
+* the log records into the new log file
+* after this call.
+*
+* <p>mt - synchronization provided by caller - rawstore boot,
+* this method is called while re-encrypting the database
+* at databse boot time.
+*/
+public void startnewlogfile   throws standardexception
+// switch the database to a new log file.
+switchlogfile
+/*
+* find if the checkpoint is in the last log file.
+*
+* <p>mt - synchronization provided by caller - rawstore boot,
+* this method is called only if a crash occured while
+* re-encrypting the database at boot time.
+* @return <code> true </code> if if the checkpoint is
+*                in the last log file, otherwise
+*                 <code> false </code>.
+*/
+public boolean ischeckpointinlastlogfile
+throws standardexception
+// check if the checkpoint is done in the last log file.
+long logfilenumberaftercheckpoint
+logcounter getlogfilenumber checkpointinstant    1
+// check if there is a log file after
+// the log file that has the last
+// checkpoint record.
+storagefile logfileaftercheckpoint
+getlogfilename logfilenumberaftercheckpoint
+// system.out.println("checking " + logfileaftercheckpoint);
+if  privexists logfileaftercheckpoint
+return false
+else
+return true
+/*
+* delete the log file after the checkpoint.
+*
+* <p>mt - synchronization provided by caller - rawstore boot,
+* this method is called only if a crash occured while
+* re-encrypting the database at boot time.
+*/
+public void deletelogfileaftercheckpointlogfile
+throws standardexception
+long logfilenumberaftercheckpoint
+logcounter getlogfilenumber checkpointinstant    1
+storagefile logfileaftercheckpoint
+getlogfilename logfilenumberaftercheckpoint
+// system.out.println("deleting " + logfileaftercheckpoint);
+if  privexists logfileaftercheckpoint
+// delete the log file (this must have beend encrypted
+// with the new key.
+if   privdelete logfileaftercheckpoint
+// throw exception, recovery can not be performed
+// without deleting the log file encyrpted with new key.
+throw standardexception newexception
+sqlstate unable_to_delete_file
+logfileaftercheckpoint
+/**
+@see rawstorefactory#encrypt
+@exception standardexception standard derby error policy
+*/
+public int encrypt byte cleartext  int offset  int length
+byte ciphertext  int outputoffset
+throws standardexception
+return rawstorefactory encrypt cleartext  offset  length
+ciphertext  outputoffset  false
+/**
+@see rawstorefactory#decrypt
+@exception standardexception standard derby error policy
+*/
+public int decrypt byte ciphertext  int offset  int length
+byte cleartext  int outputoffset
+throws standardexception
+return rawstorefactory decrypt ciphertext  offset  length  cleartext  outputoffset
+/**
+return the encryption block size used during encrypted db creation
+*/
+public int getencryptionblocksize
+return rawstorefactory getencryptionblocksize
+/**
+returns the length that will make the data to be multiple of encryption
+block size based on the given length. block cipher algorithms like des
+and blowfish ..etc  require their input to be an exact multiple of the block size.
+*/
+public int getencrypteddatalength int length
+if   length % getencryptionblocksize       0
+return length   getencryptionblocksize      length % getencryptionblocksize
+return length
+/**
+get the instant of the first record which was not
+flushed.
+<p>this only works after running recovery the first time.
+<p>mt - resolve:
+*/
+public synchronized loginstant getfirstunflushedinstant
+if  sanitymanager debug
+sanitymanager assert logfilenumber > 0    lastflush > 0
+return new logcounter logfilenumber lastflush
+public synchronized long getfirstunflushedinstantaslong
+if  sanitymanager debug
+sanitymanager assert logfilenumber > 0    lastflush > 0
+return logcounter makeloginstantaslong logfilenumber lastflush
+/**
+* backup restore - stop sending log record to the log stream
+* @exception standardexception standard derby error policy
+*/
+public void freezepersistentstore   throws standardexception
+// if i get into this synchronized block, i know i am not in the middle
+// of a write because writing to the log file is synchronized under this.
+synchronized this
+isfrozen   true
+/**
+* backup restore - start sending log record to the log stream
+* @exception standardexception standard derby error policy
+*/
+public void unfreezepersistentstore   throws standardexception
+synchronized this
+isfrozen   false
+notifyall
+/**
+* backup restore - is the log being archived to some directory?
+* if log archive mode is enabled return true else false
+*/
+public boolean logarchived
+return logarchived
+/**
+check to see if a database has been upgraded to the required
+level in order to use a store feature.
+@param requiredmajorversion  required database engine major version
+@param requiredminorversion  required database engine minor version
+@return true if the database has been upgraded to the required level, false otherwise.
+**/
+boolean checkversion int requiredmajorversion  int requiredminorversion
+if ondiskmajorversion > requiredmajorversion
+return true
+else
+if ondiskmajorversion    requiredmajorversion
+ondiskminorversion >  requiredminorversion
+return true
+return false
+/**
+*  check to see if a database has been upgraded to the required
+*  level in order to use a store feature.
+*
+* @param requiredmajorversion  required database engine major version
+* @param requiredminorversion  required database engine minor version
+* @param feature non-null to throw an exception, null to return the
+*                state of the version match.
+* @return <code> true </code> if the database has been upgraded to
+*         the required level, <code> false </code> otherwise.
+* @exception  standardexception
+*             if the database is not at the require version
+*             when <code>feature</code> feature is
+*             not <code> null </code>.
+*/
+public boolean checkversion int requiredmajorversion
+int requiredminorversion
+string feature  throws standardexception
+boolean isrequiredversion
+checkversion requiredmajorversion  requiredminorversion
+// if the database is not at the required version , throw exception
+// if the feature is non-null .
+if   isrequiredversion    feature    null
+throw standardexception newexception
+sqlstate lang_statement_upgrade_required  feature
+productversionholder simpleversionstring ondiskmajorversion
+ondiskminorversion
+ondiskbeta
+productversionholder simpleversionstring requiredmajorversion
+requiredminorversion
+false
+return isrequiredversion
+/*
+** sending information to the user without throwing exception.
+** there are times when unusual external or system related things happen in
+** the log which the user may be interested in but which doesn't impede on
+** the normal operation of the store.  when such an event occur, just send
+** a message or a warning message to the user rather than throw an
+** exception, which will rollback a user transaction or crash the database.
+**
+** logerrmsg - sends a warning message to the user
+*/
+/**
+print error message to user about the log
+mt - not needed, informational only
+*/
+protected void logerrmsg string msg
+logerrmsgfordurabilitytestmodenosync
+monitor logtextmessage messageid log_begin_error
+monitor logmessage msg
+monitor logtextmessage messageid log_end_error
+/**
+print error message to user about the log
+mt - not needed, informational only
+*/
+protected void logerrmsg throwable t
+logerrmsgfordurabilitytestmodenosync
+if  corrupt    null
+monitor logtextmessage messageid log_begin_corrupt_stack
+printerrorstack corrupt
+monitor logtextmessage messageid log_end_corrupt_stack
+if  t    corrupt
+monitor logtextmessage messageid log_begin_error_stack
+printerrorstack t
+monitor logtextmessage messageid log_end_error_stack
+/**
+* in case of boot errors, and if database is either booted
+* with derby.system.durability=test or was previously at any time booted in
+* this mode, mention in the error message that the error is probably
+* because the derby.system.durability was set.
+* dont want to waste time to resolve issues in such
+* cases
+* <p>
+* mt - not needed, informational only
+*/
+private void logerrmsgfordurabilitytestmodenosync
+if  lognotsynced    wasdbindurabilitytestmodenosync
+monitor logtextmessage
+messageid log_durability_testmode_no_sync_err
+property durability_property
+property durability_testmode_no_sync
+/**
+* print stack trace from the throwable including
+* its nested exceptions
+* @param t trace starts from this error
+*/
+private void printerrorstack throwable t
+errorstringbuilder esb
+new errorstringbuilder monitor getstream   getheader
+esb stacktrace t
+monitor logmessage esb get   tostring
+esb reset
+/**
+*  testing support
+*/
+/**
+writes out a partial log record - takes the appendlogrecord.
+need to shutdown the database before another log record gets written,
+or the database is not recoverable.
+*/
+private long logtest_appendpartiallogrecord byte data  int offset
+int	length
+byte optionaldata
+int optionaldataoffset
+int optionaldatalength
+throws standardexception
+if  sanitymanager debug
+int bytestowrite   1
+string testpartiallogwrite   propertyutil getsystemproperty test_log_partial_log_write_num_bytes
+if  testpartiallogwrite    null
+bytestowrite   integer valueof testpartiallogwrite  intvalue
+monitor logmessage     bytestowrite
+length       log_record_overhead
+long instant
+try
+synchronized  this
+// reserve the space for the checksum log record
+// note:  bytestowrite include the log record overhead.
+endposition
+logout reservespaceforchecksum   length   log_record_overhead
+< bytestowrite ? length
+bytestowrite   log_record_overhead
+logfilenumber endposition
+instant   currentinstant
+//check if the length of the records to be written is
+//actually smaller than the number of bytestowrite
+if length   log_record_overhead < bytestowrite
+endposition     length   log_record_overhead
+else
+endposition    bytestowrite
+while true 		   so we can break out without returning out of
+// sync block...
+if  bytestowrite < 4
+int shift   3
+while bytestowrite   > 0
+logout write  byte   length >>> 8 shift    0xff
+shift
+break
+// the length before the log record
+logout writeint length
+bytestowrite    4
+if  bytestowrite < 8
+int shift   7
+while bytestowrite   > 0
+logout write  byte   instant >>> 8 shift    0xff
+shift
+break
+// the log instant
+logout writelong instant
+bytestowrite    8
+if  bytestowrite < length
+int datalength   length   optionaldatalength
+if bytestowrite < datalength
+logout write data  offset bytestowrite
+else
+logout write data  offset  datalength
+bytestowrite    datalength
+if optionaldatalength    0    bytestowrite > 0
+logout write optionaldata  optionaldataoffset  bytestowrite
+break
+// the log data
+logout write data  offset  length   optionaldatalength
+//write optional data
+if optionaldatalength    0
+logout write optionaldata  optionaldataoffset  optionaldatalength
+bytestowrite    length
+if  bytestowrite < 4
+int shift   3
+while bytestowrite   > 0
+logout write  byte   length >>> 8 shift    0xff
+shift
+break
+// the length after the log record
+logout writeint length
+break
+// do make sure the partial write gets on disk by sync'ing it
+flush logfilenumber  endposition
+catch  ioexception ioe
+throw standardexception newexception sqlstate log_full  ioe
+return instant
+return 0
+/**
+simulate a log full condition
+if test_log_full is set to true, then the property
+test_record_to_fill_log indicates the number of times this function is
+call before an ioexception simulating a log full condition is raised.
+if test_record_to_fill_log is not set, it defaults to 100 log record
+*/
+protected void testlogfull   throws ioexception
+if  sanitymanager debug
+if  test_numrecordtofilllog < 0
+string recordtofilllog   propertyutil getsystemproperty test_record_to_fill_log
+if  recordtofilllog    null
+test_numrecordtofilllog   integer valueof recordtofilllog  intvalue
+else
+test_numrecordtofilllog   100
+if    test_logwritten > test_numrecordtofilllog
+throw new ioexception     test_numrecordtofilllog
+test_logwritten
+/**
+* get the log file to simulate a log corruption
+* for unit testing usage only
+*/
+public storagerandomaccessfile getlogfiletosimulatecorruption long filenum  throws ioexception  standardexception
+if  sanitymanager debug
+//long filenum = logcounter.getlogfilenumber(loginstant);
+//			long filepos = logcounter.getlogfileposition(loginstant);
+storagefile filename   getlogfilename filenum
+storagerandomaccessfile log   null
+return privrandomaccessfile filename
+return null
+/**
+* used to determine if the replication master mode has been started,
+* and the logging for unlogged operations needs to be enabled.
+*
+* @return true if the master replication mode is turned on and the
+*              unlogged operations need to be logged.
+*         false if the master replication mode is turned off and the
+*               unlogged operations need not be logged.
+*/
+public boolean inreplicationmastermode
+return inreplicationmastermode
+/*********************************************************************
+* log testing
+*
+* implementations may use these strings to simulate error conditions for
+* testing purposes.
+*
+*********************************************************************/
+/**
+set to true if we want the checkpoint to only switch the log but not
+actually do the checkpoint
+*/
+public static final string test_log_switch_log   sanitymanager debug ?     null
+/**
+set to true if we want the up comming log record to be only partially
+written.  the database is corrupted if not immediately shutdown.
+set test_log_partial_log_write_num_bytes to the number of bytes to write
+out, default is 1 byte.
+*/
+public static final string test_log_incomplete_log_write   sanitymanager debug ?     null
+/**
+set to the number of bytes we want the next log record to actually write
+out, only used when test_log_incomplete_log_write is on.  default is 1
+byte.
+*/
+public static final string test_log_partial_log_write_num_bytes   sanitymanager debug ?     null
+/**
+set to true if we want to simulate a log full condition
+*/
+public static final string test_log_full
+sanitymanager debug ?     null
+/**
+set to true if we want to simulate a log full condition while switching log
+*/
+public static final string test_switch_log_fail1
+sanitymanager debug ?     null
+public static final string test_switch_log_fail2
+sanitymanager debug ?     null
+/**
+set to the number of log record we want to write before the log is
+simulated to be full.
+*/
+public static final string test_record_to_fill_log
+sanitymanager debug ?     null
+/**
+* set to true if we want to simulate max possible log file number is
+* being used.
+*/
+public static final string test_max_logfile_number
+sanitymanager debug ?     null
+//enable the log archive mode
+public void enablelogarchivemode   throws standardexception
+//if the log archive mode is already enabled; thre is nothing to do
+if  logarchived
+logarchived   true
+accessfactory af
+accessfactory monitor getservicemodule this  accessfactory module
+if  af    null
+transactioncontroller tc   null
+tc   af gettransaction
+contextservice getfactory   getcurrentcontextmanager
+tc setproperty property log_archive_mode      true
+// disable the log archive mode
+public void disablelogarchivemode   throws standardexception
+accessfactory af
+accessfactory monitor getservicemodule this  accessfactory module
+if  af    null
+transactioncontroller tc   null
+tc   af gettransaction contextservice getfactory   getcurrentcontextmanager
+tc setproperty property log_archive_mode      true
+logarchived   false
+//delete the online archived log files
+public void deleteonlinearchivedlogfiles
+deleteobsoletelogfiles
+/*
+* start the transaction log backup.
+*
+* the transaction log is required to bring the database to the consistent
+* state on restore.
+*
+* all the log files that are created after the backup starts
+* must be kept around until they are copied into the backup,
+* even if there are checkpoints when backup is in progress.
+*
+* copy the log control files to the backup (the checkpoint recorded in the
+* control files is the backup checkpoint). restore will use the checkpoint
+* info in these control files to perform recovery to bring
+* the database to the consistent state.
+*
+* find first log file that needs to be copied into the backup to bring
+* the database to the consistent state on restore.
+*
+* in the end, existing log files that are needed to recover from the backup
+* checkpoint are copied into the backup, any log that gets generated after
+* this call are also copied into the backup after all the information
+* in the data containers is written to the backup, when endlogbackup()
+* is called.
+*
+* @param todir - location where the log files should be copied to.
+* @exception standardexception standard derby error policy
+*
+*/
+public void startlogbackup file todir  throws standardexception
+// synchronization is necessary to make sure no parallel
+// checkpoint happens when the current checkpoint information
+// is being copied to the backup.
+synchronized this
+// wait until the thread that is doing the checkpoint completes it.
+while incheckpoint
+try
+wait
+catch  interruptedexception ie
+throw standardexception interrupt ie
+backupinprogress   true
+// copy the control files.
+storagefile fromfile
+file tofile
+// copy the log control file
+fromfile   getcontrolfilename
+tofile   new file todir fromfile getname
+if  privcopyfile fromfile  tofile
+throw standardexception newexception
+sqlstate rawstore_error_copying_file  fromfile  tofile
+// copy the log mirror control file
+fromfile   getmirrorcontrolfilename
+tofile   new file todir fromfile getname
+if  privcopyfile fromfile  tofile
+throw standardexception newexception
+sqlstate rawstore_error_copying_file  fromfile  tofile
+// find the first log file number that is active
+logfiletobackup   getfirstlogneeded currentcheckpoint
+// copy all the log files that have to go into the backup
+backuplogfiles todir  getlogfilenumber     1
+/*
+* copy the log files into the given backup location
+*
+* @param todir               - location to copy the log files to
+* @param lastlogfiletobackup - last log file that needs to be copied.
+**/
+private void backuplogfiles file todir  long lastlogfiletobackup
+throws standardexception
+while logfiletobackup <  lastlogfiletobackup
+storagefile fromfile   getlogfilename logfiletobackup
+file tofile   new file todir  fromfile getname
+if  privcopyfile fromfile  tofile
+throw standardexception newexception
+sqlstate rawstore_error_copying_file  fromfile  tofile
+logfiletobackup
+/*
+* copy all the log files that have to go into the backup
+* and mark that backup is compeleted.
+*
+* @param todir - location where the log files should be copied to.
+* @exception standardexception standard derby error policy
+*/
+public void endlogbackup file todir  throws standardexception
+long lastlogfiletobackup
+// make sure all log records are synced to disk.  the online backup
+// copied data "through" the cache, so may have picked up dirty pages
+// which have not yet synced the associated log records to disk.
+// without this force, the backup may end up with page versions
+// in the backup without their associated log records.
+flush logfilenumber  endposition
+if  logarchived
+// when the log is being archived for roll-forward recovery
+// we would like to switch to a new log file.
+// otherwise during restore logfile in the backup could
+// overwrite the more uptodate log files in the
+// online log path. and also we would like to mark the end
+// marker for the log file other wise during roll-forward recovery,
+// if we see a log file with fuzzy end, we think that is the
+// end of the recovery.
+switchlogfile
+lastlogfiletobackup   getlogfilenumber     1
+else
+// for a plain online backup partial filled up log file is ok,
+// no need to do a log switch.
+lastlogfiletobackup   getlogfilenumber
+// backup all the log that got generated after the backup started.
+backuplogfiles todir  lastlogfiletobackup
+// mark that backup is completed.
+backupinprogress   false
+/*
+* backup is not in progress any more, it failed for some reason.
+**/
+public void abortlogbackup
+backupinprogress   false
+// is the transaction in rollforward recovery
+public boolean inrfr
+/*
+*logging system does not differentiate between the
+*crash-recovery and a rollforward recovery.
+*except in case of rollforward atttempt on
+*read only databases to check for pending transaction.
+*(see the comments in recovery() function)
+*/
+if recoveryneeded
+boolean readonly   false
+try
+readonly    privcanwrite getcontrolfilename
+catch standardexception se
+//exception should never have come here
+//because getcontrolfilename() is called
+//earlier at boot time, if there were problems
+//it should have showed up earlier.
+//we just ignore this error and hope that
+//datafactory must have market it as read only if that is the case.
+readonly   readonly     datafactory    null ? false  datafactory isreadonly
+return  readonly
+else
+return false
+/**
+*	redo a checkpoint during rollforward recovery
+*
+* @throws org.apache.derby.iapi.error.standardexception
+*/
+public void checkpointinrfr loginstant cinstant  long redolwm
+long undolwm  datafactory df
+throws standardexception
+//sync the data
+df checkpoint
+//write the log control file; this will make sure that restart of the
+//rollfoward recovery will start this log instant next time instead of
+//from the beginning.
+try
+if   writecontrolfile getcontrolfilename      logcounter cinstant  getvalueaslong
+throw standardexception newexception
+sqlstate log_control_file  getcontrolfilename
+catch  ioexception ioe
+throw markcorrupt
+standardexception newexception sqlstate log_io_error  ioe
+//remove the stub files
+df removedroppedcontainerfilestubs new logcounter redolwm
+if  inreplicationslavemode
+truncatelog logcounter getlogfilenumber undolwm
+/**
+* make this logfactory pass log records to the masterfactory
+* every time a log record is appended to the log on disk, and
+* notify the masterfactory when a log disk flush has taken place.
+* @param masterfactory the masterfactory service responsible for
+* controlling the master side replication behaviour.
+* @exception standardexception standard derby exception policy,
+* thrown on replication startup error. will only be thrown if
+* replication is attempted started on a readonly database, i.e,
+* never thrown here.
+*/
+public void startreplicationmasterrole masterfactory masterfactory
+throws standardexception
+this masterfactory   masterfactory
+synchronized this
+inreplicationmastermode   true
+logout setreplicationmasterrole masterfactory
+/**
+* stop this logfactory from passing log records to the
+* masterfactory and from notifying the masterfactory when a log
+* disk flush has taken place.
+*/
+public void stopreplicationmasterrole
+inreplicationmastermode   false
+masterfactory   null
+if logout    null
+logout stopreplicationmasterrole
+/**
+* stop the slave functionality for this logfactory. calling this
+* method causes the thread currently doing recovery to stop the
+* recovery process and throw a standardexception with sqlstate
+* shutdown_database. this should only be done when the database
+* will be shutdown.
+* @throws standardexception standard derby exception policy
+* @see org.apache.derby.impl.db.slavedatabase
+*/
+public void stopreplicationslaverole   throws standardexception
+// do not set inreplicationslavemode=false here because that
+// will let the thread currently doing recover complete the
+// boot process. setting replicationslaveexception aborts the
+// boot process.
+if   stopped
+flushall
+replicationslaveexception
+standardexception newexception
+sqlstate shutdown_database
+synchronized  slaverecoverymonitor
+slaverecoverymonitor notify
+/**
+* used by logaccessfile to check if it should take the
+* replication master role, and thereby send log records to the
+* masterfactory.
+* @param log the logaccessfile that will take the replication
+* master role iff this database is master.
+*/
+protected void checkforreplication logaccessfile log
+if  inreplicationmastermode
+log setreplicationmasterrole masterfactory
+else if  inreplicationslavemode
+log setreplicationslaverole
+/**
+* initializes logout so that log received from the replication
+* master can be appended to the log file.
+*
+* normally, logout (the file log records are appended to) is set
+* up as part of the recovery process. when the database is booted
+* in replication slave mode, however, recovery will not get to
+* the point where logout is initialized until this database is no
+* longer in slave mode. since logout is needed to append log
+* records received from the master, logout needs to be set up for
+* replication slave mode.
+*
+* this method finds the last log record in the log file with the
+* highest number. logout is set up so that log records will be
+* appended to the end of that file, and the endposition and
+* lastflush variables are set to point to the end of the same
+* file. all this is normally done as part of recovery.
+*
+* after the first log file switch resulting from applying log
+* received from the master, recovery will be allowed to read up
+* to, but not including, the current log file which is the file
+* numbered logfilenumber.
+*
+* note that this method must not be called until logtofile#boot()
+* has completed. currently, this is ensured because rawstore#boot
+* starts the slavefactory (in turn calling this method) after
+* logfactory.boot() has completed. race conditions for
+* logfilenumber may occur if this is changed.
+*
+* @exception standardexception standard derby error policy
+*/
+public void initializereplicationslaverole
+throws standardexception
+if  sanitymanager debug
+sanitymanager assert inreplicationslavemode
+/*
+* find the end of the log, i.e the highest log file and the
+* end position in that file
+*/
+try
+// find the log file with the highest file number on disk
+while  getlogfileatbeginning logfilenumber 1     null
+logfilenumber
+// scan the highest log file to find it's end.
+long startinstant
+logcounter makeloginstantaslong logfilenumber
+log_file_header_size
+long logendinstant   log_file_header_size
+streamlogscan scanofhighestlogfile
+streamlogscan  openforwardsscan startinstant
+loginstant null
+arrayinputstream scaninputstream   new arrayinputstream
+while scanofhighestlogfile getnextrecord scaninputstream  null  0
+
+logendinstant   scanofhighestlogfile getlogrecordend
+endposition   logcounter getlogfileposition logendinstant
+// endposition and logfilenumber now point to the end of the
+// highest log file. this is where a new log record should be
+// appended.
+/*
+* open the highest log file and make sure log records are
+* appended at the end of it
+*/
+storagerandomaccessfile logfile   null
+if iswritesynced
+logfile   openlogfileinwritemode
+getlogfilename logfilenumber
+else
+logfile   privrandomaccessfile getlogfilename logfilenumber
+logout   new logaccessfile this  logfile  logbuffersize
+lastflush   endposition
+logfile seek endposition      append log records at the end of
+// the file
+catch  ioexception ioe
+throw standardexception newexception
+sqlstate replication_unexpected_exception  ioe
+/**
+* used to make the slave stop appending log records, complete recovery
+* and boot the database.
+*/
+public void failoverslave
+if   stopped
+try
+flushall
+catch  standardexception ex
+// do nothing
+inreplicationslavemode   false
+synchronized  slaverecoverymonitor
+slaverecoverymonitor notify
+/**
+*
+* this function restores logs based on the  following attributes
+* are specified on connection url:
+* attribute.create_from (create database from backup if it does not exist)
+* attribute.restore_from (delete the whole database if it exists and then
+* restore it from backup)
+* attribute.roll_forward_recovery_from:(perform rollforward recovery;
+* except for the log directory everthing else is replced  by the copy  from
+* backup. log files in the backup are copied to the existing online log
+* directory.
+*
+* in cases of restore_from whole databases directoy is
+* is removed in directory.java while restoring service.properties
+* so even the log directory is removed.
+* in case of create_from , log directoy will not exist if
+* we came so far bacause it should fail if a database already exists.
+* in case roll_forward_recovery_from log directotry should not be removed.
+* so only thing that needs to be done here is create a
+* a log directory if it does not exists and copy the
+* log files(including control files) that exists in the backup from which
+* we are are trying to restore the database to the onlie log directory.
+*/
+private boolean restorelogs properties properties  throws standardexception
+string backuppath  null
+boolean iscreatefrom   false
+boolean isrestorefrom   false
+//check if the user requested for restore/recovery/create from backup
+backuppath   properties getproperty attribute create_from
+if  backuppath    null
+iscreatefrom   true
+else
+backuppath   properties getproperty attribute restore_from
+if  backuppath    null
+isrestorefrom   true
+else
+backuppath   properties getproperty
+attribute roll_forward_recovery_from
+// if the backup is not null then it is a rollforward recovery.
+if backuppath   null
+if  iscreatefrom
+if logdevice    null
+/**
+* in restorefrom/rollforwardrecoveryfrom mode when no
+* logdevice on url then the log is restored to the same
+* location where the log was when backup was taken.
+* in createfrom mode behaviour is same as when create=true,
+* i.e unless user specifies the logdevice on url, log will
+* be copied to the database home dir.
+* note: log_device_at_backup will get set if log is not in
+* default location(db home).
+*/
+logdevice
+properties getproperty property log_device_at_backup
+getlogstoragefactory
+storagefile logdir
+logdir   logstoragefactory newstoragefile
+logfactory log_directory_name
+//remove the log directory in case of restorefrom
+//if it exist, this happens if the log device is on seperate
+//location than the db home.
+if  isrestorefrom    logdevice    null
+if  privremovedirectory logdir
+//it may be just a file, try deleting it
+if  privdelete logdir
+throw standardexception newexception
+sqlstate unable_to_remove_data_directory
+getlogdirpath  logdir
+// if it is a create/restore from backup,
+// create the log directory.
+if  iscreatefrom    isrestorefrom
+createlogdirectory
+file backuplogdir   new file backuppath  logfactory log_directory_name
+string logfilelist   privlist backuplogdir
+if logfilelist   null
+for  int i   0  i < logfilelist length  i
+file blogfile   new file backuplogdir  logfilelist
+storagefile clogfile   logstoragefactory newstoragefile logdir  logfilelist
+if  privcopyfile blogfile   clogfile
+throw
+standardexception newexception sqlstate unable_to_copy_log_file  blogfile  clogfile
+else
+throw standardexception newexception sqlstate log_directory_not_found_in_backup backuplogdir
+//we need to switch the log file after redo while
+//doing recovery from backups, otherwise we will
+//be replacing updated log after a restore withe
+// a log in the backup on next restore.
+logswitchrequired   true
+// log is restored from backup.
+return true
+else
+// log is not restored from backup.
+return false
+/*preallocate the given log file to the logswitchinterval size;
+*file is extended by writing zeros after the header till
+*the log file size the set by the user.
+*/
+private void preallocatenewlogfile storagerandomaccessfile log  throws ioexception  standardexception
+//preallocate a file by writing zeros into it .
+if  sanitymanager debug
+int currentpostion    int log getfilepointer
+sanitymanager assert currentpostion    log_file_header_size
+int amounttowrite   logswitchinterval   log_file_header_size
+int buffersize   logbuffersize   2
+byte emptybuffer   new byte
+int nwrites   amounttowrite buffersize
+int remainingbytes   amounttowrite % buffersize
+try
+while nwrites   > 0
+log write emptybuffer
+if remainingbytes   0
+log write emptybuffer   0  remainingbytes
+//sync the file
+syncfile log
+catch ioexception ie
+//ignore io exceptions during preallocations
+//because this more for performance improvements
+//system shoulf work fine even without preallocations.
+//resolve: if  the exception is because of no
+//space, might be good idea to trigger a checkpoint.
+//in debug mode throw the exception
+if  sanitymanager debug
+throw ie
+end of preallocatenewlogfile
+/**
+* open the given log file name for writes; if file can not be
+* be opened in write sync mode then disable the write sync mode and
+* open the file in "rw" mode.
+*/
+private storagerandomaccessfile openlogfileinwritemode storagefile logfile  throws ioexception
+/* some jvms have an error in the code for write syncing. if this error
+is present we disable write syncing and fall back to doing writes
+followed by an explicit sync operation. see the details about this
+problem in the checkjvmsyncerror() method. this code should be
+removed when we no longer support the jvms with this problem. */
+if    jvmsyncerrorchecked
+if   checkjvmsyncerror logfile
+// to work around the problem of error for write syncing we
+// disable write sync and open the file in "rw" mode
+iswritesynced   false
+return privrandomaccessfile logfile
+storagerandomaccessfile log   privrandomaccessfile logfile
+return log
+private string getlogdirpath  storagefile logdir
+if  logdevice    null
+return logdir tostring
+return logdevice   logstoragefactory getseparator     logdir tostring
+end of getlogdirpath
+/**
+* in java 1.4.2 and newer rws and rwd modes for randomaccessfile
+* are supported. still, on some jvms (e.g. early versions of 1.4.2
+* and 1.5 on mac os and freebsd) the support for rws and rwd is
+* not working. this method attempts to detect this by opening an
+* existing file in "rws" mode. if this fails, derby should fall
+* back to use "rw" mode for the log files followed by explicit
+* syncing of the log.
+*
+* note: it is important to use "rws" for the test. if "rwd" is used, no
+* exception is thrown when opening the file, but the syncing does not
+* take place.
+*
+* for more details see derby-1 (and derby-2020).
+*
+* @param logfile information about the log file to be opened
+*
+* @return true if a jvm error is detected, false otherwise
+*
+* @exception standardexception standard derby exception
+*/
+private boolean checkjvmsyncerror storagefile logfile  throws ioexception
+boolean hasjvmsyncerror   false
+storagerandomaccessfile rwstest
+// normally this log file already exists but in case it does
+// not we open the file using "rw" mode. this is needed in
+// order to ensure that the file already exists when it is
+// opened in "rws" mode. this should succeed on all jvms
+rwstest   privrandomaccessfile logfile
+rwstest close
+// try to re-open the file in "rws" mode
+try
+rwstest   privrandomaccessfile logfile
+rwstest close
+catch  filenotfoundexception ex
+// normally this exception should never occur. for some
+// reason currently on some mac and freebsd jvm 1.4.2 and
+// 1.5 filenotfoundexception exception is thrown if a file
+// is opened in "rws" mode and if it already
+// exists. please refer to derby-1 for more details on
+// this issue.  temporary workaround to avoid this problem
+// is to make the logging system use file sync mechanism.
+logerrmsg
+hasjvmsyncerror   true
+// set this variable to true to avoid that this method is called
+// multiple times
+jvmsyncerrorchecked   true
+return hasjvmsyncerror
+/*
+following  methods require priv blocks to run under a security manager.
+*/
+private int action
+private storagefile activefile
+private file tofile
+private string activeperms
+protected boolean privexists storagefile file
+return runbooleanaction 0  file
+protected boolean privdelete storagefile file
+return runbooleanaction 1  file
+private synchronized storagerandomaccessfile privrandomaccessfile storagefile file  string perms
+throws ioexception
+action   2
+activefile   file
+activeperms   perms
+try
+return  storagerandomaccessfile  java security accesscontroller doprivileged this
+catch  java security privilegedactionexception pae
+throw  ioexception  pae getexception
+protected boolean privcanwrite storagefile file
+return runbooleanaction 3  file
+protected boolean privmkdirs storagefile file
+return runbooleanaction 4  file
+private synchronized string privlist file file
+action   8
+tofile   file
+try
+return  string  java security accesscontroller doprivileged this
+catch  java security privilegedactionexception pae
+return null
+private synchronized string privlist storagefile file
+action   5
+activefile   file
+try
+return  string  java security accesscontroller doprivileged this
+catch  java security privilegedactionexception pae
+return null
+private synchronized boolean privcopyfile storagefile from  file to
+action   6
+activefile   from
+tofile   to
+try
+return   boolean  java security accesscontroller doprivileged this   booleanvalue
+catch  java security privilegedactionexception pae
+return false
+private synchronized boolean privcopyfile file from  storagefile to
+action   9
+activefile   to
+tofile   from
+try
+return   boolean  java security accesscontroller doprivileged this   booleanvalue
+catch  java security privilegedactionexception pae
+return false
+private boolean privremovedirectory storagefile file
+return runbooleanaction 7  file
+private synchronized boolean runbooleanaction int action  storagefile file
+this action   action
+this activefile   file
+try
+return   boolean  java security accesscontroller doprivileged this   booleanvalue
+catch  java security privilegedactionexception pae
+return false
+public final object run   throws ioexception
+switch  action
+case 0
+// security permission - mp1
+return reusefactory getboolean activefile exists
+case 1
+// security permission - op5
+return reusefactory getboolean activefile delete
+case 2
+// security permission - mp1 and/or op4
+// dependening on the value of activeperms
+return activefile getrandomaccessfile activeperms
+case 3
+// security permission - op4
+return reusefactory getboolean activefile canwrite
+case 4
+// security permission - op4
+return reusefactory getboolean activefile mkdirs
+case 5
+// security permission - mp1
+return activefile list
+case 6
+// security permission - op4 (have to check these codes ??)
+return reusefactory getboolean fileutil copyfile logstoragefactory  activefile  tofile
+case 7
+// security permission - op4
+if    activefile exists
+return reusefactory getboolean  true
+return reusefactory getboolean activefile deleteall
+case 8
+return tofile list
+case 9
+return reusefactory getboolean fileutil copyfile  logstoragefactory  tofile  activefile
+default
+return null

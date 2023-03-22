@@ -1,0 +1,614 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hive ql exec mr
+import java io ioexception
+import java io inputstream
+import java io outputstream
+import java io serializable
+import java lang management managementfactory
+import java lang management memorymxbean
+import java util arraylist
+import java util collection
+import java util collections
+import java util enumeration
+import java util list
+import java util properties
+import org apache commons lang stringutils
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop filecache distributedcache
+import org apache hadoop fs filestatus
+import org apache hadoop fs filesystem
+import org apache hadoop fs path
+import org apache hadoop hive common compressionutils
+import org apache hadoop hive common logutils
+import org apache hadoop hive common logutils loginitializationexception
+import org apache hadoop hive conf hiveconf
+import org apache hadoop hive conf hiveconf confvars
+import org apache hadoop hive ql context
+import org apache hadoop hive ql drivercontext
+import org apache hadoop hive ql errormsg
+import org apache hadoop hive ql queryplan
+import org apache hadoop hive ql exec fetchoperator
+import org apache hadoop hive ql exec hivetotalorderpartitioner
+import org apache hadoop hive ql exec jobclosefeedback
+import org apache hadoop hive ql exec operator
+import org apache hadoop hive ql exec partitionkeysampler
+import org apache hadoop hive ql exec tablescanoperator
+import org apache hadoop hive ql exec task
+import org apache hadoop hive ql exec utilities
+import org apache hadoop hive ql io bucketizedhiveinputformat
+import org apache hadoop hive ql io hivekey
+import org apache hadoop hive ql io hiveoutputformatimpl
+import org apache hadoop hive ql io iopreparecache
+import org apache hadoop hive ql metadata hiveexception
+import org apache hadoop hive ql plan fetchwork
+import org apache hadoop hive ql plan mapwork
+import org apache hadoop hive ql plan mapredlocalwork
+import org apache hadoop hive ql plan mapredwork
+import org apache hadoop hive ql plan operatordesc
+import org apache hadoop hive ql plan partitiondesc
+import org apache hadoop hive ql plan reducework
+import org apache hadoop hive ql plan api stagetype
+import org apache hadoop hive ql session sessionstate
+import org apache hadoop hive ql session sessionstate loghelper
+import org apache hadoop hive ql stats statsfactory
+import org apache hadoop hive ql stats statspublisher
+import org apache hadoop hive serde2 objectinspector objectinspector
+import org apache hadoop hive shims shimloader
+import org apache hadoop io byteswritable
+import org apache hadoop io text
+import org apache hadoop mapred counters
+import org apache hadoop mapred inputformat
+import org apache hadoop mapred jobclient
+import org apache hadoop mapred jobconf
+import org apache hadoop mapred partitioner
+import org apache hadoop mapred runningjob
+import org apache log4j appender
+import org apache log4j basicconfigurator
+import org apache log4j fileappender
+import org apache log4j logmanager
+import org apache log4j varia nullappender
+/**
+* execdriver is the central class in co-ordinating execution of any map-reduce task.
+* it's main responsabilities are:
+*
+* - converting the plan (mapredwork) into a mr job (jobconf)
+* - submitting a mr job to the cluster via jobclient and exechelper
+* - executing mr job in local execution mode (where applicable)
+*
+*/
+public class execdriver extends task<mapredwork> implements serializable  hadoopjobexechook
+private static final long serialversionuid   1l
+private static final string jobconf_filename
+protected transient jobconf job
+public static memorymxbean memorymxbean
+protected hadoopjobexechelper jobexechelper
+protected static transient final log log   logfactory getlog execdriver class
+private runningjob rj
+/**
+* constructor when invoked from ql.
+*/
+public execdriver
+super
+console   new loghelper log
+this jobexechelper   new hadoopjobexechelper job  console  this  this
+@override
+public boolean requirelock
+return true
+private void initializefiles string prop  string files
+if  files    null    files length   > 0
+job set prop  files
+shimloader gethadoopshims   settmpfiles prop  files
+/**
+* initialization when invoked from ql.
+*/
+@override
+public void initialize hiveconf conf  queryplan queryplan  drivercontext drivercontext
+super initialize conf  queryplan  drivercontext
+job   new jobconf conf  execdriver class
+// note: initialize is only called if it is in non-local mode.
+// in case it's in non-local mode, we need to move the sessionstate files
+// and jars to jobconf.
+// in case it's in local mode, mapredtask will set the jobconf.
+//
+// "tmpfiles" and "tmpjars" are set by the method execdriver.execute(),
+// which will be called by both local and non-local mode.
+string addedfiles   utilities getresourcefiles job  sessionstate resourcetype file
+if  stringutils isnotblank addedfiles
+hiveconf setvar job  confvars hiveaddedfiles  addedfiles
+string addedjars   utilities getresourcefiles job  sessionstate resourcetype jar
+if  stringutils isnotblank addedjars
+hiveconf setvar job  confvars hiveaddedjars  addedjars
+string addedarchives   utilities getresourcefiles job  sessionstate resourcetype archive
+if  stringutils isnotblank addedarchives
+hiveconf setvar job  confvars hiveaddedarchives  addedarchives
+this jobexechelper   new hadoopjobexechelper job  console  this  this
+/**
+* constructor/initialization for invocation as independent utility.
+*/
+public execdriver mapredwork plan  jobconf job  boolean issilent  throws hiveexception
+setwork plan
+this job   job
+console   new loghelper log  issilent
+this jobexechelper   new hadoopjobexechelper job  console  this  this
+/**
+* fatal errors are those errors that cannot be recovered by retries. these are application
+* dependent. examples of fatal errors include: - the small table in the map-side joins is too
+* large to be feasible to be handled by one mapper. the job should fail and the user should be
+* warned to use regular joins rather than map-side joins. fatal errors are indicated by counters
+* that are set at execution time. if the counter is non-zero, a fatal error occurred. the value
+* of the counter indicates the error type.
+*
+* @return true if fatal errors happened during job execution, false otherwise.
+*/
+public boolean checkfatalerrors counters ctrs  stringbuilder errmsg
+for  operator<? extends operatordesc> op   work getmapwork   getaliastowork   values
+if  op checkfatalerrors ctrs  errmsg
+return true
+if  work getreducework      null
+if  work getreducework   getreducer   checkfatalerrors ctrs  errmsg
+return true
+return false
+/**
+* execute a query plan using hadoop.
+*/
+@suppresswarnings
+@override
+public int execute drivercontext drivercontext
+iopreparecache iopreparecache   iopreparecache get
+iopreparecache clear
+boolean success   true
+context ctx   drivercontext getctx
+boolean ctxcreated   false
+string emptyscratchdirstr
+path emptyscratchdir
+mapwork mwork   work getmapwork
+reducework rwork   work getreducework
+try
+if  ctx    null
+ctx   new context job
+ctxcreated   true
+emptyscratchdirstr   ctx getmrtmpfileuri
+emptyscratchdir   new path emptyscratchdirstr
+filesystem fs   emptyscratchdir getfilesystem job
+fs mkdirs emptyscratchdir
+catch  ioexception e
+e printstacktrace
+console printerror
+org apache hadoop util stringutils stringifyexception e
+return 5
+shimloader gethadoopshims   preparejoboutput job
+//see the javadoc on hiveoutputformatimpl and hadoopshims.preparejoboutput()
+job setoutputformat hiveoutputformatimpl class
+job setmapperclass execmapper class
+job setmapoutputkeyclass hivekey class
+job setmapoutputvalueclass byteswritable class
+try
+job setpartitionerclass  class<? extends partitioner>   class forname hiveconf getvar job
+hiveconf confvars hivepartitioner
+catch  classnotfoundexception e
+throw new runtimeexception e getmessage
+if  mwork getnummaptasks      null
+job setnummaptasks mwork getnummaptasks   intvalue
+if  mwork getmaxsplitsize      null
+hiveconf setlongvar job  hiveconf confvars mapredmaxsplitsize  mwork getmaxsplitsize   longvalue
+if  mwork getminsplitsize      null
+hiveconf setlongvar job  hiveconf confvars mapredminsplitsize  mwork getminsplitsize   longvalue
+if  mwork getminsplitsizepernode      null
+hiveconf setlongvar job  hiveconf confvars mapredminsplitsizepernode  mwork getminsplitsizepernode   longvalue
+if  mwork getminsplitsizeperrack      null
+hiveconf setlongvar job  hiveconf confvars mapredminsplitsizeperrack  mwork getminsplitsizeperrack   longvalue
+job setnumreducetasks rwork    null ? rwork getnumreducetasks   intvalue     0
+job setreducerclass execreducer class
+// set input format information if necessary
+setinputattributes job
+// turn on speculative execution for reducers
+boolean usespeculativeexecreducers   hiveconf getboolvar job
+hiveconf confvars hivespeculativeexecreducers
+hiveconf setboolvar job  hiveconf confvars hadoopspeculativeexecreducers
+usespeculativeexecreducers
+string inpformat   hiveconf getvar job  hiveconf confvars hiveinputformat
+if   inpformat    null       stringutils isnotblank inpformat
+inpformat   shimloader gethadoopshims   getinputformatclassname
+if  mwork isusebucketizedhiveinputformat
+inpformat   bucketizedhiveinputformat class getname
+log info     inpformat
+try
+job setinputformat  class<? extends inputformat>   class forname inpformat
+catch  classnotfoundexception e
+throw new runtimeexception e getmessage
+// no-op - we don't really write anything here ..
+job setoutputkeyclass text class
+job setoutputvalueclass text class
+// transfer hiveauxjars and hiveaddedjars to "tmpjars" so hadoop understands
+// it
+string auxjars   hiveconf getvar job  hiveconf confvars hiveauxjars
+string addedjars   hiveconf getvar job  hiveconf confvars hiveaddedjars
+if  stringutils isnotblank auxjars     stringutils isnotblank addedjars
+string alljars   stringutils isnotblank auxjars  ?  stringutils isnotblank addedjars  ? addedjars
+auxjars
+auxjars
+addedjars
+log info     alljars
+initializefiles    alljars
+// transfer hiveaddedfiles to "tmpfiles" so hadoop understands it
+string addedfiles   hiveconf getvar job  hiveconf confvars hiveaddedfiles
+if  stringutils isnotblank addedfiles
+initializefiles    addedfiles
+int returnval   0
+boolean noname   stringutils isempty hiveconf getvar job  hiveconf confvars hadoopjobname
+if  noname
+// this is for a special case to ensure unit tests pass
+hiveconf setvar job  hiveconf confvars hadoopjobname      utilities randgen nextint
+string addedarchives   hiveconf getvar job  hiveconf confvars hiveaddedarchives
+// transfer hiveaddedarchives to "tmparchives" so hadoop understands it
+if  stringutils isnotblank addedarchives
+initializefiles    addedarchives
+try
+mapredlocalwork localwork   mwork getmaplocalwork
+if  localwork    null
+if   shimloader gethadoopshims   islocalmode job
+path localpath   new path localwork gettmpfileuri
+path hdfspath   new path mwork gettmphdfsfileuri
+filesystem hdfs   hdfspath getfilesystem job
+filesystem localfs   localpath getfilesystem job
+filestatus hashtablefiles   localfs liststatus localpath
+int filenumber   hashtablefiles length
+string filenames   new string
+for   int i   0  i < filenumber  i
+filenames   hashtablefiles getpath   getname
+//package and compress all the hashtable files to an archive file
+string parentdir   localpath touri   getpath
+string stageid   this getid
+string archivefileuri   utilities generatetaruri parentdir  stageid
+string archivefilename   utilities generatetarfilename stageid
+localwork setstageid stageid
+compressionutils tar parentdir  filenames archivefilename
+path archivepath   new path archivefileuri
+log info    hashtablefiles length     archivefileuri
+//upload archive file to hdfs
+string hdfsfile  utilities generatetaruri hdfspath  stageid
+path hdfsfilepath   new path hdfsfile
+short replication    short  job getint    10
+hdfs setreplication hdfsfilepath  replication
+hdfs copyfromlocalfile archivepath  hdfsfilepath
+log info     archivepath       hdfsfilepath
+//add the archive file to distributed cache
+distributedcache createsymlink job
+distributedcache addcachearchive hdfsfilepath touri    job
+log info     hdfsfilepath touri
+work configurejobconf job
+list<path> inputpaths   utilities getinputpaths job  mwork  emptyscratchdirstr  ctx
+utilities setinputpaths job  inputpaths
+utilities setmapredwork job  work  ctx getmrtmpfileuri
+if  mwork getsamplingtype   > 0    rwork    null    rwork getnumreducetasks   > 1
+try
+handlesampling drivercontext  mwork  job  conf
+job setpartitionerclass hivetotalorderpartitioner class
+catch  exception e
+console printinfo
+rwork setnumreducetasks 1
+job setnumreducetasks 1
+// remove the pwd from conf file so that job tracker doesn't show this
+// logs
+string pwd   hiveconf getvar job  hiveconf confvars metastorepwd
+if  pwd    null
+hiveconf setvar job  hiveconf confvars metastorepwd
+jobclient jc   new jobclient job
+// make this client wait if job trcker is not behaving well.
+throttle checkjobtracker job  log
+if  mwork isgatheringstats       rwork    null    rwork isgatheringstats
+// initialize stats publishing table
+statspublisher statspublisher
+string statsimplementationclass   hiveconf getvar job  hiveconf confvars hivestatsdbclass
+if  statsfactory setimplementation statsimplementationclass  job
+statspublisher   statsfactory getstatspublisher
+if   statspublisher init job        creating stats table if not exists
+if  hiveconf getboolvar job  hiveconf confvars hive_stats_reliable
+throw
+new hiveexception errormsg statspublisher_initialization_error geterrorcodedmsg
+utilities createtmpdirs job  mwork
+utilities createtmpdirs job  rwork
+// finally submit the job!
+rj   jc submitjob job
+// replace it back
+if  pwd    null
+hiveconf setvar job  hiveconf confvars metastorepwd  pwd
+returnval   jobexechelper progress rj  jc
+success    returnval    0
+catch  exception e
+e printstacktrace
+string mesg       utilities getnamemessage e
+if  rj    null
+mesg       rj getjobid     mesg
+else
+mesg       mesg
+// has to use full name to make sure it does not conflict with
+// org.apache.commons.lang.stringutils
+console printerror mesg      org apache hadoop util stringutils stringifyexception e
+success   false
+returnval   1
+finally
+utilities clearwork job
+try
+if  ctxcreated
+ctx clear
+if  rj    null
+if  returnval    0
+rj killjob
+hadoopjobexechelper runningjobkilluris remove rj getjobid
+jobid   rj getid   tostring
+catch  exception e
+// get the list of dynamic partition paths
+try
+if  rj    null
+jobclosefeedback feedback   new jobclosefeedback
+if  mwork getaliastowork      null
+for  operator<? extends operatordesc> op   mwork getaliastowork   values
+op jobclose job  success  feedback
+if  rwork    null
+rwork getreducer   jobclose job  success  feedback
+catch  exception e
+// jobclose needs to execute successfully otherwise fail task
+if  success
+success   false
+returnval   3
+string mesg       utilities getnamemessage e
+console printerror mesg      org apache hadoop util stringutils stringifyexception e
+return  returnval
+private void handlesampling drivercontext context  mapwork mwork  jobconf job  hiveconf conf
+throws exception
+assert mwork getaliastowork   keyset   size      1
+string alias   mwork getaliases   get 0
+operator<?> topop   mwork getaliastowork   get alias
+partitiondesc partdesc   mwork getaliastopartninfo   get alias
+arraylist<string> paths   mwork getpaths
+arraylist<partitiondesc> parts   mwork getpartitiondescs
+path onepath   new path paths get 0
+string tmppath   context getctx   getexternaltmpfileuri onepath touri
+path partitionfile   new path tmppath
+shimloader gethadoopshims   settotalorderpartitionfile job  partitionfile
+partitionkeysampler sampler   new partitionkeysampler
+if  mwork getsamplingtype      mapwork sampling_on_prev_mr
+console printinfo
+// merges sampling data from previous mr and make paritition keys for total sort
+for  string path   paths
+path inputpath   new path path
+filesystem fs   inputpath getfilesystem job
+for  filestatus status   fs globstatus new path inputpath
+sampler addsamplefile status getpath    job
+else if  mwork getsamplingtype      mapwork sampling_on_start
+console printinfo
+assert topop instanceof tablescanoperator
+tablescanoperator ts    tablescanoperator  topop
+fetchwork fetchwork
+if   partdesc ispartitioned
+assert paths size      1
+fetchwork   new fetchwork paths get 0   partdesc gettabledesc
+else
+fetchwork   new fetchwork paths  parts  partdesc gettabledesc
+fetchwork setsource ts
+// random sampling
+fetchoperator fetcher   partitionkeysampler createsampler fetchwork  conf  job  ts
+try
+ts initialize conf  new objectinspector fetcher getoutputobjectinspector
+ts setoutputcollector sampler
+while  fetcher pushrow
+finally
+fetcher clearfetchcontext
+else
+throw new illegalargumentexception     mwork getsamplingtype
+sampler writepartitionkeys partitionfile  job
+/**
+* set hive input format, and input format file if necessary.
+*/
+protected void setinputattributes configuration conf
+mapwork mwork   work getmapwork
+if  mwork getinputformat      null
+hiveconf setvar conf  hiveconf confvars hiveinputformat  mwork getinputformat
+if  mwork getindexintermediatefile      null
+conf set    mwork getindexintermediatefile
+conf set    mwork getindexintermediatefile
+// intentionally overwrites anything the user may have put here
+conf setboolean    mwork isinputformatsorted
+public boolean mapstarted
+return this jobexechelper mapstarted
+public boolean reducestarted
+return this jobexechelper reducestarted
+public boolean mapdone
+return this jobexechelper mapdone
+public boolean reducedone
+return this jobexechelper reducedone
+private static void printusage
+system err println
+system exit 1
+/**
+* we are running the hadoop job via a sub-command. this typically happens when we are running
+* jobs in local mode. the log4j in this mode is controlled as follows: 1. if the admin provides a
+* log4j properties file especially for execution mode - then we pick that up 2. otherwise - we
+* default to the regular hive log4j properties if one is supplied 3. if none of the above two
+* apply - we don't do anything - the log4j properties would likely be determined by hadoop.
+*
+* the intention behind providing a separate option #1 is to be able to collect hive run time logs
+* generated in local mode in a separate (centralized) location if desired. this mimics the
+* behavior of hive run time logs when running against a hadoop cluster where they are available
+* on the tasktracker nodes.
+*/
+private static void setupchildlog4j configuration conf
+try
+logutils inithiveexeclog4j
+catch  loginitializationexception e
+system err println e getmessage
+@suppresswarnings
+public static void main string args  throws ioexception  hiveexception
+string planfilename   null
+string jobconffilename   null
+boolean nolog   false
+string files   null
+boolean localtask   false
+try
+for  int i   0  i < args length  i
+if  args equals
+planfilename   args
+else if  args equals
+jobconffilename   args
+else if  args equals
+nolog   true
+else if  args equals
+files   args
+else if  args equals
+localtask   true
+catch  indexoutofboundsexception e
+system err println
+printusage
+jobconf conf
+if  localtask
+conf   new jobconf mapredlocaltask class
+else
+conf   new jobconf execdriver class
+if  jobconffilename    null
+conf addresource new path jobconffilename
+if  files    null
+conf set    files
+if shimloader gethadoopshims   issecurityenabled
+string hadoopauthtoken
+system getenv shimloader gethadoopshims   gettokenfilelocenvname
+if hadoopauthtoken    null
+conf set    hadoopauthtoken
+boolean issilent   hiveconf getboolvar conf  hiveconf confvars hivesessionsilent
+if  nolog
+// if started from main(), and nolog is on, we should not output
+// any logs. to turn the log on, please set -dtest.silent=false
+basicconfigurator resetconfiguration
+basicconfigurator configure new nullappender
+else
+setupchildlog4j conf
+log log   logfactory getlog execdriver class getname
+loghelper console   new loghelper log  issilent
+if  planfilename    null
+console printerror
+printusage
+// print out the location of the log file for the user so
+// that it's easy to find reason for local mode execution failures
+for  appender appender   collections list  enumeration<appender>  logmanager getrootlogger
+getallappenders
+if  appender instanceof fileappender
+console printinfo       fileappender  appender  getfile
+// the plan file should always be in local directory
+path p   new path planfilename
+filesystem fs   filesystem getlocal conf
+inputstream pathdata   fs open p
+// this is workaround for hadoop-17 - libjars are not added to classpath of the
+// child process. so we add it here explicitly
+string auxjars   hiveconf getvar conf  hiveconf confvars hiveauxjars
+string addedjars   hiveconf getvar conf  hiveconf confvars hiveaddedjars
+try
+// see also - code in clidriver.java
+classloader loader   conf getclassloader
+if  stringutils isnotblank auxjars
+loader   utilities addtoclasspath loader  stringutils split auxjars
+if  stringutils isnotblank addedjars
+loader   utilities addtoclasspath loader  stringutils split addedjars
+conf setclassloader loader
+// also set this to the thread contextclassloader, so new threads will
+// inherit
+// this class loader, and propagate into newly created configurations by
+// those
+// new threads.
+thread currentthread   setcontextclassloader loader
+catch  exception e
+throw new hiveexception e getmessage    e
+int ret
+if  localtask
+memorymxbean   managementfactory getmemorymxbean
+mapredlocalwork plan    mapredlocalwork  utilities deserializeplan pathdata
+mapredlocaltask ed   new mapredlocaltask plan  conf  issilent
+ret   ed executefromchildjvm new drivercontext
+else
+mapredwork plan    mapredwork  utilities deserializeplan pathdata
+execdriver ed   new execdriver plan  conf  issilent
+ret   ed execute new drivercontext
+if  ret    0
+system exit ret
+/**
+* given a hive configuration object - generate a command line fragment for passing such
+* configuration information to execdriver.
+*/
+public static string generatecmdline hiveconf hconf  context ctx
+throws ioexception
+hiveconf tempconf   new hiveconf
+path hconffilepath   new path ctx getlocaltmpfileuri    jobconf_filename
+outputstream out   null
+properties deltap   hconf getchangedproperties
+boolean hadooplocalmode   shimloader gethadoopshims   islocalmode hconf
+string hadoopsysdir
+string hadoopworkdir
+for  object one   deltap keyset
+string oneprop    string  one
+if  hadooplocalmode     oneprop equals hadoopsysdir     oneprop equals hadoopworkdir
+continue
+tempconf set oneprop  deltap getproperty oneprop
+// multiple concurrent local mode job submissions can cause collisions in
+// working dirs and system dirs
+// workaround is to rename map red working dir to a temp dir in such cases
+if  hadooplocalmode
+tempconf set hadoopsysdir  hconf get hadoopsysdir        utilities randgen nextint
+tempconf set hadoopworkdir  hconf get hadoopworkdir        utilities randgen nextint
+try
+out   filesystem getlocal hconf  create hconffilepath
+tempconf writexml out
+finally
+if  out    null
+out close
+return     hconffilepath tostring
+@override
+public boolean ismapredtask
+return true
+@override
+public collection<operator<? extends operatordesc>> gettopoperators
+return getwork   getmapwork   getaliastowork   values
+@override
+public boolean hasreduce
+mapredwork w   getwork
+return w getreducework      null
+@override
+public stagetype gettype
+return stagetype mapred
+@override
+public string getname
+return
+@override
+public void updatecounters counters ctrs  runningjob rj  throws ioexception
+for  operator<? extends operatordesc> op   work getmapwork   getaliastowork   values
+op updatecounters ctrs
+if  work getreducework      null
+work getreducework   getreducer   updatecounters ctrs
+@override
+public void logplanprogress sessionstate ss  throws ioexception
+ss gethivehistory   logplanprogress queryplan
+@override
+public void shutdown
+super shutdown
+if  rj    null
+try
+rj killjob
+catch  exception e
+log warn     rj getid    e
+rj   null

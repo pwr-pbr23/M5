@@ -1,0 +1,309 @@
+/**
+* copyright 2011 the apache software foundation
+*
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase io hfile slab
+import java math bigdecimal
+import java util list
+import java util map entry
+import java util treemap
+import java util concurrent concurrenthashmap
+import java util concurrent executors
+import java util concurrent scheduledexecutorservice
+import java util concurrent timeunit
+import java util concurrent atomic atomiclong
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop conf configuration
+import org apache hadoop hbase io heapsize
+import org apache hadoop hbase io hfile blockcache
+import org apache hadoop hbase io hfile blockcachecolumnfamilysummary
+import org apache hadoop hbase io hfile blockcachekey
+import org apache hadoop hbase io hfile cachestats
+import org apache hadoop hbase io hfile cacheable
+import org apache hadoop hbase util classsize
+import org apache hadoop hbase util hasthread
+import org apache hadoop util stringutils
+import com google common base preconditions
+import com google common util concurrent threadfactorybuilder
+/**
+* slabcache is composed of multiple singlesizecaches. it uses a treemap in
+* order to determine where a given element fits. redirects gets and puts to the
+* correct singlesizecache.
+*
+**/
+public class slabcache implements slabitemactionwatcher  blockcache  heapsize
+private final concurrenthashmap<blockcachekey  singlesizecache> backingstore
+private final treemap<integer  singlesizecache> sizer
+static final log log   logfactory getlog slabcache class
+static final int stat_thread_period_secs   60   5
+private final scheduledexecutorservice schedulethreadpool   executors
+newscheduledthreadpool 1
+new threadfactorybuilder   setnameformat
+build
+long size
+private final cachestats stats
+final slabstats requeststats
+final slabstats successfullycachedstats
+private final long avgblocksize
+private static final long cache_fixed_overhead   classsize estimatebase
+slabcache class  false
+/**
+* default constructor, creates an empty slabcache.
+*
+* @param size total size allocated to the slabcache. (bytes)
+* @param avgblocksize average size of a block being cached.
+**/
+public slabcache long size  long avgblocksize
+this avgblocksize   avgblocksize
+this size   size
+this stats   new cachestats
+this requeststats   new slabstats
+this successfullycachedstats   new slabstats
+backingstore   new concurrenthashmap<blockcachekey  singlesizecache>
+sizer   new treemap<integer  singlesizecache>
+this schedulethreadpool scheduleatfixedrate new statisticsthread this
+stat_thread_period_secs  stat_thread_period_secs  timeunit seconds
+/**
+* a way of allocating the desired amount of slabs of each particular size.
+*
+* this reads two lists from conf, hbase.offheap.slab.proportions and
+* hbase.offheap.slab.sizes.
+*
+* the first list is the percentage of our total space we allocate to the
+* slabs.
+*
+* the second list is blocksize of the slabs in bytes. (e.g. the slab holds
+* blocks of this size).
+*
+* @param conf configuration file.
+*/
+public void addslabbyconf configuration conf
+// proportions we allocate to each slab of the total size.
+string porportions   conf getstrings
+string sizes   conf getstrings
+long valueof avgblocksize   11   10  tostring
+long valueof avgblocksize   21   10  tostring
+if  porportions length    sizes length
+throw new illegalargumentexception
+porportions length
+sizes length
+/*
+* we use bigdecimals instead of floats because float rounding is annoying
+*/
+bigdecimal parsedproportions   stringarraytobigdecimalarray porportions
+bigdecimal parsedsizes   stringarraytobigdecimalarray sizes
+bigdecimal sumproportions   new bigdecimal 0
+for  bigdecimal b   parsedproportions
+/* make sure all proportions are greater than 0 */
+preconditions
+checkargument b compareto bigdecimal zero     1
+sumproportions   sumproportions add b
+/* if the sum is greater than 1 */
+preconditions
+checkargument sumproportions compareto bigdecimal one     1
+/* if the sum of all proportions is less than 0.99 */
+if  sumproportions compareto new bigdecimal         1
+log warn
+for  int i   0  i < parsedproportions length  i
+int blocksize   parsedsizes intvalue
+int numblocks   new bigdecimal this size  multiply parsedproportions
+divide parsedsizes  bigdecimal round_down  intvalue
+addslab blocksize  numblocks
+/**
+* gets the size of the slab cache a bytebuffer of this size would be
+* allocated to.
+*
+* @param size size of the bytebuffer we are checking.
+*
+* @return the slab that the above bytebuffer would be allocated towards. if
+*         object is too large, returns null.
+*/
+entry<integer  singlesizecache> gethigherblock int size
+return sizer higherentry size   1
+private bigdecimal stringarraytobigdecimalarray string parsee
+bigdecimal parsed   new bigdecimal
+for  int i   0  i < parsee length  i
+parsed   new bigdecimal parsee trim
+return parsed
+private void addslab int blocksize  int numblocks
+log info     blocksize       numblocks
+sizer put blocksize  new singlesizecache blocksize  numblocks  this
+/**
+* cache the block with the specified key and buffer. first finds what size
+* singleslabcache it should fit in. if the block doesn't fit in any, it will
+* return without doing anything.
+* <p>
+* it is assumed this will never be called on an already cached block. if that
+* is done, it is assumed that you are reinserting the same exact block due to
+* a race condition, and will throw a runtime exception.
+*
+* @param cachekey block cache key
+* @param cacheditem block buffer
+*/
+public void cacheblock blockcachekey cachekey  cacheable cacheditem
+entry<integer  singlesizecache> scacheentry   gethigherblock cacheditem
+getserializedlength
+this requeststats addin cacheditem getserializedlength
+if  scacheentry    null
+return     we can't cache  something too big
+this successfullycachedstats addin cacheditem getserializedlength
+singlesizecache scache   scacheentry getvalue
+/*
+* this will throw a runtime exception if we try to cache the same value
+* twice
+*/
+scache cacheblock cachekey  cacheditem
+/**
+* we don't care about whether its in memory or not, so we just pass the call
+* through.
+*/
+public void cacheblock blockcachekey cachekey  cacheable buf  boolean inmemory
+cacheblock cachekey  buf
+public cachestats getstats
+return this stats
+/**
+* get the buffer of the block with the specified name.
+*
+* @param key
+* @param caching
+* @return buffer of specified block name, or null if not in cache
+*/
+public cacheable getblock blockcachekey key  boolean caching
+singlesizecache cachedblock   backingstore get key
+if  cachedblock    null
+stats miss caching
+return null
+cacheable contentblock   cachedblock getblock key  caching
+if  contentblock    null
+stats hit caching
+else
+stats miss caching
+return contentblock
+/**
+* evicts a block from the cache. this is public, and thus contributes to the
+* the evict counter.
+*/
+public boolean evictblock blockcachekey cachekey
+singlesizecache cacheentry   backingstore get cachekey
+if  cacheentry    null
+return false
+else
+cacheentry evictblock cachekey
+return true
+@override
+public void oneviction blockcachekey key  singlesizecache notifier
+stats evicted
+backingstore remove key
+@override
+public void oninsertion blockcachekey key  singlesizecache notifier
+backingstore put key  notifier
+/**
+* sends a shutdown to all singlesizecache's contained by this cache.
+*
+* also terminates the schedulethreadpool.
+*/
+public void shutdown
+for  singlesizecache s   sizer values
+s shutdown
+this schedulethreadpool shutdown
+public long heapsize
+long childcachesize   0
+for  singlesizecache s   sizer values
+childcachesize    s heapsize
+return slabcache cache_fixed_overhead   childcachesize
+public long size
+return this size
+public long getfreesize
+return 0     this cache  by default  allocates all its space
+@override
+public long getblockcount
+long count   0
+for  singlesizecache cache   backingstore values
+count    cache getblockcount
+return count
+public long getcurrentsize
+return size
+public long getevictedcount
+return stats getevictedcount
+/*
+* statistics thread. periodically prints the cache statistics to the log.
+*/
+static class statisticsthread extends hasthread
+slabcache ourcache
+public statisticsthread slabcache slabcache
+super
+setdaemon true
+this ourcache   slabcache
+@override
+public void run
+for  singlesizecache s   ourcache sizer values
+s logstats
+slabcache log info
+stringutils humanreadableint ourcache heapsize
+log info
+ourcache requeststats logstats
+log info
+ourcache successfullycachedstats logstats
+/**
+* just like cachestats, but more slab specific. finely grained profiling of
+* sizes we store using logs.
+*
+*/
+static class slabstats
+// the maximum size somebody will ever try to cache, then we multiply by
+// 10
+// so we have finer grained stats.
+final int multiplier   10
+final int numdivisions    int   math log integer max_value    multiplier
+private final atomiclong counts   new atomiclong
+public slabstats
+for  int i   0  i < numdivisions  i
+counts   new atomiclong
+public void addin int size
+int index    int   math log size    multiplier
+counts incrementandget
+public atomiclong getusage
+return counts
+double getupperbound int index
+return math pow math e    index   0 5    multiplier
+double getlowerbound int index
+return math pow math e    index   0 5    multiplier
+public void logstats
+atomiclong finegrainedstats   getusage
+for  int i   0  i < finegrainedstats length  i
+if  finegrainedstats get   > 0
+slabcache log info
+stringutils humanreadableint  long  getlowerbound i
+stringutils humanreadableint  long  getupperbound i
+stringutils humanreadableint finegrainedstats get
+public int evictblocksbyhfilename string hfilename
+int numevicted   0
+for  blockcachekey key   backingstore keyset
+if  key gethfilename   equals hfilename
+if  evictblock key
+numevicted
+return numevicted
+/*
+* not implemented. extremely costly to do this from the off heap cache, you'd
+* need to copy every object on heap once
+*/
+@override
+public list<blockcachecolumnfamilysummary> getblockcachecolumnfamilysummaries
+configuration conf
+throw new unsupportedoperationexception

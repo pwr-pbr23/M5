@@ -1,0 +1,650 @@
+/*
+derby - class org.apache.derby.impl.store.raw.data.basecontainer
+licensed to the apache software foundation (asf) under one or more
+contributor license agreements.  see the notice file distributed with
+this work for additional information regarding copyright ownership.
+the asf licenses this file to you under the apache license, version 2.0
+(the "license"); you may not use this file except in compliance with
+the license.  you may obtain a copy of the license at
+http://www.apache.org/licenses/license-2.0
+unless required by applicable law or agreed to in writing, software
+distributed under the license is distributed on an "as is" basis,
+without warranties or conditions of any kind, either express or implied.
+see the license for the specific language governing permissions and
+limitations under the license.
+*/
+package org apache derby impl store raw data
+import org apache derby iapi reference sqlstate
+import org apache derby iapi services locks lockable
+import org apache derby iapi services locks latch
+import org apache derby iapi services locks c_lockfactory
+import org apache derby iapi services sanity sanitymanager
+import org apache derby iapi error standardexception
+import org apache derby iapi store access transactioncontroller
+import org apache derby iapi store access spaceinfo
+import org apache derby iapi store raw containerhandle
+import org apache derby iapi store raw lockingpolicy
+import org apache derby iapi store raw page
+import org apache derby iapi store raw pagekey
+import org apache derby iapi store raw pagetimestamp
+import org apache derby iapi store raw recordhandle
+import org apache derby iapi store raw transaction
+import org apache derby iapi store raw containerkey
+import org apache derby iapi store raw data rawcontainerhandle
+import org apache derby iapi store raw log loginstant
+import org apache derby iapi store raw xact rawtransaction
+import org apache derby iapi util bytearray
+import java util properties
+import java util hashtable
+/**
+basecontainer is an abstract class that provides the locking bahaviour
+for an object representing an active container, that is the actual
+storage container, not the containerhandle interface. this class is designed
+so that it can change the container it represents to avoid creating
+a new object for every container.
+<p>
+this object implements lockable to provide an object to lock while a page is being
+allocated.
+<br> mt - mutable - mutable identity :
+*/
+abstract class basecontainer implements lockable
+/**
+identity of the container.
+<br> mt - mutable
+*/
+protected containerkey identity
+/**
+dropped state of the container.
+<br> mt - mutable : single thread required. either the container must be exclusive
+locked by this thread, or the container must have no identity (ie. it is being created
+or opened).
+*/
+protected boolean	isdropped
+/**
+committed drop state of the container.  if a post comit action
+determined that the drop container operation is committed, the whole
+container may be removed and space reclaimed.
+<br> mt - mutable : single thread required. either the container must be exclusive
+locked by this thread, or the container must have no identity (ie. it is being created
+or opened).
+*/
+protected boolean iscommitteddrop
+/**
+is reusable recordid.  by default, record ids are not reusable when a
+page is reused.  however, under special circumstances, clients to raw
+store may decide that record ids may be reused after the page is
+reused.   when this flag is set, pages that are reused will have its
+next recordid set to recordhandle.first_record_id
+*/
+protected boolean isreusablerecordid   false
+basecontainer
+/*
+** portions of cacheable interface, interface is actually implemented by
+** sub-class. this section also contains methods related to this interface.
+*/
+protected void fillinidentity containerkey key
+if  sanitymanager debug
+sanitymanager assert identity    null     identity    key
+identity   key
+public void clearidentity
+if  sanitymanager debug
+sanitymanager assert identity    null
+identity   null
+public object getidentity
+return identity
+/*
+** methods from lockable, just require a single exclusive locker
+*/
+public void lockevent latch lockinfo
+if  sanitymanager debug
+sanitymanager assert identity    null
+public boolean requestcompatible object requestedqualifier  object grantedqualifier
+if  sanitymanager debug
+sanitymanager assert identity    null
+return false
+public boolean lockeralwayscompatible
+if  sanitymanager debug
+sanitymanager assert identity    null
+return false
+public void unlockevent latch lockinfo
+if  sanitymanager debug
+sanitymanager assert identity    null
+/*
+** implementation specific methods
+*/
+/**
+release free space to the os.
+<p>
+as is possible release any free space to the operating system.  this
+will usually mean releasing any free pages located at the end of the
+file using the java truncate() interface.
+@exception standardexception	standard cloudscape error policy
+*/
+public void compresscontainer basecontainerhandle handle
+throws standardexception
+rawtransaction ntt   handle gettransaction   startnestedtoptransaction
+int mode   handle getmode
+if  sanitymanager debug
+sanitymanager assert  mode   containerhandle mode_forupdate
+containerhandle mode_forupdate
+// if we are not in the same transaction as the one which created the
+// container and the container may have logged some operation already,
+// then we need to log allocation regardless of whether user changes
+// are logged.  otherwise, the database will be corrupted if it
+// crashed.
+if   mode   containerhandle mode_create_unlogged     0
+mode   containerhandle mode_unlogged
+containerhandle mode_unlogged
+mode    ~containerhandle mode_unlogged
+// make a handle which is tied to the ntt, not to the user transaction
+// this handle is tied to.  the container is already locked by the
+// user transaction, open it nolock
+basecontainerhandle allochandle    basecontainerhandle
+ntt opencontainer identity   lockingpolicy null  mode
+if  allochandle    null
+throw standardexception newexception
+sqlstate data_alloc_ntt_cant_open
+new long getsegmentid
+new long getcontainerid
+// latch this container, the commit will release the latch
+ntt getlockfactory   lockobject
+ntt  ntt  this  null  c_lockfactory wait_forever
+try
+incrementreusablerecordidsequencenumber
+compresscontainer ntt  allochandle
+finally
+ntt commit
+ntt close
+/**
+* get the reusable recordid sequence number for the
+* container. this sequence number should be incremented every time
+* there is an operation which may cause recorids to be reused.
+* this method can be used by clients to check if a recordid they
+* obtained is still guaranteed to be valid.
+* if the sequence number has changed, the recordid may have been
+* reused for another row.
+* @return sequence number for reusable recordid
+*/
+public abstract long getreusablerecordidsequencenumber
+/**
+* increment the reusable recordid sequence number.
+*/
+protected abstract void incrementreusablerecordidsequencenumber
+/**
+add a page to this container.
+<br> mt - thread aware -
+the add page operation involves 2 transactions, one is the user
+transaction (the transaction which owns the passed in handle), the
+other one is a nestedtoptransaction created by this basecontainer.
+the nestedtoptransaction is used by the underlying container to change
+high contention structures, such as link list anchor or bit map pages.
+the nestedtoptransaction commits or aborts before this routine returns.
+the user transaction is used to latch the newly created page.
+@exception standardexception standard cloudscape error policy
+*/
+public page addpage basecontainerhandle handle  boolean isoverflow  throws standardexception
+rawtransaction ntt   handle gettransaction   startnestedtoptransaction
+int mode   handle getmode
+if  sanitymanager debug
+sanitymanager assert  mode   containerhandle mode_forupdate
+containerhandle mode_forupdate
+// if we are not in the same transaction as the one which created the
+// container and the container may have logged some operation already,
+// then we need to log allocation regardless of whether user changes
+// are logged.  otherwise, the database will be corrupted if it
+// crashed.
+if   mode   containerhandle mode_create_unlogged     0
+mode   containerhandle mode_unlogged
+containerhandle mode_unlogged
+mode    ~containerhandle mode_unlogged
+// make a handle which is tied to the ntt, not to the user transaction this
+// handle is tied to.  the container is already locked by the user transaction,
+// open it nolock
+basecontainerhandle allochandle    basecontainerhandle ntt opencontainer
+identity   lockingpolicy null  mode
+if  allochandle    null
+throw standardexception newexception
+sqlstate data_alloc_ntt_cant_open
+new long getsegmentid
+new long getcontainerid
+// latch this container, the commit will release the latch
+ntt getlockfactory   lockobject
+ntt  ntt  this  null  c_lockfactory wait_forever
+basepage newpage   null
+try
+newpage   newpage handle  ntt  allochandle  isoverflow
+finally
+if  newpage    null
+// it is ok to commit without syncing, as it is ok if this
+// transaction never makes it to the db, if no subsequent
+// log record makes it to the log.  if any subsequent log
+// record is sync'd then this transaction will be sync'd
+// as well.
+ntt commitnosync transaction release_locks
+else
+ntt abort
+ntt close
+if  sanitymanager debug
+sanitymanager assert newpage islatched
+if   this identity equals newpage getpageid   getcontainerid
+if  sanitymanager debug
+sanitymanager throwassert
+this identity
+newpage getpageid   getcontainerid
+handle
+allochandle
+this
+throw standardexception newexception
+sqlstate data_different_container
+this identity  newpage getpageid   getcontainerid
+return newpage
+/**
+* request the system properties associated with a container.
+* <p>
+* request the value of properties that are associated with a container.
+* the following properties can be requested:
+*     derby.storage.pagesize
+*     derby.storage.pagereservedspace
+*     derby.storage.minimumrecordsize
+* <p>
+* to get the value of a particular property add it to the property list,
+* and on return the value of the property will be set to it's current
+* value.  for example:
+*
+* get_prop(basecontainer base)
+* {
+*     properties prop = new properties();
+*     prop.put("derby.storage.pagesize", "");
+*     base.getcontainerproperties(prop);
+*
+*     system.out.println(
+*         "container's page size = " +
+*         prop.getproperty("derby.storage.pagesize");
+* }
+*
+* @param prop   property list to fill in.
+*
+* @exception  standardexception  standard exception policy.
+**/
+public abstract void getcontainerproperties properties prop
+throws standardexception
+/**
+remove a page from this container.  the page will be unlatched by this
+routine before it returns.
+unlike addpage, this method done as part of the user transaction.
+the removed page is not usable by anyone until the user transaction
+comits.
+if the user transaction rolls back, the removed page is un-removed.
+<br> mt - thread aware -
+@param handle the container handle that has opened the container and latched the page
+@param page the latched page that is to be deallocated
+@exception standardexception standard cloudscape error policy
+*/
+protected void removepage basecontainerhandle handle  basepage page
+throws standardexception
+try
+if  sanitymanager debug
+sanitymanager assert page islatched
+// get dealloc lock nowait on the page to be deallocated
+// this lock is held until this transaction commits.
+// then gc can free this page
+recordhandle dealloclock
+page makerecordhandle recordhandle deallocate_protection_handle
+// don't get dealloclock wait because caller have a page latched
+if   getdealloclock handle  dealloclock
+false    no wait
+false    not zeroduration
+throw standardexception newexception
+sqlstate data_cannot_get_dealloc_lock
+page getidentity
+deallocatepage handle  page
+finally
+if  page    null
+page unlatch
+/**
+get the special dealloc lock on the page - the lock is gotten by the
+transaction that owns the container handle
+@exception standardexception standard cloudscape error policy
+*/
+protected boolean getdealloclock basecontainerhandle handle
+recordhandle dealloclock
+boolean wait
+boolean zeroduration
+throws standardexception
+// get deallocate lock on page so that the gc won't attempt to
+// free and re-allocate it until the transaction commits
+rawtransaction tran   handle gettransaction
+lockingpolicy lp
+tran newlockingpolicy
+lockingpolicy mode_record
+transactioncontroller isolation_repeatable_read
+true      striterok
+pagekey pkey   new pagekey identity  dealloclock getpagenumber
+if  lp    null
+if  zeroduration
+return lp zerodurationlockrecordforwrite
+tran  dealloclock  false  wait
+else
+return lp lockrecordforwrite tran  dealloclock  false  wait
+else
+throw standardexception newexception
+sqlstate data_cannot_get_dealloc_lock  pkey
+/**
+get an allocation page and latch it.
+@exception standardexception standard cloudscape error policy
+*/
+protected page getallocpage basecontainerhandle handle  long pagenumber  boolean wait
+throws standardexception
+return latchpage handle  getallocpage pagenumber   wait
+/**
+get any page and latch it .
+@exception standardexception standard cloudscape error policy
+*/
+protected page getanypage basecontainerhandle handle  long pagenumber  boolean wait
+throws standardexception
+return latchpage handle  getanypage handle  pagenumber   wait
+/**
+get the first valid page. result is latched.
+@exception standardexception standard cloudscape error policy
+*/
+protected page getfirstpage basecontainerhandle handle  throws standardexception
+return getfirstheadpage handle  true    wait
+/**
+get the next valid page and latch it
+@exception standardexception standard cloudscape error policy
+*/
+protected page getnextpage basecontainerhandle handle  long pagenumber
+throws standardexception
+return getnextheadpage handle  pagenumber  true    wait
+/*
+utility to latch a page
+*/
+protected basepage latchpage basecontainerhandle handle  basepage foundpage  boolean wait
+throws standardexception
+if  foundpage    null
+if  wait
+foundpage setexclusive handle
+else
+if   foundpage setexclusivenowait handle
+// sub-class will release page from the cache if required.
+return null
+if  sanitymanager debug
+sanitymanager assert  foundpage    null     foundpage islatched
+return foundpage
+/**
+lock the container and mark the container as in-use by this container handle.
+@param droppedok if true, use this container even if it is dropped.,
+@return true if the container can be used, false if it has been dropped
+since the lock was requested and droppedok is not true.
+@exception standardexception i cannot be opened for update.
+*/
+protected boolean use basecontainerhandle handle  boolean forupdate
+boolean droppedok
+throws standardexception
+// see if the container can be updated
+if  forupdate     canupdate
+throw standardexception newexception
+sqlstate data_container_read_only
+// if the container is dropped, cannot see if unless droppedok is set
+if   droppedok     getdroppedstate      getcommitteddropstate
+return false
+return true
+/**
+discontinue use of this container. note that the unlockcontainer
+call made from this method may not release any locks. the container
+lock may be held until the end of the transaction.
+*/
+protected void letgo basecontainerhandle handle
+rawtransaction t   handle gettransaction
+handle getlockingpolicy   unlockcontainer t  handle
+protected boolean getdroppedstate
+return isdropped
+protected boolean getcommitteddropstate
+return iscommitteddrop
+protected boolean isreusablerecordid
+return isreusablerecordid
+public int getcontainerstatus
+if  getcommitteddropstate
+return rawcontainerhandle committed_drop
+if  getdroppedstate
+return rawcontainerhandle dropped
+return rawcontainerhandle normal
+public long getcontainerid
+return identity getcontainerid
+public long getsegmentid
+return identity getsegmentid
+//public int getpagesize() {
+//	return pagesize();
+//}
+/*
+**	methods that need to be provided by a sub-class.
+*/
+/**
+get information about space used by the container.
+**/
+protected abstract spaceinfo getspaceinfo basecontainerhandle handle
+throws standardexception
+/**
+can the container be updated.
+@return true if the container can be updated, false otherwise.
+*/
+protected abstract boolean canupdate
+/**
+the container is about to be modified.
+loggable actions use this to make sure the container gets cleaned if a
+checkpoint is taken after any log record is sent to the log stream but
+before the container is actually dirtied.
+*/
+protected abstract void predirty boolean predirtyon
+/**
+return a basepage that represents the given page number in this container.
+the resulting page is latched.
+@exception standardexception standard cloudscape error policy
+*/
+protected abstract basepage getpage basecontainerhandle handle  long pagenumber
+boolean wait  throws standardexception
+/**
+return a basepage that represents the given alloc page number in this container.
+@exception standardexception standard cloudscape error policy
+*/
+protected abstract basepage getallocpage long pagenumber  throws standardexception
+/**
+return a basepage that represents any page - alloc page, valid page, free page,
+dealloced page etc.  the only requirement is that the page is initialized...
+@exception standardexception cloudscape standard error policy
+*/
+protected abstract basepage getanypage basecontainerhandle handle  long pagenumber
+throws standardexception
+/**
+* recreate a page for rollforward recovery.
+* <p>
+* during redo recovery it is possible for the system to try to redo
+* the creation of a page (ie. going from non-existence to version 0).
+* it first trys to read the page from disk, but a few different types
+* of errors can occur:
+*     o the page does not exist at all on disk, this can happen during
+*       rollforward recovery applied to a backup where the file was
+*       copied and the page was added to the file during the time frame
+*       of the backup but after the physical file was copied.
+*     o space in the file exists, but it was never initalized.  this
+*       can happen if you happen to crash at just the right moment during
+*       the allocation process.  also
+*       on some os's it is possible to read from a part of the file that
+*       was not ever written - resulting in garbage from the store's
+*       point of view (often the result is all 0's).
+*
+* all these errors are easy to recover from as the system can easily
+* create a version 0 from scratch and write it to disk.
+*
+* because the system does not sync allocation of data pages, it is also
+* possible at this point that whlie writing the version 0 to disk to
+* create it we may encounter an out of disk space error (caught in this
+* routine as a standardexception from the create() call.  we can't
+* recovery from this without help from outside, so the caught exception
+* is nested and a new exception thrown which the recovery system will
+* output to the user asking them to check their disk for space/errors.
+*
+* the arguments passed in need to be sufficient for the page cache to
+* materialize a brand new page and write it to disk.
+*
+* @exception  standardexception  standard exception policy.
+**/
+protected abstract basepage
+recreatepageforredorecovery
+basecontainerhandle handle
+int pageformat
+long pagenumber
+long pageoffset
+throws standardexception
+/**
+log all information on the container creation necessary to recreate teh
+container during a load tran.
+@exception standardexception cloudscape standard error policy
+*/
+protected abstract bytearray logcreatecontainerinfo
+throws standardexception
+/**
+get only a valid, non-overflow page.  if page number is either invalid
+or overflow, returns null
+@exception standardexception cloudscape standard error policy
+*/
+protected abstract basepage getheadpage basecontainerhandle handle
+long pagenumber  boolean wait  throws standardexception
+/**
+get the first page in the container.
+@exception standardexception standard cloudscape error policy
+*/
+protected abstract basepage getfirstheadpage basecontainerhandle handle
+boolean wait  throws standardexception
+/**
+get the next page in the container.
+@exception standardexception standard cloudscape error policy
+*/
+protected abstract basepage getnextheadpage basecontainerhandle handle
+long pagenumber  boolean wait  throws standardexception
+/**
+get a potentially suitable page for insert and latch it.
+@exception standardexception standard cloudscape error policy
+*/
+protected abstract basepage getpageforinsert basecontainerhandle handle
+int flag
+throws standardexception
+protected abstract basepage getpageforcompress
+basecontainerhandle handle
+int                 flag
+long                pageno
+throws standardexception
+protected abstract void truncatepages long lastvalidpagenum
+throws standardexception
+/**
+create a new page in the container.
+@exception standardexception standard cloudscape error policy
+*/
+protected abstract basepage newpage basecontainerhandle userhandle
+rawtransaction t
+basecontainerhandle allochandle
+boolean isoverflow  throws standardexception
+protected abstract void compresscontainer
+rawtransaction      t
+basecontainerhandle allochandle
+throws standardexception
+/**
+deallocate a page from the container.
+@exception standardexception standard cloudscape error policy
+*/
+protected abstract void deallocatepage basecontainerhandle userhandle
+basepage page  throws standardexception
+protected void truncate basecontainerhandle handle  throws standardexception
+if  sanitymanager debug
+sanitymanager throwassert
+/**
+mark the container as drop or not drop depending on the input value.
+*/
+protected abstract void dropcontainer loginstant instant  boolean drop
+/**
+remove the container and reclaim its space.  once executed, this
+operation cannot be undone - as opposed to dropcontainer which only
+marks the container as dropped and can be rolled back.
+<br><b> this operation should only be called by post commit clean up </b>
+@param leavestub if true, leave a stub.  if false, remove everything
+@see org.apache.derby.iapi.store.raw.data.rawcontainerhandle#removecontainer
+@exception standardexception standard cloudscape error policy
+*/
+protected abstract void removecontainer loginstant instant  boolean leavestub  throws standardexception
+/**
+get the logged container version.
+@exception standardexception standard cloudscape error policy
+*/
+protected abstract long getcontainerversion   throws standardexception
+/**
+flush all outstanding changes in this container to persistent storage.
+@exception standardexception standard cloudscape error policy
+*/
+protected abstract void flushall   throws standardexception
+/**
+the container will be grown vastly, prepare for it.
+*/
+protected abstract void prepareforbulkload basecontainerhandle handle
+int numpage
+/**
+the container will have no pre-allocate threshold, i.e., if the
+implementation supports it, page preallocation will happen
+the next time a new page is allocated.
+*/
+protected abstract void clearpreallocthreshold
+/*
+cost estimates
+*/
+/**
+@see containerhandle#getestimatedrowcount
+@exception standardexception standard cloudscape error policy
+*/
+public abstract long getestimatedrowcount int flag  throws standardexception
+/**
+@see containerhandle#setestimatedrowcount
+@exception standardexception standard cloudscape error policy
+*/
+public abstract void setestimatedrowcount long count  int flag  throws standardexception
+/**
+@see containerhandle#getestimatedpagecount
+@exception standardexception standard cloudscape error policy
+*/
+public abstract long getestimatedpagecount basecontainerhandle handle  int flag  throws standardexception
+/**
+* backup the container to the specified path.
+*
+* @param handle the container handle.
+* @param backupcontainerpath  location of the backup container.
+* @exception standardexception standard derby error policy
+*/
+protected abstract void  backupcontainer basecontainerhandle handle
+string backupcontainerpath  throws standardexception
+/**
+* create encrypted version of the  container with the
+* user specified encryption properties.
+*
+* @param handle the container handle.
+* @param newfilepath file to store the new encrypted version of the container
+* @exception standardexception standard derby error policy
+*/
+protected abstract void  encryptcontainer basecontainerhandle handle
+string newfilepath
+throws standardexception
+/*
+** methods to be used by sub-classes.
+*/
+/**
+set the container's dropped state
+*/
+protected void setdroppedstate boolean isdropped
+this isdropped   isdropped
+protected void setcommitteddropstate boolean iscommitteddrop
+this iscommitteddrop   iscommitteddrop
+protected void setreusablerecordidstate boolean isreusablerecordid
+this isreusablerecordid   isreusablerecordid
+//protected void setpagesize(int pagesize) {
+//	identity.setpagesize(pagesize);
+//}
+// not interested in participating in the diagnostic virtual lock table.
+public boolean lockattributes int flag  hashtable attributes
+return false

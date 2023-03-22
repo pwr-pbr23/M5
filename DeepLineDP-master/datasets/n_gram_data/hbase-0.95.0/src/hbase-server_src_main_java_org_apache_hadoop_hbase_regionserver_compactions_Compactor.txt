@@ -1,0 +1,204 @@
+/**
+* licensed to the apache software foundation (asf) under one
+* or more contributor license agreements.  see the notice file
+* distributed with this work for additional information
+* regarding copyright ownership.  the asf licenses this file
+* to you under the apache license, version 2.0 (the
+* "license"); you may not use this file except in compliance
+* with the license.  you may obtain a copy of the license at
+*
+*     http://www.apache.org/licenses/license-2.0
+*
+* unless required by applicable law or agreed to in writing, software
+* distributed under the license is distributed on an "as is" basis,
+* without warranties or conditions of any kind, either express or implied.
+* see the license for the specific language governing permissions and
+* limitations under the license.
+*/
+package org apache hadoop hbase regionserver compactions
+import java io ioexception
+import java util arraylist
+import java util collection
+import java util list
+import java util map
+import org apache commons logging log
+import org apache commons logging logfactory
+import org apache hadoop classification interfaceaudience
+import org apache hadoop conf configuration
+import org apache hadoop fs path
+import org apache hadoop hbase hconstants
+import org apache hadoop hbase keyvalue
+import org apache hadoop hbase client scan
+import org apache hadoop hbase io celloutputstream
+import org apache hadoop hbase io compress compression
+import org apache hadoop hbase io hfile hfilewriterv2
+import org apache hadoop hbase regionserver hstore
+import org apache hadoop hbase regionserver internalscanner
+import org apache hadoop hbase regionserver multiversionconsistencycontrol
+import org apache hadoop hbase regionserver scantype
+import org apache hadoop hbase regionserver store
+import org apache hadoop hbase regionserver storefile
+import org apache hadoop hbase regionserver storefilescanner
+import org apache hadoop hbase regionserver storescanner
+import org apache hadoop hbase util bytes
+import org apache hadoop util stringutils
+/**
+* a compactor is a compaction algorithm associated a given policy. base class also contains
+* reusable parts for implementing compactors (what is common and what isn't is evolving).
+*/
+@interfaceaudience private
+public abstract class compactor
+private static final log log   logfactory getlog compactor class
+protected compactionprogress progress
+protected configuration conf
+protected store store
+private int compactionkvmax
+protected compression algorithm compactioncompression
+//todo: depending on store is not good but, realistically, all compactors currently do.
+compactor final configuration conf  final store store
+this conf   conf
+this store   store
+this compactionkvmax   this conf getint hconstants compaction_kv_max  10
+this compactioncompression    this store getfamily      null  ?
+compression algorithm none   this store getfamily   getcompactioncompression
+/**
+* todo: replace this with {@link celloutputstream} when storefile.writer uses cells.
+*/
+public interface cellsink
+void append keyvalue kv  throws ioexception
+/**
+* do a minor/major compaction on an explicit set of storefiles from a store.
+* @param request the requested compaction
+* @return product of compaction or an empty list if all cells expired or deleted and nothing made
+*         it through the compaction.
+* @throws ioexception
+*/
+public abstract list<path> compact final compactionrequest request  throws ioexception
+/**
+* compact a list of files for testing. creates a fake {@link compactionrequest} to pass to
+* {@link #compact(compactionrequest)};
+* @param filestocompact the files to compact. these are used as the compactionselection for the
+*          generated {@link compactionrequest}.
+* @param ismajor true to major compact (prune all deletes, max versions, etc)
+* @return product of compaction or an empty list if all cells expired or deleted and nothing made
+*         it through the compaction.
+* @throws ioexception
+*/
+public list<path> compactfortesting final collection<storefile> filestocompact  boolean ismajor
+throws ioexception
+compactionrequest cr   new compactionrequest filestocompact
+cr setismajor ismajor
+return this compact cr
+public compactionprogress getprogress
+return this progress
+/** the sole reason this class exists is that java has no ref/out/pointer parameters. */
+protected static class filedetails
+/** maximum key count after compaction (for blooms) */
+public int maxkeycount   0
+/** earliest put timestamp if major compaction */
+public long earliestputts   hconstants latest_timestamp
+/** the last key in the files we're compacting. */
+public long maxseqid   0
+/** latest memstore read point found in any of the involved files */
+public long maxmvccreadpoint   0
+protected filedetails getfiledetails
+collection<storefile> filestocompact  boolean calculateputts  throws ioexception
+filedetails fd   new filedetails
+for  storefile file   filestocompact
+long seqnum   file getmaxsequenceid
+fd maxseqid   math max fd maxseqid  seqnum
+storefile reader r   file getreader
+if  r    null
+log warn     file getpath
+continue
+// note: getfilterentries could cause under-sized blooms if the user
+// switches bloom type (e.g. from row to rowcol)
+long keycount    r getbloomfiltertype      store getfamily   getbloomfiltertype
+? r getfilterentries     r getentries
+fd maxkeycount    keycount
+// calculate the latest mvcc readpoint in any of the involved store files
+map<byte  byte> fileinfo   r loadfileinfo
+byte tmp   fileinfo get hfilewriterv2 max_memstore_ts_key
+if  tmp    null
+fd maxmvccreadpoint   math max fd maxmvccreadpoint  bytes tolong tmp
+// if required, calculate the earliest put timestamp of all involved storefiles.
+// this is used to remove family delete marker during compaction.
+long earliestputts   0
+if  calculateputts
+tmp   fileinfo get storefile earliest_put_ts
+if  tmp    null
+// there's a file with no information, must be an old one
+// assume we have very old puts
+fd earliestputts   earliestputts   hconstants oldest_timestamp
+else
+earliestputts   bytes tolong tmp
+fd earliestputts   math min fd earliestputts  earliestputts
+if  log isdebugenabled
+log debug     file
+keycount
+r getbloomfiltertype   tostring
+stringutils humanreadableint r length
+r gethfilereader   getencodingondisk
+seqnum
+calculateputts ?     earliestputts
+return fd
+protected list<storefilescanner> createfilescanners
+final collection<storefile> filestocompact  throws ioexception
+return storefilescanner getscannersforstorefiles filestocompact  false  false  true
+protected long setsmallestreadpoint
+long smallestreadpoint   store getsmallestreadpoint
+multiversionconsistencycontrol setthreadreadpoint smallestreadpoint
+return smallestreadpoint
+protected internalscanner precreatecoprocscanner final compactionrequest request
+scantype scantype  long earliestputts   list<storefilescanner> scanners  throws ioexception
+if  store getcoprocessorhost      null  return null
+return store getcoprocessorhost
+precompactscanneropen store  scanners  scantype  earliestputts  request
+protected internalscanner postcreatecoprocscanner final compactionrequest request
+scantype scantype  internalscanner scanner  throws ioexception
+if  store getcoprocessorhost      null  return scanner
+return store getcoprocessorhost   precompact store  scanner  scantype  request
+@suppresswarnings
+protected boolean performcompaction internalscanner scanner
+cellsink writer  long smallestreadpoint  throws ioexception
+int byteswritten   0
+// since scanner.next() can return 'false' but still be delivering data,
+// we have to use a do/while loop.
+list<keyvalue> kvs   new arraylist<keyvalue>
+// limit to "hbase.hstore.compaction.kv.max" (default 10) to avoid oome
+int closecheckinterval   hstore getclosecheckinterval
+boolean hasmore
+do
+hasmore   scanner next kvs  compactionkvmax
+// output to writer:
+for  keyvalue kv   kvs
+if  kv getmemstorets   <  smallestreadpoint
+kv setmemstorets 0
+writer append kv
+// update progress per key
+progress currentcompactedkvs
+// check periodically to see if a system stop is requested
+if  closecheckinterval > 0
+byteswritten    kv getlength
+if  byteswritten > closecheckinterval
+byteswritten   0
+if   store arewritesenabled    return false
+kvs clear
+while  hasmore
+return true
+protected void abortwriter final storefile writer writer  throws ioexception
+writer close
+store getfilesystem   delete writer getpath    false
+/**
+* @param scanners store file scanners.
+* @param scantype scan type.
+* @param smallestreadpoint smallest mvcc read point.
+* @param earliestputts earliest put across all files.
+* @return a compaction scanner.
+*/
+protected internalscanner createscanner store store  list<storefilescanner> scanners
+scantype scantype  long smallestreadpoint  long earliestputts  throws ioexception
+scan scan   new scan
+scan setmaxversions store getfamily   getmaxversions
+return new storescanner store  store getscaninfo    scan  scanners
+scantype  smallestreadpoint  earliestputts
