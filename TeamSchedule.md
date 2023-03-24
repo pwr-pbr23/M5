@@ -2,8 +2,8 @@
 
 |         | Date                    | Leader              |
 | ------- | ----------------------- | ------------------- |
-| Current | 10.03.2023 - 24.03.2023 | Jakub Tkaczyk       |
-|         | 25.03.2023 - 07.04.2023 | Mikołaj Macioszczyk |
+|         | 10.03.2023 - 24.03.2023 | Jakub Tkaczyk       |
+| Current | 25.03.2023 - 07.04.2023 | Mikołaj Macioszczyk |
 |         | 08.04.2023 - 21.04.2023 | Karol Waliszewski   |
 |         | 22.04.2023 - 05.05.2023 | Jakub Tkaczyk       |
 |         | 06.05.2023 - 19.05.2023 | Mikołaj Macioszczyk |
