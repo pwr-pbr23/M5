@@ -101,10 +101,12 @@ def train_RF_model(dataset_name):
             _, __, ___, line_rep = model(codevec_padded_tensor)
 
         numpy_line_rep = line_rep.cpu().detach().numpy()
+        print("numpy_line_rep", line_rep, numpy_line_rep)
 
         line_rep_list.append(numpy_line_rep)
 
     x = np.concatenate(line_rep_list)
+    print(x, "x")
 
     print('prepare data finished')
 
