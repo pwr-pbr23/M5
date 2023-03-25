@@ -4,14 +4,15 @@ import os, sys, pickle
 
 import numpy as np
 
-from gensim.models import Word2Vec
+from gensim.models import Word2Vec, torch
 from torch.utils import data
 
 from tqdm import tqdm
 
 sys.path.append('../')
-from DeepLineDP_model import *
-from my_util import *
+from DeepLineDP_model import HierarchicalAttentionNetwork
+from my_util import get_w2v_path, all_train_releases, get_df, prepare_code2d, get_x_vec, all_eval_releases, pd
+
 
 model_dir = '../../output/model/RF-line-level/'
 result_dir = '../../output/RF-line-level-result/'
