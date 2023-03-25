@@ -77,7 +77,7 @@ def pad_features(codevec, padding_idx, seq_length):
     
     return features
     
-def get_dataloader(w2v_model, code,encoded_labels, padding_idx, batch_size):
+def get_dataloader(w2v_model, code, encoded_labels, padding_idx, batch_size):
     '''
         input
             w2v_model (Word2Vec)
