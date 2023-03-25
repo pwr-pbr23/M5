@@ -10,7 +10,7 @@ from baseline_util import *
 
 sys.path.append('../')
 
-from my_util import *
+from my_util import get_w2v_path, all_train_releases, all_eval_releases, get_df
 
 from imblearn.over_sampling import SMOTE 
 
