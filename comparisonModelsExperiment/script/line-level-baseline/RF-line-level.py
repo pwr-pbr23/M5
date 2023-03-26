@@ -5,6 +5,7 @@ import os, sys, pickle
 import numpy as np
 
 from gensim.models import Word2Vec
+from sklearn.metrics import accuracy_score
 from torch.utils import data
 
 from tqdm import tqdm
@@ -21,31 +22,14 @@ if not os.path.exists(model_dir):
 if not os.path.exists(result_dir):
     os.makedirs(result_dir)
 
-max_grad_norm = 5
 embed_dim = 50
-word_gru_hidden_dim = 64
-sent_gru_hidden_dim = 64
-word_gru_num_layers = 1
-sent_gru_num_layers = 1
-word_att_dim = 64
-sent_att_dim = 64
-use_layer_norm = True
-
 to_lowercase = True
 
 def get_W2V(dataset_name):
     w2v_dir = get_w2v_path()
-
     word2vec_file_dir = os.path.join(w2v_dir,dataset_name+'-'+str(embed_dim)+'dim.bin')
-
     word2vec = Word2Vec.load('../'+word2vec_file_dir)
     print('load Word2Vec for',dataset_name,'finished')
-
-    # https://github.com/RaRe-Technologies/gensim/wiki/Migrating-from-Gensim-3.x-to-4
-    # total_vocab = len(word2vec.wv)
-
-    # vocab_size = total_vocab +1 # for unknown tokens
-
     return word2vec
 
 def train_RF_model(dataset_name):
@@ -61,33 +45,27 @@ def train_RF_model(dataset_name):
     all_line_label = []
 
     # loop to get line representation of each file in train data
-    for filename, df in tqdm(train_df.groupby('filename')):
+    for _, df in tqdm(train_df.groupby('filename')):
 
         code = df['code_line'].tolist()
         line_label = df['line-label'].tolist()
 
         all_line_label.extend(line_label)
-
+    
         code2d = prepare_code2d(code, to_lowercase)
-
         code3d = [code2d]
-
         codevec = get_x_vec(code3d, word2vec)
-        print(codevec)
 
-        # with torch.no_grad():
-            # codevec_padded_tensor = torch.tensor(codevec)
-            # _, __, ___, line_rep = model(codevec_padded_tensor)
+        simplified_code_vec = list(map(lambda v: v[0:50], codevec[0]))
 
-        # numpy_line_rep = line_rep.cpu().detach().numpy()
+        line_rep_list.append(simplified_code_vec)
 
-        line_rep_list.append(np.random.randint(100000, size = (120,4)))
-
-    print("test", all_line_label[0], len(all_line_label), all_line_label[1])
-    x = np.concatenate(line_rep_list)[0:len(all_line_label)]
+    x = np.concatenate(line_rep_list)
 
     print('prepare data finished', len(x))
 
+    # global y_train
+    # y_train = all_line_label
     clf.fit(x,all_line_label)
 
     pickle.dump(clf, open(model_dir+dataset_name+'-RF-model.bin','wb'))
@@ -111,7 +89,7 @@ def predict_defective_line(dataset_name):
 
         all_df_list = [] # store df for saving later...
 
-        for filename, df in tqdm(test_df.groupby('filename')):
+        for _, df in tqdm(test_df.groupby('filename')):
 
             code = df['code_line'].tolist()
 
@@ -120,17 +98,11 @@ def predict_defective_line(dataset_name):
             code3d = [code2d]
 
             codevec = get_x_vec(code3d, word2vec)
-            print(codevec, "predict")
+            simplified_code_vec = list(map(lambda v: v[0:50], codevec[0]))
 
-            # with torch.no_grad():
-            #     codevec_padded_tensor = torch.tensor(codevec)
-            #     _, __, ___, line_rep = model(codevec_padded_tensor)
+            pred = clf.predict(simplified_code_vec)
 
-            # numpy_line_rep = line_rep.cpu().detach().numpy()
-
-            pred = clf.predict(codevec)
-
-            df['line-score-pred'] = pred.astype(int)
+            df['line-score-pred'] = pred.astype(int) # 1 or 0, if 1 then the label is correct (ie. l should have no defect and is labeled as no defect), else 0
 
             all_df_list.append(df)
 
@@ -142,5 +114,5 @@ def predict_defective_line(dataset_name):
 
 proj_name = sys.argv[1]
 
-# train_RF_model(proj_name)
+train_RF_model(proj_name)
 predict_defective_line(proj_name)

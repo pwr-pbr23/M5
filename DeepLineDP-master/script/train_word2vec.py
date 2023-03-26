@@ -27,7 +27,7 @@ def train_word2vec_model(dataset_name, embedding_dim = 50):
 
     train_code_3d, _ = get_code3d_and_label(train_df, True)
 
-    all_texts = list(more_itertools.collapse(train_code_3d[:],levels=1))
+    all_texts = list(collapse(train_code_3d[:],levels=1))
 
     word2vec = Word2Vec(all_texts,size=embedding_dim, min_count=1,sorted_vocab=1)
 
