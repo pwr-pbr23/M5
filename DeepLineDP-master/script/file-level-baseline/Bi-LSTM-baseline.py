@@ -17,7 +17,8 @@ from baseline_util import *
 # for importing file from previous directory
 sys.path.append('../')
 
-from my_util import *
+# from my_util import *
+from my_util import get_w2v_path, all_train_releases, all_eval_releases, get_df
 
 arg = argparse.ArgumentParser()
 arg.add_argument('-dataset',type=str, default='activemq', help='software project name (lowercase)')
@@ -143,9 +144,9 @@ def train_model(dataset_name):
     padding_idx = word2vec_model.wv.vocab['<pad>'].index
 
     vocab_size = len(word2vec_model.wv.vocab)+1
-        
-    train_dl = get_dataloader(word2vec_model, train_code,train_label, padding_idx, batch_size)
-    valid_dl = get_dataloader(word2vec_model, valid_code,valid_label, padding_idx, batch_size)
+
+    train_dl = get_dataloader(word2vec_model, train_code, train_label, padding_idx, batch_size)
+    valid_dl = get_dataloader(word2vec_model, valid_code, valid_label, padding_idx, batch_size)
 
     net = LSTMClassifier(batch_size, hidden_dim, vocab_size, embed_dim)
 

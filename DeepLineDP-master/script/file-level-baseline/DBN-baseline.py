@@ -16,7 +16,7 @@ sys.path.append('../')
 
 from tqdm import tqdm
 
-from my_util import *
+from my_util import get_w2v_path, all_train_releases, all_eval_releases, get_df
 
 arg = argparse.ArgumentParser()
 arg.add_argument('-dataset',type=str, default='activemq', help='software project name (lowercase)')
@@ -36,7 +36,7 @@ args = arg.parse_args()
 batch_size = 30
 hidden_layers_structure = [100]*10
 embed_dim = 50
-exp_name = arg.exp_name
+exp_name = args.exp_name
 
 save_model_dir = '../../output/model/DBN/'
 save_prediction_dir = '../../output/prediction/DBN/'
