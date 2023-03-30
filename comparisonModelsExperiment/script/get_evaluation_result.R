@@ -31,7 +31,6 @@ preprocess <- function(x, reverse){
   { 
     ranking <- sk_esd(df)$group 
   }
-  
   x$rank <- paste("Rank",ranking[as.character(x$variable)])
   return(x)
 }
@@ -240,7 +239,6 @@ get.line.metrics.result = function(baseline.df, cur.df.file)
     merge(total_true) %>% mutate(recall20LOC = correct_pred/total_true)
   
   recall.list = recall20LOC$recall20LOC
-  
   #Effort20%Recall
   effort20Recall = sorted %>% merge(total_true) %>% group_by(filename) %>% mutate(cummulative_correct_pred = cumsum(line.level.ground.truth == "True"), recall = round(cumsum(line.level.ground.truth == "True")/total_true, digits = 2)) %>%
     summarise(effort20Recall = sum(recall <= 0.2)/n())
@@ -252,11 +250,12 @@ get.line.metrics.result = function(baseline.df, cur.df.file)
   return(result.df)
 }
 
-all_eval_releases = c('activemq-5.2.0', 'activemq-5.3.0', 'activemq-5.8.0', 
-                      'camel-2.10.0', 'camel-2.11.0' , 
-                      'derby-10.5.1.1' , 'groovy-1_6_BETA_2' , 'hbase-0.95.2', 
-                      'hive-0.12.0', 'jruby-1.5.0', 'jruby-1.7.0.preview1',  
-                      'lucene-3.0.0', 'lucene-3.1', 'wicket-1.5.3')
+all_eval_releases = c('activemq-5.2.0', 'activemq-5.3.0')
+# all_eval_releases = c('activemq-5.2.0', 'activemq-5.3.0', 'activemq-5.8.0', 
+#                       'camel-2.10.0', 'camel-2.11.0' , 
+#                       'derby-10.5.1.1' , 'groovy-1_6_BETA_2' , 'hbase-0.95.2', 
+#                       'hive-0.12.0', 'jruby-1.5.0', 'jruby-1.7.0.preview1',  
+#                       'lucene-3.0.0', 'lucene-3.1', 'wicket-1.5.3')
 
 # error.prone.result.dir = '../output/ErrorProne_result/'
 # ngram.result.dir = '../output/n_gram_result/'
@@ -335,7 +334,6 @@ recall20LOC = sorted %>% group_by(test, filename) %>% mutate(effort = round(orde
 effort20Recall = sorted %>% merge(total_true) %>% group_by(test, filename) %>% mutate(cummulative_correct_pred = cumsum(line.level.ground.truth == "True"), recall = round(cumsum(line.level.ground.truth == "True")/total_true, digits = 2)) %>%
   summarise(effort20Recall = sum(recall <= 0.2)/n())
 
-
 ## prepare data for plotting
 deeplinedp.ifa = IFA$order
 deeplinedp.recall = recall20LOC$recall20LOC
@@ -352,7 +350,6 @@ rf.result.df$technique = 'RF'
 # n.gram.result.df$technique = 'N.gram'
 # error.prone.result.df$technique = 'ErrorProne'
 # deepline.dp.line.result$technique = 'DeepLineDP'
-
 all.line.result = rbind(rf.result.df)
 # all.line.result = rbind(rf.result.df, n.gram.result.df, error.prone.result.df, deepline.dp.line.result)
 
@@ -360,9 +357,13 @@ recall.result.df = select(all.line.result, c('technique', 'Recall20%LOC'))
 ifa.result.df = select(all.line.result, c('technique', 'IFA'))
 effort.result.df = select(all.line.result, c('technique', 'Effort@20%Recall'))
 
-recall.result.df = preprocess(recall.result.df, FALSE)
-ifa.result.df = preprocess(ifa.result.df, TRUE)
-effort.result.df = preprocess(effort.result.df, TRUE)
+print(recall.result.df)
+print(ifa.result.df)
+print(effort.result.df)
+
+# recall.result.df = preprocess(recall.result.df, FALSE)# preprocess function fails with this input
+# ifa.result.df = preprocess(ifa.result.df, TRUE)
+# effort.result.df = preprocess(effort.result.df, TRUE)
 
 ggplot(recall.result.df, aes(x=reorder(variable, -value, FUN=median), y=value)) + geom_boxplot() + facet_grid(~rank, drop=TRUE, scales = "free", space = "free") + ylab("Recall@Top20%LOC") + xlab("")
 ggsave(paste0(save.fig.dir,"file-Recall@Top20LOC.pdf"),width=4,height=2.5)
