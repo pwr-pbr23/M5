@@ -10,7 +10,7 @@
 
 [🛠️ Board](https://github.com/orgs/pwr-pbr23/projects/2/views/1)
 
-[📦 Drive](https://drive.google.com/drive/folders/1gr3X0em6e5LsyTPUC-HE70NLZPSHTx2c?usp=sharing)
+[📦 Drive](https://drive.google.com/drive/folders/1_MXc-f5kqJA_23dCv05t6dJl375_0nnU?usp=sharing)
 
 [📄 Team policy](./TeamPolicy.md)
 
