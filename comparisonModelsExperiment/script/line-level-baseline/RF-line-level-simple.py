@@ -141,7 +141,7 @@ def train_and_predict(dataset_name):
     y_train = all_line_label
 
 
-    clf = RandomForestClassifier(random_state=42, n_jobs=24)
+    clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=24)
 
     clf.fit(X_train, y_train)
 
