@@ -188,11 +188,11 @@ deeplinedp.effort <- effort20Recall$effort20Recall
 deepline.dp.line.result <- data.frame(deeplinedp.ifa, deeplinedp.recall, deeplinedp.effort)
 
 names(rf.result.df) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
-# names(deepline.dp.line.result) = c("IFA", "Recall20%LOC", "Effort@20%Recall")
+names(deepline.dp.line.result) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
 
 rf.result.df$technique <- "RF"
-# deepline.dp.line.result$technique = 'DeepLineDP'
-all.line.result <- rbind(rf.result.df)
+deepline.dp.line.result$technique <- "DeepLineDP"
+all.line.result <- rbind(rf.result.df, deepline.dp.line.result)
 # all.line.result = rbind(rf.result.df, n.gram.result.df, error.prone.result.df, deepline.dp.line.result)
 
 recall.result.df <- select(all.line.result, c("technique", "Recall20%LOC"))
