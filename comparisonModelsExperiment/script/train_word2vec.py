@@ -2,9 +2,6 @@ import os, sys
 
 from gensim.models import Word2Vec
 
-import more_itertools
-
-from DeepLineDP_model import *
 from my_util import *
 
 
@@ -29,7 +26,7 @@ def train_word2vec_model(dataset_name, embedding_dim = 50):
 
     all_texts = list(collapse(train_code_3d[:],levels=1))
 
-    word2vec = Word2Vec(all_texts,size=embedding_dim, min_count=1,sorted_vocab=1)
+    word2vec = Word2Vec(all_texts,vector_size=embedding_dim, min_count=1,sorted_vocab=1)
 
     word2vec.save(save_path)
     print('save word2vec model at path {} done'.format(save_path))
