@@ -112,11 +112,13 @@ all_eval_releases <- c("activemq-5.2.0", "activemq-5.3.0")
 
 rf.result.dir <- "../output/RF-line-level-result/"
 xgb.result.dir <- "../output/XGB-line-level-result/"
+lgbm.result.dir <- "../output/LGBM-line-level-result/"
 
 n.gram.result.df <- NULL
 error.prone.result.df <- NULL
 rf.result.df <- NULL
 xgb.result.df <- NULL
+lgbm.result.df <- NULL
 
 ## get result from baseline
 for (rel in all_eval_releases)
@@ -142,6 +144,17 @@ for (rel in all_eval_releases)
   xgb.eval.result <- get.line.metrics.result(xgb.result, cur.df.file)
 
   xgb.result.df <- rbind(xgb.result.df, xgb.eval.result)
+
+  lgbm.result <- read.csv(paste0(lgbm.result.dir, rel, "-line-lvl-result.csv"))
+  lgbm.result <- select(lgbm.result, "filename", "line_number", "line.score.pred")
+  names(lgbm.result) <- c("filename", "line.number", "line.score")
+
+  cur.df.file <- filter(line.ground.truth, test == rel)
+  cur.df.file <- select(cur.df.file, filename, line.number, line.level.ground.truth)
+
+  lgbm.eval.result <- get.line.metrics.result(lgbm.result, cur.df.file)
+
+  lgbm.result.df <- rbind(lgbm.result.df, lgbm.eval.result)
 
   print(paste0("finished ", rel))
 }
@@ -202,12 +215,14 @@ deepline.dp.line.result <- data.frame(deeplinedp.ifa, deeplinedp.recall, deeplin
 
 names(rf.result.df) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
 names(xgb.result.df) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
+names(lgbm.result.df) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
 names(deepline.dp.line.result) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
 
 rf.result.df$technique <- "RF"
 xgb.result.df$technique <- "XGB"
+lgbm.result.df$technique <- "LGBM"
 deepline.dp.line.result$technique <- "DeepLineDP"
-all.line.result <- rbind(rf.result.df, xgb.result.df, deepline.dp.line.result)
+all.line.result <- rbind(rf.result.df, xgb.result.df, lgbm.result.df, deepline.dp.line.result)
 # all.line.result = rbind(rf.result.df, n.gram.result.df, error.prone.result.df, deepline.dp.line.result)
 
 recall.result.df <- select(all.line.result, c("technique", "Recall20%LOC"))
