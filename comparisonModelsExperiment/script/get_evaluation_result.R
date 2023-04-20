@@ -111,10 +111,12 @@ all_eval_releases <- c("activemq-5.2.0", "activemq-5.3.0")
 #                       'lucene-3.0.0', 'lucene-3.1', 'wicket-1.5.3')
 
 rf.result.dir <- "../output/RF-line-level-result/"
+xgb.result.dir <- "../output/XGB-line-level-result/"
 
 n.gram.result.df <- NULL
 error.prone.result.df <- NULL
 rf.result.df <- NULL
+xgb.result.df <- NULL
 
 ## get result from baseline
 for (rel in all_eval_releases)
@@ -129,6 +131,17 @@ for (rel in all_eval_releases)
   rf.eval.result <- get.line.metrics.result(rf.result, cur.df.file)
 
   rf.result.df <- rbind(rf.result.df, rf.eval.result)
+
+  xgb.result <- read.csv(paste0(xgb.result.dir, rel, "-line-lvl-result.csv"))
+  xgb.result <- select(xgb.result, "filename", "line_number", "line.score.pred")
+  names(xgb.result) <- c("filename", "line.number", "line.score")
+
+  cur.df.file <- filter(line.ground.truth, test == rel)
+  cur.df.file <- select(cur.df.file, filename, line.number, line.level.ground.truth)
+
+  xgb.eval.result <- get.line.metrics.result(xgb.result, cur.df.file)
+
+  xgb.result.df <- rbind(xgb.result.df, xgb.eval.result)
 
   print(paste0("finished ", rel))
 }
@@ -188,11 +201,13 @@ deeplinedp.effort <- effort20Recall$effort20Recall
 deepline.dp.line.result <- data.frame(deeplinedp.ifa, deeplinedp.recall, deeplinedp.effort)
 
 names(rf.result.df) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
+names(xgb.result.df) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
 names(deepline.dp.line.result) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
 
 rf.result.df$technique <- "RF"
+xgb.result.df$technique <- "XGB"
 deepline.dp.line.result$technique <- "DeepLineDP"
-all.line.result <- rbind(rf.result.df, deepline.dp.line.result)
+all.line.result <- rbind(rf.result.df, xgb.result.df, deepline.dp.line.result)
 # all.line.result = rbind(rf.result.df, n.gram.result.df, error.prone.result.df, deepline.dp.line.result)
 
 recall.result.df <- select(all.line.result, c("technique", "Recall20%LOC"))
