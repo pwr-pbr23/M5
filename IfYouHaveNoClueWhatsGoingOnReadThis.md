@@ -74,7 +74,7 @@ Recall@Top20%LOC measures how many defective lines that can be accurately found 
 
 Effort@Top20%Recall measures how much effort (i.e., LOC) required to find the 20% actual defective lines of the whole release. A low value of Effort@Top20%Recall indicates that developers spend a small amount of effort to find the top-20% actual defective lines. On the other hand, a high value of Effort@Top20%Recall indicates that developers spend a large amount of effort to find the top-20% actual defective lines.
 
-
+Initial False Alarm measures the number of clean lines that developers need to inspect until the first defective line is found for each file. A low IFA value indicates that few clean lines are ranked at the top, while a high IFA value indicates that developers will spend unnecessary effort on clean lines. The intuition behinds this measure is that developers may stop inspecting if they could not get promising results (i.e., find defective lines) within the first few inspected lines
 
 ### Comparison
 We compare the ranking of risky lines with the three state-of-the-art line-level defect prediction approaches:
