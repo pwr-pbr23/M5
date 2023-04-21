@@ -27,3 +27,11 @@
 - Jakub Tkaczyk
 - Karol Waliszewski
 - Mikołaj Macioszczyk
+
+### Reproduction
+
+Steps to replicate the study:
+1. access the shared file [🛠️ Main - with our research - DeepLineDp](https://colab.research.google.com/drive/1RRcg-vouL0gPwLS6mjSvePa06ikFZXzN?usp=sharing),
+4. within this file, execute all tasks.
+
+Results will stored be in the folder /comparisonModelsExperiment/output/figure
