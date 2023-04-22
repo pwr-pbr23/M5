@@ -5,7 +5,7 @@ library(caret)
 library(reshape2)
 library(pROC)
 library(effsize)
-library(ScottKnottESD) # this package is not available on CRAN
+library(ScottKnottESD)
 
 save.fig.dir <- "../output/figure/"
 
