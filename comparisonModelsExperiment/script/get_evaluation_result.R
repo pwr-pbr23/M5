@@ -103,7 +103,7 @@ get.line.metrics.result <- function(baseline.df, cur.df.file) {
   return(result.df)
 }
 
-all_eval_releases <- c("activemq-5.2.0", "activemq-5.3.0")
+all_eval_releases <- c("activemq-5.2.0", "activemq-5.3.0", "activemq-5.8.0")
 # all_eval_releases = c('activemq-5.2.0', 'activemq-5.3.0', 'activemq-5.8.0',
 #                       'camel-2.10.0', 'camel-2.11.0' ,
 #                       'derby-10.5.1.1' , 'groovy-1_6_BETA_2' , 'hbase-0.95.2',
