@@ -30,9 +30,8 @@ save_model_dir = '../output/model/DeepLineDP/'
 
 file_lvl_gt = '../datasets/preprocessed_data/'
 
-weight_dict = {}
 
-def get_loss_weight(labels):
+def get_loss_weight(labels, weight_dict):
     '''
         input
             labels: a PyTorch tensor that contains labels
@@ -52,6 +51,7 @@ def get_loss_weight(labels):
     return weight_tensor
 
 def train_model(dataset_name, batch_size, num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, word_gru_num_layers, sent_gru_num_layers, dropout, lr, exp_name = ''):
+    weight_dict = {}
 
     loss_dir = '../output/loss/DeepLineDP/'
     actual_save_model_dir = save_model_dir+dataset_name+'/'
@@ -160,7 +160,7 @@ def train_model(dataset_name, batch_size, num_epochs, embed_dim, word_gru_hidden
             inputs_cuda, labels_cuda = inputs.cuda(), labels.cuda()
             output, _, __, ___ = model(inputs_cuda)
 
-            weight_tensor = get_loss_weight(labels)
+            weight_tensor = get_loss_weight(labels, weight_dict)
 
             criterion.weight = weight_tensor
 
