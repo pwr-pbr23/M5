@@ -34,7 +34,7 @@ torch.manual_seed(0)
 
 # model parameters
 
-batch_size = 8
+batch_size = 4
 embed_dim = 50
 hidden_dim = 64
 lr = 0.001
