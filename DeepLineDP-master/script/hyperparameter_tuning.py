@@ -10,28 +10,37 @@ args = arg.parse_args()
 
 dataset_name = args.dataset
 
-batch_size = 8
-num_epochs = 10
-max_grad_norm = 5
-embed_dim = 50
+
+# give try
+lr = 0.001                      # krok w jaki sposób się zmieniają wagi
+dropout = 0.2                   # wyższe wartości - więcej zerowanych neuronów
+num_epochs = 10                 # można spróbować wyższe
+
 word_gru_hidden_dim = 64
 sent_gru_hidden_dim = 64
 word_gru_num_layers = 1
 sent_gru_num_layers = 1
+
+embed_dim = 50                  # większa wartość może poprawić, ale kosztowna
+
+# not
+batch_size = 8 
 use_layer_norm = True
-dropout = 0.2
-lr = 0.001
+max_grad_norm = 5
 
 save_every_epochs = 1
-exp_name = ''
 
-max_train_LOC = 900
+#learning rate in range 0.001 to 0.003 
+for lr in range(1, 4):
+    lr = lr * 0.001
+    print(f'setting learning rate to {lr}')
 
-prediction_dir = '../output/prediction/DeepLineDP/'
-save_model_dir = '../output/model/DeepLineDP/'
-
-file_lvl_gt = '../datasets/preprocessed_data/'
-
-weight_dict = {}
-
-train_model(dataset_name, batch_size, num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, word_gru_num_layers, sent_gru_num_layers, dropout, lr, exp_name)
+    for num_layers in range(1, 3):
+        num_layers = num_layers
+        print(f'setting word_gru_hidden_dim to {num_layers}')
+        sent_gru_num_layers = num_layers
+        print(f'setting sent_gru_num_layers to {sent_gru_num_layers}')
+    
+        exp_name = f'lr={lr}&num_layers={num_layers}'
+        print('training model: ', exp_name)
+        train_model(dataset_name, batch_size, num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, word_gru_num_layers, sent_gru_num_layers, dropout, lr, exp_name)
