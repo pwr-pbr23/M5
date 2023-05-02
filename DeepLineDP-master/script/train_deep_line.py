@@ -135,10 +135,12 @@ def train_model(dataset_name, batch_size, num_epochs, embed_dim, word_gru_hidden
         val_loss_all_epochs = []
     
     else:
-        checkpoint_nums = [int(re.findall('\d+',s)[0]) for s in checkpoint_files]
+        checkpoint_nums = [int(re.findall('\d+', re.findall('\d+epochs',s)[0])[0]) for s in checkpoint_files]
         current_checkpoint_num = max(checkpoint_nums)
 
-        checkpoint = torch.load(actual_save_model_dir+'checkpoint_'+str(current_checkpoint_num)+'epochs.pth')
+        checkpoint_file_name = [re.sub('\d+epochs', f'{current_checkpoint_num}epochs', s) for s in checkpoint_files][0]
+
+        checkpoint = torch.load(actual_save_model_dir+checkpoint_file_name)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
