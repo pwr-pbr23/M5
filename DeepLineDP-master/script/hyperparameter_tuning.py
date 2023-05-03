@@ -45,11 +45,15 @@ def train_with_params(num_epochs, embed_dim, hidden_dim, num_layers, dropout, lr
 # may have higher value
 num_epochs = 10
 
+# determines the length of the word embedding vectors. 
+# Typically, a higher embed_dim value results in word embeddings with more expressive power, but also requires more computational resources and may lead to overfitting
+# Preprocesed data have vector of length 50
+embed_dim = 50
+
 def tune_model(
     lr_start, lr_count, lr_step, 
     dropout_start, dropout_count, dropout_step,
     num_layers_start, num_layers_count, num_layers_step, 
-    embed_dim_start, embed_dim_count, embed_dim_step, 
     hidden_dim_start, hidden_dim_count, hidden_dim_step):
     
     for num_layers in range(num_layers_start, num_layers_start + num_layers_count):
@@ -58,19 +62,15 @@ def tune_model(
         for hidden_dim in range(hidden_dim_start, hidden_dim_start + hidden_dim_count):
             hidden_dim = int(hidden_dim * hidden_dim_step)
 
-            for embed_dim in range(embed_dim_start, embed_dim_start + embed_dim_count):
-                embed_dim = int(embed_dim * embed_dim_step)
-                print(f'setting embed_dim to {embed_dim}')
-            
-                for dropout in range(dropout_start, dropout_start + dropout_count):
-                    dropout = dropout * dropout_step
-                    print(f'setting dropout to {dropout}')
+            for dropout in range(dropout_start, dropout_start + dropout_count):
+                dropout = dropout * dropout_step
+                print(f'setting dropout to {dropout}')
 
-                    for lr in range(lr_start, lr_start + lr_count):
-                        lr = lr * lr_step
-                        print(f'setting learning rate to {lr}')
+                for lr in range(lr_start, lr_start + lr_count):
+                    lr = lr * lr_step
+                    print(f'setting learning rate to {lr}')
 
-                        train_with_params(num_epochs, embed_dim, hidden_dim, num_layers, dropout, lr)
+                    train_with_params(num_epochs, embed_dim, hidden_dim, num_layers, dropout, lr)
 
 
 # learning rate is the step by which the weights in the model change
@@ -85,13 +85,6 @@ lr_step = 0.0005
 dropout_start = 1
 dropout_count = 6
 dropout_step = 0.05
-
-# determines the length of the word embedding vectors. 
-# Typically, a higher embed_dim value results in word embeddings with more expressive power, but also requires more computational resources and may lead to overfitting
-# embed dim in range 50 to 100 
-embed_dim_start = 2
-embed_dim_count = 3
-embed_dim_step = 25
 
 # The Hierarchical Attention Network consists of two levels of attention mechanisms to capture the importance of different parts of the text.
     # word_gru_num_layers 
@@ -121,5 +114,4 @@ tune_model(
     lr_start, lr_count, lr_step, 
     dropout_start, dropout_count, dropout_step, 
     num_layers_start, num_layers_count, num_layers_step,
-    embed_dim_start, embed_dim_count, embed_dim_step, 
     hidden_dim_start, hidden_dim_count, hidden_dim_step)
