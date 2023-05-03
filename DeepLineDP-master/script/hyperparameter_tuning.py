@@ -16,6 +16,7 @@ dataset_name = args.dataset
 # sent_gru_num_layers = 1
 
 # give try
+# check warning
 dropout = 0.2                   # wyższe wartości - więcej zerowanych neuronów
 num_epochs = 10                 # można spróbować wyższe
 
@@ -26,7 +27,7 @@ sent_gru_hidden_dim = 64
 embed_dim = 50                  # większa wartość może poprawić, ale kosztowna
 
 # not
-batch_size = 8 
+batch_size = 8
 use_layer_norm = True
 max_grad_norm = 5
 
@@ -38,6 +39,10 @@ for lr in range(1, 4):
     print(f'setting learning rate to {lr}')
 
     for num_layers in range(1, 3):
+        if num_layers > 1:
+            actual_batch_size = batch_size / 2
+        else:
+            actual_batch_size = batch_size
         word_gru_num_layers = num_layers
         print(f'setting word_gru_num_layers to {num_layers}')
         sent_gru_num_layers = num_layers
@@ -45,4 +50,4 @@ for lr in range(1, 4):
     
         exp_name = f'lr={lr}&num_layers={num_layers}'
         print('training model: ', exp_name)
-        train_model(dataset_name, batch_size, num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, word_gru_num_layers, sent_gru_num_layers, dropout, lr, exp_name)
+        train_model(dataset_name, actual_batch_size, num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, word_gru_num_layers, sent_gru_num_layers, dropout, lr, exp_name)

@@ -53,12 +53,12 @@ def get_loss_weight(labels, weight_dict):
 def train_model(dataset_name, batch_size, num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, word_gru_num_layers, sent_gru_num_layers, dropout, lr, exp_name = ''):
     weight_dict = {}
 
-    loss_dir = '../output/loss/DeepLineDP/'
+    loss_dir = '../output/loss/DeepLineDP/' + dataset_name + '/'
     actual_save_model_dir = save_model_dir+dataset_name+'/'
 
     if not exp_name == '':
         actual_save_model_dir = actual_save_model_dir+exp_name+'/'
-        loss_dir = loss_dir + exp_name
+        loss_dir = loss_dir + exp_name + '/'
 
     if not os.path.exists(actual_save_model_dir):
         os.makedirs(actual_save_model_dir)
@@ -119,7 +119,7 @@ def train_model(dataset_name, batch_size, num_epochs, embed_dim, word_gru_hidden
 
     criterion = nn.BCELoss()
 
-    checkpoint_files = os.listdir(actual_save_model_dir)
+    checkpoint_files = [file for file in os.listdir(actual_save_model_dir) if os.path.isfile(os.path.join(actual_save_model_dir, file))] 
 
     if '.ipynb_checkpoints' in checkpoint_files:
         checkpoint_files.remove('.ipynb_checkpoints')
@@ -135,6 +135,7 @@ def train_model(dataset_name, batch_size, num_epochs, embed_dim, word_gru_hidden
         val_loss_all_epochs = []
     
     else:
+        print(f'total_checkpoints={total_checkpoints}')
         checkpoint_nums = [int(re.findall('\d+', re.findall('\d+epochs',s)[0])[0]) for s in checkpoint_files]
         current_checkpoint_num = max(checkpoint_nums)
 
