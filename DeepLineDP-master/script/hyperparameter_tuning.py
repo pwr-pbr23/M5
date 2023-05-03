@@ -40,7 +40,12 @@ def calculate_batch_size(num_layers):
     else:
         return batch_size
 
-def train_with_params(num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, word_gru_num_layers, sent_gru_num_layers, dropout, lr):
+def train_with_params(num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, num_layers, dropout, lr):
+    word_gru_num_layers = int(num_layers * num_layers_step)
+    print(f'setting word_gru_num_layers to {num_layers}')
+    sent_gru_num_layers = int(num_layers * num_layers_step)
+    print(f'setting sent_gru_num_layers to {sent_gru_num_layers}')
+    
     actual_batch_size = calculate_batch_size(num_layers)
     print(f'setting batch_size to {actual_batch_size}')
 
@@ -48,20 +53,33 @@ def train_with_params(num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidde
     print('training model: ', exp_name)
     train_model(dataset_name, actual_batch_size, num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, word_gru_num_layers, sent_gru_num_layers, dropout, lr, exp_name)
 
-#learning rate in range 0.005 to 0.003 
-for lr in range(1, 7):
-    lr = lr * 0.0005
-    print(f'setting learning rate to {lr}')
+def tune_model(lr_start, lr_count, lr_step, dropout_start, dropout_count, dropout_step, num_layers_start, num_layers_count, num_layers_step):
+    for lr in range(lr_start, lr_start + lr_count):
+        lr = lr * lr_step
+        print(f'setting learning rate to {lr}')
 
-    #dropout in range 0.05 to 0.03 
-    for dropout in range(1,7):
-        dropout = dropout * 0.05
-        print(f'setting dropout to {dropout}')
+        for dropout in range(dropout_start, dropout_start + dropout_count):
+            dropout = dropout * dropout_step
+            print(f'setting dropout to {dropout}')
 
-        for num_layers in range(1, 3):
-            word_gru_num_layers = num_layers
-            print(f'setting word_gru_num_layers to {num_layers}')
-            sent_gru_num_layers = num_layers
-            print(f'setting sent_gru_num_layers to {sent_gru_num_layers}')
+            for num_layers in range(num_layers_start, num_layers_start + num_layers_count):
+                num_layers = int(num_layers * num_layers_step)
+                
+                train_with_params(num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, num_layers, dropout, lr)
 
-            train_with_params(num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, word_gru_num_layers, sent_gru_num_layers, dropout, lr)
+# learning rate in range 0.005 to 0.003 
+lr_start = 1
+lr_count = 6
+lr_step = 0.0005
+
+# dropout in range 0.05 to 0.03 
+dropout_start = 1
+dropout_count = 6
+dropout_step = 0.05
+
+# num layers in range 1 to 2
+num_layers_start = 1
+num_layers_count = 2
+num_layers_step = 1
+
+tune_model(lr_start, lr_count, lr_step, dropout_start, dropout_count, dropout_step, num_layers_start, num_layers_count, num_layers_step)
