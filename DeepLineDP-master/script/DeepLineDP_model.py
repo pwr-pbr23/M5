@@ -27,7 +27,7 @@ class HierarchicalAttentionNetwork(nn.Module):
         self.fc = nn.Linear(2 * sent_gru_hidden_dim, 1)
         self.sig = nn.Sigmoid()
 
-        self.use_layer_nome = use_layer_norm
+        self.use_layer_norm = use_layer_norm
         self.dropout = dropout
 
     def forward(self, code_tensor):
