@@ -24,7 +24,12 @@ def calculate_batch_size(num_layers):
     else:
         return batch_size
 
-def train_with_params(num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, num_layers, dropout, lr):
+def train_with_params(num_epochs, embed_dim, hidden_dim, num_layers, dropout, lr):
+    word_gru_hidden_dim = hidden_dim
+    print(f'setting word_gru_hidden_dim to {word_gru_hidden_dim}')
+    sent_gru_hidden_dim = hidden_dim
+    print(f'setting sent_gru_hidden_dim to {sent_gru_hidden_dim}')
+
     word_gru_num_layers = int(num_layers * num_layers_step)
     print(f'setting word_gru_num_layers to {num_layers}')
     sent_gru_num_layers = int(num_layers * num_layers_step)
@@ -33,11 +38,11 @@ def train_with_params(num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidde
     actual_batch_size = calculate_batch_size(num_layers)
     print(f'setting batch_size to {actual_batch_size}')
 
-    exp_name = f'lr={lr}&dropout={dropout}&embed_dim={embed_dim}&num_layers={num_layers}'
+    exp_name = f'lr={lr}&dropout={dropout}&embed_dim={embed_dim}&hidden_dim={hidden_dim}&num_layers={num_layers}'
     print('training model: ', exp_name)
     train_model(dataset_name, actual_batch_size, num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, word_gru_num_layers, sent_gru_num_layers, dropout, lr, exp_name)
 
-# try higher values
+# may have higher value
 num_epochs = 10
 
 def tune_model(
@@ -45,28 +50,27 @@ def tune_model(
     dropout_start, dropout_count, dropout_step,
     num_layers_start, num_layers_count, num_layers_step, 
     embed_dim_start, embed_dim_count, embed_dim_step, 
-    hidden_dim):
+    hidden_dim_start, hidden_dim_count, hidden_dim_step):
     
-    # TODO: Tune
-    word_gru_hidden_dim = hidden_dim
-    sent_gru_hidden_dim = hidden_dim
-
     for num_layers in range(num_layers_start, num_layers_start + num_layers_count):
         num_layers = int(num_layers * num_layers_step)
 
-        for embed_dim in range(embed_dim_start, embed_dim_start + embed_dim_count):
-            embed_dim = int(embed_dim * embed_dim_step)
-            print(f'setting embed_dim to {embed_dim}')
-        
-            for dropout in range(dropout_start, dropout_start + dropout_count):
-                dropout = dropout * dropout_step
-                print(f'setting dropout to {dropout}')
+        for hidden_dim in range(hidden_dim_start, hidden_dim_start + hidden_dim_count):
+            hidden_dim = int(hidden_dim * hidden_dim_step)
 
-                for lr in range(lr_start, lr_start + lr_count):
-                    lr = lr * lr_step
-                    print(f'setting learning rate to {lr}')
+            for embed_dim in range(embed_dim_start, embed_dim_start + embed_dim_count):
+                embed_dim = int(embed_dim * embed_dim_step)
+                print(f'setting embed_dim to {embed_dim}')
+            
+                for dropout in range(dropout_start, dropout_start + dropout_count):
+                    dropout = dropout * dropout_step
+                    print(f'setting dropout to {dropout}')
 
-                    train_with_params(num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, num_layers, dropout, lr)
+                    for lr in range(lr_start, lr_start + lr_count):
+                        lr = lr * lr_step
+                        print(f'setting learning rate to {lr}')
+
+                        train_with_params(num_epochs, embed_dim, hidden_dim, num_layers, dropout, lr)
 
 
 # learning rate is the step by which the weights in the model change
@@ -102,18 +106,20 @@ num_layers_start = 1
 num_layers_count = 2
 num_layers_step = 1
 
-# TODO: give try
 # The Hierarchical Attention Network consists of two levels of attention mechanisms to capture the importance of different parts of the text.
     # can potentially allow the model to learn more complex representations of the input text, but it can also increase the computational cost of training and may make the model more prone to overfitting.
     # word_gru_hidden_dim
         # refers to the number of hidden units in the gated recurrent unit (GRU) network used to process the word-level inputs.
     # sent_gru_hidden_dim
         # refers to the number of hidden units in the gated recurrent unit (GRU) network used to process the sentence-level inputs.
-hidden_dim = 64
+# hidden dim in range 32 to 128
+hidden_dim_start = 1
+hidden_dim_count = 4
+hidden_dim_step = 32
 
 tune_model(
     lr_start, lr_count, lr_step, 
     dropout_start, dropout_count, dropout_step, 
     num_layers_start, num_layers_count, num_layers_step,
     embed_dim_start, embed_dim_count, embed_dim_step, 
-    hidden_dim)
+    hidden_dim_start, hidden_dim_count, hidden_dim_step)
