@@ -33,16 +33,19 @@ def train_with_params(num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidde
     actual_batch_size = calculate_batch_size(num_layers)
     print(f'setting batch_size to {actual_batch_size}')
 
-    exp_name = f'lr={lr}&dropout={dropout}&num_layers={num_layers}'
+    exp_name = f'lr={lr}&dropout={dropout}&embed_dim={embed_dim}&num_layers={num_layers}'
     print('training model: ', exp_name)
     train_model(dataset_name, actual_batch_size, num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, word_gru_num_layers, sent_gru_num_layers, dropout, lr, exp_name)
 
 # try higher values
 num_epochs = 10
 
-def tune_model(lr_start, lr_count, lr_step, dropout_start, dropout_count, dropout_step, num_layers_start, num_layers_count, num_layers_step, embed_dim, hidden_dim):
-    # TODO: Tune
-    embed_dim = embed_dim
+def tune_model(
+    lr_start, lr_count, lr_step, 
+    dropout_start, dropout_count, dropout_step,
+    num_layers_start, num_layers_count, num_layers_step, 
+    embed_dim_start, embed_dim_count, embed_dim_step, 
+    hidden_dim):
     
     # TODO: Tune
     word_gru_hidden_dim = hidden_dim
@@ -50,16 +53,20 @@ def tune_model(lr_start, lr_count, lr_step, dropout_start, dropout_count, dropou
 
     for num_layers in range(num_layers_start, num_layers_start + num_layers_count):
         num_layers = int(num_layers * num_layers_step)
+
+        for embed_dim in range(embed_dim_start, embed_dim_start + embed_dim_count):
+            embed_dim = int(embed_dim * embed_dim_step)
+            print(f'setting embed_dim to {embed_dim}')
         
-        for dropout in range(dropout_start, dropout_start + dropout_count):
-            dropout = dropout * dropout_step
-            print(f'setting dropout to {dropout}')
+            for dropout in range(dropout_start, dropout_start + dropout_count):
+                dropout = dropout * dropout_step
+                print(f'setting dropout to {dropout}')
 
-            for lr in range(lr_start, lr_start + lr_count):
-                lr = lr * lr_step
-                print(f'setting learning rate to {lr}')
+                for lr in range(lr_start, lr_start + lr_count):
+                    lr = lr * lr_step
+                    print(f'setting learning rate to {lr}')
 
-                train_with_params(num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, num_layers, dropout, lr)
+                    train_with_params(num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, num_layers, dropout, lr)
 
 
 # learning rate is the step by which the weights in the model change
@@ -75,10 +82,12 @@ dropout_start = 1
 dropout_count = 6
 dropout_step = 0.05
 
-# TODO: give try values between 50 to 300
 # determines the length of the word embedding vectors. 
 # Typically, a higher embed_dim value results in word embeddings with more expressive power, but also requires more computational resources and may lead to overfitting
-embed_dim = 50
+# embed dim in range 50 to 100 
+embed_dim_start = 2
+embed_dim_count = 3
+embed_dim_step = 25
 
 # The Hierarchical Attention Network consists of two levels of attention mechanisms to capture the importance of different parts of the text.
     # word_gru_num_layers 
@@ -102,4 +111,9 @@ num_layers_step = 1
         # refers to the number of hidden units in the gated recurrent unit (GRU) network used to process the sentence-level inputs.
 hidden_dim = 64
 
-tune_model(lr_start, lr_count, lr_step, dropout_start, dropout_count, dropout_step, num_layers_start, num_layers_count, num_layers_step, embed_dim, hidden_dim)
+tune_model(
+    lr_start, lr_count, lr_step, 
+    dropout_start, dropout_count, dropout_step, 
+    num_layers_start, num_layers_count, num_layers_step,
+    embed_dim_start, embed_dim_count, embed_dim_step, 
+    hidden_dim)
