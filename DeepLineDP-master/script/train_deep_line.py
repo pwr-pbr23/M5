@@ -30,6 +30,7 @@ save_model_dir = '../output/model/DeepLineDP/'
 
 file_lvl_gt = '../datasets/preprocessed_data/'
 
+word2vec_dictionary = {}
 
 def get_loss_weight(labels, weight_dict):
     '''
@@ -84,8 +85,13 @@ def train_model(dataset_name, batch_size, num_epochs, embed_dim, word_gru_hidden
 
     word2vec_file_dir = os.path.join(w2v_dir,dataset_name+'-'+str(embed_dim)+'dim.bin')
 
-    word2vec = Word2Vec.load(word2vec_file_dir)
-    print('load Word2Vec for',dataset_name,'finished')
+    if word2vec_file_dir in word2vec_dictionary:
+        word2vec = word2vec_dictionary[word2vec_file_dir]
+        print('get Word2Vec for',dataset_name,'from cache')
+    else:
+        word2vec = Word2Vec.load(word2vec_file_dir)
+        print('load Word2Vec for',dataset_name,'finished')
+        word2vec_dictionary[word2vec_file_dir] = word2vec
 
     word2vec_weights = get_w2v_weight_for_deep_learning_models(word2vec, embed_dim)
 
