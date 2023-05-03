@@ -10,16 +10,18 @@ args = arg.parse_args()
 
 dataset_name = args.dataset
 
+# describe
+# lr = 0.001                      # krok w jaki sposób się zmieniają wagi
+# word_gru_num_layers = 1
+# sent_gru_num_layers = 1
 
 # give try
-lr = 0.001                      # krok w jaki sposób się zmieniają wagi
 dropout = 0.2                   # wyższe wartości - więcej zerowanych neuronów
 num_epochs = 10                 # można spróbować wyższe
 
 word_gru_hidden_dim = 64
 sent_gru_hidden_dim = 64
-word_gru_num_layers = 1
-sent_gru_num_layers = 1
+
 
 embed_dim = 50                  # większa wartość może poprawić, ale kosztowna
 
@@ -36,8 +38,8 @@ for lr in range(1, 4):
     print(f'setting learning rate to {lr}')
 
     for num_layers in range(1, 3):
-        num_layers = num_layers
-        print(f'setting word_gru_hidden_dim to {num_layers}')
+        word_gru_num_layers = num_layers
+        print(f'setting word_gru_num_layers to {num_layers}')
         sent_gru_num_layers = num_layers
         print(f'setting sent_gru_num_layers to {sent_gru_num_layers}')
     
