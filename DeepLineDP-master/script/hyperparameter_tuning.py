@@ -35,12 +35,18 @@ def train_with_params(num_epochs, embed_dim, hidden_dim, num_layers, dropout, lr
     sent_gru_num_layers = int(num_layers * num_layers_step)
     print(f'setting sent_gru_num_layers to {sent_gru_num_layers}')
     
-    actual_batch_size = calculate_batch_size(num_layers)
-    print(f'setting batch_size to {actual_batch_size}')
+    actual_batch_size = batch_size
+    succeded = False
 
     exp_name = f'lr={lr}&dropout={dropout}&embed_dim={embed_dim}&hidden_dim={hidden_dim}&num_layers={num_layers}'
-    print('training model: ', exp_name)
-    train_model(dataset_name, actual_batch_size, num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, word_gru_num_layers, sent_gru_num_layers, dropout, lr, exp_name)
+    while not succeded:
+        print('training model: ', exp_name)
+        try:
+            train_model(dataset_name, actual_batch_size, num_epochs, embed_dim, word_gru_hidden_dim, sent_gru_hidden_dim, word_gru_num_layers, sent_gru_num_layers, dropout, lr, exp_name)
+            succeded = True
+        except:
+            actual_batch_size = int(batch_size / 2)
+        
 
 # may have higher value
 num_epochs = 10
