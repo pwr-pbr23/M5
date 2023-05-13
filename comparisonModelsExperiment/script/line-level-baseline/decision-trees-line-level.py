@@ -102,9 +102,9 @@ def train_and_predict(dataset_name, classifierName, Classifier, params):
 def hyperparameters_tuning(dataset_name, Classifier, params_grid):
     word2vec = get_W2V(dataset_name)
     X_train, y_train = get_XY_train(dataset_name, word2vec)    
-    clfSearch = Classifier()
-    searchCV = RandomizedSearchCV(
-        estimator=clfSearch,
+    clf_search = Classifier()
+    search_cv = RandomizedSearchCV(
+        estimator=clf_search,
         param_distributions=params_grid,
         scoring='accuracy',
         n_iter=25,
@@ -112,29 +112,32 @@ def hyperparameters_tuning(dataset_name, Classifier, params_grid):
         verbose=1
     )
     
-    searchCV.fit(X_train, y_train)
-    return searchCV.best_params_
+    search_cv.fit(X_train, y_train)
+    return search_cv.best_params_
+
+def dict_to_csv(dict, path):
+    pd.DataFrame.from_dict(dict).to_csv(path, index=False)
 
 rf_params_grid = {
-    "n_estimators": np.arange(10, 100, 10),
-    "max_depth": [None, 3, 5, 10],
+    "n_estimators": np.array([10, 50, 200, 1000]),
+    "max_depth": np.array([3, 7, 12, 15]),
     "min_samples_split": np.arange(2, 20, 2),
     "min_samples_leaf": np.arange(1, 20, 2),
-    "max_features": [0.5, 1, "sqrt"],
-    "max_samples": [10000]
+    "max_features": np.array([1, "sqrt"]),
+    "max_samples": np.array([10000])
 }
 
 # https://xgboost.readthedocs.io/en/stable/parameter.html
 xgb_params_grid = {    
     "objective": ["binary:logistic", "reg:logistic", "count:poisson"],
+    "n_estimators": np.array([10, 50, 200, 1000]),
     "tree_method": ["hist"],
-    "eta": [0.1, 0.3, 0.9],
-    'max_depth': [3, 6, 10, 15],
-    'learning_rate': [0.01, 0.1, 0.2, 0.3, 0.4],
+    "eta": np.array([0.1, 0.3, 0.9]),
+    "max_depth": np.array([3, 7, 12, 15]),
+    "learning_rate": np.arange(0.2, 0.9, 0.1),
     'subsample': np.arange(0.5, 1.0, 0.1),
     'colsample_bytree': np.arange(0.5, 1.0, 0.1),
     'colsample_bylevel': np.arange(0.5, 1.0, 0.1),
-    'n_estimators': np.arange(10, 100, 10),
 }
 
 # https://lightgbm.readthedocs.io/en/latest/Parameters-Tuning.html
@@ -153,21 +156,23 @@ lgbm_params_grid = {
     "feature_fraction": np.arange(0.2, 0.95, 0.1)
 }
 
-classifierByName = {
+classifier_by_name = {
     "RF": { "classifier": RandomForestClassifier, "params_grid": rf_params_grid },
     "XGB": { "classifier": XGBClassifier, "params_grid": xgb_params_grid },
     "LGBM": { "classifier": LGBMClassifier, "params_grid": lgbm_params_grid }
 }
 
 default_proj_name = "activemq"
-proj_name = sys.argv[1] or default_proj_name
+proj_name = sys.argv[1] if sys.argv.length > 0 else default_proj_name
 results = { "RF": {}, "XGB": {}, "LGBM": {} }
+results_path = "../../output/decision-tree-best-params.csv"
 
-for classifierName in classifierByName.keys():
-    Classifier = classifierByName[classifierName]["classifier"]
-    best_params = hyperparameters_tuning(proj_name, Classifier, classifierByName[classifierName]["params_grid"])
+for classifier_name in classifier_by_name.keys():
+    Classifier = classifier_by_name[classifier_name]["classifier"]
+    best_params = hyperparameters_tuning(proj_name, Classifier, classifier_by_name[classifier_name]["params_grid"])
     print(best_params, "best params")
-    results[classifierName]["best_params"] = best_params
-    train_and_predict(proj_name, classifierName, Classifier, best_params)
+    results[classifier_name]["best_params"] = best_params
+    train_and_predict(proj_name, classifier_name, Classifier, best_params)
 
+dict_to_csv(results, results_path)
 print(results, "Best params")
