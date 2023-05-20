@@ -126,7 +126,7 @@ all_eval_releases <- c("activemq-5.2.0", "activemq-5.3.0", "activemq-5.8.0")
 df_all[df_all$is.comment.line == "True", ]$token.attention.score <- 0
 
 TOP_K = 1500
-TRESHOLD = 0.8
+TRESHOLD = 0.9
 
 tmp.top.k <- get.top.k.tokens(df_all, TOP_K)
 tmp.top.treshold <- get.top.treshold.tokens(df_all, TRESHOLD)
@@ -238,8 +238,9 @@ deepline_treshold.dp.line.result <- data.frame(deeplinedp_treshold.ifa, deepline
 names(deepline_k.dp.line.result) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
 names(deepline_treshold.dp.line.result) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
 
-deepline_k.dp.line.result$technique <- "DeepLineDP top "
-deepline_treshold.dp.line.result$technique <- "DeepLineDP treshold "
+deepline_k.dp.line.result$technique <- paste("DeepLineDP top ", TOP_K)
+deepline_treshold.dp.line.result$technique <- paste("DeepLineDP treshold ", TRESHOLD)
+
 all.line.result <- rbind(deepline_k.dp.line.result, deepline_treshold.dp.line.result)
 
 recall.result.df <- select(all.line.result, c("technique", "Recall20%LOC"))
