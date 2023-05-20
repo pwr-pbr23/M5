@@ -41,6 +41,18 @@ get.top.k.tokens <- function(df, k) {
   return(top.k)
 }
 
+get.top.treshold.tokens <- function(df, treshold) {
+  top.k <- df %>%
+    filter(is.comment.line == "False" & file.level.ground.truth == "True" & prediction.label == "True" & token.attention.score > treshold) %>%
+    group_by(test, filename) %>%
+    select("project", "train", "test", "filename", "token") %>%
+    distinct()
+
+  top.k$flag <- "topk"
+
+  return(top.k)
+}
+
 
 prediction_dir <- "../output/prediction/DeepLineDP/within-release/"
 
@@ -163,6 +175,7 @@ for (rel in all_eval_releases)
 df_all[df_all$is.comment.line == "True", ]$token.attention.score <- 0
 
 tmp.top.k <- get.top.k.tokens(df_all, 1500)
+tmp.top.treshold <- get.top.treshold.tokens(df_all, 0.8)
 
 merged_df_all <- merge(df_all, tmp.top.k, by = c("project", "train", "test", "filename", "token"), all.x = TRUE)
 
@@ -221,7 +234,7 @@ names(deepline.dp.line.result) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
 rf.result.df$technique <- "RF"
 xgb.result.df$technique <- "XGB"
 lgbm.result.df$technique <- "LGBM"
-deepline.dp.line.result$technique <- "DeepLineDP"
+deepline.dp.line.result$technique <- "DeepLineDP top 1500"
 all.line.result <- rbind(rf.result.df, xgb.result.df, lgbm.result.df, deepline.dp.line.result)
 # all.line.result = rbind(rf.result.df, n.gram.result.df, error.prone.result.df, deepline.dp.line.result)
 
