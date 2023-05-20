@@ -28,11 +28,11 @@ preprocess <- function(x, reverse) {
   return(x)
 }
 
-get.top.k.tokens <- function(df, k) {
+get.top.k.tokens <- function(df, value) {
   top.k <- df %>%
     filter(is.comment.line == "False" & file.level.ground.truth == "True" & prediction.label == "True") %>%
     group_by(test, filename) %>%
-    top_n(k, token.attention.score) %>%
+    top_n(value, token.attention.score) %>%
     select("project", "train", "test", "filename", "token") %>%
     distinct()
 
@@ -41,9 +41,9 @@ get.top.k.tokens <- function(df, k) {
   return(top.k)
 }
 
-get.top.treshold.tokens <- function(df, treshold) {
+get.top.treshold.tokens <- function(df, value) {
   top.k <- df %>%
-    filter(is.comment.line == "False" & file.level.ground.truth == "True" & prediction.label == "True" & token.attention.score > treshold) %>%
+    filter(is.comment.line == "False" & file.level.ground.truth == "True" & prediction.label == "True" & token.attention.score > value) %>%
     group_by(test, filename) %>%
     select("project", "train", "test", "filename", "token") %>%
     distinct()
@@ -126,122 +126,99 @@ all_eval_releases <- c("activemq-5.2.0", "activemq-5.3.0", "activemq-5.8.0")
 df_all[df_all$is.comment.line == "True", ]$token.attention.score <- 0
 
 TOP_K = 1500
-TRESHOLD = 0.9
+TRESHOLD085 = 0.85
+TRESHOLD090 = 0.9
+TRESHOLD095 = 0.95
 
-tmp.top.k <- get.top.k.tokens(df_all, TOP_K)
-tmp.top.treshold <- get.top.treshold.tokens(df_all, TRESHOLD)
+strategy_name_1 <- paste("DeepLineDP top ", TOP_K)
+strategy_name_2 <- paste("DeepLineDP treshold ", TRESHOLD085)
+strategy_name_3 <- paste("DeepLineDP treshold ", TRESHOLD090)
+strategy_name_4 <- paste("DeepLineDP treshold ", TRESHOLD095)
 
-# tmp_tops <- list(
-#   c(tmp.top.k, 'DeepLineDP top K'),
-#   c(tmp.top.k, 'DeepLineDP TRESHOLD'),
-# )
+tmp_tops <- list(
+  c(strategy_name_1, TOP_K, get.top.k.tokens),
+  c(strategy_name_2, TRESHOLD085, get.top.treshold.tokens),
+  c(strategy_name_3, TRESHOLD090, get.top.treshold.tokens),
+  c(strategy_name_4, TRESHOLD095, get.top.treshold.tokens)
+)
 
-# for (top_tokens in tmp_tops) {
-#   # Access the elements of each tuple
-#   tokens <- tuple[1]
-#   name <- tuple[2]
-  
-#   # Print the elements
-#   print(element2)
-# }
+stats_list <- list(strategy1 = 1, strategy2 = 2)
 
-merged_df_all_k <- merge(df_all, tmp.top.k, by = c("project", "train", "test", "filename", "token"), all.x = TRUE)
-merged_df_all_treshold <- merge(df_all, tmp.top.treshold, by = c("project", "train", "test", "filename", "token"), all.x = TRUE)
+for (tokens_name in tmp_tops) {
+  # Access the elements of each tuple
+  name <- tokens_name[[1]]
+  value <- tokens_name[[2]]
+  factory <- tokens_name[[3]]
 
-merged_df_all_k[is.na(merged_df_all_k$flag), ]$token.attention.score <- 0
-merged_df_all_treshold[is.na(merged_df_all_treshold$flag), ]$token.attention.score <- 0
+  print(paste("name: ", name))
+  print(paste("value: ", value))
 
-## use top-k tokens
-sum_line_attn_k <- merged_df_all_k %>%
-  filter(file.level.ground.truth == "True" & prediction.label == "True") %>%
-  group_by(test, filename, is.comment.line, file.level.ground.truth, prediction.label, line.number, line.level.ground.truth) %>%
-  summarize(attention_score = sum(token.attention.score), num_tokens = n())
+  tmp.top.k <- do.call(factory, args = list(df = df_all, value = value))
 
-sum_line_attn_treshold <- merged_df_all_treshold %>%
-  filter(file.level.ground.truth == "True" & prediction.label == "True") %>%
-  group_by(test, filename, is.comment.line, file.level.ground.truth, prediction.label, line.number, line.level.ground.truth) %>%
-  summarize(attention_score = sum(token.attention.score), num_tokens = n())
+  print("got tokens")
 
-sorted_k <- sum_line_attn_k %>%
-  group_by(test, filename) %>%
-  arrange(-attention_score, .by_group = TRUE) %>%
-  mutate(order = row_number())
+  merged_df_all <- merge(df_all, tmp.top.k, by = c("project", "train", "test", "filename", "token"), all.x = TRUE)
 
-sorted_treshold <- sum_line_attn_treshold %>%
-  group_by(test, filename) %>%
-  arrange(-attention_score, .by_group = TRUE) %>%
-  mutate(order = row_number())
+  merged_df_all[is.na(merged_df_all$flag), ]$token.attention.score <- 0
 
-## get result from DeepLineDP
-# calculate IFA
-IFA_k <- sorted_k %>%
-  filter(line.level.ground.truth == "True") %>%
-  group_by(test, filename) %>%
-  top_n(1, -order)
+  ## use top-k tokens
+  sum_line_attn <- merged_df_all %>%
+    filter(file.level.ground.truth == "True" & prediction.label == "True") %>%
+    group_by(test, filename, is.comment.line, file.level.ground.truth, prediction.label, line.number, line.level.ground.truth) %>%
+    summarize(attention_score = sum(token.attention.score), num_tokens = n())
 
-IFA_treshold <- sorted_treshold %>%
-  filter(line.level.ground.truth == "True") %>%
-  group_by(test, filename) %>%
-  top_n(1, -order)
+  sorted <- sum_line_attn %>%
+    group_by(test, filename) %>%
+    arrange(-attention_score, .by_group = TRUE) %>%
+    mutate(order = row_number())
 
-total_true_k <- sorted_k %>%
-  group_by(test, filename) %>%
-  summarize(total_true = sum(line.level.ground.truth == "True"))
+  ## get result from DeepLineDP
+  # calculate IFA
+  IFA <- sorted %>%
+    filter(line.level.ground.truth == "True") %>%
+    group_by(test, filename) %>%
+    top_n(1, -order)
 
-total_true_treshold <- sorted_treshold %>%
-  group_by(test, filename) %>%
-  summarize(total_true = sum(line.level.ground.truth == "True"))
+  print(paste("calculated IFA: ", name))
 
-# calculate Recall20%LOC
-recall20LOC_k <- sorted_k %>%
-  group_by(test, filename) %>%
-  mutate(effort = round(order / n(), digits = 2)) %>%
-  filter(effort <= 0.2) %>%
-  summarize(correct_pred = sum(line.level.ground.truth == "True")) %>%
-  merge(total_true_k) %>%
-  mutate(recall20LOC = correct_pred / total_true)
+  total_true <- sorted %>%
+    group_by(test, filename) %>%
+    summarize(total_true = sum(line.level.ground.truth == "True"))
 
-recall20LOC_treshold <- sorted_treshold %>%
-  group_by(test, filename) %>%
-  mutate(effort = round(order / n(), digits = 2)) %>%
-  filter(effort <= 0.2) %>%
-  summarize(correct_pred = sum(line.level.ground.truth == "True")) %>%
-  merge(total_true_treshold) %>%
-  mutate(recall20LOC = correct_pred / total_true)
+  # calculate Recall20%LOC
+  recall20LOC <- sorted %>%
+    group_by(test, filename) %>%
+    mutate(effort = round(order / n(), digits = 2)) %>%
+    filter(effort <= 0.2) %>%
+    summarize(correct_pred = sum(line.level.ground.truth == "True")) %>%
+    merge(total_true) %>%
+    mutate(recall20LOC = correct_pred / total_true)
 
-# calculate Effort20%Recall
-effort20Recall_k <- sorted_k %>%
-  merge(total_true_k) %>%
-  group_by(test, filename) %>%
-  mutate(cummulative_correct_pred = cumsum(line.level.ground.truth == "True"), recall = round(cumsum(line.level.ground.truth == "True") / total_true, digits = 2)) %>%
-  summarise(effort20Recall = sum(recall <= 0.2) / n())
+  print(paste("calculated Recall20: ", name))
 
-effort20Recall_treshold <- sorted_treshold %>%
-  merge(total_true_treshold) %>%
-  group_by(test, filename) %>%
-  mutate(cummulative_correct_pred = cumsum(line.level.ground.truth == "True"), recall = round(cumsum(line.level.ground.truth == "True") / total_true, digits = 2)) %>%
-  summarise(effort20Recall = sum(recall <= 0.2) / n())
+  # calculate Effort20%Recall
+  effort20Recall <- sorted %>%
+    merge(total_true) %>%
+    group_by(test, filename) %>%
+    mutate(cummulative_correct_pred = cumsum(line.level.ground.truth == "True"), recall = round(cumsum(line.level.ground.truth == "True") / total_true, digits = 2)) %>%
+    summarise(effort20Recall = sum(recall <= 0.2) / n())
 
-## prepare data for plotting
-deeplinedp_k.ifa <- IFA_k$order
-deeplinedp_k.recall <- recall20LOC_k$recall20LOC
-deeplinedp_k.effort <- effort20Recall_k$effort20Recall
+  print(paste("calculated Effort20: ", name))
 
-deepline_k.dp.line.result <- data.frame(deeplinedp_k.ifa, deeplinedp_k.recall, deeplinedp_k.effort)
+  ## prepare data for plotting
+  deeplinedp.ifa <- IFA$order
+  deeplinedp.recall <- recall20LOC$recall20LOC
+  deeplinedp.effort <- effort20Recall$effort20Recall
 
-deeplinedp_treshold.ifa <- IFA_treshold$order
-deeplinedp_treshold.recall <- recall20LOC_treshold$recall20LOC
-deeplinedp_treshold.effort <- effort20Recall_treshold$effort20Recall
+  deepline.dp.line.result <- data.frame(deeplinedp.ifa, deeplinedp.recall, deeplinedp.effort)
+  names(deepline.dp.line.result) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
+  deepline.dp.line.result$technique <- name
+  stats_list[[name]] <- deepline.dp.line.result
 
-deepline_treshold.dp.line.result <- data.frame(deeplinedp_treshold.ifa, deeplinedp_treshold.recall, deeplinedp_treshold.effort)
+  print(paste("added to stats_list: ", name))
+}
 
-names(deepline_k.dp.line.result) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
-names(deepline_treshold.dp.line.result) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
-
-deepline_k.dp.line.result$technique <- paste("DeepLineDP top ", TOP_K)
-deepline_treshold.dp.line.result$technique <- paste("DeepLineDP treshold ", TRESHOLD)
-
-all.line.result <- rbind(deepline_k.dp.line.result, deepline_treshold.dp.line.result)
+all.line.result <- rbind(stats_list[[strategy_name_1]], stats_list[[strategy_name_2]], stats_list[[strategy_name_3]], stats_list[[strategy_name_4]])
 
 recall.result.df <- select(all.line.result, c("technique", "Recall20%LOC"))
 ifa.result.df <- select(all.line.result, c("technique", "IFA"))
