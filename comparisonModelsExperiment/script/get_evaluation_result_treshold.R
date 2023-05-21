@@ -66,61 +66,11 @@ for (f in all_files)
   df_all <- rbind(df_all, df)
 }
 
-## prepare data for baseline
-line.ground.truth <- select(df_all, project, train, test, filename, file.level.ground.truth, prediction.prob, line.number, line.level.ground.truth)
-line.ground.truth <- filter(line.ground.truth, file.level.ground.truth == "True" & prediction.prob >= 0.5)
-line.ground.truth <- distinct(line.ground.truth)
-
-get.line.metrics.result <- function(baseline.df, cur.df.file) {
-  baseline.df.with.ground.truth <- merge(baseline.df, cur.df.file, by = c("filename", "line.number"))
-
-  sorted <- baseline.df.with.ground.truth %>%
-    group_by(filename) %>%
-    arrange(-line.score, .by_group = TRUE) %>%
-    mutate(order = row_number())
-
-  # IFA
-  IFA <- sorted %>%
-    filter(line.level.ground.truth == "True") %>%
-    group_by(filename) %>%
-    top_n(1, -order)
-
-  ifa.list <- IFA$order
-
-  total_true <- sorted %>%
-    group_by(filename) %>%
-    summarize(total_true = sum(line.level.ground.truth == "True"))
-
-  # Recall20%LOC
-  recall20LOC <- sorted %>%
-    group_by(filename) %>%
-    mutate(effort = round(order / n(), digits = 2)) %>%
-    filter(effort <= 0.2) %>%
-    summarize(correct_pred = sum(line.level.ground.truth == "True")) %>%
-    merge(total_true) %>%
-    mutate(recall20LOC = correct_pred / total_true)
-
-  recall.list <- recall20LOC$recall20LOC
-  # Effort20%Recall
-  effort20Recall <- sorted %>%
-    merge(total_true) %>%
-    group_by(filename) %>%
-    mutate(cummulative_correct_pred = cumsum(line.level.ground.truth == "True"), recall = round(cumsum(line.level.ground.truth == "True") / total_true, digits = 2)) %>%
-    summarise(effort20Recall = sum(recall <= 0.2) / n())
-
-  effort.list <- effort20Recall$effort20Recall
-
-  result.df <- data.frame(ifa.list, recall.list, effort.list)
-
-  return(result.df)
-}
-
-all_eval_releases <- c("activemq-5.2.0", "activemq-5.3.0", "activemq-5.8.0")
-# all_eval_releases = c('activemq-5.2.0', 'activemq-5.3.0', 'activemq-5.8.0',
-#                       'camel-2.10.0', 'camel-2.11.0' ,
-#                       'derby-10.5.1.1' , 'groovy-1_6_BETA_2' , 'hbase-0.95.2',
-#                       'hive-0.12.0', 'jruby-1.5.0', 'jruby-1.7.0.preview1',
-#                       'lucene-3.0.0', 'lucene-3.1', 'wicket-1.5.3')
+all_eval_releases = c('activemq-5.2.0', 'activemq-5.3.0', 'activemq-5.8.0',
+                      'camel-2.10.0', 'camel-2.11.0' ,
+                      'derby-10.5.1.1' , 'groovy-1_6_BETA_2',
+                      'jruby-1.5.0', 'jruby-1.7.0.preview1',
+                      'lucene-3.0.0', 'lucene-3.1', 'wicket-1.5.3')
 
 # Force attention score of comment line is 0
 df_all[df_all$is.comment.line == "True", ]$token.attention.score <- 0
