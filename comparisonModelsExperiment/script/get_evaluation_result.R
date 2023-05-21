@@ -41,6 +41,7 @@ get.top.k.tokens <- function(df, k) {
   return(top.k)
 }
 
+
 prediction_dir <- "../output/prediction/DeepLineDP/within-release/"
 
 all_files <- list.files(prediction_dir)
@@ -220,7 +221,7 @@ names(deepline.dp.line.result) <- c("IFA", "Recall20%LOC", "Effort@20%Recall")
 rf.result.df$technique <- "RF"
 xgb.result.df$technique <- "XGB"
 lgbm.result.df$technique <- "LGBM"
-deepline.dp.line.result$technique <- "DeepLineDP top 1500"
+deepline.dp.line.result$technique <- "DeepLineDP"
 all.line.result <- rbind(rf.result.df, xgb.result.df, lgbm.result.df, deepline.dp.line.result)
 # all.line.result = rbind(rf.result.df, n.gram.result.df, error.prone.result.df, deepline.dp.line.result)
 
