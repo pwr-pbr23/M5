@@ -106,7 +106,7 @@ def hyperparameters_tuning(dataset_name, Classifier, params_grid):
     search_cv = RandomizedSearchCV(
         estimator=clf_search,
         param_distributions=params_grid,
-        scoring='accuracy',
+        scoring='f1',
         n_iter=25,
         n_jobs=4,
         verbose=1
