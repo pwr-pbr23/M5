@@ -132,7 +132,6 @@ xgb_params_grid = {
     "objective": ["binary:logistic", "reg:logistic", "count:poisson"],
     "n_estimators": np.array([10, 50, 200, 1000]),
     "tree_method": ["hist"],
-    "eta": np.array([0.1, 0.3, 0.9]),
     "max_depth": np.array([3, 7, 12, 15]),
     "learning_rate": np.arange(0.2, 0.9, 0.1),
     'subsample': np.arange(0.5, 1.0, 0.1),
