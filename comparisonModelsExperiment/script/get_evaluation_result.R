@@ -33,7 +33,7 @@ get.top.k.tokens <- function(df, k) {
     filter(is.comment.line == "False" & file.level.ground.truth == "True" & prediction.label == "True") %>%
     group_by(test, filename) %>%
     top_n(k, token.attention.score) %>%
-    select("project", "train", "test", "filename", "token") %>%
+    select("project", "train", "test", "filename", "token", token.attention.score) %>%
     distinct()
 
   top.k$flag <- "topk"
@@ -121,48 +121,53 @@ xgb.result.df <- NULL
 lgbm.result.df <- NULL
 
 ## get result from baseline
-for (rel in all_eval_releases)
-{
-  rf.result <- read.csv(paste0(rf.result.dir, rel, "-line-lvl-result.csv"))
-  rf.result <- select(rf.result, "filename", "line_number", "line.score.pred")
-  names(rf.result) <- c("filename", "line.number", "line.score")
+# for (rel in all_eval_releases)
+# {
+#   rf.result <- read.csv(paste0(rf.result.dir, rel, "-line-lvl-result.csv"))
+#   rf.result <- select(rf.result, "filename", "line_number", "line.score.pred")
+#   names(rf.result) <- c("filename", "line.number", "line.score")
 
-  cur.df.file <- filter(line.ground.truth, test == rel)
-  cur.df.file <- select(cur.df.file, filename, line.number, line.level.ground.truth)
+#   cur.df.file <- filter(line.ground.truth, test == rel)
+#   cur.df.file <- select(cur.df.file, filename, line.number, line.level.ground.truth)
 
-  rf.eval.result <- get.line.metrics.result(rf.result, cur.df.file)
+#   rf.eval.result <- get.line.metrics.result(rf.result, cur.df.file)
 
-  rf.result.df <- rbind(rf.result.df, rf.eval.result)
+#   rf.result.df <- rbind(rf.result.df, rf.eval.result)
 
-  xgb.result <- read.csv(paste0(xgb.result.dir, rel, "-line-lvl-result.csv"))
-  xgb.result <- select(xgb.result, "filename", "line_number", "line.score.pred")
-  names(xgb.result) <- c("filename", "line.number", "line.score")
+#   xgb.result <- read.csv(paste0(xgb.result.dir, rel, "-line-lvl-result.csv"))
+#   xgb.result <- select(xgb.result, "filename", "line_number", "line.score.pred")
+#   names(xgb.result) <- c("filename", "line.number", "line.score")
 
-  cur.df.file <- filter(line.ground.truth, test == rel)
-  cur.df.file <- select(cur.df.file, filename, line.number, line.level.ground.truth)
+#   cur.df.file <- filter(line.ground.truth, test == rel)
+#   cur.df.file <- select(cur.df.file, filename, line.number, line.level.ground.truth)
 
-  xgb.eval.result <- get.line.metrics.result(xgb.result, cur.df.file)
+#   xgb.eval.result <- get.line.metrics.result(xgb.result, cur.df.file)
 
-  xgb.result.df <- rbind(xgb.result.df, xgb.eval.result)
+#   xgb.result.df <- rbind(xgb.result.df, xgb.eval.result)
 
-  lgbm.result <- read.csv(paste0(lgbm.result.dir, rel, "-line-lvl-result.csv"))
-  lgbm.result <- select(lgbm.result, "filename", "line_number", "line.score.pred")
-  names(lgbm.result) <- c("filename", "line.number", "line.score")
+#   lgbm.result <- read.csv(paste0(lgbm.result.dir, rel, "-line-lvl-result.csv"))
+#   lgbm.result <- select(lgbm.result, "filename", "line_number", "line.score.pred")
+#   names(lgbm.result) <- c("filename", "line.number", "line.score")
 
-  cur.df.file <- filter(line.ground.truth, test == rel)
-  cur.df.file <- select(cur.df.file, filename, line.number, line.level.ground.truth)
+#   cur.df.file <- filter(line.ground.truth, test == rel)
+#   cur.df.file <- select(cur.df.file, filename, line.number, line.level.ground.truth)
 
-  lgbm.eval.result <- get.line.metrics.result(lgbm.result, cur.df.file)
+#   lgbm.eval.result <- get.line.metrics.result(lgbm.result, cur.df.file)
 
-  lgbm.result.df <- rbind(lgbm.result.df, lgbm.eval.result)
+#   lgbm.result.df <- rbind(lgbm.result.df, lgbm.eval.result)
 
-  print(paste0("finished ", rel))
-}
+#   print(paste0("finished ", rel))
+# }
 
 # Force attention score of comment line is 0
 df_all[df_all$is.comment.line == "True", ]$token.attention.score <- 0
 
 tmp.top.k <- get.top.k.tokens(df_all, 1500)
+
+print("got tokens")
+print(dim(tmp.top.k))
+print("minimal attenttion score = ")
+print(min(tmp.top.k$token.attention.score))
 
 merged_df_all <- merge(df_all, tmp.top.k, by = c("project", "train", "test", "filename", "token"), all.x = TRUE)
 

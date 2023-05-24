@@ -41,7 +41,7 @@ get.top.k.tokens <- function(df, value) {
   return(top.k)
 }
 
-get.top.treshold.tokens <- function(df, value) {
+get.top.threshold.tokens <- function(df, value) {
   top.k <- df %>%
     filter(is.comment.line == "False" & file.level.ground.truth == "True" & prediction.label == "True" & token.attention.score > value) %>%
     group_by(test, filename) %>%
@@ -76,22 +76,29 @@ all_eval_releases = c('activemq-5.2.0', 'activemq-5.3.0', 'activemq-5.8.0',
 df_all[df_all$is.comment.line == "True", ]$token.attention.score <- 0
 
 TOP_K = 1500
-TRESHOLD01 = 0.5
-TRESHOLD02 = 0.85
-TRESHOLD03 = 0.93
-TRESHOLD04 = 0.97
+TOP_K2 = 30
+THRESHOLD01 = 0.80
+THRESHOLD02 = 0.10
+THRESHOLD03 = 0.01
+THRESHOLD04 = 2.254433e-13
+THRESHOLD05 = -1
 
 strategy_name_1 <- paste("Top K ", TOP_K)
-strategy_name_2 <- paste("Treshold ", TRESHOLD01)
-strategy_name_3 <- paste("Treshold ", TRESHOLD02)
-strategy_name_4 <- paste("Treshold ", TRESHOLD03)
-strategy_name_5 <- paste("Treshold ", TRESHOLD04)
+strategy_name_2 <- paste("Top K  ", TOP_K2)
+strategy_name_3 <- paste("Threshold ", THRESHOLD01)
+strategy_name_4 <- paste("Threshold ", THRESHOLD02)
+strategy_name_5 <- paste("Threshold ", THRESHOLD03)
+strategy_name_6 <- paste("Threshold ", THRESHOLD04)
+strategy_name_7 <- paste("Threshold ", THRESHOLD05)
 
 tmp_tops <- list(
   c(strategy_name_1, TOP_K, get.top.k.tokens),
-  c(strategy_name_2, TRESHOLD01, get.top.treshold.tokens),
-  c(strategy_name_3, TRESHOLD02, get.top.treshold.tokens),
-  c(strategy_name_4, TRESHOLD03, get.top.treshold.tokens)
+  c(strategy_name_2, TOP_K2, get.top.k.tokens),
+  c(strategy_name_3, THRESHOLD01, get.top.threshold.tokens),
+  c(strategy_name_4, THRESHOLD02, get.top.threshold.tokens),
+  c(strategy_name_5, THRESHOLD03, get.top.threshold.tokens),
+  c(strategy_name_6, THRESHOLD04, get.top.threshold.tokens),
+  c(strategy_name_7, THRESHOLD05, get.top.threshold.tokens)
 )
 
 stats_list <- list(strategy1 = 1, strategy2 = 2)
@@ -108,6 +115,7 @@ for (tokens_name in tmp_tops) {
   tmp.top.k <- do.call(factory, args = list(df = df_all, value = value))
 
   print("got tokens")
+  print(dim(tmp.top.k))
 
   merged_df_all <- merge(df_all, tmp.top.k, by = c("project", "train", "test", "filename", "token"), all.x = TRUE)
 
@@ -170,7 +178,7 @@ for (tokens_name in tmp_tops) {
   print(paste("added to stats_list: ", name))
 }
 
-all.line.result <- rbind(stats_list[[strategy_name_1]], stats_list[[strategy_name_2]], stats_list[[strategy_name_3]], stats_list[[strategy_name_4]], stats_list[[strategy_name_5]])
+all.line.result <- rbind(stats_list[[strategy_name_1]], stats_list[[strategy_name_2]], stats_list[[strategy_name_3]], stats_list[[strategy_name_4]], stats_list[[strategy_name_5]], stats_list[[strategy_name_6]], stats_list[[strategy_name_7]])
 
 recall.result.df <- select(all.line.result, c("technique", "Recall20%LOC"))
 ifa.result.df <- select(all.line.result, c("technique", "IFA"))
@@ -189,14 +197,14 @@ ggplot(recall.result.df, aes(x = reorder(variable, -value, FUN = median), y = va
   facet_grid(~rank, drop = TRUE, scales = "free", space = "free") +
   ylab("Recall@Top20%LOC") +
   xlab("")
-ggsave(paste0(save.fig.dir, "file-Recall@Top20LOC.pdf"), width = 8, height = 5)
+ggsave(paste0(save.fig.dir, "file-Recall@Top20LOC.pdf"), width = 16, height = 5)
 
 ggplot(effort.result.df, aes(x = reorder(variable, value, FUN = median), y = value)) +
   geom_boxplot() +
   facet_grid(~rank, drop = TRUE, scales = "free", space = "free") +
   ylab("Effort@Top20%Recall") +
   xlab("")
-ggsave(paste0(save.fig.dir, "file-Effort@Top20Recall.pdf"), width = 8, height = 5)
+ggsave(paste0(save.fig.dir, "file-Effort@Top20Recall.pdf"), width = 16, height = 5)
 
 ggplot(ifa.result.df, aes(x = reorder(variable, value, FUN = median), y = value)) +
   geom_boxplot() +
@@ -204,4 +212,4 @@ ggplot(ifa.result.df, aes(x = reorder(variable, value, FUN = median), y = value)
   facet_grid(~rank, drop = TRUE, scales = "free", space = "free") +
   ylab("IFA") +
   xlab("")
-ggsave(paste0(save.fig.dir, "file-IFA.pdf"), width = 8, height = 5)
+ggsave(paste0(save.fig.dir, "file-IFA.pdf"), width = 16, height = 5)
