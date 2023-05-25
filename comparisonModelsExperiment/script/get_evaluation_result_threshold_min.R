@@ -53,6 +53,18 @@ get.top.threshold.tokens <- function(df, value) {
   return(top.k)
 }
 
+get.not.filtered <- function(df) {
+  top.k <- df %>%
+    filter(is.comment.line == "False" & file.level.ground.truth == "True" & prediction.label == "True") %>%
+    group_by(test, filename) %>%
+    select("project", "train", "test", "filename", "token", token.attention.score) %>%
+    distinct()
+
+  top.k$flag <- "topk"
+
+  return(top.k)
+}
+
 
 prediction_dir <- "../output/prediction/DeepLineDP/within-release/"
 
@@ -74,6 +86,12 @@ all_eval_releases = c('activemq-5.2.0', 'activemq-5.3.0', 'activemq-5.8.0',
 
 # Force attention score of comment line is 0
 df_all[df_all$is.comment.line == "True", ]$token.attention.score <- 0
+
+not.filtered <- get.not.filtered(df_all)
+dim <- dim(not.filtered)
+print("df_all dimensions: ")
+print(paste("row count: ", dim[1], " col count: ", dim[2]))
+print(paste("minimal attenttion score = ", min(df_all$token.attention.score)))
 
 TOP_K = 1500
 TOP_K2 = 30
