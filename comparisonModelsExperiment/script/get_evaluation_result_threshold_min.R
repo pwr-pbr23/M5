@@ -114,8 +114,8 @@ for (tokens_name in tmp_tops) {
 
   tmp.top.k <- do.call(factory, args = list(df = df_all, value = value))
 
-  print("got tokens")
-  print(dim(tmp.top.k))
-  print("minimal attenttion score = ")
-  print(min(tmp.top.k$token.attention.score))
+  dim <- dim(tmp.top.k)
+  print("tokens dimensions: ")
+  print(paste("row count: ", dim[1], " col count: ", dim[2]))
+  print(paste("minimal attenttion score = ", min(tmp.top.k$token.attention.score)))
 }

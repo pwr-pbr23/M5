@@ -164,10 +164,10 @@ df_all[df_all$is.comment.line == "True", ]$token.attention.score <- 0
 
 tmp.top.k <- get.top.k.tokens(df_all, 1500)
 
-print("got tokens")
-print(dim(tmp.top.k))
-print("minimal attenttion score = ")
-print(min(tmp.top.k$token.attention.score))
+dim <- dim(tmp.top.k)
+print("tokens dimensions: ")
+print(paste("row count: ", dim[1], " col count: ", dim[2]))
+print(paste("minimal attenttion score = ", min(tmp.top.k$token.attention.score)))
 
 merged_df_all <- merge(df_all, tmp.top.k, by = c("project", "train", "test", "filename", "token"), all.x = TRUE)
 
