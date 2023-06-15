@@ -99,7 +99,7 @@ THRESHOLD01 = 0.80
 THRESHOLD02 = 0.10
 THRESHOLD03 = 0.01
 THRESHOLD04 = 1.8623564e-12
-THRESHOLD05 = 0
+THRESHOLD05 = -1
 
 strategy_name_1 <- paste("Top K ", TOP_K)
 strategy_name_2 <- paste("Top K  ", TOP_K2)
