@@ -67,24 +67,37 @@ def calculate_mcc(tp, tn, fp, fn):
 
     return mcc
 
+def calculate_balanced_accuracy(tp, tn, fp, fn):
+    sensitivity = tp / (tp + fn) if (tp + fn) != 0 else 0  # True Positive Rate
+    specificity = tn / (tn + fp) if (tn + fp) != 0 else 0  # True Negative Rate
+    balanced_accuracy = (sensitivity + specificity) / 2
+
+    return balanced_accuracy
+
 df = pd.read_csv(rf_prediction_file)
 tp, tn, fp, fn = calculate_confusion_matrix_rf(df)
 mcc = calculate_mcc(tp, tn, fp, fn)
+ba = calculate_balanced_accuracy(tp, tn, fp, fn)
 
 print("Matthews Correlation Coefficient (MCC) RF:", mcc)
+print("Balanced Accuracy (BA) RF:", ba)
 
 df = pd.read_csv(bow_prediction_file)
 tp, tn, fp, fn = calculate_confusion_matrix_bow(df)
 mcc = calculate_mcc(tp, tn, fp, fn)
+ba = calculate_balanced_accuracy(tp, tn, fp, fn)
 
 print("Matthews Correlation Coefficient (MCC) BoW:", mcc)
-
+print("Balanced Accuracy (BA) BoW:", ba)
 
 def get_dp_mcc_with_thresholds(df, thresholds):
     for t in thresholds:
         tp, tn, fp, fn = calculate_confusion_matrix_deepLine(df, t)
         mcc = calculate_mcc(tp, tn, fp, fn)
-        print("Matthews Correlation Coefficient (MCC) DP :", mcc, "Threshold", t)
+        ba = calculate_balanced_accuracy(tp, tn, fp, fn)
+        print("Matthews Correlation Coefficient (MCC) DP:", mcc, "Threshold", t)
+        print("Balanced Accuracy (BA) DP:", ba, "Threshold", t)
+
 
 df = pd.read_csv(deepLineDp_prediction_file)
 get_dp_mcc_with_thresholds(df, thresholds)
