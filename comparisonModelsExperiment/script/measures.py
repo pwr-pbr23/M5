@@ -3,6 +3,8 @@ from math import sqrt
 
 deepLineDp_prediction_file = '../output/prediction/DeepLineDP/within-release/activemq-5.2.0.csv'
 rf_prediction_file = '../output/RF-line-level-result/activemq-5.2.0-line-lvl-result.csv'
+xgb_prediction_file = '../output/XGB-line-level-result/activemq-5.2.0-line-lvl-result.csv'
+lgbm_prediction_file = '../output/LGBM-line-level-result/activemq-5.2.0-line-lvl-result.csv'
 bi_lstm_prediction_file = '../output/prediction/Bi-LSTM/within-release/activemq-5.2.0-6-epochs.csv'
 bow_prediction_file = '../output/prediction/BoW/within-release/activemq-5.2.0.csv'
 cnn_prediction_file = '../output/prediction/CNN/within-release/activemq-5.2.0-6-epochs.csv'
@@ -25,7 +27,7 @@ def calculate_confusion_matrix_deepLine(df, threshold):
 
     return tp, tn, fp, fn
 
-def calculate_confusion_matrix_rf(df):
+def calculate_confusion_matrix_tree_clasifier(df):
     # True Positive (TP)
     tp_df = df[(df['line-label'] == True) & (df['line-score-pred'] == 1)]
     tp = 0 if tp_df.empty else len(tp_df)
@@ -77,18 +79,16 @@ def calculate_balanced_accuracy(tp, tn, fp, fn):
 
     return balanced_accuracy
 
-print("MCC: Matthews Correlation Coefficient")
-print("RF: Balanced Accuracy")
+def calculate_metrics_for_tree_clasifiers(prefiction_file, baseline_name):
+    df = pd.read_csv(prefiction_file)
+    tp, tn, fp, fn = calculate_confusion_matrix_tree_clasifier(df)
+    mcc = calculate_mcc(tp, tn, fp, fn)
+    ba = calculate_balanced_accuracy(tp, tn, fp, fn)
 
-df = pd.read_csv(rf_prediction_file)
-tp, tn, fp, fn = calculate_confusion_matrix_rf(df)
-mcc = calculate_mcc(tp, tn, fp, fn)
-ba = calculate_balanced_accuracy(tp, tn, fp, fn)
-
-print()
-print("Random Forest:")
-print("MCC = ", mcc)
-print("BA = ", ba)
+    print()
+    print(baseline_name, ":")
+    print("MCC = ", mcc)
+    print("BA = ", ba)
 
 def calculate_metrics_for_baselines(prefiction_file, baseline_name):
     df = pd.read_csv(prefiction_file)
@@ -100,6 +100,13 @@ def calculate_metrics_for_baselines(prefiction_file, baseline_name):
     print(baseline_name, ":")
     print("MCC = ", mcc)
     print("BA = ", ba)
+
+print("MCC: Matthews Correlation Coefficient")
+print("RF: Balanced Accuracy")
+
+calculate_metrics_for_tree_clasifiers(rf_prediction_file, "Random Forest")
+calculate_metrics_for_tree_clasifiers(xgb_prediction_file, "XGBoost")
+calculate_metrics_for_tree_clasifiers(lgbm_prediction_file, "LightGBM")
 
 calculate_metrics_for_baselines(bi_lstm_prediction_file, "Bi-LSTM")
 calculate_metrics_for_baselines(bow_prediction_file, "BOW")
