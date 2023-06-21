@@ -129,30 +129,30 @@ print("MCC: Matthews Correlation Coefficient")
 print("RF: Balanced Accuracy")
 
 df_rf = get_eval_data_frames(rf_prediction_folder, rf_prediction_files)
-evaluate_metrics_for_tree_clasifiers(df_rf, "Random Forest")
+evaluate_metrics_for_tree_clasifiers(df_rf, "Random Forest (line level)")
 
 df_xgb = get_eval_data_frames(xgb_prediction_folder, xgb_prediction_files)
-evaluate_metrics_for_tree_clasifiers(df_xgb, "XGBoost")
+evaluate_metrics_for_tree_clasifiers(df_xgb, "XGBoost (line level)")
 
 df_lgbm = get_eval_data_frames(lgbm_prediction_folder, lgbm_prediction_files)
-evaluate_metrics_for_tree_clasifiers(df_lgbm, "LightGBM")
+evaluate_metrics_for_tree_clasifiers(df_lgbm, "LightGBM (line level)")
 
 df_bi_lstm = get_eval_data_frames(bi_lstm_prediction_folder, bi_lstm_prediction_files)
-evaluate_metrics_for_baselines(df_bi_lstm, "Bi-LSTM")
+evaluate_metrics_for_baselines(df_bi_lstm, "Bi-LSTM (file level)")
 
 df_bow = get_eval_data_frames(bow_prediction_folder, bow_prediction_files)
-evaluate_metrics_for_baselines(df_bow, "BOW")
+evaluate_metrics_for_baselines(df_bow, "BOW (file level)")
 
 df_cnn = get_eval_data_frames(cnn_prediction_folder, cnn_prediction_files)
-evaluate_metrics_for_baselines(df_cnn, "CNN")
+evaluate_metrics_for_baselines(df_cnn, "CNN (file level)")
 
 df_dbn = get_eval_data_frames(dbn_prediction_folder, dbn_prediction_files)
-evaluate_metrics_for_baselines(df_dbn, "DBN")
+evaluate_metrics_for_baselines(df_dbn, "DBN (file level)")
 
 def get_dp_mcc_with_thresholds(df, thresholds):
     for t in thresholds:
         resolver = lambda df: get_confusion_matrix_deepLine(df, t)
-        evaluate_metrics(resolver, df, "DeepLineDP with Threshold " + str(t))
+        evaluate_metrics(resolver, df, "DeepLineDP (line level) with Threshold " + str(t))
 
 df_dp = get_eval_data_frames(deepLineDp_prediction_folder, deepLineDp_prediction_files)
 get_dp_mcc_with_thresholds(df_dp, thresholds)
