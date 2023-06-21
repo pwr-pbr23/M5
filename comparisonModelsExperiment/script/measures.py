@@ -1,16 +1,38 @@
 import pandas as pd
 from math import sqrt
 
-deepLineDp_prediction_file = '../output/prediction/DeepLineDP/within-release/activemq-5.2.0.csv'
-rf_prediction_file = '../output/RF-line-level-result/activemq-5.2.0-line-lvl-result.csv'
-xgb_prediction_file = '../output/XGB-line-level-result/activemq-5.2.0-line-lvl-result.csv'
-lgbm_prediction_file = '../output/LGBM-line-level-result/activemq-5.2.0-line-lvl-result.csv'
-bi_lstm_prediction_file = '../output/prediction/Bi-LSTM/within-release/activemq-5.2.0-6-epochs.csv'
-bow_prediction_file = '../output/prediction/BoW/within-release/activemq-5.2.0.csv'
-cnn_prediction_file = '../output/prediction/CNN/within-release/activemq-5.2.0-6-epochs.csv'
-dbn_prediction_file = '../output/prediction/DBN/within-release/activemq-5.2.0.csv'
+deepLineDp_prediction_folder = '../output/prediction/DeepLineDP/within-release/'
+deepLineDp_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv']
+
+rf_prediction_folder = '../output/RF-line-level-result/'
+rf_prediction_files = ['activemq-5.2.0-line-lvl-result.csv', 'activemq-5.3.0-line-lvl-result.csv', 'activemq-5.8.0-line-lvl-result.csv']
+
+xgb_prediction_folder = '../output/XGB-line-level-result/'
+xgb_prediction_files = ['activemq-5.2.0-line-lvl-result.csv', 'activemq-5.3.0-line-lvl-result.csv', 'activemq-5.8.0-line-lvl-result.csv']
+
+lgbm_prediction_folder = '../output/LGBM-line-level-result/'
+lgbm_prediction_files = ['activemq-5.2.0-line-lvl-result.csv', 'activemq-5.3.0-line-lvl-result.csv', 'activemq-5.8.0-line-lvl-result.csv']
+
+bi_lstm_prediction_folder = '../output/prediction/Bi-LSTM/within-release/'
+bi_lstm_prediction_files = ['activemq-5.2.0-6-epochs.csv', 'activemq-5.3.0-6-epochs.csv', 'activemq-5.8.0-6-epochs.csv']
+
+bow_prediction_folder = '../output/prediction/BoW/within-release/'
+bow_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv']
+
+cnn_prediction_folder = '../output/prediction/CNN/within-release/'
+cnn_prediction_files = ['activemq-5.2.0-6-epochs.csv', 'activemq-5.3.0-6-epochs.csv', 'activemq-5.8.0-6-epochs.csv']
+
+dbn_prediction_folder = '../output/prediction/DBN/within-release/'
+dbn_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv']
 
 thresholds = [0.99, 0.9, 0.8, 0.6, 0.3, 0.1, 0.01, 0.0001, 0]
+
+def get_eval_data_frames(prediction_folder, prediction_files):
+    df_all = pd.DataFrame()
+    for file_name in prediction_files:
+        new_df = pd.read_csv(prediction_folder + file_name)
+        df_all = pd.concat([df_all, new_df])
+    return df_all
 
 def get_confusion_matrix_deepLine(df, threshold):
     # True Positive (TP)
@@ -98,19 +120,31 @@ def evaluate_metrics_for_baselines(prefiction_file, baseline_name):
 print("MCC: Matthews Correlation Coefficient")
 print("RF: Balanced Accuracy")
 
-evaluate_metrics_for_tree_clasifiers(pd.read_csv(rf_prediction_file), "Random Forest")
-evaluate_metrics_for_tree_clasifiers(pd.read_csv(xgb_prediction_file), "XGBoost")
-evaluate_metrics_for_tree_clasifiers(pd.read_csv(lgbm_prediction_file), "LightGBM")
+df_rf = get_eval_data_frames(rf_prediction_folder, rf_prediction_files)
+evaluate_metrics_for_tree_clasifiers(df_rf, "Random Forest")
 
-evaluate_metrics_for_baselines(pd.read_csv(bi_lstm_prediction_file), "Bi-LSTM")
-evaluate_metrics_for_baselines(pd.read_csv(bow_prediction_file), "BOW")
-evaluate_metrics_for_baselines(pd.read_csv(cnn_prediction_file), "CNN")
-evaluate_metrics_for_baselines(pd.read_csv(dbn_prediction_file), "DBN")
+df_xgb = get_eval_data_frames(xgb_prediction_folder, xgb_prediction_files)
+evaluate_metrics_for_tree_clasifiers(df_xgb, "XGBoost")
+
+df_lgbm = get_eval_data_frames(lgbm_prediction_folder, lgbm_prediction_files)
+evaluate_metrics_for_tree_clasifiers(df_lgbm, "LightGBM")
+
+df_bi_lstm = get_eval_data_frames(bi_lstm_prediction_folder, bi_lstm_prediction_files)
+evaluate_metrics_for_baselines(df_bi_lstm, "Bi-LSTM")
+
+df_bow = get_eval_data_frames(bow_prediction_folder, bow_prediction_files)
+evaluate_metrics_for_baselines(df_bow, "BOW")
+
+df_cnn = get_eval_data_frames(cnn_prediction_folder, cnn_prediction_files)
+evaluate_metrics_for_baselines(df_cnn, "CNN")
+
+df_dbn = get_eval_data_frames(dbn_prediction_folder, dbn_prediction_files)
+evaluate_metrics_for_baselines(df_dbn, "DBN")
 
 def get_dp_mcc_with_thresholds(df, thresholds):
     for t in thresholds:
         resolver = lambda df: get_confusion_matrix_deepLine(df, t)
         evaluate_metrics(resolver, df, "DeepLineDP with Threshold " + str(t))
 
-df = pd.read_csv(deepLineDp_prediction_file)
-get_dp_mcc_with_thresholds(df, thresholds)
+df_dp = get_eval_data_frames(deepLineDp_prediction_folder, deepLineDp_prediction_files)
+get_dp_mcc_with_thresholds(df_dp, thresholds)
