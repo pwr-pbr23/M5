@@ -12,7 +12,7 @@ dbn_prediction_file = '../output/prediction/DBN/within-release/activemq-5.2.0.cs
 
 thresholds = [0.99, 0.9, 0.8, 0.6, 0.3, 0.1, 0.01, 0.0001, 0]
 
-def calculate_confusion_matrix_deepLine(df, threshold):
+def get_confusion_matrix_deepLine(df, threshold):
     # True Positive (TP)
     tp = len(df[(df['line-level-ground-truth'] == True) & (df['line-attention-score'] > threshold)])
     
@@ -27,7 +27,7 @@ def calculate_confusion_matrix_deepLine(df, threshold):
 
     return tp, tn, fp, fn
 
-def calculate_confusion_matrix_tree_clasifier(df):
+def get_confusion_matrix_tree_clasifier(df):
     # True Positive (TP)
     tp_df = df[(df['line-label'] == True) & (df['line-score-pred'] == 1)]
     tp = 0 if tp_df.empty else len(tp_df)
@@ -46,7 +46,7 @@ def calculate_confusion_matrix_tree_clasifier(df):
 
     return tp, tn, fp, fn
 
-def calculate_confusion_matrix_file_level_baseline(df):
+def get_confusion_matrix_file_level_baseline(df):
     # True Positive (TP)
     tp_df = df[(df['file-level-ground-truth'] == True) & (df['prediction-label'] == True)]
     tp = 0 if tp_df.empty else len(tp_df)
@@ -79,9 +79,8 @@ def calculate_balanced_accuracy(tp, tn, fp, fn):
 
     return balanced_accuracy
 
-def calculate_metrics_for_tree_clasifiers(prefiction_file, baseline_name):
-    df = pd.read_csv(prefiction_file)
-    tp, tn, fp, fn = calculate_confusion_matrix_tree_clasifier(df)
+def evaluate_metrics(confusion_matrix_resolver, df, baseline_name):
+    tp, tn, fp, fn = confusion_matrix_resolver(df)
     mcc = calculate_mcc(tp, tn, fp, fn)
     ba = calculate_balanced_accuracy(tp, tn, fp, fn)
 
@@ -90,40 +89,28 @@ def calculate_metrics_for_tree_clasifiers(prefiction_file, baseline_name):
     print("MCC = ", mcc)
     print("BA = ", ba)
 
-def calculate_metrics_for_baselines(prefiction_file, baseline_name):
-    df = pd.read_csv(prefiction_file)
-    tp, tn, fp, fn = calculate_confusion_matrix_file_level_baseline(df)
-    mcc = calculate_mcc(tp, tn, fp, fn)
-    ba = calculate_balanced_accuracy(tp, tn, fp, fn)
+def evaluate_metrics_for_tree_clasifiers(prefiction_file, baseline_name):
+    evaluate_metrics(get_confusion_matrix_tree_clasifier, prefiction_file, baseline_name)
 
-    print()
-    print(baseline_name, ":")
-    print("MCC = ", mcc)
-    print("BA = ", ba)
+def evaluate_metrics_for_baselines(prefiction_file, baseline_name):
+    evaluate_metrics(get_confusion_matrix_file_level_baseline, prefiction_file, baseline_name)
 
 print("MCC: Matthews Correlation Coefficient")
 print("RF: Balanced Accuracy")
 
-calculate_metrics_for_tree_clasifiers(rf_prediction_file, "Random Forest")
-calculate_metrics_for_tree_clasifiers(xgb_prediction_file, "XGBoost")
-calculate_metrics_for_tree_clasifiers(lgbm_prediction_file, "LightGBM")
+evaluate_metrics_for_tree_clasifiers(pd.read_csv(rf_prediction_file), "Random Forest")
+evaluate_metrics_for_tree_clasifiers(pd.read_csv(xgb_prediction_file), "XGBoost")
+evaluate_metrics_for_tree_clasifiers(pd.read_csv(lgbm_prediction_file), "LightGBM")
 
-calculate_metrics_for_baselines(bi_lstm_prediction_file, "Bi-LSTM")
-calculate_metrics_for_baselines(bow_prediction_file, "BOW")
-calculate_metrics_for_baselines(cnn_prediction_file, "CNN")
-calculate_metrics_for_baselines(dbn_prediction_file, "DBN")
+evaluate_metrics_for_baselines(pd.read_csv(bi_lstm_prediction_file), "Bi-LSTM")
+evaluate_metrics_for_baselines(pd.read_csv(bow_prediction_file), "BOW")
+evaluate_metrics_for_baselines(pd.read_csv(cnn_prediction_file), "CNN")
+evaluate_metrics_for_baselines(pd.read_csv(dbn_prediction_file), "DBN")
 
 def get_dp_mcc_with_thresholds(df, thresholds):
     for t in thresholds:
-        tp, tn, fp, fn = calculate_confusion_matrix_deepLine(df, t)
-        mcc = calculate_mcc(tp, tn, fp, fn)
-        ba = calculate_balanced_accuracy(tp, tn, fp, fn)
-
-        print()
-        print("DeepLineDP with Threshold", t, ":")
-        print("MCC = ", mcc)
-        print("BA = ", ba)
-
+        resolver = lambda df: get_confusion_matrix_deepLine(df, t)
+        evaluate_metrics(resolver, df, "DeepLineDP with Threshold " + str(t))
 
 df = pd.read_csv(deepLineDp_prediction_file)
 get_dp_mcc_with_thresholds(df, thresholds)
