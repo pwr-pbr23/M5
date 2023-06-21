@@ -77,59 +77,45 @@ def calculate_balanced_accuracy(tp, tn, fp, fn):
 
     return balanced_accuracy
 
+print("MCC: Matthews Correlation Coefficient")
+print("RF: Balanced Accuracy")
+
 df = pd.read_csv(rf_prediction_file)
 tp, tn, fp, fn = calculate_confusion_matrix_rf(df)
 mcc = calculate_mcc(tp, tn, fp, fn)
 ba = calculate_balanced_accuracy(tp, tn, fp, fn)
 
 print()
-print("Matthews Correlation Coefficient (MCC) RF:", mcc)
-print("Balanced Accuracy (BA) RF:", ba)
+print("Random Forest:")
+print("MCC = ", mcc)
+print("BA = ", ba)
 
-df = pd.read_csv(bi_lstm_prediction_file)
-tp, tn, fp, fn = calculate_confusion_matrix_file_level_baseline(df)
-mcc = calculate_mcc(tp, tn, fp, fn)
-ba = calculate_balanced_accuracy(tp, tn, fp, fn)
+def calculate_metrics_for_baselines(prefiction_file, baseline_name):
+    df = pd.read_csv(prefiction_file)
+    tp, tn, fp, fn = calculate_confusion_matrix_file_level_baseline(df)
+    mcc = calculate_mcc(tp, tn, fp, fn)
+    ba = calculate_balanced_accuracy(tp, tn, fp, fn)
 
-print()
-print("Matthews Correlation Coefficient (MCC) Bi-LSTM:", mcc)
-print("Balanced Accuracy (BA) Bi-LSTM:", ba)
+    print()
+    print(baseline_name, ":")
+    print("MCC = ", mcc)
+    print("BA = ", ba)
 
-df = pd.read_csv(bow_prediction_file)
-tp, tn, fp, fn = calculate_confusion_matrix_file_level_baseline(df)
-mcc = calculate_mcc(tp, tn, fp, fn)
-ba = calculate_balanced_accuracy(tp, tn, fp, fn)
-
-print()
-print("Matthews Correlation Coefficient (MCC) BoW:", mcc)
-print("Balanced Accuracy (BA) BoW:", ba)
-
-df = pd.read_csv(cnn_prediction_file)
-tp, tn, fp, fn = calculate_confusion_matrix_file_level_baseline(df)
-mcc = calculate_mcc(tp, tn, fp, fn)
-ba = calculate_balanced_accuracy(tp, tn, fp, fn)
-
-print()
-print("Matthews Correlation Coefficient (MCC) CNN:", mcc)
-print("Balanced Accuracy (BA) CNN:", ba)
-
-df = pd.read_csv(dbn_prediction_file)
-tp, tn, fp, fn = calculate_confusion_matrix_file_level_baseline(df)
-mcc = calculate_mcc(tp, tn, fp, fn)
-ba = calculate_balanced_accuracy(tp, tn, fp, fn)
-
-print()
-print("Matthews Correlation Coefficient (MCC) DBN:", mcc)
-print("Balanced Accuracy (BA) DBN:", ba)
+calculate_metrics_for_baselines(bi_lstm_prediction_file, "Bi-LSTM")
+calculate_metrics_for_baselines(bow_prediction_file, "BOW")
+calculate_metrics_for_baselines(cnn_prediction_file, "CNN")
+calculate_metrics_for_baselines(dbn_prediction_file, "DBN")
 
 def get_dp_mcc_with_thresholds(df, thresholds):
     for t in thresholds:
         tp, tn, fp, fn = calculate_confusion_matrix_deepLine(df, t)
         mcc = calculate_mcc(tp, tn, fp, fn)
         ba = calculate_balanced_accuracy(tp, tn, fp, fn)
+
         print()
-        print("Matthews Correlation Coefficient (MCC) DP:", mcc, "Threshold", t)
-        print("Balanced Accuracy (BA) DP:", ba, "Threshold", t)
+        print("DeepLineDP with Threshold", t, ":")
+        print("MCC = ", mcc)
+        print("BA = ", ba)
 
 
 df = pd.read_csv(deepLineDp_prediction_file)
