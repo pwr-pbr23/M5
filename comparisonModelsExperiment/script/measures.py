@@ -1,8 +1,18 @@
 import pandas as pd
 from math import sqrt
+import os, argparse
 
-deepLineDp_prediction_folder = '../output/prediction/DeepLineDP/within-release/'
-deepLineDp_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv'] # only activemq
+arg = argparse.ArgumentParser()
+
+# arg.add_argument('-dataset',type=str, default='activemq', help='software project name (lowercase)')
+arg.add_argument('-classifiers',type=str, default='all', help='list of calssifiers. Values = all,dp,rf,xgb,lgbm,bi_lstm,bow,cnn,dbn')
+
+args = arg.parse_args()
+
+classifiers = args.classifiers
+
+deep_line_dp_prediction_folder = '../output/prediction/DeepLineDP/within-release/'
+deep_line_dp_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv'] # only activemq
 # deepLineDp_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv', 'camel-2.10.0.csv', 'camel-2.11.0.csv', 'derby-10.5.1.1.csv', 'groovy-1_6_BETA_2.csv', 'hbase-0.95.2.csv', 'hive-0.12.0.csv', 'jruby-1.5.0.csv', 'jruby-1.7.0.preview1.csv', 'lucene-3.0.0.csv', 'lucene-3.1.csv', 'wicket-1.5.3.csv']
 
 rf_prediction_folder = '../output/RF-line-level-result/'
@@ -128,31 +138,25 @@ def evaluate_metrics_for_baselines(prefiction_file, baseline_name):
 print("MCC: Matthews Correlation Coefficient")
 print("RF: Balanced Accuracy")
 
-df_rf = get_eval_data_frames(rf_prediction_folder, rf_prediction_files)
-evaluate_metrics_for_tree_clasifiers(df_rf, "Random Forest (line level)")
+def try_process_clasifier(key, name, metrix_resolver, prediction_folder, prediction_files):
+    if "all" in classifiers or key in classifiers:
+        df_rf = get_eval_data_frames(prediction_folder, prediction_files)
+        metrix_resolver(df_rf, name)
+    else:
+        print(name, "not included in statistics")
 
-df_xgb = get_eval_data_frames(xgb_prediction_folder, xgb_prediction_files)
-evaluate_metrics_for_tree_clasifiers(df_xgb, "XGBoost (line level)")
-
-df_lgbm = get_eval_data_frames(lgbm_prediction_folder, lgbm_prediction_files)
-evaluate_metrics_for_tree_clasifiers(df_lgbm, "LightGBM (line level)")
-
-df_bi_lstm = get_eval_data_frames(bi_lstm_prediction_folder, bi_lstm_prediction_files)
-evaluate_metrics_for_baselines(df_bi_lstm, "Bi-LSTM (file level)")
-
-df_bow = get_eval_data_frames(bow_prediction_folder, bow_prediction_files)
-evaluate_metrics_for_baselines(df_bow, "BOW (file level)")
-
-df_cnn = get_eval_data_frames(cnn_prediction_folder, cnn_prediction_files)
-evaluate_metrics_for_baselines(df_cnn, "CNN (file level)")
-
-df_dbn = get_eval_data_frames(dbn_prediction_folder, dbn_prediction_files)
-evaluate_metrics_for_baselines(df_dbn, "DBN (file level)")
+try_process_clasifier("rf", "Random Forest (line level)", evaluate_metrics_for_tree_clasifiers, rf_prediction_folder, rf_prediction_files)
+try_process_clasifier("xgb", "XGBoost (line level)", evaluate_metrics_for_tree_clasifiers, xgb_prediction_folder, xgb_prediction_files)
+try_process_clasifier("lgbm", "LightGBM (line level)", evaluate_metrics_for_tree_clasifiers, lgbm_prediction_folder, lgbm_prediction_files)
+try_process_clasifier("bi_lstm", "Bi-LSTM (file level)", evaluate_metrics_for_baselines, bi_lstm_prediction_folder, bi_lstm_prediction_files)
+try_process_clasifier("bow", "BOW (file level)", evaluate_metrics_for_baselines, bow_prediction_folder, bow_prediction_files)
+try_process_clasifier("cnn", "CNN (file level)", evaluate_metrics_for_baselines, cnn_prediction_folder, cnn_prediction_files)
+try_process_clasifier("dbn", "DBN (file level)", evaluate_metrics_for_baselines, dbn_prediction_folder, dbn_prediction_files)
 
 def get_dp_mcc_with_thresholds(df, thresholds):
     for t in thresholds:
         resolver = lambda df: get_confusion_matrix_deepLine(df, t)
         evaluate_metrics(resolver, df, "DeepLineDP (line level) with Threshold " + str(t))
 
-df_dp = get_eval_data_frames(deepLineDp_prediction_folder, deepLineDp_prediction_files)
+df_dp = get_eval_data_frames(deep_line_dp_prediction_folder, deep_line_dp_prediction_files)
 get_dp_mcc_with_thresholds(df_dp, thresholds)
