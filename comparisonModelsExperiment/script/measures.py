@@ -1,10 +1,9 @@
 import pandas as pd
 from math import sqrt
-import os, argparse
+import argparse
 
 arg = argparse.ArgumentParser()
 
-# arg.add_argument('-dataset',type=str, default='activemq', help='software project name (lowercase)')
 arg.add_argument('-classifiers',type=str, default='all', help='list of calssifiers. Values = all,dp,rf,xgb,lgbm,bi_lstm,bow,cnn,dbn')
 
 args = arg.parse_args()
