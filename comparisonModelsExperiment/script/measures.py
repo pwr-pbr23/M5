@@ -3,35 +3,35 @@ from math import sqrt
 
 deepLineDp_prediction_folder = '../output/prediction/DeepLineDP/within-release/'
 deepLineDp_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv'] # only activemq
-# deepLineDp_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv', 'camel-2.10.0.csv', 'camel-2.11.0.csv', 'derby-10.5.1.1.csv', 'groovy-1_6_BETA_2.csv', 'jruby-1.5.0.csv', 'jruby-1.7.0.preview1.csv', 'lucene-3.0.0.csv', 'lucene-3.1.csv', 'wicket-1.5.3.csv']
+# deepLineDp_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv', 'camel-2.10.0.csv', 'camel-2.11.0.csv', 'derby-10.5.1.1.csv', 'groovy-1_6_BETA_2.csv', 'hbase-0.95.2.csv', 'hive-0.12.0.csv', 'jruby-1.5.0.csv', 'jruby-1.7.0.preview1.csv', 'lucene-3.0.0.csv', 'lucene-3.1.csv', 'wicket-1.5.3.csv']
 
 rf_prediction_folder = '../output/RF-line-level-result/'
 rf_prediction_files = ['activemq-5.2.0-line-lvl-result.csv', 'activemq-5.3.0-line-lvl-result.csv', 'activemq-5.8.0-line-lvl-result.csv'] # only activemq
-# rf_prediction_files = ['activemq-5.2.0-line-lvl-result.csv', 'activemq-5.3.0-line-lvl-result.csv', 'activemq-5.8.0-line-lvl-result.csv', 'camel-2.10.0-line-lvl-result.csv', 'camel-2.11.0-line-lvl-result.csv', 'derby-10.5.1.1-line-lvl-result.csv', 'groovy-1_6_BETA_2-line-lvl-result.csv', 'jruby-1.5.0-line-lvl-result.csv', 'jruby-1.7.0.preview1-line-lvl-result.csv', 'lucene-3.0.0-line-lvl-result.csv', 'lucene-3.1-line-lvl-result.csv', 'wicket-1.5.3-line-lvl-result.csv']
+# rf_prediction_files = ['activemq-5.2.0-line-lvl-result.csv', 'activemq-5.3.0-line-lvl-result.csv', 'activemq-5.8.0-line-lvl-result.csv', 'camel-2.10.0-line-lvl-result.csv', 'camel-2.11.0-line-lvl-result.csv', 'derby-10.5.1.1-line-lvl-result.csv', 'groovy-1_6_BETA_2-line-lvl-result.csv', 'hbase-0.95.2-line-lvl-result.csv', 'hive-0.12.0-line-lvl-result.csv', 'jruby-1.5.0-line-lvl-result.csv', 'jruby-1.7.0.preview1-line-lvl-result.csv', 'lucene-3.0.0-line-lvl-result.csv', 'lucene-3.1-line-lvl-result.csv', 'wicket-1.5.3-line-lvl-result.csv']
 
 xgb_prediction_folder = '../output/XGB-line-level-result/'
 xgb_prediction_files = ['activemq-5.2.0-line-lvl-result.csv', 'activemq-5.3.0-line-lvl-result.csv', 'activemq-5.8.0-line-lvl-result.csv'] # only activemq
-# xgb_prediction_files = ['activemq-5.2.0-line-lvl-result.csv', 'activemq-5.3.0-line-lvl-result.csv', 'activemq-5.8.0-line-lvl-result.csv', 'camel-2.10.0-line-lvl-result.csv', 'camel-2.11.0-line-lvl-result.csv', 'derby-10.5.1.1-line-lvl-result.csv', 'groovy-1_6_BETA_2-line-lvl-result.csv', 'jruby-1.5.0-line-lvl-result.csv', 'jruby-1.7.0.preview1-line-lvl-result.csv', 'lucene-3.0.0-line-lvl-result.csv', 'lucene-3.1-line-lvl-result.csv', 'wicket-1.5.3-line-lvl-result.csv']
+# xgb_prediction_files = ['activemq-5.2.0-line-lvl-result.csv', 'activemq-5.3.0-line-lvl-result.csv', 'activemq-5.8.0-line-lvl-result.csv', 'camel-2.10.0-line-lvl-result.csv', 'camel-2.11.0-line-lvl-result.csv', 'derby-10.5.1.1-line-lvl-result.csv', 'groovy-1_6_BETA_2-line-lvl-result.csv', 'hbase-0.95.2-line-lvl-result.csv', 'hive-0.12.0-line-lvl-result.csv', 'jruby-1.5.0-line-lvl-result.csv', 'jruby-1.7.0.preview1-line-lvl-result.csv', 'lucene-3.0.0-line-lvl-result.csv', 'lucene-3.1-line-lvl-result.csv', 'wicket-1.5.3-line-lvl-result.csv']
 
 lgbm_prediction_folder = '../output/LGBM-line-level-result/'
 lgbm_prediction_files = ['activemq-5.2.0-line-lvl-result.csv', 'activemq-5.3.0-line-lvl-result.csv', 'activemq-5.8.0-line-lvl-result.csv'] # only activemq
-# lgbm_prediction_files = ['activemq-5.2.0-line-lvl-result.csv', 'activemq-5.3.0-line-lvl-result.csv', 'activemq-5.8.0-line-lvl-result.csv', 'camel-2.10.0-line-lvl-result.csv', 'camel-2.11.0-line-lvl-result.csv', 'derby-10.5.1.1-line-lvl-result.csv', 'groovy-1_6_BETA_2-line-lvl-result.csv', 'jruby-1.5.0-line-lvl-result.csv', 'jruby-1.7.0.preview1-line-lvl-result.csv', 'lucene-3.0.0-line-lvl-result.csv', 'lucene-3.1-line-lvl-result.csv', 'wicket-1.5.3-line-lvl-result.csv']
+# lgbm_prediction_files = ['activemq-5.2.0-line-lvl-result.csv', 'activemq-5.3.0-line-lvl-result.csv', 'activemq-5.8.0-line-lvl-result.csv', 'camel-2.10.0-line-lvl-result.csv', 'camel-2.11.0-line-lvl-result.csv', 'derby-10.5.1.1-line-lvl-result.csv', 'groovy-1_6_BETA_2-line-lvl-result.csv', 'hbase-0.95.2-line-lvl-result.csv', 'hive-0.12.0-line-lvl-result.csv', 'jruby-1.5.0-line-lvl-result.csv', 'jruby-1.7.0.preview1-line-lvl-result.csv', 'lucene-3.0.0-line-lvl-result.csv', 'lucene-3.1-line-lvl-result.csv', 'wicket-1.5.3-line-lvl-result.csv']
 
 bi_lstm_prediction_folder = '../output/prediction/Bi-LSTM/within-release/'
 bi_lstm_prediction_files = ['activemq-5.2.0-6-epochs.csv', 'activemq-5.3.0-6-epochs.csv', 'activemq-5.8.0-6-epochs.csv'] # only activemq
-# bi_lstm_prediction_files = ['activemq-5.2.0-6-epochs.csv', 'activemq-5.3.0-6-epochs.csv', 'activemq-5.8.0-6-epochs.csv', 'camel-2.10.0-6-epochs.csv', 'camel-2.11.0-6-epochs.csv', 'derby-10.5.1.1-6-epochs.csv', 'groovy-1_6_BETA_2-6-epochs.csv', 'jruby-1.5.0-6-epochs.csv', 'jruby-1.7.0.preview1-6-epochs.csv', 'lucene-3.0.0-6-epochs.csv', 'lucene-3.1-6-epochs.csv', 'wicket-1.5.3-6-epochs.csv']
+# bi_lstm_prediction_files = ['activemq-5.2.0-6-epochs.csv', 'activemq-5.3.0-6-epochs.csv', 'activemq-5.8.0-6-epochs.csv', 'camel-2.10.0-6-epochs.csv', 'camel-2.11.0-6-epochs.csv', 'derby-10.5.1.1-6-epochs.csv', 'groovy-1_6_BETA_2-6-epochs.csv', 'hbase-0.95.2-6-epochs.csv', 'hive-0.12.0-6-epochs.csv', 'jruby-1.5.0-6-epochs.csv', 'jruby-1.7.0.preview1-6-epochs.csv', 'lucene-3.0.0-6-epochs.csv', 'lucene-3.1-6-epochs.csv', 'wicket-1.5.3-6-epochs.csv']
 
 bow_prediction_folder = '../output/prediction/BoW/within-release/'
 bow_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv'] # only activemq
-# bow_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv', 'camel-2.10.0.csv', 'camel-2.11.0.csv', 'derby-10.5.1.1.csv', 'groovy-1_6_BETA_2.csv', 'jruby-1.5.0.csv', 'jruby-1.7.0.preview1.csv', 'lucene-3.0.0.csv', 'lucene-3.1.csv', 'wicket-1.5.3.csv']
+# bow_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv', 'camel-2.10.0.csv', 'camel-2.11.0.csv', 'derby-10.5.1.1.csv', 'groovy-1_6_BETA_2.csv', 'hbase-0.95.2.csv', 'hive-0.12.0.csv', 'jruby-1.5.0.csv', 'jruby-1.7.0.preview1.csv', 'lucene-3.0.0.csv', 'lucene-3.1.csv', 'wicket-1.5.3.csv']
 
 cnn_prediction_folder = '../output/prediction/CNN/within-release/'
 cnn_prediction_files = ['activemq-5.2.0-6-epochs.csv', 'activemq-5.3.0-6-epochs.csv', 'activemq-5.8.0-6-epochs.csv'] # only activemq
-# cnn_prediction_files = ['activemq-5.2.0-6-epochs.csv', 'activemq-5.3.0-6-epochs.csv', 'activemq-5.8.0-6-epochs.csv', 'camel-2.10.0-6-epochs.csv', 'camel-2.11.0-6-epochs.csv', 'derby-10.5.1.1-6-epochs.csv', 'groovy-1_6_BETA_2-6-epochs.csv', 'jruby-1.5.0-6-epochs.csv', 'jruby-1.7.0.preview1-6-epochs.csv', 'lucene-3.0.0-6-epochs.csv', 'lucene-3.1-6-epochs.csv', 'wicket-1.5.3-6-epochs.csv']
+# cnn_prediction_files = ['activemq-5.2.0-6-epochs.csv', 'activemq-5.3.0-6-epochs.csv', 'activemq-5.8.0-6-epochs.csv', 'camel-2.10.0-6-epochs.csv', 'camel-2.11.0-6-epochs.csv', 'derby-10.5.1.1-6-epochs.csv', 'groovy-1_6_BETA_2-6-epochs.csv', 'hbase-0.95.2-6-epochs.csv', 'hive-0.12.0-6-epochs.csv', 'jruby-1.5.0-6-epochs.csv', 'jruby-1.7.0.preview1-6-epochs.csv', 'lucene-3.0.0-6-epochs.csv', 'lucene-3.1-6-epochs.csv', 'wicket-1.5.3-6-epochs.csv']
 
 dbn_prediction_folder = '../output/prediction/DBN/within-release/'
 dbn_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv'] # only activemq
-# dbn_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv', 'camel-2.10.0.csv', 'camel-2.11.0.csv', 'derby-10.5.1.1.csv', 'groovy-1_6_BETA_2.csv', 'jruby-1.5.0.csv', 'jruby-1.7.0.preview1.csv', 'lucene-3.0.0.csv', 'lucene-3.1.csv', 'wicket-1.5.3.csv']
+# dbn_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv', 'camel-2.10.0.csv', 'camel-2.11.0.csv', 'derby-10.5.1.1.csv', 'groovy-1_6_BETA_2.csv', 'hbase-0.95.2.csv', 'hive-0.12.0.csv', 'jruby-1.5.0.csv', 'jruby-1.7.0.preview1.csv', 'lucene-3.0.0.csv', 'lucene-3.1.csv', 'wicket-1.5.3.csv']
 
 thresholds = [0.99, 0.9, 0.8, 0.6, 0.3, 0.1, 0.01, 0.0001, 0]
 
