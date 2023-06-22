@@ -162,7 +162,7 @@ classifier_by_name = {
 }
 
 default_proj_name = "activemq"
-proj_name = sys.argv[1] if sys.argv.length > 0 else default_proj_name
+proj_name = sys.argv[1] if len(sys.argv) > 1 else default_proj_name
 results = { "RF": {}, "XGB": {}, "LGBM": {} }
 results_path = "../../output/decision-tree-best-params.csv"
 
