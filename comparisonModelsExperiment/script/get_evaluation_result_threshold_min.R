@@ -78,11 +78,13 @@ for (f in all_files)
   df_all <- rbind(df_all, df)
 }
 
-all_eval_releases = c('activemq-5.2.0', 'activemq-5.3.0', 'activemq-5.8.0',
-                      'camel-2.10.0', 'camel-2.11.0' ,
-                      'derby-10.5.1.1' , 'groovy-1_6_BETA_2',
-                      'jruby-1.5.0', 'jruby-1.7.0.preview1',
-                      'lucene-3.0.0', 'lucene-3.1', 'wicket-1.5.3')
+
+all_eval_releases = c('activemq-5.2.0', 'activemq-5.3.0', 'activemq-5.8.0')
+# all_eval_releases = c('activemq-5.2.0', 'activemq-5.3.0', 'activemq-5.8.0',
+#                       'camel-2.10.0', 'camel-2.11.0' ,
+#                       'derby-10.5.1.1' , 'groovy-1_6_BETA_2',
+#                       'jruby-1.5.0', 'jruby-1.7.0.preview1',
+#                       'lucene-3.0.0', 'lucene-3.1', 'wicket-1.5.3')
 
 # Force attention score of comment line is 0
 df_all[df_all$is.comment.line == "True", ]$token.attention.score <- 0
