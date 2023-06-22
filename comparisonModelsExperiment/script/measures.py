@@ -2,6 +2,7 @@ import pandas as pd
 from math import sqrt
 import argparse
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 
 arg = argparse.ArgumentParser()
 
@@ -203,7 +204,11 @@ def generate_charts(classifiers, metric, values):
     ax.legend()
 
     plt.tight_layout()
-    plt.show()
+    
+    with PdfPages(f'../output/figure/file-{metric}.pdf') as pdf:
+        pdf.savefig(fig)
+
+    plt.close(fig) 
 
 
 def evaluate_metrics_for_tree_clasifiers(prefiction_file, baseline_name):
@@ -283,6 +288,5 @@ values = {metric: [results[classifier][metric]
                    for classifier in classifiersResultList] for metric in metrics}
 
 # Plotting
-generate_charts(classifiersResultList, 'MCC', values['MCC'])
-# generate_charts(classifiersResultList, 'Balanced Accuracy',
-#                 values['Balanced Accuracy'])
+for metric in metrics:
+    generate_charts(classifiersResultList, metric, values[metric])
