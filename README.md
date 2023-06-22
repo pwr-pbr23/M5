@@ -33,12 +33,8 @@
 Steps to replicate the study:
 1. Access the shared file [🛠️ Main - with our research - DeepLineDp](https://colab.research.google.com/drive/1RRcg-vouL0gPwLS6mjSvePa06ikFZXzN?usp=sharing).
 2. Create a copy of that file: `File -> Save a copy in Drive`.
-3. On your copy of `Main - with our research - DeepLineDP`, execute all the tasks: they include data preprocessing, training DeepLineDP, RandomForest, XGBoost, LighGBM models and predicting results. Predictions are stored as .csv files (one file per release of the library) located in `./comparisonModelsExperiment/output`, split by model folders: `prediction/DeepLineDP`, `RF-line-level-result`, `XGB-line-level-result`, `LGBM-line-level-result`.
-4. The next step is to get the evaluation results: Recall@Top20LOC, Effort@Top20Recall and IFA. The workflow requires you to connect a google drive. The whole `./comparisonModelsExperiment` folder will be copied to your google drive as `comparisonModelsExperiment.zip`. You should then download the file from google drive and unzip on your local machine. Make sure that extracted folder contains `output` folder with prediction data - it should be there after running google colab workflow.
-5. Furthermore, install R language for your system environment (https://cran.r-project.org/).
-6. Open `./comparisonModelsExperiment` folder.
-7. Make sure your current pwd is `./comparisonModelsExperiment`.
-8. Navigate to `script`: `cd ./script`.
-9.  Install required packages by running: `Rscript ./install_packages.R`.
-10. Run to evaluate the results: `Rscript ./get_evaluation_result.R`.
-11. The evaluation figures are located in `./comparisonModelsExperiment/output/figure` folder.
+3. On your copy of `Main - with our research - DeepLineDP`, execute all the tasks. They include data preprocessing, training DeepLineDP, RandomForest, XGBoost, LighGBM models, predicting results, top-k tokens investigation and comparison of the classifiers based on MCC, BA metrics. Predictions are stored as .csv files (one file per release of the library) located in `./comparisonModelsExperiment/output`, split by model folders: `prediction/DeepLineDP`, `RF-line-level-result`, `XGB-line-level-result`, `LGBM-line-level-result`. The comparison results of the classifiers with metrics are located in `./comparisonModelsExperiment/output/figure`.
+4. The workflow asks you to connect a google drive. This is optional but will provide better user experience - it's possible to download all of the results and figures.
+5. The next step is the evaluation results: Recall@Top20LOC, Effort@Top20Recall and IFA. After that the top-k investigation will be performed and at the end MCC, BA metrics will be calculated.
+6.  The `./comparisonModelsExperiment/output` folder will be copied to your google drive as `comparisonModelsExperimentFigure.zip`. You can then download the file from google drive and unzip on your local machine.
+7.  The evaluation results are located in `./figure` folder.
