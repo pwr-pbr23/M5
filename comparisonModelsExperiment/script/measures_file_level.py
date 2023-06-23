@@ -18,14 +18,13 @@ dataset = args.dataset
 
 print("Dataset: ", dataset)
 
-# TODO: Restore releases
 deep_line_dp_prediction_folder = '../output/prediction/DeepLineDP/within-release/'
 if dataset == 'activemq':
     deep_line_dp_prediction_files = [
         'activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv']  # only activemq
 else:
     deep_line_dp_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv', 'camel-2.10.0.csv', 'camel-2.11.0.csv', 'derby-10.5.1.1.csv',
-                                     'groovy-1_6_BETA_2.csv', 'jruby-1.5.0.csv', 'jruby-1.7.0.preview1.csv', 'lucene-3.0.0.csv', 'lucene-3.1.csv', 'wicket-1.5.3.csv']
+                                     'groovy-1_6_BETA_2.csv', 'hbase-0.95.2.csv', 'hive-0.12.0.csv', 'jruby-1.5.0.csv', 'jruby-1.7.0.preview1.csv', 'lucene-3.0.0.csv', 'lucene-3.1.csv', 'wicket-1.5.3.csv']
 
 bi_lstm_prediction_folder = '../output/prediction/Bi-LSTM/within-release/'
 if dataset == 'activemq':
@@ -49,14 +48,15 @@ if dataset == 'activemq':
                             'activemq-5.3.0-6-epochs.csv', 'activemq-5.8.0-6-epochs.csv']  # only activemq
 else:
     cnn_prediction_files = ['activemq-5.2.0-6-epochs.csv', 'activemq-5.3.0-6-epochs.csv', 'activemq-5.8.0-6-epochs.csv', 'camel-2.10.0-6-epochs.csv', 'camel-2.11.0-6-epochs.csv', 'derby-10.5.1.1-6-epochs.csv', 'groovy-1_6_BETA_2-6-epochs.csv',
-                            'jruby-1.5.0-6-epochs.csv', 'jruby-1.7.0.preview1-6-epochs.csv', 'lucene-3.0.0-6-epochs.csv', 'lucene-3.1-6-epochs.csv', 'wicket-1.5.3-6-epochs.csv']
+                            'hbase-0.95.2-6-epochs.csv', 'hive-0.12.0-6-epochs.csv', 'jruby-1.5.0-6-epochs.csv', 'jruby-1.7.0.preview1-6-epochs.csv', 'lucene-3.0.0-6-epochs.csv', 'lucene-3.1-6-epochs.csv', 'wicket-1.5.3-6-epochs.csv']
 
 dbn_prediction_folder = '../output/prediction/DBN/within-release/'
 if dataset == 'activemq':
     dbn_prediction_files = [
         'activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv']  # only activemq
 else:
-    dbn_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv', 'camel-2.10.0.csv', 'camel-2.11.0.csv']
+    dbn_prediction_files = ['activemq-5.2.0.csv', 'activemq-5.3.0.csv', 'activemq-5.8.0.csv', 'camel-2.10.0.csv', 'camel-2.11.0.csv', 'derby-10.5.1.1.csv',
+                            'groovy-1_6_BETA_2.csv', 'hbase-0.95.2.csv', 'hive-0.12.0.csv', 'jruby-1.5.0.csv', 'jruby-1.7.0.preview1.csv', 'lucene-3.0.0.csv', 'lucene-3.1.csv', 'wicket-1.5.3.csv']
 
 thresholds = [0.99, 0.9, 0.8, 0.6, 0.3, 0.1, 0.01, 0.0001, 0]
 
